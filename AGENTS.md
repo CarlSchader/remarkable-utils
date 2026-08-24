@@ -17,8 +17,12 @@ This repository is **open source** (dual-licensed MIT OR Apache-2.0):
 - New crates inherit `license`, `version`, `edition`, `repository`, and
   `authors` from `[workspace.package]` in the root `Cargo.toml` and should
   include a `description`.
-- Keep docs written for a general audience; do not reference private
-  infrastructure or repos.
+- **Never reference private repos or infrastructure** — anywhere:
+  docs, code comments, commit messages, PR descriptions. Describe
+  patterns and conventions on their own merits instead of citing where
+  they came from. Referencing public projects (e.g. for attribution or
+  domain references) is fine.
+- Keep docs written for a general audience.
 
 ## Layout
 
@@ -55,6 +59,10 @@ This repository is **open source** (dual-licensed MIT OR Apache-2.0):
 - `client.rs` — high-level operations composing the two. `list_items`
   fetches all metadata in a single SSH round trip (batched remote script
   with a per-call random marker); keep new operations batched too.
+- `progress.rs` — observer trait for progress events (`step`, `bytes`,
+  `bytes_done`, `finished`). The **library never prints**; `rmu` renders
+  these as indicatif bars on stderr. New long-running `Client`
+  operations must emit steps and call `finished()` on completion.
 - `error.rs` — typed errors (`thiserror`).
 
 ## reMarkable domain knowledge
@@ -130,8 +138,27 @@ nix build .#rmu                    # build the CLI via crane
   (edition 2024, `resolver = "3"`).
 - Shared dependency versions live in `[workspace.dependencies]` in the root
   `Cargo.toml`; member crates depend via `{ workspace = true }`.
+- Prefer functional style: iterator chains, `fold`/`try_fold`,
+  `filter_map`, `try_for_each`, and `std::iter::successors` for chain
+  walks (see `ancestor_chain` in `xochitl.rs`) over imperative `for`
+  loops with mutable state. Local mutation *inside* a fold accumulator
+  or builder closure is fine; threading mutable state *across* loop
+  iterations is what to avoid. Low-level I/O pumps (`copy_with_progress`
+  in `ssh.rs`) are the accepted exception.
+- Parallelism (rayon) only for **measured** CPU-bound hot spots, never
+  by default — this repo's workloads are dominated by SSH round trips.
+  Measured: parsing 10k metadata JSONs takes ~7 ms sequentially
+  (release, M-series), invisible next to the network fetch. If a real
+  CPU-bound workload appears (e.g. bulk `.rm` rendering), use
+  `par_iter` with per-thread `fold` + `reduce` over a commutative
+  merge, and quote the measurement in the PR. The `build_items`
+  pipeline is already shaped for a drop-in `par_iter` if that day
+  comes.
 - Reusable, tool-agnostic logic goes in `libremarkable-utils/`; CLI/tool
   concerns (flags, prompting, printing) go in binary crates.
+- Output discipline in binaries: **stdout is machine-usable results
+  only** (trees/JSON, paths, UUIDs); progress and human status lines go
+  to stderr and must respect `--quiet` and non-tty stderr.
 - New binary crates: add to `[workspace] members`, register a package in
   `nix/rust-packages.nix` (copy the `rmu` block, and add any new library
   crates to `fileSetForCrate`).

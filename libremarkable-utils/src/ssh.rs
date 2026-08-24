@@ -17,11 +17,12 @@
 
 use std::fmt;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 use crate::error::{Error, Result};
+use crate::progress::{NoProgress, Progress};
 
 /// Default hostname of a reMarkable tablet when connected over USB.
 pub const DEFAULT_USB_HOST: &str = "10.11.99.1";
@@ -125,9 +126,9 @@ impl SshSession {
         if let Some(identity) = &self.opts.identity_file {
             cmd.arg("-i").arg(identity);
         }
-        for opt in &self.opts.extra_options {
+        self.opts.extra_options.iter().for_each(|opt| {
             cmd.arg("-o").arg(opt);
-        }
+        });
         if let Some(dir) = &self.control_dir {
             cmd.arg("-o").arg("ControlMaster=auto");
             cmd.arg("-o")
@@ -167,19 +168,37 @@ impl SshSession {
 
     /// Run a remote command and return stdout; non-zero exit is an error.
     pub fn run_checked(&self, remote_cmd: &str) -> Result<String> {
-        let stdout = self.run_checked_bytes(remote_cmd)?;
+        let stdout = self.run_checked_bytes(remote_cmd, &NoProgress)?;
         Ok(String::from_utf8_lossy(&stdout).into_owned())
     }
 
-    /// Like [`Self::run_checked`], but for binary stdout (e.g. tar streams).
-    pub fn run_checked_bytes(&self, remote_cmd: &str) -> Result<Vec<u8>> {
-        let output = checked(self.run(remote_cmd)?)?;
-        Ok(output.stdout)
+    /// Like [`Self::run_checked`], but for binary stdout (e.g. tar
+    /// streams), reporting transfer progress (total unknown).
+    pub fn run_checked_bytes(&self, remote_cmd: &str, progress: &dyn Progress) -> Result<Vec<u8>> {
+        let mut child = self
+            .command(remote_cmd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let mut data = Vec::new();
+        {
+            let mut stdout = child.stdout.take().expect("stdout was piped");
+            copy_with_progress(&mut stdout, &mut data, None, progress)?;
+        }
+        checked(child.wait_with_output()?)?;
+        progress.bytes_done();
+        Ok(data)
     }
 
     /// Run a remote command with bytes piped to its stdin; non-zero
-    /// exit is an error.
-    pub fn run_checked_with_stdin(&self, remote_cmd: &str, data: &[u8]) -> Result<()> {
+    /// exit is an error. Reports transfer progress (total known).
+    pub fn run_checked_with_stdin(
+        &self,
+        remote_cmd: &str,
+        data: &[u8],
+        progress: &dyn Progress,
+    ) -> Result<()> {
         let mut child = self
             .command(remote_cmd)
             .stdin(Stdio::piped())
@@ -188,37 +207,71 @@ impl SshSession {
             .spawn()?;
         {
             let mut stdin = child.stdin.take().expect("stdin was piped");
-            stdin.write_all(data)?;
+            let mut reader = data;
+            copy_with_progress(&mut reader, &mut stdin, Some(data.len() as u64), progress)?;
         }
         checked(child.wait_with_output()?)?;
+        progress.bytes_done();
         Ok(())
     }
 
-    /// Write bytes to a remote file (via `cat > path`).
+    /// Write bytes to a remote file (via `cat > path`). Small control
+    /// writes; no progress reporting.
     pub fn write_remote_file(&self, remote_path: &str, data: &[u8]) -> Result<()> {
-        self.run_checked_with_stdin(&format!("cat > {}", shell_quote(remote_path)), data)
+        self.run_checked_with_stdin(
+            &format!("cat > {}", shell_quote(remote_path)),
+            data,
+            &NoProgress,
+        )
     }
 
-    /// Stream a local file to a remote path.
-    pub fn upload_local_file(&self, local: &Path, remote_path: &str) -> Result<()> {
-        let file = fs::File::open(local)?;
-        let output = self
+    /// Stream a local file to a remote path, reporting progress.
+    pub fn upload_local_file(
+        &self,
+        local: &Path,
+        remote_path: &str,
+        progress: &dyn Progress,
+    ) -> Result<()> {
+        let mut file = fs::File::open(local)?;
+        let total = file.metadata()?.len();
+        let mut child = self
             .command(&format!("cat > {}", shell_quote(remote_path)))
-            .stdin(Stdio::from(file))
-            .output()?;
-        checked(output)?;
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        {
+            let mut stdin = child.stdin.take().expect("stdin was piped");
+            copy_with_progress(&mut file, &mut stdin, Some(total), progress)?;
+        }
+        checked(child.wait_with_output()?)?;
+        progress.bytes_done();
         Ok(())
     }
 
-    /// Stream a remote file to a local path.
-    pub fn download_remote_file(&self, remote_path: &str, local: &Path) -> Result<()> {
-        let file = fs::File::create(local)?;
-        let output = self
+    /// Stream a remote file to a local path, reporting progress.
+    /// `total` is a size hint for the progress bar (e.g. from a prior
+    /// listing); the transfer itself does not depend on it.
+    pub fn download_remote_file(
+        &self,
+        remote_path: &str,
+        local: &Path,
+        total: Option<u64>,
+        progress: &dyn Progress,
+    ) -> Result<()> {
+        let mut child = self
             .command(&format!("cat {}", shell_quote(remote_path)))
             .stdin(Stdio::null())
-            .stdout(Stdio::from(file))
-            .output()?;
-        checked(output)?;
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        {
+            let mut stdout = child.stdout.take().expect("stdout was piped");
+            let mut file = fs::File::create(local)?;
+            copy_with_progress(&mut stdout, &mut file, total, progress)?;
+        }
+        checked(child.wait_with_output()?)?;
+        progress.bytes_done();
         Ok(())
     }
 }
@@ -283,6 +336,26 @@ pub fn shell_quote(s: &str) -> String {
     }
 }
 
+/// `io::copy` with per-chunk progress callbacks.
+fn copy_with_progress(
+    reader: &mut impl Read,
+    writer: &mut impl Write,
+    total: Option<u64>,
+    progress: &dyn Progress,
+) -> std::io::Result<u64> {
+    let mut buffer = [0u8; 64 * 1024];
+    let mut transferred = 0u64;
+    loop {
+        let n = reader.read(&mut buffer)?;
+        if n == 0 {
+            return Ok(transferred);
+        }
+        writer.write_all(&buffer[..n])?;
+        transferred += n as u64;
+        progress.bytes(transferred, total);
+    }
+}
+
 fn checked(output: Output) -> Result<Output> {
     if output.status.success() {
         return Ok(output);
@@ -323,6 +396,34 @@ mod tests {
             "/home/root/.local/share"
         );
         assert_eq!(shell_quote("abc-123_x.y"), "abc-123_x.y");
+    }
+
+    #[test]
+    fn copy_reports_progress() {
+        use std::cell::RefCell;
+
+        struct Recorder(RefCell<Vec<(u64, Option<u64>)>>);
+        impl crate::progress::Progress for Recorder {
+            fn step(&self, _: &str) {}
+            fn bytes(&self, transferred: u64, total: Option<u64>) {
+                self.0.borrow_mut().push((transferred, total));
+            }
+            fn bytes_done(&self) {}
+            fn finished(&self) {}
+        }
+
+        let data = vec![7u8; 100 * 1024]; // spans two 64 KiB chunks
+        let recorder = Recorder(RefCell::new(Vec::new()));
+        let mut out = Vec::new();
+        let copied =
+            copy_with_progress(&mut &data[..], &mut out, Some(data.len() as u64), &recorder)
+                .unwrap();
+        assert_eq!(copied, data.len() as u64);
+        assert_eq!(out, data);
+        let events = recorder.0.borrow();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0], (64 * 1024, Some(100 * 1024)));
+        assert_eq!(events[1], (100 * 1024, Some(100 * 1024)));
     }
 
     #[test]

@@ -203,16 +203,15 @@ fn sort_key(item: &Item) -> (u8, String, &str) {
 
 /// Map of parent UUID -> sorted children (folders first, then name).
 pub fn children_map(items: &[Item], folders_only: bool) -> HashMap<&str, Vec<&Item>> {
-    let mut map: HashMap<&str, Vec<&Item>> = HashMap::new();
-    for item in items {
-        if folders_only && !item.is_folder() {
-            continue;
-        }
-        map.entry(item.parent.as_str()).or_default().push(item);
-    }
-    for children in map.values_mut() {
-        children.sort_by(|a, b| sort_key(a).cmp(&sort_key(b)));
-    }
+    let mut map = items
+        .iter()
+        .filter(|item| !folders_only || item.is_folder())
+        .fold(HashMap::<&str, Vec<&Item>>::new(), |mut map, item| {
+            map.entry(item.parent.as_str()).or_default().push(item);
+            map
+        });
+    map.values_mut()
+        .for_each(|children| children.sort_by(|a, b| sort_key(a).cmp(&sort_key(b))));
     map
 }
 
@@ -230,28 +229,24 @@ pub fn resolve_item_ref<'a>(items: &'a [Item], item_ref: &str) -> Result<&'a Ite
         return Err(Error::RootTarget);
     }
 
-    let mut parent = "";
-    let mut current: Option<&Item> = None;
-    for part in path.split('/').map(str::trim).filter(|p| !p.is_empty()) {
-        let matches: Vec<&Item> = items
-            .iter()
-            .filter(|item| item.parent == parent && item.visible_name == part)
-            .collect();
-        match matches.as_slice() {
-            [] => return Err(Error::PathNotFound(item_ref.to_string())),
-            [only] => {
-                parent = only.uuid.as_str();
-                current = Some(only);
-            }
-            _ => {
-                return Err(Error::AmbiguousPath {
+    path.split('/')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .try_fold(None::<&Item>, |current, part| {
+            let parent = current.map_or("", |item| item.uuid.as_str());
+            let mut matches = items
+                .iter()
+                .filter(|item| item.parent == parent && item.visible_name == part);
+            match (matches.next(), matches.next()) {
+                (Some(only), None) => Ok(Some(only)),
+                (Some(_), Some(_)) => Err(Error::AmbiguousPath {
                     segment: part.to_string(),
                     path: item_ref.to_string(),
-                });
+                }),
+                (None, _) => Err(Error::PathNotFound(item_ref.to_string())),
             }
-        }
-    }
-    current.ok_or_else(|| Error::PathNotFound(item_ref.to_string()))
+        })?
+        .ok_or_else(|| Error::PathNotFound(item_ref.to_string()))
 }
 
 /// Resolve a folder reference to its UUID. `""`, `/`, and `(root)` all
@@ -274,21 +269,18 @@ pub fn find_child<'a>(
     name: &str,
     folders_only: bool,
 ) -> Result<Option<&'a Item>> {
-    let matches: Vec<&Item> = items
-        .iter()
-        .filter(|item| {
-            item.parent == parent_uuid
-                && item.visible_name == name
-                && (!folders_only || item.is_folder())
-        })
-        .collect();
-    if matches.len() > 1 {
-        return Err(Error::AmbiguousPath {
+    let mut matches = items.iter().filter(|item| {
+        item.parent == parent_uuid
+            && item.visible_name == name
+            && (!folders_only || item.is_folder())
+    });
+    match (matches.next(), matches.next()) {
+        (first, None) => Ok(first),
+        _ => Err(Error::AmbiguousPath {
             segment: name.to_string(),
             path: display_parent(parent_uuid).to_string(),
-        });
+        }),
     }
-    Ok(matches.first().copied())
 }
 
 /// Error if `parent_uuid` already contains an item named `name`
@@ -315,53 +307,40 @@ pub fn ensure_no_conflict(
 
 /// All transitive descendants of `parent_uuid`.
 pub fn descendants<'a>(items: &'a [Item], parent_uuid: &str) -> Vec<&'a Item> {
-    let children = children_map(items, false);
-    let mut out = Vec::new();
-    let mut stack: Vec<&Item> = children.get(parent_uuid).cloned().unwrap_or_default();
-    while let Some(item) = stack.pop() {
-        out.push(item);
-        if item.is_folder()
-            && let Some(kids) = children.get(item.uuid.as_str())
-        {
-            stack.extend(kids.iter().copied());
-        }
+    fn walk<'a>(children: &HashMap<&str, Vec<&'a Item>>, parent: &str) -> Vec<&'a Item> {
+        children
+            .get(parent)
+            .into_iter()
+            .flatten()
+            .flat_map(|item| std::iter::once(*item).chain(walk(children, &item.uuid)))
+            .collect()
     }
-    out
+    walk(&children_map(items, false), parent_uuid)
 }
 
 /// Whether `candidate_uuid` is `ancestor_uuid` or inside it.
 pub fn is_descendant(items: &[Item], candidate_uuid: &str, ancestor_uuid: &str) -> bool {
-    let parents: HashMap<&str, &str> = items
-        .iter()
-        .map(|item| (item.uuid.as_str(), item.parent.as_str()))
-        .collect();
-    let mut current = candidate_uuid;
-    // Hop cap guards against parent cycles in corrupt metadata.
-    for _ in 0..=items.len() {
-        if current.is_empty() {
-            return false;
-        }
-        if current == ancestor_uuid {
-            return true;
-        }
-        current = parents.get(current).copied().unwrap_or("");
-    }
-    false
+    ancestor_chain(items, candidate_uuid).any(|uuid| uuid == ancestor_uuid)
 }
 
 /// Number of ancestors between `item` and the root.
 pub fn depth(items: &[Item], item: &Item) -> usize {
+    ancestor_chain(items, &item.parent).count()
+}
+
+/// Walk a UUID's parent chain toward the root: the UUID itself, its
+/// parent, and so on. Stops at root/unknown parents; the length cap
+/// guards against parent cycles in corrupt metadata.
+fn ancestor_chain<'a>(items: &'a [Item], start_uuid: &'a str) -> impl Iterator<Item = &'a str> {
     let parents: HashMap<&str, &str> = items
         .iter()
         .map(|item| (item.uuid.as_str(), item.parent.as_str()))
         .collect();
-    let mut depth = 0;
-    let mut current = item.parent.as_str();
-    while !current.is_empty() && depth <= items.len() {
-        depth += 1;
-        current = parents.get(current).copied().unwrap_or("");
-    }
-    depth
+    std::iter::successors(Some(start_uuid), move |current| {
+        parents.get(*current).copied()
+    })
+    .take(items.len() + 1)
+    .take_while(|current| !current.is_empty())
 }
 
 /// Absolute logical path of an item, e.g. `/Books/Math/Notes`.
@@ -370,22 +349,16 @@ pub fn build_path(items: &[Item], item: &Item) -> String {
         .iter()
         .map(|item| (item.uuid.as_str(), item))
         .collect();
-    let mut parts = vec![item.visible_name.as_str()];
-    let mut current = item.parent.as_str();
-    for _ in 0..=items.len() {
-        if current.is_empty() {
-            break;
-        }
-        match by_uuid.get(current) {
-            Some(parent) => {
-                parts.push(parent.visible_name.as_str());
-                current = parent.parent.as_str();
-            }
-            None => break,
-        }
-    }
-    parts.reverse();
-    format!("/{}", parts.join("/"))
+    let parts: Vec<&str> = std::iter::successors(Some(item), |current| {
+        by_uuid.get(current.parent.as_str()).copied()
+    })
+    .take(items.len() + 1)
+    .map(|item| item.visible_name.as_str())
+    .collect();
+    format!(
+        "/{}",
+        parts.iter().rev().copied().collect::<Vec<_>>().join("/")
+    )
 }
 
 /// Render the logical tree as text lines.
@@ -415,26 +388,27 @@ pub fn render_tree(items: &[Item], show_uuid: bool, folders_only: bool) -> Vec<S
         prefix: &str,
         children: &HashMap<&str, Vec<&Item>>,
         show_uuid: bool,
-        lines: &mut Vec<String>,
-    ) {
-        let Some(kids) = children.get(parent) else {
-            return;
-        };
-        for (index, child) in kids.iter().enumerate() {
-            let last = index == kids.len() - 1;
-            let branch = if last { "└─ " } else { "├─ " };
-            lines.push(format!("{prefix}{branch}{}", label(child, show_uuid)));
-            if child.is_folder() {
-                let child_prefix = format!("{prefix}{}", if last { "   " } else { "│  " });
-                walk(&child.uuid, &child_prefix, children, show_uuid, lines);
-            }
-        }
+    ) -> Vec<String> {
+        let kids = children.get(parent).map(Vec::as_slice).unwrap_or_default();
+        kids.iter()
+            .enumerate()
+            .flat_map(|(index, child)| {
+                let last = index == kids.len() - 1;
+                let branch = if last { "└─ " } else { "├─ " };
+                let line = format!("{prefix}{branch}{}", label(child, show_uuid));
+                let subtree = if child.is_folder() {
+                    let child_prefix = format!("{prefix}{}", if last { "   " } else { "│  " });
+                    walk(&child.uuid, &child_prefix, children, show_uuid)
+                } else {
+                    Vec::new()
+                };
+                std::iter::once(line).chain(subtree)
+            })
+            .collect()
     }
 
     let children = children_map(items, folders_only);
     let known: HashSet<&str> = items.iter().map(|item| item.uuid.as_str()).collect();
-    let mut lines = vec!["(root)".to_string()];
-    walk("", "", &children, show_uuid, &mut lines);
 
     let mut orphan_parents: Vec<&str> = children
         .keys()
@@ -442,14 +416,23 @@ pub fn render_tree(items: &[Item], show_uuid: bool, folders_only: bool) -> Vec<S
         .filter(|parent| !parent.is_empty() && !known.contains(parent))
         .collect();
     orphan_parents.sort_unstable();
-    if !orphan_parents.is_empty() {
-        lines.push(String::new());
-        lines.push("Orphan items:".to_string());
-        for parent in orphan_parents {
-            walk(parent, "", &children, show_uuid, &mut lines);
-        }
-    }
-    lines
+    let orphan_section: Vec<String> = if orphan_parents.is_empty() {
+        Vec::new()
+    } else {
+        [String::new(), "Orphan items:".to_string()]
+            .into_iter()
+            .chain(
+                orphan_parents
+                    .iter()
+                    .flat_map(|parent| walk(parent, "", &children, show_uuid)),
+            )
+            .collect()
+    };
+
+    std::iter::once("(root)".to_string())
+        .chain(walk("", "", &children, show_uuid))
+        .chain(orphan_section)
+        .collect()
 }
 
 fn display_parent(parent_uuid: &str) -> &str {

@@ -27,7 +27,7 @@ pub fn tar_to_rmdoc(tar_bytes: &[u8]) -> Result<Vec<u8>> {
     let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
     let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
 
-    for entry in archive.entries()? {
+    archive.entries()?.try_for_each(|entry| -> Result<()> {
         let mut entry = entry?;
         let path = entry
             .path()?
@@ -36,7 +36,7 @@ pub fn tar_to_rmdoc(tar_bytes: &[u8]) -> Result<Vec<u8>> {
             .trim_end_matches('/')
             .to_string();
         if path.is_empty() || is_appledouble(&path) {
-            continue;
+            return Ok(());
         }
         match entry.header().entry_type() {
             tar::EntryType::Directory => {
@@ -50,7 +50,8 @@ pub fn tar_to_rmdoc(tar_bytes: &[u8]) -> Result<Vec<u8>> {
             // than produce a bundle the official importer might reject.
             _ => {}
         }
-    }
+        Ok(())
+    })?;
 
     Ok(zip.finish().map_err(zip_err)?.into_inner())
 }
@@ -100,62 +101,63 @@ impl Rmdoc {
 pub fn parse_rmdoc(bytes: &[u8]) -> Result<Rmdoc> {
     let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).map_err(zip_err)?;
 
-    let mut uuid: Option<String> = None;
-    for index in 0..zip.len() {
-        let name = zip.by_index(index).map_err(zip_err)?.name().to_string();
-        if !name.contains('/')
-            && !is_appledouble(&name)
-            && let Some(stem) = name.strip_suffix(".metadata")
-            && uuid.replace(stem.to_string()).is_some()
-        {
-            return Err(Error::Bundle(
-                "multiple .metadata entries; expected exactly one document".to_string(),
-            ));
-        }
-    }
-    let uuid = uuid.ok_or_else(|| Error::Bundle("no .metadata entry found".to_string()))?;
+    let uuid = (0..zip.len())
+        .try_fold(None::<String>, |found, index| {
+            let name = zip.by_index(index).map_err(zip_err)?.name().to_string();
+            let stem = (!name.contains('/') && !is_appledouble(&name))
+                .then(|| name.strip_suffix(".metadata"))
+                .flatten();
+            match (found, stem) {
+                (Some(_), Some(_)) => Err(Error::Bundle(
+                    "multiple .metadata entries; expected exactly one document".to_string(),
+                )),
+                (found, stem) => Ok(stem.map(str::to_string).or(found)),
+            }
+        })?
+        .ok_or_else(|| Error::Bundle("no .metadata entry found".to_string()))?;
 
-    let mut metadata: Option<Value> = None;
-    let mut content: Option<Value> = None;
-    let mut files = Vec::new();
-    for index in 0..zip.len() {
-        let mut entry = zip.by_index(index).map_err(zip_err)?;
-        let is_dir = entry.is_dir();
-        let path = entry.name().trim_end_matches('/').to_string();
-        if path.is_empty() || is_appledouble(&path) {
-            continue;
-        }
-        if !belongs_to(&path, &uuid) {
-            return Err(Error::Bundle(format!(
-                "entry '{path}' does not belong to document {uuid}"
-            )));
-        }
-        if is_dir {
-            files.push(RmdocEntry { path, data: None });
-            continue;
-        }
-        let mut data = Vec::new();
-        entry.read_to_end(&mut data)?;
-        if path == format!("{uuid}.metadata") {
-            metadata = Some(serde_json::from_slice(&data).map_err(|source| Error::Json {
-                path: path.clone(),
-                source,
-            })?);
-            // Regenerated from the parsed (possibly mutated) value in
-            // rmdoc_to_tar; not carried as a verbatim file.
-            continue;
-        }
-        if path == format!("{uuid}.content") {
-            content = Some(serde_json::from_slice(&data).map_err(|source| Error::Json {
-                path: path.clone(),
-                source,
-            })?);
-        }
-        files.push(RmdocEntry {
-            path,
-            data: Some(data),
-        });
-    }
+    type Parsed = (Option<Value>, Option<Value>, Vec<RmdocEntry>);
+    let (metadata, content, files) = (0..zip.len()).try_fold(
+        (None, None, Vec::new()) as Parsed,
+        |(metadata, mut content, mut files), index| {
+            let mut entry = zip.by_index(index).map_err(zip_err)?;
+            let is_dir = entry.is_dir();
+            let path = entry.name().trim_end_matches('/').to_string();
+            if path.is_empty() || is_appledouble(&path) {
+                return Ok((metadata, content, files));
+            }
+            if !belongs_to(&path, &uuid) {
+                return Err(Error::Bundle(format!(
+                    "entry '{path}' does not belong to document {uuid}"
+                )));
+            }
+            if is_dir {
+                files.push(RmdocEntry { path, data: None });
+                return Ok((metadata, content, files));
+            }
+            let mut data = Vec::new();
+            entry.read_to_end(&mut data)?;
+            let parse = |data: &[u8]| {
+                serde_json::from_slice::<Value>(data).map_err(|source| Error::Json {
+                    path: path.clone(),
+                    source,
+                })
+            };
+            if path == format!("{uuid}.metadata") {
+                // Regenerated from the parsed (possibly mutated) value
+                // in rmdoc_to_tar; not carried as a verbatim file.
+                return Ok((Some(parse(&data)?), content, files));
+            }
+            if path == format!("{uuid}.content") {
+                content = Some(parse(&data)?);
+            }
+            files.push(RmdocEntry {
+                path,
+                data: Some(data),
+            });
+            Ok((metadata, content, files))
+        },
+    )?;
 
     Ok(Rmdoc {
         uuid,
@@ -183,13 +185,13 @@ pub fn rmdoc_to_tar(rmdoc: &Rmdoc, new_uuid: &str) -> Result<Vec<u8>> {
         metadata_text.as_bytes(),
     )?;
 
-    for entry in &rmdoc.files {
+    rmdoc.files.iter().try_for_each(|entry| {
         let renamed = format!("{new_uuid}{}", &entry.path[rmdoc.uuid.len()..]);
         match &entry.data {
-            Some(data) => append_file(&mut builder, &renamed, data)?,
-            None => append_dir(&mut builder, &renamed)?,
+            Some(data) => append_file(&mut builder, &renamed, data),
+            None => append_dir(&mut builder, &renamed),
         }
-    }
+    })?;
     Ok(builder.into_inner()?)
 }
 

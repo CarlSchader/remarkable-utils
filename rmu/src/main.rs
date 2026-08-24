@@ -2,13 +2,22 @@
 //!
 //! Manages documents and folders on a reMarkable tablet over SSH. All
 //! configuration is passed as flags; there is no config file.
+//!
+//! Output discipline: stdout carries only machine-usable results (the
+//! `ls` tree/JSON, downloaded paths, created UUIDs). Everything else —
+//! progress bars, human status lines — goes to stderr.
 
 use std::fs;
+use std::io::IsTerminal;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use indicatif::{ProgressBar, ProgressStyle};
 use libremarkable_utils::client::Client;
+use libremarkable_utils::progress::{NoProgress, Progress};
 use libremarkable_utils::ssh::{
     Auth, DEFAULT_SSH_PORT, DEFAULT_SSH_USER, DEFAULT_USB_HOST, SshOptions, SshSession,
     maybe_run_askpass,
@@ -67,6 +76,10 @@ struct Cli {
     /// Disable SSH connection multiplexing
     #[arg(long, global = true)]
     no_multiplex: bool,
+
+    /// Suppress progress bars and status messages on stderr
+    #[arg(short, long, global = true)]
+    quiet: bool,
 
     #[command(subcommand)]
     command: Command,
@@ -158,24 +171,50 @@ fn main() -> Result<()> {
         auth,
         multiplex: !cli.no_multiplex,
     })?;
-    let client = Client::new(session, cli.xochitl_dir.clone());
 
-    let modified = run_command(&client, &cli.command)?;
+    // Progress bars only when stderr is a terminal and not --quiet.
+    let progress: Arc<dyn Progress> = if cli.quiet || !std::io::stderr().is_terminal() {
+        Arc::new(NoProgress)
+    } else {
+        Arc::new(CliProgress::default())
+    };
+    let client = Client::new(session, cli.xochitl_dir.clone()).with_progress(progress.clone());
+
+    let result = run_command(&client, &cli);
+    // Clear any progress UI before errors are printed.
+    progress.finished();
+    let modified = result?;
+
     if modified {
         if cli.no_restart {
-            eprintln!("note: xochitl not restarted (--no-restart); changes appear after restart");
+            info(
+                &cli,
+                "note: xochitl not restarted (--no-restart); changes appear after restart",
+            );
         } else {
-            client
+            let restart = client
                 .restart_xochitl()
-                .context("changes were written, but restarting xochitl failed")?;
+                .context("changes were written, but restarting xochitl failed");
+            progress.finished();
+            restart?;
         }
     }
     Ok(())
 }
 
+/// Human status line: stderr, suppressed by --quiet.
+fn info(cli: &Cli, message: impl AsRef<str>) {
+    if !cli.quiet {
+        eprintln!("{}", message.as_ref());
+    }
+}
+
 /// Execute a subcommand; returns whether device storage was modified.
-fn run_command(client: &Client, command: &Command) -> Result<bool> {
-    match command {
+///
+/// stdout gets machine-usable results only; human status goes to
+/// stderr via [`info`].
+fn run_command(client: &Client, cli: &Cli) -> Result<bool> {
+    match &cli.command {
         Command::Ls {
             folders_only,
             show_uuid,
@@ -209,16 +248,22 @@ fn run_command(client: &Client, command: &Command) -> Result<bool> {
         }
         Command::Mkdir { path, parent } => {
             let item = client.mkdir_path(path, parent)?;
-            println!("Created folder: {}/", item.visible_name);
-            println!("UUID: {}", item.uuid);
+            info(cli, format!("Created folder: {}/", item.visible_name));
+            println!("{}", item.uuid);
             Ok(true)
         }
         Command::Upload { file, name, parent } => {
             let item = client.upload(file, parent, name.as_deref())?;
-            println!("Uploaded: {}", file.display());
-            println!("Visible name: {}", item.visible_name);
-            println!("UUID: {}", item.uuid);
-            println!("Type: {}", item.file_type.as_deref().unwrap_or("?"));
+            info(
+                cli,
+                format!(
+                    "Uploaded {} as '{}' ({})",
+                    file.display(),
+                    item.visible_name,
+                    item.file_type.as_deref().unwrap_or("?"),
+                ),
+            );
+            println!("{}", item.uuid);
             Ok(true)
         }
         Command::Download {
@@ -227,20 +272,24 @@ fn run_command(client: &Client, command: &Command) -> Result<bool> {
             bundle,
         } => {
             let destination = client.download(target, output.as_deref(), *bundle)?;
-            println!("Downloaded to: {}", destination.display());
+            info(cli, "Downloaded to:");
+            println!("{}", destination.display());
             Ok(false)
         }
         Command::Rm { target, recursive } => {
             let deleted = client.delete(target, *recursive)?;
-            println!("Deleted {} item(s):", deleted.len());
-            for item in &deleted {
-                println!(
-                    "  {}{} [{}]",
-                    item.visible_name,
-                    item_suffix(item),
-                    item.uuid
+            info(cli, format!("Deleted {} item(s):", deleted.len()));
+            deleted.iter().for_each(|item| {
+                info(
+                    cli,
+                    format!(
+                        "  {}{} [{}]",
+                        item.visible_name,
+                        item_suffix(item),
+                        item.uuid
+                    ),
                 );
-            }
+            });
             Ok(true)
         }
         Command::Mv {
@@ -248,26 +297,105 @@ fn run_command(client: &Client, command: &Command) -> Result<bool> {
             destination,
         } => {
             let item = client.move_item(target, destination)?;
-            println!("Moved: {}", item.visible_name);
-            println!(
-                "New parent: {}",
-                if item.parent.is_empty() {
-                    "(root)"
-                } else {
-                    &item.parent
-                }
+            info(
+                cli,
+                format!(
+                    "Moved '{}' to {}",
+                    item.visible_name,
+                    if item.parent.is_empty() {
+                        "(root)"
+                    } else {
+                        &item.parent
+                    }
+                ),
             );
             Ok(true)
         }
         Command::Rename { target, new_name } => {
             let item = client.rename(target, new_name)?;
-            println!("Renamed to: {}", item.visible_name);
+            info(cli, format!("Renamed to: {}", item.visible_name));
             Ok(true)
         }
         Command::Restart => {
             client.restart_xochitl()?;
-            println!("xochitl restarted");
+            info(cli, "xochitl restarted");
             Ok(false)
+        }
+    }
+}
+
+/// Renders [`Progress`] events as indicatif bars on stderr: a spinner
+/// per step, upgraded in place to a byte bar during transfers.
+#[derive(Default)]
+struct CliProgress {
+    bar: Mutex<Option<ProgressBar>>,
+}
+
+impl CliProgress {
+    fn new_bar() -> ProgressBar {
+        let bar = ProgressBar::new_spinner();
+        bar.enable_steady_tick(Duration::from_millis(80));
+        bar
+    }
+
+    fn spinner_style() -> ProgressStyle {
+        ProgressStyle::with_template("{spinner} {msg}").expect("static template")
+    }
+
+    fn bytes_style() -> ProgressStyle {
+        ProgressStyle::with_template(
+            "{msg} [{bar:25}] {bytes}/{total_bytes} ({bytes_per_sec}, eta {eta})",
+        )
+        .expect("static template")
+        .progress_chars("=> ")
+    }
+
+    fn bytes_unknown_style() -> ProgressStyle {
+        ProgressStyle::with_template("{spinner} {msg} {bytes} ({bytes_per_sec})")
+            .expect("static template")
+    }
+}
+
+impl Progress for CliProgress {
+    fn step(&self, message: &str) {
+        let mut state = self.bar.lock().expect("progress mutex");
+        let bar = state.get_or_insert_with(Self::new_bar);
+        bar.set_style(Self::spinner_style());
+        bar.set_message(message.to_string());
+    }
+
+    fn bytes(&self, transferred: u64, total: Option<u64>) {
+        let mut state = self.bar.lock().expect("progress mutex");
+        let bar = state.get_or_insert_with(Self::new_bar);
+        match total {
+            Some(total) => {
+                if bar.length() != Some(total) {
+                    bar.set_style(Self::bytes_style());
+                    bar.set_length(total);
+                }
+            }
+            None => {
+                if bar.length().is_some() {
+                    bar.unset_length();
+                }
+                bar.set_style(Self::bytes_unknown_style());
+            }
+        }
+        bar.set_position(transferred);
+    }
+
+    fn bytes_done(&self) {
+        // Drop back to a plain spinner; the next step restyles it.
+        let state = self.bar.lock().expect("progress mutex");
+        if let Some(bar) = state.as_ref() {
+            bar.set_style(Self::spinner_style());
+            bar.unset_length();
+        }
+    }
+
+    fn finished(&self) {
+        if let Some(bar) = self.bar.lock().expect("progress mutex").take() {
+            bar.finish_and_clear();
         }
     }
 }

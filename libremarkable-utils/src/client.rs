@@ -8,6 +8,7 @@
 use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -15,6 +16,7 @@ use serde_json::Value;
 
 use crate::bundle;
 use crate::error::{Error, Result};
+use crate::progress::{NoProgress, Progress};
 use crate::ssh::{SshSession, shell_quote};
 use crate::xochitl::{self, Item, ItemKind};
 
@@ -22,12 +24,24 @@ use crate::xochitl::{self, Item, ItemKind};
 pub struct Client {
     session: SshSession,
     dir: String,
+    progress: Arc<dyn Progress>,
 }
 
 impl Client {
     pub fn new(session: SshSession, xochitl_dir: impl Into<String>) -> Self {
         let dir = xochitl_dir.into().trim_end_matches('/').to_string();
-        Self { session, dir }
+        Self {
+            session,
+            dir,
+            progress: Arc::new(NoProgress),
+        }
+    }
+
+    /// Attach a progress observer (rendered by the frontend; the
+    /// library itself never prints).
+    pub fn with_progress(mut self, progress: Arc<dyn Progress>) -> Self {
+        self.progress = progress;
+        self
     }
 
     /// Load the logical item list in a single SSH round trip.
@@ -35,6 +49,7 @@ impl Client {
     /// One remote script dumps every `.metadata`/`.content` file plus
     /// payload sizes, delimited by a per-call random marker.
     pub fn list_items(&self) -> Result<Vec<Item>> {
+        self.progress.step("Reading document index");
         let marker = format!("===RMU:{}===", uuid::Uuid::new_v4().simple());
         let script = format!(
             "cd {dir} || exit 9\n\
@@ -51,8 +66,11 @@ impl Client {
             dir = shell_quote(&self.dir),
             marker = shell_quote(&marker),
         );
-        let stdout = self.session.run_checked(&script)?;
-        Ok(build_items(&parse_listing(&marker, &stdout)))
+        let stdout_bytes = self.session.run_checked_bytes(&script, &*self.progress)?;
+        let stdout = String::from_utf8_lossy(&stdout_bytes);
+        let items = build_items(&parse_listing(&marker, &stdout));
+        self.progress.finished();
+        Ok(items)
     }
 
     /// Create a nested folder path (like `mkdir -p`), reusing existing
@@ -67,22 +85,27 @@ impl Client {
             return Err(Error::EmptyPath);
         }
 
-        let mut items = self.list_items()?;
-        let mut parent = xochitl::resolve_folder_ref(&items, parent_ref)?;
-        let mut current: Option<Item> = None;
+        let items = self.list_items()?;
+        let parent = xochitl::resolve_folder_ref(&items, parent_ref)?;
 
-        for part in parts {
-            if let Some(existing) = xochitl::find_child(&items, &parent, part, true)?.cloned() {
-                parent = existing.uuid.clone();
-                current = Some(existing);
-                continue;
-            }
-            xochitl::ensure_no_conflict(&items, &parent, part, None)?;
-            let created = self.create_folder(part, &parent)?;
-            parent = created.uuid.clone();
-            items.push(created.clone());
-            current = Some(created);
-        }
+        // Fold each path segment into (known items, current parent),
+        // reusing existing folders and creating missing ones.
+        let (_, _, current) = parts.iter().try_fold(
+            (items, parent, None::<Item>),
+            |(mut items, parent, _), part| {
+                if let Some(existing) = xochitl::find_child(&items, &parent, part, true)?.cloned() {
+                    let next_parent = existing.uuid.clone();
+                    return Ok((items, next_parent, Some(existing)));
+                }
+                xochitl::ensure_no_conflict(&items, &parent, part, None)?;
+                self.progress.step(&format!("Creating folder '{part}'"));
+                let created = self.create_folder(part, &parent)?;
+                let next_parent = created.uuid.clone();
+                items.push(created.clone());
+                Ok::<_, Error>((items, next_parent, Some(created)))
+            },
+        )?;
+        self.progress.finished();
         Ok(current.expect("at least one path segment"))
     }
 
@@ -131,8 +154,16 @@ impl Client {
 
         let doc_uuid = uuid::Uuid::new_v4().to_string();
         let now = now_ms();
-        self.session
-            .upload_local_file(local, &self.remote_path(&format!("{doc_uuid}.{file_type}")))?;
+        self.progress.step(&format!(
+            "Uploading {}",
+            local.file_name().unwrap_or_default().to_string_lossy()
+        ));
+        self.session.upload_local_file(
+            local,
+            &self.remote_path(&format!("{doc_uuid}.{file_type}")),
+            &*self.progress,
+        )?;
+        self.progress.step("Registering document");
         self.write_text(
             &format!("{doc_uuid}.metadata"),
             &xochitl::document_metadata_json(&name, &parent, now),
@@ -146,6 +177,7 @@ impl Client {
             shell_quote(&self.remote_path(&doc_uuid))
         ))?;
         self.write_text(&format!("{doc_uuid}.pagedata"), "")?;
+        self.progress.finished();
 
         Ok(Item {
             uuid: doc_uuid,
@@ -200,10 +232,16 @@ impl Client {
         object.insert("lastModified".to_string(), Value::String(now.to_string()));
 
         let tar_bytes = bundle::rmdoc_to_tar(&rmdoc, &new_uuid)?;
+        self.progress.step(&format!(
+            "Restoring bundle {}",
+            local.file_name().unwrap_or_default().to_string_lossy()
+        ));
         self.session.run_checked_with_stdin(
             &format!("cd {} && tar -xf -", shell_quote(&self.dir)),
             &tar_bytes,
+            &*self.progress,
         )?;
+        self.progress.finished();
 
         xochitl::item_from_metadata(&new_uuid, &rmdoc.metadata, rmdoc.content.as_ref(), None)
             .ok_or(Error::InvalidMetadata(new_uuid))
@@ -228,18 +266,27 @@ impl Client {
         let is_notebook = matches!(item.file_type.as_deref(), None | Some("notebook"));
         if bundle || is_notebook {
             let destination = resolve_destination(output, &format!("{}.rmdoc", item.visible_name));
+            self.progress
+                .step(&format!("Downloading '{}'", item.visible_name));
             let tar_bytes = self.fetch_item_tar(&item.uuid)?;
+            self.progress.step("Packing .rmdoc");
             std::fs::write(&destination, bundle::tar_to_rmdoc(&tar_bytes)?)?;
+            self.progress.finished();
             return Ok(destination);
         }
 
         let extension = item.file_type.as_deref().expect("payload types are Some");
         let destination =
             resolve_destination(output, &format!("{}.{extension}", item.visible_name));
+        self.progress
+            .step(&format!("Downloading '{}'", item.visible_name));
         self.session.download_remote_file(
             &self.remote_path(&format!("{}.{extension}", item.uuid)),
             &destination,
+            item.size_bytes,
+            &*self.progress,
         )?;
+        self.progress.finished();
         Ok(destination)
     }
 
@@ -257,7 +304,7 @@ impl Client {
              tar -cf - \"$@\"\n",
             dir = shell_quote(&self.dir),
         );
-        self.session.run_checked_bytes(&script)
+        self.session.run_checked_bytes(&script, &*self.progress)
     }
 
     /// Delete a document or folder. Deleting a non-empty folder
@@ -275,9 +322,12 @@ impl Client {
         order.sort_by_key(|descendant| Reverse(xochitl::depth(&items, descendant)));
         order.push(item);
 
-        for target in &order {
-            self.delete_artifacts(&target.uuid)?;
-        }
+        order.iter().try_for_each(|target| {
+            self.progress
+                .step(&format!("Deleting '{}'", target.visible_name));
+            self.delete_artifacts(&target.uuid)
+        })?;
+        self.progress.finished();
         Ok(order)
     }
 
@@ -299,10 +349,12 @@ impl Client {
         xochitl::ensure_no_conflict(&items, &destination, &item.visible_name, Some(&item.uuid))?;
 
         let now = now_ms();
+        self.progress.step("Updating metadata");
         self.update_metadata(&item.uuid, |metadata| {
             metadata.insert("parent".to_string(), Value::String(destination.clone()));
             metadata.insert("lastModified".to_string(), Value::String(now.to_string()));
         })?;
+        self.progress.finished();
         Ok(Item {
             parent: destination,
             last_modified: now,
@@ -328,10 +380,12 @@ impl Client {
         xochitl::ensure_no_conflict(&items, &item.parent, name, Some(&item.uuid))?;
 
         let now = now_ms();
+        self.progress.step("Updating metadata");
         self.update_metadata(&item.uuid, |metadata| {
             metadata.insert("visibleName".to_string(), Value::String(name.to_string()));
             metadata.insert("lastModified".to_string(), Value::String(now.to_string()));
         })?;
+        self.progress.finished();
         Ok(Item {
             visible_name: name.to_string(),
             last_modified: now,
@@ -347,9 +401,11 @@ impl Client {
     /// reboots the whole tablet. Reset the unit's failure state first
     /// so maintenance restarts do not accumulate against that counter.
     pub fn restart_xochitl(&self) -> Result<()> {
+        self.progress.step("Restarting xochitl");
         let _ = self.session.run("systemctl reset-failed xochitl.service");
         let restart = self.session.run("systemctl restart xochitl.service")?;
         if restart.status.success() {
+            self.progress.finished();
             return Ok(());
         }
         // Device-side restarts can transiently drop the command channel
@@ -357,6 +413,7 @@ impl Client {
         thread::sleep(Duration::from_secs(1));
         let status = self.session.run("systemctl is-active xochitl.service")?;
         if status.status.success() && String::from_utf8_lossy(&status.stdout).trim() == "active" {
+            self.progress.finished();
             return Ok(());
         }
         Err(Error::XochitlRestart(format!(
@@ -467,71 +524,76 @@ struct Listing {
 }
 
 fn parse_listing(marker: &str, output: &str) -> Listing {
-    fn flush(listing: &mut Listing, section: Option<&str>, body: &str) {
-        let Some(name) = section else { return };
-        if name == "__sizes__" {
-            for line in body.lines() {
-                if let Some((size, filename)) = line.split_once(' ')
-                    && let Ok(size) = size.trim().parse::<u64>()
-                {
-                    listing.sizes.insert(filename.to_string(), size);
+    // Group lines into (section name, body) pairs, then fold the
+    // sections into the listing maps.
+    let sections = output
+        .lines()
+        .fold(Vec::<(String, String)>::new(), |mut sections, line| {
+            match line
+                .strip_prefix(marker)
+                .and_then(|rest| rest.strip_prefix(' '))
+            {
+                Some(name) => sections.push((name.trim().to_string(), String::new())),
+                None => {
+                    if let Some((_, body)) = sections.last_mut() {
+                        body.push_str(line);
+                        body.push('\n');
+                    }
                 }
             }
-        } else if let Some(uuid) = name.strip_suffix(".metadata") {
-            listing.metadata.insert(uuid.to_string(), body.to_string());
-        } else if let Some(uuid) = name.strip_suffix(".content") {
-            listing.content.insert(uuid.to_string(), body.to_string());
-        }
-    }
+            sections
+        });
 
-    let mut listing = Listing::default();
-    let mut section: Option<String> = None;
-    let mut body = String::new();
-    for line in output.lines() {
-        if let Some(rest) = line.strip_prefix(marker)
-            && let Some(name) = rest.strip_prefix(' ')
-        {
-            flush(&mut listing, section.as_deref(), &body);
-            section = Some(name.trim().to_string());
-            body.clear();
-            continue;
-        }
-        if section.is_some() {
-            body.push_str(line);
-            body.push('\n');
-        }
-    }
-    flush(&mut listing, section.as_deref(), &body);
-    listing
+    sections
+        .into_iter()
+        .fold(Listing::default(), |mut listing, (name, body)| {
+            if name == "__sizes__" {
+                listing.sizes.extend(
+                    body.lines()
+                        .filter_map(|line| line.split_once(' '))
+                        .filter_map(|(size, filename)| {
+                            size.trim()
+                                .parse::<u64>()
+                                .ok()
+                                .map(|size| (filename.to_string(), size))
+                        }),
+                );
+            } else if let Some(uuid) = name.strip_suffix(".metadata") {
+                listing.metadata.insert(uuid.to_string(), body);
+            } else if let Some(uuid) = name.strip_suffix(".content") {
+                listing.content.insert(uuid.to_string(), body);
+            }
+            listing
+        })
 }
 
 fn build_items(listing: &Listing) -> Vec<Item> {
     let mut uuids: Vec<&String> = listing.metadata.keys().collect();
     uuids.sort();
 
-    let mut items = Vec::new();
-    for uuid in uuids {
-        // Skip unparsable metadata (partial writes, corruption) rather
-        // than failing the whole listing.
-        let Ok(metadata) = serde_json::from_str::<Value>(&listing.metadata[uuid]) else {
-            continue;
-        };
-        let content = listing
-            .content
-            .get(uuid)
-            .and_then(|body| serde_json::from_str::<Value>(body).ok());
-        let size = content
-            .as_ref()
-            .and_then(|c| c.get("fileType"))
-            .and_then(Value::as_str)
-            .filter(|file_type| !file_type.is_empty())
-            .and_then(|file_type| listing.sizes.get(&format!("{uuid}.{file_type}")))
-            .copied();
-        if let Some(item) = xochitl::item_from_metadata(uuid, &metadata, content.as_ref(), size) {
-            items.push(item);
-        }
-    }
-    items
+    // Sequential on purpose: parsing 10k metadata docs measures ~7 ms,
+    // dwarfed by the SSH round trip that fetched them. Revisit with
+    // rayon only if a measured workload says otherwise.
+    uuids
+        .into_iter()
+        .filter_map(|uuid| {
+            // Skip unparsable metadata (partial writes, corruption)
+            // rather than failing the whole listing.
+            let metadata = serde_json::from_str::<Value>(&listing.metadata[uuid]).ok()?;
+            let content = listing
+                .content
+                .get(uuid)
+                .and_then(|body| serde_json::from_str::<Value>(body).ok());
+            let size = content
+                .as_ref()
+                .and_then(|c| c.get("fileType"))
+                .and_then(Value::as_str)
+                .filter(|file_type| !file_type.is_empty())
+                .and_then(|file_type| listing.sizes.get(&format!("{uuid}.{file_type}")))
+                .copied();
+            xochitl::item_from_metadata(uuid, &metadata, content.as_ref(), size)
+        })
+        .collect()
 }
 
 #[cfg(test)]

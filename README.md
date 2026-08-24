@@ -92,6 +92,19 @@ Password mode uses `SSH_ASKPASS` under the hood and requires OpenSSH 8.4+
 (any recent Linux or macOS). The password is passed to ssh via the
 environment, never argv.
 
+### Output & scripting
+
+stdout carries only machine-usable results: the `ls` tree/JSON, the path a
+download was written to, and the UUID of a created folder/document.
+Progress bars and status messages go to stderr (bars auto-disable when
+stderr is not a terminal; `-q`/`--quiet` silences both). So things like
+this work cleanly:
+
+```sh
+open "$(rmu download Books/Physics)"
+uuid=$(rmu -q upload ./sample.pdf)
+```
+
 ## Layout
 
 | Path                   | Description                                       |

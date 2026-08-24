@@ -15,6 +15,8 @@
 //!   (path/UUID resolution, rendering, conflict and cycle checks).
 //! - [`client`] — high-level operations: list, mkdir, upload,
 //!   download, delete, move, rename, restart xochitl.
+//! - [`progress`] — observer trait for progress reporting; the
+//!   library itself never prints.
 //! - [`error`] — typed errors for all of the above.
 //!
 //! Keep tool-specific CLI concerns out of this crate.
@@ -22,6 +24,7 @@
 pub mod bundle;
 pub mod client;
 pub mod error;
+pub mod progress;
 pub mod ssh;
 pub mod xochitl;
 
