@@ -86,7 +86,9 @@ impl Client {
         Ok(current.expect("at least one path segment"))
     }
 
-    /// Upload a `.pdf` or `.epub` into a logical folder.
+    /// Upload a `.pdf`, `.epub`, or `.rmdoc` bundle into a logical
+    /// folder. Bundles are re-targeted to a fresh UUID, so re-importing
+    /// a download never collides with the original document.
     pub fn upload(
         &self,
         local: &Path,
@@ -101,12 +103,21 @@ impl Client {
             .and_then(|e| e.to_str())
             .map(str::to_ascii_lowercase)
             .unwrap_or_default();
-        let file_type = match extension.as_str() {
-            "pdf" => "pdf",
-            "epub" => "epub",
-            _ => return Err(Error::UnsupportedFileType(extension)),
-        };
+        match extension.as_str() {
+            "pdf" | "epub" => self.upload_payload(local, parent_ref, visible_name, &extension),
+            "rmdoc" => self.upload_rmdoc(local, parent_ref, visible_name),
+            _ => Err(Error::UnsupportedFileType(extension)),
+        }
+    }
 
+    /// Upload a bare `.pdf`/`.epub` payload, generating fresh metadata.
+    fn upload_payload(
+        &self,
+        local: &Path,
+        parent_ref: &str,
+        visible_name: Option<&str>,
+        file_type: &str,
+    ) -> Result<Item> {
         let items = self.list_items()?;
         let parent = xochitl::resolve_folder_ref(&items, parent_ref)?;
         let name = match visible_name {
@@ -146,6 +157,56 @@ impl Client {
             last_modified: now,
             size_bytes: std::fs::metadata(local).ok().map(|m| m.len()),
         })
+    }
+
+    /// Restore an `.rmdoc` bundle: parse locally, rewrite
+    /// `parent`/`visibleName`/`lastModified` (preserving all other
+    /// metadata fields), re-target every file to a fresh UUID, and
+    /// stream one tar into the data dir.
+    fn upload_rmdoc(
+        &self,
+        local: &Path,
+        parent_ref: &str,
+        visible_name: Option<&str>,
+    ) -> Result<Item> {
+        let mut rmdoc = bundle::parse_rmdoc(&std::fs::read(local)?)?;
+        if rmdoc.metadata.get("type").and_then(Value::as_str) != Some("DocumentType") {
+            return Err(Error::Bundle(
+                "bundle metadata is not a DocumentType item".to_string(),
+            ));
+        }
+
+        let items = self.list_items()?;
+        let parent = xochitl::resolve_folder_ref(&items, parent_ref)?;
+        let name = visible_name
+            .map(str::to_string)
+            .or_else(|| rmdoc.visible_name().map(str::to_string))
+            .or_else(|| {
+                local
+                    .file_stem()
+                    .map(|stem| stem.to_string_lossy().into_owned())
+            })
+            .unwrap_or_else(|| "untitled".to_string());
+        xochitl::ensure_no_conflict(&items, &parent, &name, None)?;
+
+        let new_uuid = uuid::Uuid::new_v4().to_string();
+        let now = now_ms();
+        let object = rmdoc
+            .metadata
+            .as_object_mut()
+            .ok_or_else(|| Error::InvalidMetadata(rmdoc.uuid.clone()))?;
+        object.insert("parent".to_string(), Value::String(parent.clone()));
+        object.insert("visibleName".to_string(), Value::String(name));
+        object.insert("lastModified".to_string(), Value::String(now.to_string()));
+
+        let tar_bytes = bundle::rmdoc_to_tar(&rmdoc, &new_uuid)?;
+        self.session.run_checked_with_stdin(
+            &format!("cd {} && tar -xf -", shell_quote(&self.dir)),
+            &tar_bytes,
+        )?;
+
+        xochitl::item_from_metadata(&new_uuid, &rmdoc.metadata, rmdoc.content.as_ref(), None)
+            .ok_or(Error::InvalidMetadata(new_uuid))
     }
 
     /// Download a document. `output` may be a file path or an existing

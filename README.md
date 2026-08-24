@@ -42,6 +42,7 @@ rmu mkdir Algebra --parent Books/Math
 
 rmu upload ./sample.pdf                            # to root
 rmu upload ./sample.pdf --parent Books/Math -n "Linear Algebra"
+rmu upload ./backup.rmdoc --parent Notes           # restore an .rmdoc bundle
 
 rmu download "Books/Math/Linear Algebra"           # to ./Linear Algebra.pdf
 rmu download Books/Physics ./downloads/
@@ -65,7 +66,9 @@ Native handwritten notebooks have no single payload file on the device, so
 `rmu download` fetches them as `.rmdoc` bundles — a zip of the raw file set
 in the same layout the official reMarkable apps export/import. `--bundle`
 forces this for PDFs/EPUBs too, which captures your annotations (a bare
-payload download does not). See `docs/notebook-data.md` for the details.
+payload download does not). `rmu upload` restores `.rmdoc` bundles under a
+fresh UUID, so re-importing a download never collides with the original
+document. See `docs/notebook-data.md` for the details.
 
 Connecting over Wi-Fi or a non-default setup:
 

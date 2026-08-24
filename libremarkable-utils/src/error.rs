@@ -53,7 +53,7 @@ pub enum Error {
     FolderNotEmpty,
 
     /// Upload of a file type the device cannot render.
-    #[error("unsupported file type '{0}': only .pdf and .epub are supported")]
+    #[error("unsupported file type '{0}': only .pdf, .epub, and .rmdoc are supported")]
     UnsupportedFileType(String),
 
     /// The root pseudo-folder is not a valid target here.

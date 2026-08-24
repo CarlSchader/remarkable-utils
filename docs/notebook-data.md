@@ -74,9 +74,17 @@ annotations. Interop with the official importer is expected but not
 guaranteed across firmware versions — treat bundles primarily as faithful
 backups.
 
-The device ships busybox only (no `zip`), so bundling streams a `tar` from
-the device and repacks it into a zip locally (`libremarkable-utils`'s
-`bundle` module).
+`rmu upload` accepts `.rmdoc` bundles and restores them under a **fresh
+document UUID**, rewriting `parent`/`visibleName`/`lastModified` in the
+metadata while preserving all other fields verbatim. Page UUIDs inside the
+bundle are kept as-is — they are scoped to the document and do not collide.
+Re-targeting matters because the original document may still exist on the
+device; importing under the exported UUID would silently merge/overwrite it.
+
+The device ships busybox only (no `zip`), so both directions go through tar
+(`libremarkable-utils`'s `bundle` module): downloads repack a device-side
+`tar -c` stream into a zip locally; uploads unpack the zip locally and
+stream one tar into `tar -x` in the data dir.
 
 ## Other quirks worth remembering
 

@@ -38,8 +38,9 @@ This repository is **open source** (dual-licensed MIT OR Apache-2.0):
 
 ### `libremarkable-utils` module map
 
-- `bundle.rs` — `.rmdoc` bundle creation: repacks a tar streamed from the
-  device into a zip (the official apps' export format). Pure
+- `bundle.rs` — `.rmdoc` bundle creation and parsing: repacks a tar
+  streamed from the device into a zip (the official apps' export format)
+  and the reverse for restore, re-targeting bundles to a fresh UUID. Pure
   bytes-to-bytes, unit-tested without a device.
 - `ssh.rs` — subprocess transport around the system `ssh` binary. No SSH
   library is linked, deliberately: users get ssh config/keys/agent for
@@ -76,7 +77,10 @@ Read `docs/notebook-data.md` first — it documents the storage model,
 - When read-modify-writing `.metadata`, preserve unknown fields
   (`Client::update_metadata`); different firmware versions have different
   field sets, and timestamps appear as both strings and numbers.
-- Only `.pdf`/`.epub` uploads are supported; reject other types.
+- Uploads accept `.pdf`/`.epub` payloads and `.rmdoc` bundles; reject
+  other types. Bundle restores must always use a **fresh UUID** (the
+  original may still exist on the device) and preserve unknown metadata
+  fields.
 - Native notebooks (`fileType` `"notebook"`, or `""` on older firmware —
   normalized to `"notebook"` in `item_from_metadata`) have **no payload
   file**; content is per-page `.rm` data in `<uuid>/`. Download must use

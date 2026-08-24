@@ -94,11 +94,11 @@ enum Command {
         #[arg(long, default_value = "")]
         parent: String,
     },
-    /// Upload a PDF or EPUB document
+    /// Upload a PDF, EPUB, or .rmdoc bundle
     Upload {
-        /// Local .pdf or .epub file
+        /// Local .pdf, .epub, or .rmdoc file
         file: PathBuf,
-        /// Visible name on the device (default: file stem)
+        /// Visible name on the device (default: bundle name or file stem)
         #[arg(short, long)]
         name: Option<String>,
         /// Destination folder (UUID or logical path); default: root

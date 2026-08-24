@@ -177,10 +177,11 @@ impl SshSession {
         Ok(output.stdout)
     }
 
-    /// Write bytes to a remote file (via `cat > path`).
-    pub fn write_remote_file(&self, remote_path: &str, data: &[u8]) -> Result<()> {
+    /// Run a remote command with bytes piped to its stdin; non-zero
+    /// exit is an error.
+    pub fn run_checked_with_stdin(&self, remote_cmd: &str, data: &[u8]) -> Result<()> {
         let mut child = self
-            .command(&format!("cat > {}", shell_quote(remote_path)))
+            .command(remote_cmd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -191,6 +192,11 @@ impl SshSession {
         }
         checked(child.wait_with_output()?)?;
         Ok(())
+    }
+
+    /// Write bytes to a remote file (via `cat > path`).
+    pub fn write_remote_file(&self, remote_path: &str, data: &[u8]) -> Result<()> {
+        self.run_checked_with_stdin(&format!("cat > {}", shell_quote(remote_path)), data)
     }
 
     /// Stream a local file to a remote path.
