@@ -20,6 +20,8 @@ flake-utils.lib.eachDefaultSystem (
         [
           rustToolchain
           self.formatter.${system}
+          # rmu shells out to the system ssh binary.
+          pkgs.openssh
         ]
         ++ preCommitCheck.enabledPackages;
 
