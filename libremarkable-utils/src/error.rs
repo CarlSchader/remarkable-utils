@@ -80,6 +80,10 @@ pub enum Error {
     #[error("cannot move a folder into its own descendant")]
     MoveIntoDescendant,
 
+    /// Failed to build an `.rmdoc` bundle.
+    #[error("bundle: {0}")]
+    Bundle(String),
+
     /// xochitl did not come back after a restart attempt.
     #[error("failed to restart xochitl: {0}")]
     XochitlRestart(String),

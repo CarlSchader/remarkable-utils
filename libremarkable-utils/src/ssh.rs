@@ -167,8 +167,14 @@ impl SshSession {
 
     /// Run a remote command and return stdout; non-zero exit is an error.
     pub fn run_checked(&self, remote_cmd: &str) -> Result<String> {
+        let stdout = self.run_checked_bytes(remote_cmd)?;
+        Ok(String::from_utf8_lossy(&stdout).into_owned())
+    }
+
+    /// Like [`Self::run_checked`], but for binary stdout (e.g. tar streams).
+    pub fn run_checked_bytes(&self, remote_cmd: &str) -> Result<Vec<u8>> {
         let output = checked(self.run(remote_cmd)?)?;
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        Ok(output.stdout)
     }
 
     /// Write bytes to a remote file (via `cat > path`).

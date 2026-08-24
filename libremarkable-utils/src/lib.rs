@@ -8,6 +8,7 @@
 //! on it over SSH.
 //!
 //! Module map:
+//! - [`bundle`] — `.rmdoc` bundle creation (tar-from-device → zip).
 //! - [`ssh`] — subprocess transport around the system `ssh` binary
 //!   (multiplexed, optional password auth via a self-askpass helper).
 //! - [`xochitl`] — on-device file formats and pure tree logic
@@ -18,6 +19,7 @@
 //!
 //! Keep tool-specific CLI concerns out of this crate.
 
+pub mod bundle;
 pub mod client;
 pub mod error;
 pub mod ssh;

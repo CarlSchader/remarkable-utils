@@ -45,6 +45,8 @@ rmu upload ./sample.pdf --parent Books/Math -n "Linear Algebra"
 
 rmu download "Books/Math/Linear Algebra"           # to ./Linear Algebra.pdf
 rmu download Books/Physics ./downloads/
+rmu download "Notes/Meeting Notes"                 # notebooks -> .rmdoc bundle
+rmu download Books/Physics --bundle                # force .rmdoc (incl. annotations)
 
 rmu mv "Books/Physics" Notes             # move into another folder
 rmu mv Notes/Physics /                   # move to root
@@ -58,6 +60,12 @@ Targets are logical paths or item UUIDs; ambiguous paths are rejected
 instead of guessed. Only `.pdf` and `.epub` uploads are supported (that is
 what the device renders). After write operations `rmu` restarts xochitl so
 changes appear on the device (`--no-restart` to skip).
+
+Native handwritten notebooks have no single payload file on the device, so
+`rmu download` fetches them as `.rmdoc` bundles — a zip of the raw file set
+in the same layout the official reMarkable apps export/import. `--bundle`
+forces this for PDFs/EPUBs too, which captures your annotations (a bare
+payload download does not). See `docs/notebook-data.md` for the details.
 
 Connecting over Wi-Fi or a non-default setup:
 

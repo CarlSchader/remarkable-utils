@@ -13,6 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
+use crate::bundle;
 use crate::error::{Error, Result};
 use crate::ssh::{SshSession, shell_quote};
 use crate::xochitl::{self, Item, ItemKind};
@@ -149,24 +150,53 @@ impl Client {
 
     /// Download a document. `output` may be a file path or an existing
     /// directory; defaults to `<name>.<ext>` in the current directory.
-    pub fn download(&self, item_ref: &str, output: Option<&Path>) -> Result<PathBuf> {
+    ///
+    /// Native notebooks have no payload file (their content is per-page
+    /// `.rm` data — see `docs/notebook-data.md`), so they always
+    /// download as an `.rmdoc` bundle: a zip of the raw xochitl file
+    /// set, the same layout the official apps export. Pass `bundle` to
+    /// force this for PDFs/EPUBs too, which captures annotations that
+    /// the bare payload lacks.
+    pub fn download(&self, item_ref: &str, output: Option<&Path>, bundle: bool) -> Result<PathBuf> {
         let items = self.list_items()?;
         let item = xochitl::resolve_item_ref(&items, item_ref)?;
         if !item.is_document() {
             return Err(Error::NotADocument(item_ref.to_string()));
         }
-        let extension = item.file_type.as_deref().unwrap_or("bin");
-        let filename = format!("{}.{extension}", item.visible_name);
-        let destination = match output {
-            None => PathBuf::from(&filename),
-            Some(path) if path.is_dir() => path.join(&filename),
-            Some(path) => path.to_path_buf(),
-        };
+
+        let is_notebook = matches!(item.file_type.as_deref(), None | Some("notebook"));
+        if bundle || is_notebook {
+            let destination = resolve_destination(output, &format!("{}.rmdoc", item.visible_name));
+            let tar_bytes = self.fetch_item_tar(&item.uuid)?;
+            std::fs::write(&destination, bundle::tar_to_rmdoc(&tar_bytes)?)?;
+            return Ok(destination);
+        }
+
+        let extension = item.file_type.as_deref().expect("payload types are Some");
+        let destination =
+            resolve_destination(output, &format!("{}.{extension}", item.visible_name));
         self.session.download_remote_file(
             &self.remote_path(&format!("{}.{extension}", item.uuid)),
             &destination,
         )?;
         Ok(destination)
+    }
+
+    /// Stream every artifact of an item (`<uuid>`, `<uuid>.*`) from the
+    /// device as one tar. The `.*` glob is deliberately outside the
+    /// quotes; `[ -e ]` filters unmatched glob literals, and busybox
+    /// tar would otherwise fail on missing arguments.
+    fn fetch_item_tar(&self, uuid: &str) -> Result<Vec<u8>> {
+        let quoted = shell_quote(uuid);
+        let script = format!(
+            "cd {dir} || exit 9\n\
+             set --\n\
+             for f in {quoted} {quoted}.*; do [ -e \"$f\" ] && set -- \"$@\" \"$f\"; done\n\
+             [ \"$#\" -gt 0 ] || exit 8\n\
+             tar -cf - \"$@\"\n",
+            dir = shell_quote(&self.dir),
+        );
+        self.session.run_checked_bytes(&script)
     }
 
     /// Delete a document or folder. Deleting a non-empty folder
@@ -346,6 +376,16 @@ impl Client {
             shell_quote(&self.dir)
         ))?;
         Ok(())
+    }
+}
+
+/// Default to `filename` in the current directory; an existing local
+/// directory means "put it in there".
+fn resolve_destination(output: Option<&Path>, filename: &str) -> PathBuf {
+    match output {
+        None => PathBuf::from(filename),
+        Some(path) if path.is_dir() => path.join(filename),
+        Some(path) => path.to_path_buf(),
     }
 }
 

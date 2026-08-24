@@ -105,12 +105,16 @@ enum Command {
         #[arg(long, default_value = "")]
         parent: String,
     },
-    /// Download a document
+    /// Download a document (notebooks download as .rmdoc bundles)
     Download {
         /// Document UUID or logical path
         target: String,
         /// Local file path or directory (default: current directory)
         output: Option<PathBuf>,
+        /// Force an .rmdoc bundle (raw file set incl. annotations)
+        /// even for PDFs/EPUBs
+        #[arg(long)]
+        bundle: bool,
     },
     /// Delete a document or folder
     Rm {
@@ -217,8 +221,12 @@ fn run_command(client: &Client, command: &Command) -> Result<bool> {
             println!("Type: {}", item.file_type.as_deref().unwrap_or("?"));
             Ok(true)
         }
-        Command::Download { target, output } => {
-            let destination = client.download(target, output.as_deref())?;
+        Command::Download {
+            target,
+            output,
+            bundle,
+        } => {
+            let destination = client.download(target, output.as_deref(), *bundle)?;
             println!("Downloaded to: {}", destination.display());
             Ok(false)
         }

@@ -38,6 +38,9 @@ This repository is **open source** (dual-licensed MIT OR Apache-2.0):
 
 ### `libremarkable-utils` module map
 
+- `bundle.rs` — `.rmdoc` bundle creation: repacks a tar streamed from the
+  device into a zip (the official apps' export format). Pure
+  bytes-to-bytes, unit-tested without a device.
 - `ssh.rs` — subprocess transport around the system `ssh` binary. No SSH
   library is linked, deliberately: users get ssh config/keys/agent for
   free and the crate stays free of native deps (the dev shell is
@@ -55,6 +58,9 @@ This repository is **open source** (dual-licensed MIT OR Apache-2.0):
 
 ## reMarkable domain knowledge
 
+Read `docs/notebook-data.md` first — it documents the storage model,
+`fileType` nuances, the `.rm` page format, and `.rmdoc` bundles.
+
 - Default USB connection: `root@10.11.99.1`; documents live under
   `/home/root/.local/share/remarkable/xochitl` (`XOCHITL_DATA_DIR`).
 - Storage model: per item UUID, `<uuid>.metadata` (JSON: `visibleName`,
@@ -71,6 +77,10 @@ This repository is **open source** (dual-licensed MIT OR Apache-2.0):
   (`Client::update_metadata`); different firmware versions have different
   field sets, and timestamps appear as both strings and numbers.
 - Only `.pdf`/`.epub` uploads are supported; reject other types.
+- Native notebooks (`fileType` `"notebook"`, or `""` on older firmware —
+  normalized to `"notebook"` in `item_from_metadata`) have **no payload
+  file**; content is per-page `.rm` data in `<uuid>/`. Download must use
+  the `.rmdoc` bundle path, never `cat <uuid>.<fileType>`.
 - All remote paths/arguments must go through `ssh::shell_quote` (the
   device shell is busybox ash).
 

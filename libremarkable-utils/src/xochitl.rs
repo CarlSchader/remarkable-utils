@@ -41,7 +41,9 @@ pub struct Item {
     /// UUID of the parent folder; `""` means root.
     pub parent: String,
     pub kind: ItemKind,
-    /// Payload type for documents (`pdf`/`epub`), if known.
+    /// Document type: `pdf`/`epub` (payload file exists on-device) or
+    /// `notebook` (native handwritten; no payload file, see
+    /// `docs/notebook-data.md`). `None` when `.content` is missing.
     pub file_type: Option<String>,
     /// Milliseconds since the epoch; `0` when absent/unparsable.
     pub created_time: i64,
@@ -85,11 +87,22 @@ pub fn item_from_metadata(
         .unwrap_or("")
         .to_string();
     let file_type = match kind {
-        ItemKind::Document => content
-            .and_then(|c| c.get("fileType"))
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string),
+        ItemKind::Document => {
+            let declared = content
+                .and_then(|c| c.get("fileType"))
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            match declared {
+                Some(file_type) => Some(file_type),
+                // Native notebooks have fileType "notebook" on current
+                // firmware but "" on older firmware; normalize so
+                // callers have one case to handle. Only infer when a
+                // .content file actually exists.
+                None if content.is_some() => Some("notebook".to_string()),
+                None => None,
+            }
+        }
         ItemKind::Folder => None,
     };
     Some(Item {
@@ -637,5 +650,24 @@ mod tests {
 
         let deleted = serde_json::json!({ "type": "TrashType", "visibleName": "X" });
         assert!(item_from_metadata("u", &deleted, None, None).is_none());
+    }
+
+    #[test]
+    fn notebook_file_type_inference() {
+        let metadata = serde_json::json!({ "type": "DocumentType", "visibleName": "N" });
+
+        // Current firmware: explicit "notebook".
+        let content = serde_json::json!({ "fileType": "notebook" });
+        let item = item_from_metadata("u", &metadata, Some(&content), None).unwrap();
+        assert_eq!(item.file_type.as_deref(), Some("notebook"));
+
+        // Older firmware: empty fileType means native notebook.
+        let content = serde_json::json!({ "fileType": "" });
+        let item = item_from_metadata("u", &metadata, Some(&content), None).unwrap();
+        assert_eq!(item.file_type.as_deref(), Some("notebook"));
+
+        // Missing .content entirely: do not guess.
+        let item = item_from_metadata("u", &metadata, None, None).unwrap();
+        assert_eq!(item.file_type, None);
     }
 }
