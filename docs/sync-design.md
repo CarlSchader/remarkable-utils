@@ -1,9 +1,10 @@
 # Design: `rmu sync`
 
-Status: **planned, not yet implemented.** This documents the agreed design
-for a two-way folder sync between a computer and the tablet's logical
-document tree, over SSH. Update this file if the design changes during
-implementation.
+Status: **phase 1 implemented** (`libremarkable-utils/src/sync.rs`,
+`rmu sync`): one-way sync with scp-style endpoints, tablet detection,
+sync-state file, and `--dry-run`. Phases 2–3 (two-way, `--conflict`,
+`--delete`, generic hosts, tablet↔tablet) remain planned. Update this
+file if the design changes during implementation.
 
 ## Goal
 
@@ -32,6 +33,19 @@ Flags:
 | `--two-way` | Bidirectional; argument order stops mattering (phase 2) |
 | `--conflict skip\|newest\|src\|dst` | Conflict policy; default `skip` (phase 2) |
 | `--remote-kind remarkable\|fs` | Override endpoint auto-detection (escape hatch) |
+
+Implementation notes (phase 1):
+
+- A push whose device folder does not exist creates it (`mkdir -p`
+  semantics); a pull creates the local root directory.
+- Only folders that will receive synced content are created — a local
+  directory containing nothing but unsupported files does not produce
+  an empty device folder.
+- A mapped file deleted on the *destination* is recopied
+  (rsync-without-`--delete` semantics), on both push and pull.
+- The regular `--host`/`--user` flags are ignored by sync; `--port`
+  (now optional everywhere) is only passed to ssh when given, so ssh
+  config `Port` works.
 
 Direction is determined by **argument order**, exactly like `scp`/`rsync`:
 the first argument is the source, the second the destination. There are no
@@ -85,14 +99,15 @@ connecting (connection multiplexing makes this near-free — the probe
 shares the master connection with the transfers that follow):
 
 ```sh
-test -d /home/root/.local/share/remarkable/xochitl && test -e /usr/bin/xochitl && echo remarkable
-cat /etc/os-release /proc/device-tree/model 2>/dev/null   # corroboration
+test -d <xochitl-dir> && test -e /usr/bin/xochitl
 ```
 
-The xochitl data dir + binary is the strong signal (present on rM1, rM2,
-and Paper Pro — same software stack); os-release / device-tree strings
-corroborate. A remote that fails the probe is classified as a generic
-filesystem host, not an error. `--remote-kind` overrides detection.
+The xochitl data dir (honoring `--xochitl-dir`) + binary is the signal
+(present on rM1, rM2, and Paper Pro — same software stack). Probe exit 1
+means "reachable but not a tablet"; ssh exit 255 is a connection error
+and fails the sync. `--remote-kind` overrides detection. Corroborating
+signals (os-release / device-tree strings) were considered and dropped
+as unnecessary; revisit only if the single probe misfires in practice.
 
 ## The core problem: identity, not transfer
 
@@ -124,10 +139,10 @@ since last sync" vs. "never existed". It also breaks both loops above:
 a state-mapped `notes.md` knows its device EPUB, and a device-side EPUB
 payload never changes on its own, so pull is a no-op for it.
 
-Placement: on the non-tablet side when there is one; for tablet↔tablet,
-on the initiating computer, keyed by the endpoint pair. Users should
-gitignore it. Written **incrementally after each action** so an
-interrupted sync resumes cleanly.
+Placement (phase 1): in the local sync root. When tablet↔tablet lands
+(phase 3), state moves to the initiating computer, keyed by the
+endpoint pair. Users should gitignore it. Written **incrementally after
+each action** so an interrupted sync resumes cleanly.
 
 ## What syncs (local ↔ tablet)
 
@@ -180,19 +195,26 @@ A brand-new local `.rmdoc` with no mapping is a deliberate restore
 
 Following repo conventions (pure logic separated from I/O):
 
-1. **`libremarkable-utils/src/sync.rs` — pure planner.** Inputs: two
-   endpoint snapshots (abstract: rel path, kind, size, change signal,
-   identity), previous state, options. Output: ordered `Vec<SyncAction>`:
-   `CopyToDst`, `UpdateDst`, `CreateDstDir`, `Delete*` (only with
-   `--delete`), `Conflict { path, resolution }`, `Skip { path, reason }`.
-   Zero I/O — exhaustively unit-testable with fabricated snapshots
-   (creates/updates/deletes/conflicts/loop-prevention/duplicate names/
-   first-sync).
-2. **Endpoint trait + executor.** Endpoints implement snapshot/read/
-   write/mkdir/delete; the executor applies actions in dependency order
-   (folders before contents, deletions last), emits `Progress` steps
-   (`"[3/17] Uploading notes.md"`), writes state incrementally, and
-   restarts xochitl **once** at the end, not per file.
+1. **`libremarkable-utils/src/sync.rs` — pure planner.** Inputs: the
+   local snapshot (`LocalEntry` list), the device snapshot
+   (`RemoteSnapshot`), previous state, and the direction. Output:
+   ordered `Vec<SyncAction>`: `CreateRemoteFolder`, `Upload`,
+   `UpdateRemote`, `Download`, `Skip { path, reason }`. Conflicts are
+   expressed as `Skip` with an explanatory reason in phase 1; a
+   dedicated `Conflict` variant with a resolution arrives with the
+   phase-2 `--conflict` policies. `Delete*` actions arrive with
+   `--delete`. Zero I/O — exhaustively unit-tested with fabricated
+   snapshots (creates/updates/conflicts/loop-prevention/duplicate
+   names/first-sync/recopy).
+2. **Executor.** Applies actions in dependency order (folders before
+   contents; deletions last, once they exist), emits `Progress` steps
+   (`"[3/17] upload notes.md"`), writes state incrementally, and
+   restarts xochitl **once** at the end, not per file. Phase 1 is
+   direction-aware over the two concrete endpoint kinds; the
+   generalized **endpoint trait** (snapshot/read/write/mkdir/delete)
+   is deliberately deferred to phase 3, when `RemoteFs` gives it a
+   second real implementation — abstracting over one implementation
+   earns nothing.
 3. **CLI.** `--dry-run` renders the plan to stdout (that *is* the
    output); summary and progress to stderr, honoring `--quiet`, per the
    repo's output discipline.

@@ -13,15 +13,15 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use anyhow::{Context, Result, bail};
+use clap::{Parser, Subcommand, ValueEnum};
 use indicatif::{ProgressBar, ProgressStyle};
 use libremarkable_utils::client::Client;
 use libremarkable_utils::progress::{NoProgress, Progress};
 use libremarkable_utils::ssh::{
-    Auth, DEFAULT_SSH_PORT, DEFAULT_SSH_USER, DEFAULT_USB_HOST, SshOptions, SshSession,
-    maybe_run_askpass,
+    Auth, DEFAULT_SSH_USER, DEFAULT_USB_HOST, SshOptions, SshSession, maybe_run_askpass,
 };
+use libremarkable_utils::sync::{self, Direction, Endpoint};
 use libremarkable_utils::xochitl::{self, Item, XOCHITL_DATA_DIR};
 
 /// Password fallback for scripting, used when neither `--password` nor
@@ -45,9 +45,9 @@ struct Cli {
     #[arg(long, global = true, default_value = DEFAULT_SSH_USER)]
     user: String,
 
-    /// SSH port
-    #[arg(long, global = true, default_value_t = DEFAULT_SSH_PORT)]
-    port: u16,
+    /// SSH port (default: ssh config, or 22)
+    #[arg(long, global = true)]
+    port: Option<u16>,
 
     /// SSH identity (private key) file
     #[arg(short = 'i', long, global = true)]
@@ -153,6 +153,28 @@ enum Command {
     },
     /// Restart the xochitl UI service on the device
     Restart,
+    /// Sync a folder with the tablet, one-way SRC -> DST (scp-style
+    /// endpoints: `[user@]host:path` is remote, resolved via ssh config)
+    Sync {
+        /// Source endpoint, e.g. `./books` or `remarkable:/Books`
+        src: String,
+        /// Destination endpoint
+        dst: String,
+        /// Print the plan without changing anything
+        #[arg(long)]
+        dry_run: bool,
+        /// Override remote endpoint auto-detection
+        #[arg(long, value_enum)]
+        remote_kind: Option<RemoteKindArg>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum RemoteKindArg {
+    /// A reMarkable tablet (skip the probe)
+    Remarkable,
+    /// A generic ssh filesystem host (not yet supported)
+    Fs,
 }
 
 fn main() -> Result<()> {
@@ -161,42 +183,182 @@ fn main() -> Result<()> {
     maybe_run_askpass();
     let cli = Cli::parse();
 
-    let auth = resolve_auth(&cli)?;
-    let session = SshSession::new(SshOptions {
-        host: cli.host.clone(),
-        user: cli.user.clone(),
-        port: cli.port,
-        identity_file: cli.identity.clone(),
-        extra_options: cli.ssh_option.clone(),
-        auth,
-        multiplex: !cli.no_multiplex,
-    })?;
-
     // Progress bars only when stderr is a terminal and not --quiet.
     let progress: Arc<dyn Progress> = if cli.quiet || !std::io::stderr().is_terminal() {
         Arc::new(NoProgress)
     } else {
         Arc::new(CliProgress::default())
     };
-    let client = Client::new(session, cli.xochitl_dir.clone()).with_progress(progress.clone());
 
-    let result = run_command(&client, &cli);
+    let result = match &cli.command {
+        Command::Sync { .. } => run_sync(&cli, progress.clone()),
+        _ => run_regular(&cli, progress.clone()),
+    };
     // Clear any progress UI before errors are printed.
     progress.finished();
-    let modified = result?;
+    result
+}
 
+/// Build a session for a destination string (`host` or `user@host`).
+fn make_session(cli: &Cli, destination: &str) -> Result<SshSession> {
+    let auth = resolve_auth(cli, destination)?;
+    Ok(SshSession::new(SshOptions {
+        destination: destination.to_string(),
+        port: cli.port,
+        identity_file: cli.identity.clone(),
+        extra_options: cli.ssh_option.clone(),
+        auth,
+        multiplex: !cli.no_multiplex,
+    })?)
+}
+
+/// All commands except `sync`: one device, addressed by --host/--user.
+fn run_regular(cli: &Cli, progress: Arc<dyn Progress>) -> Result<()> {
+    let destination = format!("{}@{}", cli.user, cli.host);
+    let session = make_session(cli, &destination)?;
+    let client = Client::new(session, cli.xochitl_dir.clone()).with_progress(progress.clone());
+
+    let modified = run_command(&client, cli)?;
     if modified {
         if cli.no_restart {
             info(
-                &cli,
+                cli,
                 "note: xochitl not restarted (--no-restart); changes appear after restart",
             );
         } else {
-            let restart = client
+            client
                 .restart_xochitl()
-                .context("changes were written, but restarting xochitl failed");
-            progress.finished();
-            restart?;
+                .context("changes were written, but restarting xochitl failed")?;
+        }
+    }
+    Ok(())
+}
+
+/// `rmu sync SRC DST` — see `docs/sync-design.md`.
+fn run_sync(cli: &Cli, progress: Arc<dyn Progress>) -> Result<()> {
+    let Command::Sync {
+        src,
+        dst,
+        dry_run,
+        remote_kind,
+    } = &cli.command
+    else {
+        unreachable!("run_sync is only called for the sync command");
+    };
+
+    // Direction from argument order, endpoint kinds from parsing.
+    let (direction, local_arg, remote) =
+        match (sync::parse_endpoint(src), sync::parse_endpoint(dst)) {
+            (Endpoint::Local(local), Endpoint::Remote { destination, path }) => {
+                (Direction::Push, local, (destination, path))
+            }
+            (Endpoint::Remote { destination, path }, Endpoint::Local(local)) => {
+                (Direction::Pull, local, (destination, path))
+            }
+            (Endpoint::Local(_), Endpoint::Local(_)) => {
+                bail!("both endpoints are local; local↔local sync is not supported yet")
+            }
+            (Endpoint::Remote { .. }, Endpoint::Remote { .. }) => {
+                bail!("both endpoints are remote; tablet↔tablet sync is not supported yet")
+            }
+        };
+    let (destination, remote_path) = remote;
+    let local_root = PathBuf::from(&local_arg);
+
+    match direction {
+        Direction::Push if !local_root.is_dir() => {
+            bail!("source directory not found: {}", local_root.display())
+        }
+        Direction::Pull => std::fs::create_dir_all(&local_root)?,
+        _ => {}
+    }
+
+    let session = make_session(cli, &destination)?;
+    match remote_kind {
+        Some(RemoteKindArg::Fs) => {
+            bail!(
+                "generic ssh filesystem endpoints are not supported yet (see docs/sync-design.md)"
+            )
+        }
+        Some(RemoteKindArg::Remarkable) => {}
+        None => {
+            progress.step(&format!("Probing {destination}"));
+            if !sync::probe_remarkable(&session, &cli.xochitl_dir)? {
+                bail!(
+                    "{destination} does not look like a reMarkable tablet \
+                     (generic hosts are not supported yet; --remote-kind remarkable to override)"
+                );
+            }
+        }
+    }
+    let client = Client::new(session, cli.xochitl_dir.clone()).with_progress(progress.clone());
+
+    // Resolve the device folder; on push, create it if missing.
+    let mut items = client.list_items()?;
+    let root_uuid = match xochitl::resolve_folder_ref(&items, &remote_path) {
+        Ok(uuid) => uuid,
+        Err(libremarkable_utils::Error::PathNotFound(_)) if direction == Direction::Push => {
+            let created = client.mkdir_path(&remote_path, "")?;
+            items = client.list_items()?;
+            created.uuid
+        }
+        Err(err) => return Err(err.into()),
+    };
+
+    let (local_entries, ignored) = sync::local_snapshot(&local_root)?;
+    let snapshot = sync::remote_snapshot(&items, &root_uuid);
+    let mut state = sync::SyncState::load(&local_root)?;
+    let plan = sync::plan(direction, &local_entries, &snapshot, &state);
+
+    if *dry_run {
+        // The plan *is* the output in dry-run mode.
+        plan.actions
+            .iter()
+            .for_each(|action| println!("{}", sync::describe(action)));
+        if plan.actions.is_empty() {
+            info(cli, "Already in sync; nothing to do.");
+        }
+        return Ok(());
+    }
+
+    let mut folders = snapshot.folders.clone();
+    let outcome = sync::execute(
+        &client,
+        &*progress,
+        &local_root,
+        &plan,
+        &mut folders,
+        &mut state,
+    )?;
+
+    outcome
+        .skipped
+        .iter()
+        .for_each(|(path, reason)| info(cli, format!("skipped {path}: {reason}")));
+    info(
+        cli,
+        format!(
+            "Sync complete: {} uploaded, {} updated, {} downloaded, {} folder(s) created, \
+             {} skipped, {} unsupported file(s) ignored.",
+            outcome.uploaded,
+            outcome.updated,
+            outcome.downloaded,
+            outcome.folders_created,
+            outcome.skipped.len(),
+            ignored,
+        ),
+    );
+
+    if outcome.modified_remote {
+        if cli.no_restart {
+            info(
+                cli,
+                "note: xochitl not restarted (--no-restart); changes appear after restart",
+            );
+        } else {
+            client
+                .restart_xochitl()
+                .context("sync wrote changes, but restarting xochitl failed")?;
         }
     }
     Ok(())
@@ -321,6 +483,8 @@ fn run_command(client: &Client, cli: &Cli) -> Result<bool> {
             info(cli, "xochitl restarted");
             Ok(false)
         }
+        // Handled by run_sync, never reaches run_command.
+        Command::Sync { .. } => unreachable!("sync is dispatched in main"),
     }
 }
 
@@ -400,7 +564,7 @@ impl Progress for CliProgress {
     }
 }
 
-fn resolve_auth(cli: &Cli) -> Result<Auth> {
+fn resolve_auth(cli: &Cli, destination: &str) -> Result<Auth> {
     if let Some(path) = &cli.password_file {
         let text = fs::read_to_string(path)
             .with_context(|| format!("reading password file {}", path.display()))?;
@@ -409,7 +573,7 @@ fn resolve_auth(cli: &Cli) -> Result<Auth> {
         ));
     }
     if cli.password {
-        let prompt = format!("Password for {}@{}: ", cli.user, cli.host);
+        let prompt = format!("Password for {destination}: ");
         return Ok(Auth::Password(rpassword::prompt_password(prompt)?));
     }
     if let Ok(password) = std::env::var(PASSWORD_ENV) {

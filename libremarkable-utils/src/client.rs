@@ -100,7 +100,7 @@ impl Client {
                 }
                 xochitl::ensure_no_conflict(&items, &parent, part, None)?;
                 self.progress.step(&format!("Creating folder '{part}'"));
-                let created = self.create_folder(part, &parent)?;
+                let created = self.create_folder_in(part, &parent)?;
                 let next_parent = created.uuid.clone();
                 items.push(created.clone());
                 Ok::<_, Error>((items, next_parent, Some(created)))
@@ -154,7 +154,19 @@ impl Client {
         let parent = xochitl::resolve_folder_ref(&items, parent_ref)?;
         let name = default_name(visible_name, local);
         xochitl::ensure_no_conflict(&items, &parent, &name, None)?;
+        self.store_payload(local, &parent, &name, file_type)
+    }
 
+    /// Store a `.pdf`/`.epub` payload under `parent_uuid` **without
+    /// conflict checks** — callers (e.g. the sync planner) must have
+    /// verified the name is free.
+    pub fn store_payload(
+        &self,
+        local: &Path,
+        parent_uuid: &str,
+        name: &str,
+        file_type: &str,
+    ) -> Result<Item> {
         let doc_uuid = uuid::Uuid::new_v4().to_string();
         self.progress.step(&format!(
             "Uploading {}",
@@ -166,7 +178,13 @@ impl Client {
             &*self.progress,
         )?;
         let size = std::fs::metadata(local).ok().map(|m| m.len());
-        self.register_document(doc_uuid, name, parent, file_type, size)
+        self.register_document(
+            doc_uuid,
+            name.to_string(),
+            parent_uuid.to_string(),
+            file_type,
+            size,
+        )
     }
 
     /// Convert a `.md`/`.txt` file to EPUB and upload it. The document
@@ -182,10 +200,21 @@ impl Client {
         let parent = xochitl::resolve_folder_ref(&items, parent_ref)?;
         let name = default_name(visible_name, local);
         xochitl::ensure_no_conflict(&items, &parent, &name, None)?;
+        self.store_text(local, &parent, &name, kind)
+    }
 
+    /// Convert and store a text file as EPUB under `parent_uuid`
+    /// **without conflict checks**.
+    pub fn store_text(
+        &self,
+        local: &Path,
+        parent_uuid: &str,
+        name: &str,
+        kind: epub::TextKind,
+    ) -> Result<Item> {
         self.progress.step("Converting to EPUB");
         let source = std::fs::read_to_string(local)?;
-        let epub_bytes = epub::text_to_epub(&name, kind, &source)?;
+        let epub_bytes = epub::text_to_epub(name, kind, &source)?;
 
         let doc_uuid = uuid::Uuid::new_v4().to_string();
         self.progress.step(&format!(
@@ -201,7 +230,13 @@ impl Client {
             &*self.progress,
         )?;
         let size = Some(epub_bytes.len() as u64);
-        self.register_document(doc_uuid, name, parent, "epub", size)
+        self.register_document(
+            doc_uuid,
+            name.to_string(),
+            parent_uuid.to_string(),
+            "epub",
+            size,
+        )
     }
 
     /// Write the metadata/content/pagedata files that make an uploaded
@@ -253,41 +288,42 @@ impl Client {
         parent_ref: &str,
         visible_name: Option<&str>,
     ) -> Result<Item> {
-        let mut rmdoc = bundle::parse_rmdoc(&std::fs::read(local)?)?;
-        if rmdoc.metadata.get("type").and_then(Value::as_str) != Some("DocumentType") {
-            return Err(Error::Bundle(
-                "bundle metadata is not a DocumentType item".to_string(),
-            ));
-        }
-
+        let rmdoc = bundle::parse_rmdoc(&std::fs::read(local)?)?;
         let items = self.list_items()?;
         let parent = xochitl::resolve_folder_ref(&items, parent_ref)?;
         let name = visible_name
             .map(str::to_string)
             .or_else(|| rmdoc.visible_name().map(str::to_string))
-            .or_else(|| {
-                local
-                    .file_stem()
-                    .map(|stem| stem.to_string_lossy().into_owned())
-            })
-            .unwrap_or_else(|| "untitled".to_string());
+            .unwrap_or_else(|| default_name(None, local));
         xochitl::ensure_no_conflict(&items, &parent, &name, None)?;
+        self.restore_bundle(rmdoc, &parent, &name)
+    }
 
+    /// Restore a parsed `.rmdoc` bundle under `parent_uuid` **without
+    /// conflict checks**, re-targeted to a fresh UUID.
+    pub fn restore_bundle(
+        &self,
+        mut rmdoc: bundle::Rmdoc,
+        parent_uuid: &str,
+        name: &str,
+    ) -> Result<Item> {
+        if rmdoc.metadata.get("type").and_then(Value::as_str) != Some("DocumentType") {
+            return Err(Error::Bundle(
+                "bundle metadata is not a DocumentType item".to_string(),
+            ));
+        }
         let new_uuid = uuid::Uuid::new_v4().to_string();
         let now = now_ms();
         let object = rmdoc
             .metadata
             .as_object_mut()
             .ok_or_else(|| Error::InvalidMetadata(rmdoc.uuid.clone()))?;
-        object.insert("parent".to_string(), Value::String(parent.clone()));
-        object.insert("visibleName".to_string(), Value::String(name));
+        object.insert("parent".to_string(), Value::String(parent_uuid.to_string()));
+        object.insert("visibleName".to_string(), Value::String(name.to_string()));
         object.insert("lastModified".to_string(), Value::String(now.to_string()));
 
         let tar_bytes = bundle::rmdoc_to_tar(&rmdoc, &new_uuid)?;
-        self.progress.step(&format!(
-            "Restoring bundle {}",
-            local.file_name().unwrap_or_default().to_string_lossy()
-        ));
+        self.progress.step(&format!("Restoring bundle '{name}'"));
         self.session.run_checked_with_stdin(
             &format!("cd {} && tar -xf -", shell_quote(&self.dir)),
             &tar_bytes,
@@ -297,6 +333,74 @@ impl Client {
 
         xochitl::item_from_metadata(&new_uuid, &rmdoc.metadata, rmdoc.content.as_ref(), None)
             .ok_or(Error::InvalidMetadata(new_uuid))
+    }
+
+    /// Overwrite an existing document's payload file from a local file
+    /// and bump `lastModified`. Preserves annotations and tree
+    /// location. Returns the new `lastModified`.
+    pub fn update_payload_from_file(
+        &self,
+        uuid: &str,
+        file_type: &str,
+        local: &Path,
+    ) -> Result<i64> {
+        self.progress.step(&format!(
+            "Updating {}",
+            local.file_name().unwrap_or_default().to_string_lossy()
+        ));
+        self.session.upload_local_file(
+            local,
+            &self.remote_path(&format!("{uuid}.{file_type}")),
+            &*self.progress,
+        )?;
+        self.touch_last_modified(uuid)
+    }
+
+    /// Overwrite an existing document's payload with in-memory bytes
+    /// (e.g. a regenerated EPUB) and bump `lastModified`.
+    pub fn update_payload_bytes(&self, uuid: &str, file_type: &str, data: &[u8]) -> Result<i64> {
+        self.progress.step("Updating document");
+        self.session.run_checked_with_stdin(
+            &format!(
+                "cat > {}",
+                shell_quote(&self.remote_path(&format!("{uuid}.{file_type}")))
+            ),
+            data,
+            &*self.progress,
+        )?;
+        self.touch_last_modified(uuid)
+    }
+
+    fn touch_last_modified(&self, uuid: &str) -> Result<i64> {
+        let now = now_ms();
+        self.update_metadata(uuid, |metadata| {
+            metadata.insert("lastModified".to_string(), Value::String(now.to_string()));
+        })?;
+        self.progress.finished();
+        Ok(now)
+    }
+
+    /// Download a document payload by UUID (no path resolution).
+    pub fn download_payload_to(
+        &self,
+        uuid: &str,
+        file_type: &str,
+        dest: &Path,
+        size_hint: Option<u64>,
+    ) -> Result<()> {
+        self.session.download_remote_file(
+            &self.remote_path(&format!("{uuid}.{file_type}")),
+            dest,
+            size_hint,
+            &*self.progress,
+        )
+    }
+
+    /// Download a document as an `.rmdoc` bundle by UUID.
+    pub fn download_bundle_to(&self, uuid: &str, dest: &Path) -> Result<()> {
+        let tar_bytes = self.fetch_item_tar(uuid)?;
+        std::fs::write(dest, bundle::tar_to_rmdoc(&tar_bytes)?)?;
+        Ok(())
     }
 
     /// Download a document. `output` may be a file path or an existing
@@ -515,7 +619,9 @@ impl Client {
         self.write_text(&name, &text)
     }
 
-    fn create_folder(&self, visible_name: &str, parent_uuid: &str) -> Result<Item> {
+    /// Create a folder under `parent_uuid` **without conflict checks**
+    /// — callers must have verified the name is free.
+    pub fn create_folder_in(&self, visible_name: &str, parent_uuid: &str) -> Result<Item> {
         let folder_uuid = uuid::Uuid::new_v4().to_string();
         let now = now_ms();
         self.write_text(

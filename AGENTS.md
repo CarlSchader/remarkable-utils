@@ -67,6 +67,11 @@ This repository is **open source** (dual-licensed MIT OR Apache-2.0):
   `bytes_done`, `finished`). The **library never prints**; `rmu` renders
   these as indicatif bars on stderr. New long-running `Client`
   operations must emit steps and call `finished()` on completion.
+- `sync.rs` — `rmu sync`: scp-style endpoint parsing, local/remote
+  snapshots, sync-state file, a **pure** planner (three-way diff →
+  `Vec<SyncAction>`, heavily unit-tested), and a thin executor. Keep
+  planner logic pure; see `docs/sync-design.md` for semantics (rmdoc
+  pull-only rule, recopy-on-destination-delete, skip-on-drift).
 - `error.rs` — typed errors (`thiserror`).
 
 ## reMarkable domain knowledge
@@ -107,6 +112,7 @@ EPUB conversion) and their sharp edges.
 ```sh
 nix develop                        # dev shell (installs pre-commit hooks)
 cargo run -p rmu -- --help         # run the CLI
+cargo run -p rmu -- sync --dry-run ./dir remarkable:/   # sync plan preview
 cargo build --workspace            # build everything
 cargo test --workspace             # run tests
 cargo clippy --all-features --all-targets -- -D warnings  # mandatory lint

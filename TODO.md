@@ -2,15 +2,64 @@
 
 Planned work, roughly in priority order.
 
-## Sync
+## Sync (`rmu sync` — design: `docs/sync-design.md`)
 
-- [ ] **`rmu sync` — folder sync over SSH.** Full design agreed and
-  written up in `docs/sync-design.md`. Phase 1: one-way
-  `rmu sync <SRC> <DST>` with scp-style endpoints
-  (`[user@]host:path`, ssh-config resolution, runtime tablet
-  detection), sync-state file, `--dry-run`. Phase 2: `--two-way`,
-  `--conflict`, `--delete`. Phase 3: generic-host endpoints and
-  tablet↔tablet.
+### Done (phase 1)
+
+- [x] One-way `rmu sync <SRC> <DST>`, direction from argument order.
+- [x] scp-style endpoints (`[user@]host:path`), ssh-config resolution,
+  optional `--port` everywhere (ssh config `Port` now works).
+- [x] Runtime tablet detection (`probe_remarkable`), `--remote-kind`
+  override.
+- [x] Sync-state file (`.rmu-sync.json`): path↔UUID mapping, three-way
+  change detection, incremental saves (interrupted syncs resume).
+- [x] Pure planner + thin executor; 20 unit tests covering
+  creates/updates/conflicts/loops/duplicate names/first-sync/recopy.
+- [x] `--dry-run` (plan to stdout), skip-on-destination-drift,
+  update-in-place for mapped payloads (preserves annotations),
+  mapped-`.rmdoc`-pull-only / new-`.rmdoc`-restore rules,
+  md/txt→EPUB push with pull loop prevention.
+
+### Testing needed (requires a real device; unit tests can't cover this)
+
+- [ ] **Device smoke test of sync phase 1**, in order:
+  1. `rmu sync --dry-run ./dir remarkable:/SyncTest` (plan looks sane),
+  2. push a small tree (pdf + md + nested folder), verify with `rmu ls`,
+  3. re-run push — must be a no-op,
+  4. edit a local pdf, push — must update in place and **preserve
+     annotations** made on the device copy,
+  5. annotate a synced pdf on the device, edit it locally too, push —
+     must skip with a drift warning,
+  6. pull a folder containing notebooks into an empty dir; re-pull —
+     must be a no-op,
+  7. draw on a synced notebook, pull — `.rmdoc` must refresh,
+  8. interrupt a multi-file sync (Ctrl-C) and re-run — must resume
+     without duplicating documents.
+- [ ] Verify `remarkable:/Books` endpoints resolve through a real
+  `~/.ssh/config` `Host` entry (including a non-22 `Port`).
+- [ ] Confirm probe behavior against a non-tablet ssh host (should fail
+  with the "not a reMarkable" message, not hang or misclassify).
+- [ ] Confirm `rmu` still works against the device after the
+  `SshOptions` destination/port refactor (regression check on the
+  pre-existing commands: `ls`, `upload`, `download`).
+
+### Next dev steps
+
+- [ ] **Phase 2 — two-way sync**: `--two-way` flag (argument order stops
+  mattering), `--conflict skip|newest|src|dst` policies (planner gains a
+  `Conflict` action with a resolution instead of bare `Skip`), and
+  opt-in `--delete` propagation (needs the state file to distinguish
+  "deleted since last sync" from "never existed"; deletions ordered
+  last).
+- [ ] **Phase 3 — more endpoint pairings**: introduce the endpoint
+  trait (snapshot/read/write/mkdir/delete) once `RemoteFs` gives it a
+  second implementation; generic ssh-host sync (`--remote-kind fs`
+  currently errors) and tablet↔tablet via bundle streaming (state file
+  keyed by endpoint pair on the initiating computer).
+- [ ] Sync niceties, after the phases: content hashing as an alternative
+  change signal (mtime/size lies on some filesystems), exclude patterns,
+  a `--pull-bundles` mode (annotated PDFs as `.rmdoc` instead of bare
+  payload), and a machine-readable `--dry-run --json` plan.
 
 ## Text import (`rmu upload` for `.md`/`.txt`)
 

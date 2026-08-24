@@ -75,6 +75,28 @@ payload download does not). `rmu upload` restores `.rmdoc` bundles under a
 fresh UUID, so re-importing a download never collides with the original
 document. See `docs/notebook-data.md` for the details.
 
+### Folder sync
+
+`rmu sync` mirrors a folder one-way between your computer and the tablet's
+logical tree, over SSH. Direction follows argument order (like `rsync`/
+`scp`), and remote endpoints use scp syntax with full ssh-config
+resolution:
+
+```sh
+rmu sync ./books remarkable:/Books          # PC -> tablet ("push")
+rmu sync remarkable:/Books ./books          # tablet -> PC ("pull")
+rmu sync --dry-run ./books remarkable:/     # show the plan, change nothing
+```
+
+Only supported files participate (`.pdf`, `.epub`, `.md`, `.txt`,
+`.rmdoc`); everything else is left alone. Notebooks pull as `.rmdoc`
+bundles; Markdown/text push as EPUBs; mapped `.rmdoc` files are pull-only
+(handwriting can't be merged — the tablet wins). A `.rmu-sync.json` state
+file in the local root (gitignore it) tracks the path↔document mapping so
+repeated syncs only transfer changes, and anything that changed on the
+destination since the last sync is skipped with a warning, never silently
+overwritten. See `docs/sync-design.md` for the full model.
+
 Connecting over Wi-Fi or a non-default setup:
 
 ```sh

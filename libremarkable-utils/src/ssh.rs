@@ -62,9 +62,12 @@ impl fmt::Debug for Auth {
 /// Connection parameters for a device.
 #[derive(Debug, Clone)]
 pub struct SshOptions {
-    pub host: String,
-    pub user: String,
-    pub port: u16,
+    /// ssh destination, passed to the binary verbatim: `host` or
+    /// `user@host`. Plain hostnames get full ssh-config resolution
+    /// (`HostName`, `User`, `Port`, `IdentityFile`, ...).
+    pub destination: String,
+    /// Explicit port; `None` lets ssh config / defaults decide.
+    pub port: Option<u16>,
     pub identity_file: Option<PathBuf>,
     /// Extra `-o` options passed verbatim to ssh.
     pub extra_options: Vec<String>,
@@ -76,9 +79,8 @@ pub struct SshOptions {
 impl Default for SshOptions {
     fn default() -> Self {
         Self {
-            host: DEFAULT_USB_HOST.to_string(),
-            user: DEFAULT_SSH_USER.to_string(),
-            port: DEFAULT_SSH_PORT,
+            destination: format!("{DEFAULT_SSH_USER}@{DEFAULT_USB_HOST}"),
+            port: None,
             identity_file: None,
             extra_options: Vec::new(),
             auth: Auth::Default,
@@ -114,15 +116,17 @@ impl SshSession {
         })
     }
 
-    /// `user@host` destination string.
+    /// The ssh destination (`host` or `user@host`).
     pub fn target(&self) -> String {
-        format!("{}@{}", self.opts.user, self.opts.host)
+        self.opts.destination.clone()
     }
 
     /// ssh invocation with all options and env set, but no destination.
     fn base_command(&self) -> Command {
         let mut cmd = Command::new("ssh");
-        cmd.arg("-p").arg(self.opts.port.to_string());
+        if let Some(port) = self.opts.port {
+            cmd.arg("-p").arg(port.to_string());
+        }
         if let Some(identity) = &self.opts.identity_file {
             cmd.arg("-i").arg(identity);
         }
