@@ -9,6 +9,8 @@
 //!
 //! Module map:
 //! - [`bundle`] — `.rmdoc` bundle creation (tar-from-device → zip).
+//! - [`epub`] — minimal EPUB 3 generation for `.md`/`.txt` imports
+//!   (the device only renders notebooks, PDF, and EPUB).
 //! - [`ssh`] — subprocess transport around the system `ssh` binary
 //!   (multiplexed, optional password auth via a self-askpass helper).
 //! - [`xochitl`] — on-device file formats and pure tree logic
@@ -23,6 +25,7 @@
 
 pub mod bundle;
 pub mod client;
+pub mod epub;
 pub mod error;
 pub mod progress;
 pub mod ssh;

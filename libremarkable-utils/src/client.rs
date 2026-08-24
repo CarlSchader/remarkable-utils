@@ -15,6 +15,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde_json::Value;
 
 use crate::bundle;
+use crate::epub;
 use crate::error::{Error, Result};
 use crate::progress::{NoProgress, Progress};
 use crate::ssh::{SshSession, shell_quote};
@@ -109,9 +110,13 @@ impl Client {
         Ok(current.expect("at least one path segment"))
     }
 
-    /// Upload a `.pdf`, `.epub`, or `.rmdoc` bundle into a logical
-    /// folder. Bundles are re-targeted to a fresh UUID, so re-importing
-    /// a download never collides with the original document.
+    /// Upload a document into a logical folder. Accepted inputs:
+    /// - `.pdf` / `.epub`: uploaded as-is.
+    /// - `.rmdoc`: bundle restore, re-targeted to a fresh UUID so
+    ///   re-importing a download never collides with the original.
+    /// - `.md` / `.markdown` / `.txt`: converted to EPUB on the host
+    ///   (the device cannot render text files — see
+    ///   `docs/text-import.md`).
     pub fn upload(
         &self,
         local: &Path,
@@ -129,6 +134,10 @@ impl Client {
         match extension.as_str() {
             "pdf" | "epub" => self.upload_payload(local, parent_ref, visible_name, &extension),
             "rmdoc" => self.upload_rmdoc(local, parent_ref, visible_name),
+            "md" | "markdown" => {
+                self.upload_text(local, parent_ref, visible_name, epub::TextKind::Markdown)
+            }
+            "txt" => self.upload_text(local, parent_ref, visible_name, epub::TextKind::Plain),
             _ => Err(Error::UnsupportedFileType(extension)),
         }
     }
@@ -143,17 +152,10 @@ impl Client {
     ) -> Result<Item> {
         let items = self.list_items()?;
         let parent = xochitl::resolve_folder_ref(&items, parent_ref)?;
-        let name = match visible_name {
-            Some(name) => name.to_string(),
-            None => local
-                .file_stem()
-                .map(|stem| stem.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "untitled".to_string()),
-        };
+        let name = default_name(visible_name, local);
         xochitl::ensure_no_conflict(&items, &parent, &name, None)?;
 
         let doc_uuid = uuid::Uuid::new_v4().to_string();
-        let now = now_ms();
         self.progress.step(&format!(
             "Uploading {}",
             local.file_name().unwrap_or_default().to_string_lossy()
@@ -163,6 +165,56 @@ impl Client {
             &self.remote_path(&format!("{doc_uuid}.{file_type}")),
             &*self.progress,
         )?;
+        let size = std::fs::metadata(local).ok().map(|m| m.len());
+        self.register_document(doc_uuid, name, parent, file_type, size)
+    }
+
+    /// Convert a `.md`/`.txt` file to EPUB and upload it. The document
+    /// lands on the device as a regular EPUB; conversion is one-way.
+    fn upload_text(
+        &self,
+        local: &Path,
+        parent_ref: &str,
+        visible_name: Option<&str>,
+        kind: epub::TextKind,
+    ) -> Result<Item> {
+        let items = self.list_items()?;
+        let parent = xochitl::resolve_folder_ref(&items, parent_ref)?;
+        let name = default_name(visible_name, local);
+        xochitl::ensure_no_conflict(&items, &parent, &name, None)?;
+
+        self.progress.step("Converting to EPUB");
+        let source = std::fs::read_to_string(local)?;
+        let epub_bytes = epub::text_to_epub(&name, kind, &source)?;
+
+        let doc_uuid = uuid::Uuid::new_v4().to_string();
+        self.progress.step(&format!(
+            "Uploading {}",
+            local.file_name().unwrap_or_default().to_string_lossy()
+        ));
+        self.session.run_checked_with_stdin(
+            &format!(
+                "cat > {}",
+                shell_quote(&self.remote_path(&format!("{doc_uuid}.epub")))
+            ),
+            &epub_bytes,
+            &*self.progress,
+        )?;
+        let size = Some(epub_bytes.len() as u64);
+        self.register_document(doc_uuid, name, parent, "epub", size)
+    }
+
+    /// Write the metadata/content/pagedata files that make an uploaded
+    /// payload a real document, and report the resulting item.
+    fn register_document(
+        &self,
+        doc_uuid: String,
+        name: String,
+        parent: String,
+        file_type: &str,
+        size_bytes: Option<u64>,
+    ) -> Result<Item> {
+        let now = now_ms();
         self.progress.step("Registering document");
         self.write_text(
             &format!("{doc_uuid}.metadata"),
@@ -187,7 +239,7 @@ impl Client {
             file_type: Some(file_type.to_string()),
             created_time: now,
             last_modified: now,
-            size_bytes: std::fs::metadata(local).ok().map(|m| m.len()),
+            size_bytes,
         })
     }
 
@@ -495,6 +547,16 @@ impl Client {
         ))?;
         Ok(())
     }
+}
+
+/// Visible name for an upload: explicit override or the file stem.
+fn default_name(visible_name: Option<&str>, local: &Path) -> String {
+    visible_name.map(str::to_string).unwrap_or_else(|| {
+        local
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "untitled".to_string())
+    })
 }
 
 /// Default to `filename` in the current directory; an existing local

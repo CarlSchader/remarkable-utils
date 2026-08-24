@@ -43,6 +43,8 @@ rmu mkdir Algebra --parent Books/Math
 rmu upload ./sample.pdf                            # to root
 rmu upload ./sample.pdf --parent Books/Math -n "Linear Algebra"
 rmu upload ./backup.rmdoc --parent Notes           # restore an .rmdoc bundle
+rmu upload ./notes.md -n "Meeting Notes"           # markdown -> EPUB on the fly
+rmu upload ./log.txt                               # plain text -> EPUB too
 
 rmu download "Books/Math/Linear Algebra"           # to ./Linear Algebra.pdf
 rmu download Books/Physics ./downloads/
@@ -58,9 +60,12 @@ rmu rm Books --recursive                 # delete non-empty folder
 ```
 
 Targets are logical paths or item UUIDs; ambiguous paths are rejected
-instead of guessed. Only `.pdf` and `.epub` uploads are supported (that is
-what the device renders). After write operations `rmu` restarts xochitl so
-changes appear on the device (`--no-restart` to skip).
+instead of guessed. Uploads accept `.pdf` and `.epub` (what the device
+renders natively), `.rmdoc` bundles, and `.md`/`.txt` — text files are
+converted to EPUB on your machine at upload time, since the tablet cannot
+render them directly (see `docs/text-import.md`; the conversion is
+one-way). After write operations `rmu` restarts xochitl so changes appear
+on the device (`--no-restart` to skip).
 
 Native handwritten notebooks have no single payload file on the device, so
 `rmu download` fetches them as `.rmdoc` bundles — a zip of the raw file set

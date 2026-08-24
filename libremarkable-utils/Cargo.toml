@@ -14,3 +14,4 @@ thiserror = { workspace = true }
 uuid = { workspace = true }
 tar = { workspace = true }
 zip = { workspace = true }
+pulldown-cmark = { workspace = true }

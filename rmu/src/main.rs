@@ -107,9 +107,9 @@ enum Command {
         #[arg(long, default_value = "")]
         parent: String,
     },
-    /// Upload a PDF, EPUB, or .rmdoc bundle
+    /// Upload a document (.pdf, .epub, .rmdoc; .md/.txt convert to EPUB)
     Upload {
-        /// Local .pdf, .epub, or .rmdoc file
+        /// Local .pdf, .epub, .rmdoc, .md, or .txt file
         file: PathBuf,
         /// Visible name on the device (default: bundle name or file stem)
         #[arg(short, long)]

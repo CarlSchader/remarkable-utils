@@ -24,3 +24,4 @@ rpassword = "7"
 indicatif = "0.18"
 tar = "0.4"
 zip = { version = "8", default-features = false, features = ["deflate"] }
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
