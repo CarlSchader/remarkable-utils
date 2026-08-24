@@ -2,6 +2,16 @@
 
 Planned work, roughly in priority order.
 
+## Sync
+
+- [ ] **`rmu sync` — folder sync over SSH.** Full design agreed and
+  written up in `docs/sync-design.md`. Phase 1: one-way
+  `rmu sync <SRC> <DST>` with scp-style endpoints
+  (`[user@]host:path`, ssh-config resolution, runtime tablet
+  detection), sync-state file, `--dry-run`. Phase 2: `--two-way`,
+  `--conflict`, `--delete`. Phase 3: generic-host endpoints and
+  tablet↔tablet.
+
 ## Text import (`rmu upload` for `.md`/`.txt`)
 
 - [ ] **Embed local images in Markdown imports.** `![alt](path.png)`
