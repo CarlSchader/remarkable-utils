@@ -187,6 +187,34 @@ impl Client {
         )
     }
 
+    /// [`Self::store_payload`] from in-memory bytes (for generic fs
+    /// endpoints that cannot hand over a local path).
+    pub fn store_payload_bytes(
+        &self,
+        data: &[u8],
+        parent_uuid: &str,
+        name: &str,
+        file_type: &str,
+    ) -> Result<Item> {
+        let doc_uuid = uuid::Uuid::new_v4().to_string();
+        self.progress.step(&format!("Uploading '{name}'"));
+        self.session.run_checked_with_stdin(
+            &format!(
+                "cat > {}",
+                shell_quote(&self.remote_path(&format!("{doc_uuid}.{file_type}")))
+            ),
+            data,
+            &*self.progress,
+        )?;
+        self.register_document(
+            doc_uuid,
+            name.to_string(),
+            parent_uuid.to_string(),
+            file_type,
+            Some(data.len() as u64),
+        )
+    }
+
     /// Convert a `.md`/`.txt` file to EPUB and upload it. The document
     /// lands on the device as a regular EPUB; conversion is one-way.
     fn upload_text(
@@ -212,31 +240,21 @@ impl Client {
         name: &str,
         kind: epub::TextKind,
     ) -> Result<Item> {
-        self.progress.step("Converting to EPUB");
         let source = std::fs::read_to_string(local)?;
-        let epub_bytes = epub::text_to_epub(name, kind, &source)?;
+        self.store_text_source(&source, parent_uuid, name, kind)
+    }
 
-        let doc_uuid = uuid::Uuid::new_v4().to_string();
-        self.progress.step(&format!(
-            "Uploading {}",
-            local.file_name().unwrap_or_default().to_string_lossy()
-        ));
-        self.session.run_checked_with_stdin(
-            &format!(
-                "cat > {}",
-                shell_quote(&self.remote_path(&format!("{doc_uuid}.epub")))
-            ),
-            &epub_bytes,
-            &*self.progress,
-        )?;
-        let size = Some(epub_bytes.len() as u64);
-        self.register_document(
-            doc_uuid,
-            name.to_string(),
-            parent_uuid.to_string(),
-            "epub",
-            size,
-        )
+    /// [`Self::store_text`] from in-memory source text.
+    pub fn store_text_source(
+        &self,
+        source: &str,
+        parent_uuid: &str,
+        name: &str,
+        kind: epub::TextKind,
+    ) -> Result<Item> {
+        self.progress.step("Converting to EPUB");
+        let epub_bytes = epub::text_to_epub(name, kind, source)?;
+        self.store_payload_bytes(&epub_bytes, parent_uuid, name, "epub")
     }
 
     /// Write the metadata/content/pagedata files that make an uploaded
@@ -251,10 +269,9 @@ impl Client {
     ) -> Result<Item> {
         let now = now_ms();
         self.progress.step("Registering document");
-        self.write_text(
-            &format!("{doc_uuid}.metadata"),
-            &xochitl::document_metadata_json(&name, &parent, now),
-        )?;
+        // .metadata is written LAST: a document only becomes visible to
+        // xochitl once it exists, so an interrupted upload leaves
+        // invisible orphan files instead of a broken document.
         self.write_text(
             &format!("{doc_uuid}.content"),
             &xochitl::document_content_json(file_type),
@@ -264,6 +281,10 @@ impl Client {
             shell_quote(&self.remote_path(&doc_uuid))
         ))?;
         self.write_text(&format!("{doc_uuid}.pagedata"), "")?;
+        self.write_text(
+            &format!("{doc_uuid}.metadata"),
+            &xochitl::document_metadata_json(&name, &parent, now),
+        )?;
         self.progress.finished();
 
         Ok(Item {
@@ -396,10 +417,32 @@ impl Client {
         )
     }
 
+    /// Download a document payload by UUID into memory.
+    pub fn download_payload_bytes(
+        &self,
+        uuid: &str,
+        file_type: &str,
+        size_hint: Option<u64>,
+    ) -> Result<Vec<u8>> {
+        self.session.run_checked_bytes_hint(
+            &format!(
+                "cat {}",
+                shell_quote(&self.remote_path(&format!("{uuid}.{file_type}")))
+            ),
+            size_hint,
+            &*self.progress,
+        )
+    }
+
+    /// Download a document as `.rmdoc` bundle bytes by UUID.
+    pub fn download_bundle_bytes(&self, uuid: &str) -> Result<Vec<u8>> {
+        let tar_bytes = self.fetch_item_tar(uuid)?;
+        bundle::tar_to_rmdoc(&tar_bytes)
+    }
+
     /// Download a document as an `.rmdoc` bundle by UUID.
     pub fn download_bundle_to(&self, uuid: &str, dest: &Path) -> Result<()> {
-        let tar_bytes = self.fetch_item_tar(uuid)?;
-        std::fs::write(dest, bundle::tar_to_rmdoc(&tar_bytes)?)?;
+        std::fs::write(dest, self.download_bundle_bytes(uuid)?)?;
         Ok(())
     }
 

@@ -59,27 +59,59 @@ Planned work, roughly in priority order.
 
 ### Testing needed (phase 2, requires a real device)
 
-- [ ] Two-way smoke test: seed both sides, `--two-way --dry-run`, then
+- [x] Two-way smoke test: seed both sides, `--two-way --dry-run`, then
   run; verify uploads and downloads in one pass and an idempotent
   re-run.
-- [ ] Conflict policies: change a synced pdf on both sides; verify
+- [x] Conflict policies: change a synced pdf on both sides; verify
   `--conflict skip` reports, `newest` picks the right side, `src`/`dst`
   respect argument order.
-- [ ] `--delete`: delete locally, push with `--delete` (device copy
+- [x] `--delete`: delete locally, push with `--delete` (device copy
   removed); delete a *changed* device doc's local copy and verify the
   conflict is reported, not silently resolved.
-- [ ] Unmapped-collision adoption: same pdf on both sides with no
+- [x] Unmapped-collision adoption: same pdf on both sides with no
   state, `--conflict newest`; verify it maps rather than duplicates.
-- [ ] Interrupted two-way sync resumes cleanly (state saved per action).
+- [x] Interrupted two-way sync resumes cleanly (state saved per action).
+  First attempt found two bugs: (1) Ctrl-C between the device write
+  and the state save left a dangling mapping + unmapped device doc,
+  and resume skipped forever — fixed via metadata-last write ordering
+  and planner `rebind` recovery; (2) the interrupted run died before
+  its xochitl restart and the rebind-only resume didn't restart either,
+  leaving the document invisible in the UI — fixed by making rebinds
+  set `modified_remote`. **Re-test**: Ctrl-C during an rmdoc restore,
+  re-run; expect a `rebind`, no skips, a xochitl restart, and the
+  document **visible in the tablet UI** (not just in `rmu ls`).
+
+### Done (phase 3)
+
+- [x] `FsEndpoint` trait with `LocalFs` and `SshFs` (generic ssh hosts:
+  POSIX `find`/`stat`/`cat`, GNU/BSD stat probed inline); device sync
+  now works against any fs endpoint (`user@server:/docs ↔ tablet`).
+- [x] fs↔fs sync: local↔local, local↔ssh, ssh↔ssh; same supported
+  document types; shared `decide_pair` decision table; verified
+  end-to-end for local↔local (push, two-way, conflicts, policies,
+  `--delete`, idempotency).
+- [x] tablet↔tablet sync via `.rmdoc` bundle streaming: identity by
+  logical path, per-side UUIDs in a pair-state file on the initiating
+  computer (order-independent), replace-wholesale updates, folder
+  creation, deletions, conflict policies.
+
+### Testing needed (phase 3, requires devices / a second host)
+
+- [ ] Generic ssh host ↔ tablet: `rmu sync user@server:/docs remarkable:/X`
+  (host auto-classified as `fs` by the probe; also verify the
+  `--remote-kind` override).
+- [ ] local ↔ ssh-host file sync against a real Linux and a macOS
+  remote (exercises both `stat` variants and the snapshot script).
+- [ ] tablet↔tablet: first sync copies both ways (`--two-way`), notebook
+  arrives with ink intact, re-run is a no-op; draw on one side and
+  verify replace-propagation; `--delete` and conflict policies;
+  pair-state found with swapped argument order.
+- [ ] Memory note: ssh-endpoint transfers buffer documents in RAM —
+  sanity-check with a large (100MB+) PDF.
 
 ### Next dev steps
 
-- [ ] **Phase 3 — more endpoint pairings**: introduce the endpoint
-  trait (snapshot/read/write/mkdir/delete) once `RemoteFs` gives it a
-  second implementation; generic ssh-host sync (`--remote-kind fs`
-  currently errors) and tablet↔tablet via bundle streaming (state file
-  keyed by endpoint pair on the initiating computer).
-- [ ] Sync niceties, after the phases: content hashing as an alternative
+- [ ] Sync niceties: content hashing as an alternative
   change signal (mtime/size lies on some filesystems), exclude patterns,
   a `--pull-bundles` mode (annotated PDFs as `.rmdoc` instead of bare
   payload), and a machine-readable `--dry-run --json` plan.

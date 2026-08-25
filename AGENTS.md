@@ -67,11 +67,13 @@ This repository is **open source** (dual-licensed MIT OR Apache-2.0):
   `bytes_done`, `finished`). The **library never prints**; `rmu` renders
   these as indicatif bars on stderr. New long-running `Client`
   operations must emit steps and call `finished()` on completion.
-- `sync.rs` — `rmu sync`: scp-style endpoint parsing, local/remote
-  snapshots, sync-state file, a **pure** planner (three-way diff →
-  `Vec<SyncAction>`, heavily unit-tested), and a thin executor. Keep
-  planner logic pure; see `docs/sync-design.md` for semantics (rmdoc
-  pull-only rule, recopy-on-destination-delete, skip-on-drift).
+- `sync.rs` — `rmu sync`: scp-style endpoint parsing, the `FsEndpoint`
+  trait (`LocalFs`, `SshFs`), snapshots, sync-state files, **pure**
+  planners (heavily unit-tested), and thin executors. Three pairings:
+  fs↔tablet (its own asymmetric decision table: conversions, rmdoc
+  pull-only, text-import one-way), and fs↔fs + tablet↔tablet (one
+  shared symmetric table, `decide_pair`). Keep planner logic pure; see
+  `docs/sync-design.md` for semantics and state-file placement rules.
 - `error.rs` — typed errors (`thiserror`).
 
 ## reMarkable domain knowledge

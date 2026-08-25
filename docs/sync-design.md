@@ -1,10 +1,10 @@
 # Design: `rmu sync`
 
-Status: **phase 1 implemented and device-verified** (see the tested
-checklist in `TODO.md`); **phase 2 implemented, device verification
-pending**: `--two-way`, `--conflict skip|newest|src|dst`, and
-`--delete`, built on a unified per-key three-way decision table.
-Phase 3 (generic hosts, tablet↔tablet) remains planned. Update this
+Status: **phases 1–2 implemented and device-verified** (see the tested
+checklists in `TODO.md`); **phase 3 implemented, device verification
+pending**: the `FsEndpoint` abstraction (local dirs + generic ssh
+hosts), fs↔fs sync in every pairing (verified end-to-end for
+local↔local), and tablet↔tablet sync via bundle streaming. Update this
 file if the design changes during implementation.
 
 ## Goal
@@ -84,14 +84,25 @@ Conversion rules activate only when **exactly one side is a
 `Remarkable`**. Supported pairings:
 
 - **local ↔ tablet** — the core feature (phase 1).
-- **tablet ↔ tablet** — copy documents between devices: stream the
-  `.rmdoc` tar from device A, re-target to a fresh UUID, extract on
-  device B. The existing bundle machinery is already this pipeline
-  (phase 3).
+- **tablet ↔ tablet** — copy documents between devices via `.rmdoc`
+  bundle streaming (full fidelity: notebooks, annotations,
+  everything). Identity is the **logical path** (folder path + name);
+  each side has its own UUID per document, recorded in a pair-state
+  file kept on the initiating computer
+  (`$XDG_STATE_HOME/rmu/sync-pair-<hash>.json`, keyed
+  order-independently by the endpoint pair). A side counts as changed
+  when its UUID *or* `lastModified` moved — a replaced document is
+  just a changed document. "Updating" replaces the destination copy
+  wholesale (delete + fresh restore): bundles carry everything and ink
+  cannot be merged. Consequence: renaming a folder re-keys its
+  contents (delete + recopy on next `--delete` sync; conflicts
+  otherwise).
 - **local ↔ generic host / pc ↔ pc** — plain file-tree sync via
-  `RemoteFs`. Honest caveat: for pure file trees this is a feature-poor
-  rsync (no delta transfer); it exists for consistency and the docs
-  should say so, not pretend to compete (phase 3).
+  `SshFs`/`LocalFs`. Honest caveats: for pure file trees this is a
+  feature-poor rsync (no delta transfer, and bytes flow through the
+  initiating machine even for ssh↔ssh pairs); it syncs only the
+  supported document types, and exists for consistency — use rsync for
+  general file trees.
 
 ### Runtime tablet detection
 
@@ -211,6 +222,21 @@ A brand-new local `.rmdoc` with no mapping is a deliberate restore
   side); that's accepted noise for now.
 - Mappings whose files vanished on *both* sides are dropped from the
   state file (`forget` actions in the plan).
+- **Interrupted-sync recovery.** State is written after each transfer,
+  so a kill between "device write finished" and "state saved" leaves a
+  dangling mapping plus an unmapped device document. Two defenses:
+  uploads write `.metadata` **last** (both the register sequence and
+  the `.rmdoc` tar entry order), so an interruption mid-write leaves
+  invisible orphan files rather than a visible half-document; and the
+  planner **rebinds** a dangling mapping to a same-name, same-kind
+  unmapped document (state-only `rebind` action, ordered first) instead
+  of wedging on name collisions. A rebound document whose
+  `lastModified` differs from the recorded one is treated as a normal
+  remote change (e.g. pull re-downloads it). Because a rebind implies a
+  previous run wrote to the device and likely died before its xochitl
+  restart, rebinds count as device modifications — the resume run
+  restarts xochitl so the recovered document actually appears in the
+  UI.
 - First sync (no state): union merge — copy what exists only on one
   side; same name on both sides with no state to arbitrate = conflict
   (resolvable by policy, see adoption above).
@@ -233,12 +259,24 @@ Following repo conventions (pure logic separated from I/O):
 2. **Executor.** Applies actions in dependency order (folders before
    contents; deletions last, once they exist), emits `Progress` steps
    (`"[3/17] upload notes.md"`), writes state incrementally, and
-   restarts xochitl **once** at the end, not per file. Phase 1 is
-   direction-aware over the two concrete endpoint kinds; the
-   generalized **endpoint trait** (snapshot/read/write/mkdir/delete)
-   is deliberately deferred to phase 3, when `RemoteFs` gives it a
-   second real implementation — abstracting over one implementation
-   earns nothing.
+   restarts xochitl **once** at the end, not per file.
+3. **Endpoint abstraction (phase 3).** The file-tree side is a
+   `FsEndpoint` trait (`snapshot`/`read`/`write`/`remove`/`stat` +
+   state-file I/O) with two implementations: `LocalFs` and `SshFs`
+   (generic ssh host; POSIX commands, GNU/BSD `stat` probed inline).
+   `as_local_path` lets local endpoints keep streamed transfers; ssh
+   endpoints buffer documents through memory. The device side is not
+   an `FsEndpoint` — it has a logical document model instead.
+4. **Three planners, one decision table.** The symmetric pairings
+   (fs↔fs `plan_files`, tablet↔tablet `plan_docs`) share one
+   side-agnostic three-way table (`decide_pair`: presence × changed ×
+   mode × policy). The fs↔tablet planner keeps its own table because
+   its rules are inherently asymmetric (conversions, rmdoc pull-only,
+   text-import one-way).
+5. **State placement.** fs↔tablet: on the fs side. fs↔fs: on the
+   local side when exactly one side is local, otherwise the first
+   argument's side (keep argument order consistent for such pairs).
+   tablet↔tablet: on the initiating computer, order-independent.
 3. **CLI.** `--dry-run` renders the plan to stdout (that *is* the
    output); summary and progress to stderr, honoring `--quiet`, per the
    repo's output discipline.
@@ -259,9 +297,14 @@ methods.
   planner was rewritten as a single per-key decision table over
   (state, local, remote) presence × mode — one-way modes are now just
   restricted projections of the same table.
-- **Phase 3:** `RemoteFs` endpoint (pc↔pc, honest-caveat mode),
-  tablet↔tablet via bundle streaming. Also candidates: pull annotated
-  PDFs as `.rmdoc`, content hashing, watch mode.
+- **Phase 3 (implemented):** `FsEndpoint` trait (`LocalFs`, `SshFs`),
+  generic-host and pc↔pc sync (`plan_files`/`execute_files` over the
+  shared `decide_pair` table), tablet↔tablet via bundle streaming
+  (`plan_docs`/`execute_docs`, pair-state on the initiating machine).
+  `--remote-kind` now selects between tablet and generic-host for any
+  remote endpoint.
+- **Later candidates:** pull annotated PDFs as `.rmdoc`, content
+  hashing, watch mode, delta transfer for fs↔fs.
 
 Testing: the planner carries the correctness burden in unit tests; the
 executor is verified against a real device, `--dry-run` first.

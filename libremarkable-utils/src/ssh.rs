@@ -179,6 +179,17 @@ impl SshSession {
     /// Like [`Self::run_checked`], but for binary stdout (e.g. tar
     /// streams), reporting transfer progress (total unknown).
     pub fn run_checked_bytes(&self, remote_cmd: &str, progress: &dyn Progress) -> Result<Vec<u8>> {
+        self.run_checked_bytes_hint(remote_cmd, None, progress)
+    }
+
+    /// [`Self::run_checked_bytes`] with a size hint for the progress
+    /// bar (the transfer itself does not depend on it).
+    pub fn run_checked_bytes_hint(
+        &self,
+        remote_cmd: &str,
+        total: Option<u64>,
+        progress: &dyn Progress,
+    ) -> Result<Vec<u8>> {
         let mut child = self
             .command(remote_cmd)
             .stdin(Stdio::null())
@@ -188,7 +199,7 @@ impl SshSession {
         let mut data = Vec::new();
         {
             let mut stdout = child.stdout.take().expect("stdout was piped");
-            copy_with_progress(&mut stdout, &mut data, None, progress)?;
+            copy_with_progress(&mut stdout, &mut data, total, progress)?;
         }
         checked(child.wait_with_output()?)?;
         progress.bytes_done();

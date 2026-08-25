@@ -174,6 +174,18 @@ pub fn parse_rmdoc(bytes: &[u8]) -> Result<Rmdoc> {
 pub fn rmdoc_to_tar(rmdoc: &Rmdoc, new_uuid: &str) -> Result<Vec<u8>> {
     let mut builder = tar::Builder::new(Vec::new());
 
+    rmdoc.files.iter().try_for_each(|entry| {
+        let renamed = format!("{new_uuid}{}", &entry.path[rmdoc.uuid.len()..]);
+        match &entry.data {
+            Some(data) => append_file(&mut builder, &renamed, data),
+            None => append_dir(&mut builder, &renamed),
+        }
+    })?;
+
+    // The .metadata entry goes LAST: tar extracts in order, and a
+    // document only becomes visible to xochitl once its .metadata
+    // exists. An interrupted extraction therefore leaves invisible
+    // orphan files instead of a half-restored document.
     let metadata_text =
         serde_json::to_string_pretty(&rmdoc.metadata).map_err(|source| Error::Json {
             path: format!("{new_uuid}.metadata"),
@@ -184,14 +196,6 @@ pub fn rmdoc_to_tar(rmdoc: &Rmdoc, new_uuid: &str) -> Result<Vec<u8>> {
         &format!("{new_uuid}.metadata"),
         metadata_text.as_bytes(),
     )?;
-
-    rmdoc.files.iter().try_for_each(|entry| {
-        let renamed = format!("{new_uuid}{}", &entry.path[rmdoc.uuid.len()..]);
-        match &entry.data {
-            Some(data) => append_file(&mut builder, &renamed, data),
-            None => append_dir(&mut builder, &renamed),
-        }
-    })?;
     Ok(builder.into_inner()?)
 }
 
@@ -359,6 +363,9 @@ mod tests {
             }
             paths.push(path);
         }
+        // Crash consistency: .metadata must be the LAST entry so an
+        // interrupted extraction never leaves a visible document.
+        assert_eq!(paths.last().map(String::as_str), Some("bbb.metadata"));
         paths.sort();
         assert_eq!(
             paths,

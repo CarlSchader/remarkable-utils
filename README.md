@@ -89,7 +89,15 @@ rmu sync --dry-run ./books remarkable:/     # show the plan, change nothing
 rmu sync --two-way ./books remarkable:/Books        # bidirectional
 rmu sync --two-way --conflict newest ./b remarkable:/b  # newer side wins
 rmu sync --delete ./books remarkable:/Books # propagate deletions (opt-in)
+rmu sync user@server:/docs remarkable:/Work # generic ssh host -> tablet
+rmu sync remarkable:/ rm-backup:/           # tablet -> tablet (full fidelity)
+rmu sync ./a user@server:/backup/a          # plain file sync (supported types)
 ```
+
+Endpoints are classified at runtime: an ssh host with xochitl on it is a
+tablet (logical document sync with conversions); anything else is a plain
+file tree. Tablet↔tablet sync streams `.rmdoc` bundles between devices, so
+notebooks and annotations arrive intact.
 
 Only supported files participate (`.pdf`, `.epub`, `.md`, `.txt`,
 `.rmdoc`); everything else is left alone. Notebooks pull as `.rmdoc`

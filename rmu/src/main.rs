@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use indicatif::{ProgressBar, ProgressStyle};
 use libremarkable_utils::client::Client;
@@ -21,7 +21,9 @@ use libremarkable_utils::progress::{NoProgress, Progress};
 use libremarkable_utils::ssh::{
     Auth, DEFAULT_SSH_USER, DEFAULT_USB_HOST, SshOptions, SshSession, maybe_run_askpass,
 };
-use libremarkable_utils::sync::{self, ConflictPolicy, Endpoint, Mode, SyncOptions};
+use libremarkable_utils::sync::{
+    self, ConflictPolicy, Endpoint, FsEndpoint, LocalFs, Mode, SshFs, SyncOptions,
+};
 use libremarkable_utils::xochitl::{self, Item, XOCHITL_DATA_DIR};
 
 /// Password fallback for scripting, used when neither `--password` nor
@@ -176,7 +178,8 @@ enum Command {
         /// collide): report, newest timestamp wins, or a fixed side
         #[arg(long, value_enum, default_value_t = ConflictArg::Skip)]
         conflict: ConflictArg,
-        /// Override remote endpoint auto-detection
+        /// Override remote endpoint auto-detection (applies to every
+        /// remote endpoint)
         #[arg(long, value_enum)]
         remote_kind: Option<RemoteKindArg>,
     },
@@ -198,7 +201,7 @@ enum ConflictArg {
 enum RemoteKindArg {
     /// A reMarkable tablet (skip the probe)
     Remarkable,
-    /// A generic ssh filesystem host (not yet supported)
+    /// A generic ssh filesystem host (plain file sync)
     Fs,
 }
 
@@ -259,6 +262,63 @@ fn run_regular(cli: &Cli, progress: Arc<dyn Progress>) -> Result<()> {
     Ok(())
 }
 
+/// One built side of a sync: a file tree (local or generic ssh host)
+/// or a reMarkable tablet.
+enum BuiltSide {
+    Fs {
+        endpoint: Box<dyn FsEndpoint>,
+        is_local: bool,
+    },
+    Tablet {
+        client: Box<Client>,
+        path: String,
+        destination: String,
+    },
+}
+
+/// Build a sync side from a parsed endpoint: local paths become
+/// `LocalFs`; remote endpoints are probed (or `--remote-kind`-forced)
+/// into a tablet or a generic ssh filesystem host.
+fn build_side(
+    cli: &Cli,
+    progress: &Arc<dyn Progress>,
+    endpoint: Endpoint,
+    remote_kind: Option<RemoteKindArg>,
+) -> Result<BuiltSide> {
+    match endpoint {
+        Endpoint::Local(path) => Ok(BuiltSide::Fs {
+            endpoint: Box::new(LocalFs::new(path)),
+            is_local: true,
+        }),
+        Endpoint::Remote { destination, path } => {
+            let session = make_session(cli, &destination)?;
+            let is_tablet = match remote_kind {
+                Some(RemoteKindArg::Remarkable) => true,
+                Some(RemoteKindArg::Fs) => false,
+                None => {
+                    progress.step(&format!("Probing {destination}"));
+                    sync::probe_remarkable(&session, &cli.xochitl_dir)?
+                }
+            };
+            if is_tablet {
+                Ok(BuiltSide::Tablet {
+                    client: Box::new(
+                        Client::new(session, cli.xochitl_dir.clone())
+                            .with_progress(progress.clone()),
+                    ),
+                    path,
+                    destination,
+                })
+            } else {
+                Ok(BuiltSide::Fs {
+                    endpoint: Box::new(SshFs::new(session, path, progress.clone())),
+                    is_local: false,
+                })
+            }
+        }
+    }
+}
+
 /// `rmu sync SRC DST` — see `docs/sync-design.md`.
 fn run_sync(cli: &Cli, progress: Arc<dyn Progress>) -> Result<()> {
     let Command::Sync {
@@ -274,91 +334,253 @@ fn run_sync(cli: &Cli, progress: Arc<dyn Progress>) -> Result<()> {
         unreachable!("run_sync is only called for the sync command");
     };
 
-    // Endpoint kinds from parsing; `src_is_local` maps --conflict
-    // src/dst onto local/remote sides.
-    let (src_is_local, local_arg, remote) =
-        match (sync::parse_endpoint(src), sync::parse_endpoint(dst)) {
-            (Endpoint::Local(local), Endpoint::Remote { destination, path }) => {
-                (true, local, (destination, path))
-            }
-            (Endpoint::Remote { destination, path }, Endpoint::Local(local)) => {
-                (false, local, (destination, path))
-            }
-            (Endpoint::Local(_), Endpoint::Local(_)) => {
-                bail!("both endpoints are local; local↔local sync is not supported yet")
-            }
-            (Endpoint::Remote { .. }, Endpoint::Remote { .. }) => {
-                bail!("both endpoints are remote; tablet↔tablet sync is not supported yet")
-            }
-        };
-    let (destination, remote_path) = remote;
-    let local_root = PathBuf::from(&local_arg);
+    let src_side = build_side(cli, &progress, sync::parse_endpoint(src), *remote_kind)?;
+    let dst_side = build_side(cli, &progress, sync::parse_endpoint(dst), *remote_kind)?;
 
-    let mode = match (*two_way, src_is_local) {
+    match (src_side, dst_side) {
+        (
+            BuiltSide::Fs {
+                endpoint, is_local, ..
+            },
+            BuiltSide::Tablet { client, path, .. },
+        ) => {
+            let _ = is_local;
+            run_device_sync(
+                cli, &progress, &*endpoint, &client, &path, true, *two_way, *delete, *conflict,
+                *dry_run,
+            )
+        }
+        (
+            BuiltSide::Tablet { client, path, .. },
+            BuiltSide::Fs {
+                endpoint, is_local, ..
+            },
+        ) => {
+            let _ = is_local;
+            run_device_sync(
+                cli, &progress, &*endpoint, &client, &path, false, *two_way, *delete, *conflict,
+                *dry_run,
+            )
+        }
+        (
+            BuiltSide::Fs {
+                endpoint: src_ep,
+                is_local: src_local,
+            },
+            BuiltSide::Fs {
+                endpoint: dst_ep,
+                is_local: dst_local,
+            },
+        ) => run_files_sync(
+            cli,
+            &progress,
+            (src_ep, src_local),
+            (dst_ep, dst_local),
+            *two_way,
+            *delete,
+            *conflict,
+            *dry_run,
+        ),
+        (
+            BuiltSide::Tablet {
+                client: src_client,
+                path: src_path,
+                destination: src_dest,
+            },
+            BuiltSide::Tablet {
+                client: dst_client,
+                path: dst_path,
+                destination: dst_dest,
+            },
+        ) => run_docs_sync(
+            cli,
+            &progress,
+            (src_client, src_path, src_dest),
+            (dst_client, dst_path, dst_dest),
+            *two_way,
+            *delete,
+            *conflict,
+            *dry_run,
+        ),
+    }
+}
+
+/// Sync between two tablets via `.rmdoc` bundle streaming.
+#[allow(clippy::too_many_arguments)]
+fn run_docs_sync(
+    cli: &Cli,
+    progress: &Arc<dyn Progress>,
+    src: (Box<Client>, String, String),
+    dst: (Box<Client>, String, String),
+    two_way: bool,
+    delete: bool,
+    conflict: ConflictArg,
+    dry_run: bool,
+) -> Result<()> {
+    let (src_client, src_path, src_dest) = src;
+    let (dst_client, dst_path, dst_dest) = dst;
+
+    // Side A is chosen order-independently (lexicographically smaller
+    // endpoint identity) so the pair-state file is found regardless of
+    // argument order.
+    let src_id = format!("{src_dest}:{}", src_path.trim_end_matches('/'));
+    let dst_id = format!("{dst_dest}:{}", dst_path.trim_end_matches('/'));
+    let a_is_src = src_id <= dst_id;
+    let (client_a, path_a, id_a, client_b, path_b, id_b) = if a_is_src {
+        (src_client, src_path, src_id, dst_client, dst_path, dst_id)
+    } else {
+        (dst_client, dst_path, dst_id, src_client, src_path, src_id)
+    };
+
+    let mode = match (two_way, a_is_src) {
+        (true, _) => Mode::TwoWay,
+        (false, true) => Mode::Push,  // A -> B
+        (false, false) => Mode::Pull, // B -> A
+    };
+    let options = SyncOptions {
+        mode,
+        delete,
+        conflict: map_conflict(conflict, a_is_src),
+    };
+
+    // Resolve each root folder; create it when that side is writable.
+    let resolve_root =
+        |client: &Client, path: &str, writable: bool| -> Result<(Vec<Item>, String)> {
+            let mut items = client.list_items()?;
+            let uuid = match xochitl::resolve_folder_ref(&items, path) {
+                Ok(uuid) => uuid,
+                Err(libremarkable_utils::Error::PathNotFound(_)) if writable => {
+                    let created = client.mkdir_path(path, "")?;
+                    items = client.list_items()?;
+                    created.uuid
+                }
+                Err(err) => return Err(err.into()),
+            };
+            Ok((items, uuid))
+        };
+    let (items_a, root_a) = resolve_root(&client_a, &path_a, mode != Mode::Push)?;
+    let (items_b, root_b) = resolve_root(&client_b, &path_b, mode != Mode::Pull)?;
+
+    let snapshot_a = sync::remote_snapshot(&items_a, &root_a);
+    let snapshot_b = sync::remote_snapshot(&items_b, &root_b);
+    let state_path = sync::pair_state_path(&id_a, &id_b);
+    let mut state = sync::PairState::load(&state_path)?;
+    let plan = sync::plan_docs(options, &snapshot_a, &snapshot_b, &state);
+
+    info(cli, format!("A = {id_a}, B = {id_b}"));
+    if dry_run {
+        plan.iter()
+            .for_each(|action| println!("{}", sync::describe_doc(action)));
+        if plan.is_empty() {
+            info(cli, "Already in sync; nothing to do.");
+        }
+        return Ok(());
+    }
+
+    let mut folders_a = snapshot_a.folders.clone();
+    let mut folders_b = snapshot_b.folders.clone();
+    let outcome = sync::execute_docs(
+        &client_a,
+        &client_b,
+        &**progress,
+        &plan,
+        &mut folders_a,
+        &mut folders_b,
+        &mut state,
+        &state_path,
+    )?;
+
+    outcome
+        .conflicts
+        .iter()
+        .for_each(|(key, reason)| info(cli, format!("conflict {key}: {reason}")));
+    info(
+        cli,
+        format!(
+            "Sync complete: {} copied to A, {} copied to B, {} deleted on A, \
+             {} deleted on B, {} folder(s) created, {} conflict(s).",
+            outcome.copied_to_a,
+            outcome.copied_to_b,
+            outcome.deleted_a,
+            outcome.deleted_b,
+            outcome.folders_created,
+            outcome.conflicts.len(),
+        ),
+    );
+
+    if !cli.no_restart {
+        if outcome.modified_a {
+            client_a
+                .restart_xochitl()
+                .context("sync wrote changes to side A, but restarting xochitl failed")?;
+        }
+        if outcome.modified_b {
+            client_b
+                .restart_xochitl()
+                .context("sync wrote changes to side B, but restarting xochitl failed")?;
+        }
+    } else if outcome.modified_a || outcome.modified_b {
+        info(
+            cli,
+            "note: xochitl not restarted (--no-restart); changes appear after restart",
+        );
+    }
+    Ok(())
+}
+
+/// Sync between a file tree and a tablet.
+#[allow(clippy::too_many_arguments)]
+fn run_device_sync(
+    cli: &Cli,
+    progress: &Arc<dyn Progress>,
+    fs_side: &dyn FsEndpoint,
+    client: &Client,
+    remote_path: &str,
+    fs_is_src: bool,
+    two_way: bool,
+    delete: bool,
+    conflict: ConflictArg,
+    dry_run: bool,
+) -> Result<()> {
+    let mode = match (two_way, fs_is_src) {
         (true, _) => Mode::TwoWay,
         (false, true) => Mode::Push,
         (false, false) => Mode::Pull,
     };
     let options = SyncOptions {
         mode,
-        delete: *delete,
-        conflict: match conflict {
-            ConflictArg::Skip => ConflictPolicy::Skip,
-            ConflictArg::Newest => ConflictPolicy::Newest,
-            ConflictArg::Src if src_is_local => ConflictPolicy::PreferLocal,
-            ConflictArg::Src => ConflictPolicy::PreferRemote,
-            ConflictArg::Dst if src_is_local => ConflictPolicy::PreferRemote,
-            ConflictArg::Dst => ConflictPolicy::PreferLocal,
-        },
+        delete,
+        conflict: map_conflict(conflict, fs_is_src),
     };
 
-    match mode {
-        Mode::Push if !local_root.is_dir() => {
-            bail!("source directory not found: {}", local_root.display())
-        }
-        Mode::Pull | Mode::TwoWay => std::fs::create_dir_all(&local_root)?,
-        _ => {}
+    // The fs side holds the state file and receives pulls: make sure
+    // its root exists (except pure push, where a missing source is an
+    // error surfaced by the snapshot).
+    if mode != Mode::Push {
+        fs_side.ensure_root()?;
     }
-
-    let session = make_session(cli, &destination)?;
-    match remote_kind {
-        Some(RemoteKindArg::Fs) => {
-            bail!(
-                "generic ssh filesystem endpoints are not supported yet (see docs/sync-design.md)"
-            )
-        }
-        Some(RemoteKindArg::Remarkable) => {}
-        None => {
-            progress.step(&format!("Probing {destination}"));
-            if !sync::probe_remarkable(&session, &cli.xochitl_dir)? {
-                bail!(
-                    "{destination} does not look like a reMarkable tablet \
-                     (generic hosts are not supported yet; --remote-kind remarkable to override)"
-                );
-            }
-        }
-    }
-    let client = Client::new(session, cli.xochitl_dir.clone()).with_progress(progress.clone());
 
     // Resolve the device folder; when this side can be written to,
     // create it if missing.
     let mut items = client.list_items()?;
-    let root_uuid = match xochitl::resolve_folder_ref(&items, &remote_path) {
+    let root_uuid = match xochitl::resolve_folder_ref(&items, remote_path) {
         Ok(uuid) => uuid,
         Err(libremarkable_utils::Error::PathNotFound(_)) if mode != Mode::Pull => {
-            let created = client.mkdir_path(&remote_path, "")?;
+            let created = client.mkdir_path(remote_path, "")?;
             items = client.list_items()?;
             created.uuid
         }
         Err(err) => return Err(err.into()),
     };
 
-    let (local_entries, ignored) = sync::local_snapshot(&local_root)?;
+    let (fs_entries, ignored) = fs_side
+        .snapshot()
+        .with_context(|| format!("reading {}", fs_side.label()))?;
     let snapshot = sync::remote_snapshot(&items, &root_uuid);
-    let mut state = sync::SyncState::load(&local_root)?;
-    let plan = sync::plan(options, &local_entries, &snapshot, &state);
+    let mut state = sync::SyncState::load_from(fs_side)?;
+    let plan = sync::plan(options, &fs_entries, &snapshot, &state);
 
-    if *dry_run {
+    if dry_run {
         // The plan *is* the output in dry-run mode.
         plan.actions
             .iter()
@@ -371,9 +593,9 @@ fn run_sync(cli: &Cli, progress: Arc<dyn Progress>) -> Result<()> {
 
     let mut folders = snapshot.folders.clone();
     let outcome = sync::execute(
-        &client,
-        &*progress,
-        &local_root,
+        client,
+        &**progress,
+        fs_side,
         &plan,
         &mut folders,
         &mut state,
@@ -419,6 +641,106 @@ fn run_sync(cli: &Cli, progress: Arc<dyn Progress>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Plain file sync between two file trees (local↔local, local↔ssh
+/// host, ssh↔ssh). No conversions; same supported file types.
+#[allow(clippy::too_many_arguments)]
+fn run_files_sync(
+    cli: &Cli,
+    progress: &Arc<dyn Progress>,
+    src: (Box<dyn FsEndpoint>, bool),
+    dst: (Box<dyn FsEndpoint>, bool),
+    two_way: bool,
+    delete: bool,
+    conflict: ConflictArg,
+    dry_run: bool,
+) -> Result<()> {
+    let (src_ep, src_local) = src;
+    let (dst_ep, dst_local) = dst;
+
+    // The state file lives on side "A": the local side when exactly
+    // one side is local, otherwise the first argument's side. Keep
+    // argument order consistent for non-local pairs so state is found.
+    let a_is_src = src_local || !dst_local;
+    let (a, b) = if a_is_src {
+        (src_ep, dst_ep)
+    } else {
+        (dst_ep, src_ep)
+    };
+
+    let mode = match (two_way, a_is_src) {
+        (true, _) => Mode::TwoWay,
+        (false, true) => Mode::Push,  // A -> B
+        (false, false) => Mode::Pull, // B -> A
+    };
+    let options = SyncOptions {
+        mode,
+        delete,
+        conflict: map_conflict(conflict, a_is_src),
+    };
+
+    // Create write-target roots; a missing pure source stays an error.
+    match mode {
+        Mode::Push => b.ensure_root()?,
+        Mode::Pull => a.ensure_root()?,
+        Mode::TwoWay => {
+            a.ensure_root()?;
+            b.ensure_root()?;
+        }
+    }
+
+    let (a_entries, a_ignored) = a
+        .snapshot()
+        .with_context(|| format!("reading {}", a.label()))?;
+    let (b_entries, b_ignored) = b
+        .snapshot()
+        .with_context(|| format!("reading {}", b.label()))?;
+    let mut state = sync::SyncState::load_from(&*a)?;
+    let plan = sync::plan_files(options, &a_entries, &b_entries, &state);
+
+    info(cli, format!("A = {}, B = {}", a.label(), b.label()));
+    if dry_run {
+        plan.iter()
+            .for_each(|action| println!("{}", sync::describe_file(action)));
+        if plan.is_empty() {
+            info(cli, "Already in sync; nothing to do.");
+        }
+        return Ok(());
+    }
+
+    let outcome = sync::execute_files(&*a, &*b, &**progress, &plan, &mut state)?;
+    outcome
+        .conflicts
+        .iter()
+        .for_each(|(path, reason)| info(cli, format!("conflict {path}: {reason}")));
+    info(
+        cli,
+        format!(
+            "Sync complete: {} copied to A, {} copied to B, {} deleted on A, \
+             {} deleted on B, {} conflict(s), {} unsupported file(s) ignored.",
+            outcome.copied_to_a,
+            outcome.copied_to_b,
+            outcome.deleted_a,
+            outcome.deleted_b,
+            outcome.conflicts.len(),
+            a_ignored + b_ignored,
+        ),
+    );
+    Ok(())
+}
+
+/// Map `--conflict src|dst` onto the planner's local/remote (A/B)
+/// policy sides based on which argument plays the "local"/"A" role.
+fn map_conflict(conflict: ConflictArg, src_is_local_side: bool) -> ConflictPolicy {
+    match conflict {
+        ConflictArg::Skip => ConflictPolicy::Skip,
+        ConflictArg::Newest => ConflictPolicy::Newest,
+        ConflictArg::Src if src_is_local_side => ConflictPolicy::PreferLocal,
+        ConflictArg::Src => ConflictPolicy::PreferRemote,
+        ConflictArg::Dst if src_is_local_side => ConflictPolicy::PreferRemote,
+        ConflictArg::Dst => ConflictPolicy::PreferLocal,
+    }
 }
 
 /// Human status line: stderr, suppressed by --quiet.
