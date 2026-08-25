@@ -509,18 +509,17 @@ impl Client {
     /// Delete a document or folder. Deleting a non-empty folder
     /// requires `recursive`; children are removed before parents.
     pub fn delete(&self, item_ref: &str, recursive: bool) -> Result<Vec<Item>> {
-        let items = self.list_items()?;
-        let item = xochitl::resolve_item_ref(&items, item_ref)?.clone();
-        let mut order: Vec<Item> = xochitl::descendants(&items, &item.uuid)
-            .into_iter()
-            .cloned()
-            .collect();
-        if item.is_folder() && !order.is_empty() && !recursive {
-            return Err(Error::FolderNotEmpty);
-        }
-        order.sort_by_key(|descendant| Reverse(xochitl::depth(&items, descendant)));
-        order.push(item);
+        self.delete_many(&[item_ref], recursive)
+    }
 
+    /// Delete several documents/folders in one pass. Every reference
+    /// is resolved against a single listing **before anything is
+    /// deleted**, so one bad target aborts the whole command instead
+    /// of leaving it half-done. Overlapping targets (one inside
+    /// another) are deduplicated; children are removed before parents.
+    pub fn delete_many(&self, item_refs: &[&str], recursive: bool) -> Result<Vec<Item>> {
+        let items = self.list_items()?;
+        let order = deletion_plan(&items, item_refs, recursive)?;
         order.iter().try_for_each(|target| {
             self.progress
                 .step(&format!("Deleting '{}'", target.visible_name));
@@ -726,6 +725,38 @@ fn resolve_destination(output: Option<&Path>, filename: &str) -> PathBuf {
     }
 }
 
+/// Resolve and order a multi-target deletion: validate every
+/// reference and the `recursive` requirement up-front, deduplicate
+/// overlapping subtrees, and order children before parents. Pure.
+fn deletion_plan(items: &[Item], item_refs: &[&str], recursive: bool) -> Result<Vec<Item>> {
+    // Resolve everything first: fail before deleting anything.
+    let targets: Vec<&Item> = item_refs
+        .iter()
+        .map(|item_ref| xochitl::resolve_item_ref(items, item_ref))
+        .collect::<Result<_>>()?;
+
+    let mut scheduled = std::collections::HashSet::<&str>::new();
+    let mut order: Vec<&Item> = Vec::new();
+    targets.iter().try_for_each(|target| -> Result<()> {
+        let descendants = xochitl::descendants(items, &target.uuid);
+        if target.is_folder() && !descendants.is_empty() && !recursive {
+            return Err(Error::FolderNotEmpty(target.visible_name.clone()));
+        }
+        descendants
+            .into_iter()
+            .chain(std::iter::once(*target))
+            .for_each(|item| {
+                if scheduled.insert(item.uuid.as_str()) {
+                    order.push(item);
+                }
+            });
+        Ok(())
+    })?;
+
+    order.sort_by_key(|item| Reverse(xochitl::depth(items, item)));
+    Ok(order.into_iter().cloned().collect())
+}
+
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -818,6 +849,63 @@ fn build_items(listing: &Listing) -> Vec<Item> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn item(uuid: &str, name: &str, parent: &str, kind: ItemKind) -> Item {
+        Item {
+            uuid: uuid.to_string(),
+            visible_name: name.to_string(),
+            parent: parent.to_string(),
+            kind,
+            file_type: None,
+            created_time: 0,
+            last_modified: 0,
+            size_bytes: None,
+        }
+    }
+
+    fn sample_tree() -> Vec<Item> {
+        vec![
+            item("b", "Books", "", ItemKind::Folder),
+            item("m", "Math", "b", ItemKind::Folder),
+            item("la", "Linear Algebra", "m", ItemKind::Document),
+            item("ph", "Physics", "b", ItemKind::Document),
+            item("n", "Notes", "", ItemKind::Document),
+        ]
+    }
+
+    #[test]
+    fn deletion_plan_orders_children_first_and_dedupes_overlap() {
+        let items = sample_tree();
+        // "Books" contains "Books/Math": listing both must not
+        // schedule the subtree twice.
+        let order = deletion_plan(&items, &["Books", "Books/Math", "Notes"], true).unwrap();
+        let uuids: Vec<&str> = order.iter().map(|i| i.uuid.as_str()).collect();
+        // Children before parents; every uuid exactly once.
+        let position = |u: &str| uuids.iter().position(|x| *x == u).unwrap();
+        assert!(position("la") < position("m"));
+        assert!(position("m") < position("b"));
+        assert!(position("ph") < position("b"));
+        assert_eq!(uuids.len(), 5);
+    }
+
+    #[test]
+    fn deletion_plan_fails_fast_on_any_bad_target() {
+        let items = sample_tree();
+        // A typo in one target aborts the whole plan.
+        assert!(matches!(
+            deletion_plan(&items, &["Notes", "Boks"], true),
+            Err(Error::PathNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn deletion_plan_names_the_non_empty_folder() {
+        let items = sample_tree();
+        match deletion_plan(&items, &["Notes", "Books"], false) {
+            Err(Error::FolderNotEmpty(name)) => assert_eq!(name, "Books"),
+            other => panic!("expected FolderNotEmpty, got {other:?}"),
+        }
+    }
 
     #[test]
     fn listing_parse_and_build() {

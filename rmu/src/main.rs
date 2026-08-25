@@ -131,10 +131,12 @@ enum Command {
         #[arg(long)]
         bundle: bool,
     },
-    /// Delete a document or folder
+    /// Delete documents or folders
     Rm {
-        /// Item UUID or logical path
-        target: String,
+        /// Item UUIDs or logical paths (all validated before anything
+        /// is deleted)
+        #[arg(required = true)]
+        targets: Vec<String>,
         /// Delete non-empty folders recursively
         #[arg(short, long)]
         recursive: bool,
@@ -817,8 +819,9 @@ fn run_command(client: &Client, cli: &Cli) -> Result<bool> {
             println!("{}", destination.display());
             Ok(false)
         }
-        Command::Rm { target, recursive } => {
-            let deleted = client.delete(target, *recursive)?;
+        Command::Rm { targets, recursive } => {
+            let refs: Vec<&str> = targets.iter().map(String::as_str).collect();
+            let deleted = client.delete_many(&refs, *recursive)?;
             info(cli, format!("Deleted {} item(s):", deleted.len()));
             deleted.iter().for_each(|item| {
                 info(

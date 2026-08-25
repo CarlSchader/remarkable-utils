@@ -57,6 +57,7 @@ rmu rename Notes/Physics "Physics II"
 
 rmu rm "Books/Math/Linear Algebra"
 rmu rm Books --recursive                 # delete non-empty folder
+rmu rm old.pdf drafts notes.epub -r      # several at once (all validated first)
 ```
 
 Targets are logical paths or item UUIDs; ambiguous paths are rejected

@@ -49,8 +49,8 @@ pub enum Error {
     NotADocument(String),
 
     /// Refusing to delete a non-empty folder without `recursive`.
-    #[error("folder is not empty (use recursive delete)")]
-    FolderNotEmpty,
+    #[error("folder is not empty: {0} (use recursive delete)")]
+    FolderNotEmpty(String),
 
     /// Upload of a file type the device cannot render.
     #[error("unsupported file type '{0}': only .pdf, .epub, .rmdoc, .md, and .txt are supported")]
