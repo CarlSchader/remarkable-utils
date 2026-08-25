@@ -25,6 +25,10 @@ use crate::error::{Error, Result};
 /// Path on the tablet where xochitl stores documents.
 pub const XOCHITL_DATA_DIR: &str = "/home/root/.local/share/remarkable/xochitl";
 
+/// Pseudo-parent UUID of items in the device's trash (deleted via the
+/// UI, restorable until the trash is emptied).
+pub const TRASH_PARENT: &str = "trash";
+
 /// Kind of a logical item.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]

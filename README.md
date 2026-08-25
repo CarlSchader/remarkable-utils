@@ -33,6 +33,7 @@ ssh-copy-id root@10.11.99.1
 ### Usage
 
 ```sh
+rmu status                               # model, firmware, disk/RAM/battery, ...
 rmu ls                                   # print the logical tree
 rmu ls --show-uuid --folders-only
 rmu ls --json                            # flat item list as JSON
@@ -58,6 +59,7 @@ rmu rename Notes/Physics "Physics II"
 rmu rm "Books/Math/Linear Algebra"
 rmu rm Books --recursive                 # delete non-empty folder
 rmu rm old.pdf drafts notes.epub -r      # several at once (all validated first)
+rmu empty-trash                          # permanently delete trashed items
 ```
 
 Targets are logical paths or item UUIDs; ambiguous paths are rejected

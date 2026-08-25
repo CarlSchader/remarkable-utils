@@ -13,7 +13,9 @@ under `nix/` handle packaging, dev shells, formatting, and checks.
 This repository is **open source** (dual-licensed MIT OR Apache-2.0):
 
 - Never commit secrets, credentials, device serial numbers, or personal data
-  (including real notebook content in test fixtures).
+  (including real notebook content in test fixtures). Tools *may display*
+  device identifiers (e.g. `rmu status` shows the serial) to the user;
+  fixtures and docs must only ever contain fabricated ones.
 - New crates inherit `license`, `version`, `edition`, `repository`, and
   `authors` from `[workspace.package]` in the root `Cargo.toml` and should
   include a `description`.
@@ -74,6 +76,9 @@ This repository is **open source** (dual-licensed MIT OR Apache-2.0):
   pull-only, text-import one-way), and fs↔fs + tablet↔tablet (one
   shared symmetric table, `decide_pair`). Keep planner logic pure; see
   `docs/sync-design.md` for semantics and state-file placement rules.
+- `status.rs` — device system state (`rmu status`): one
+  marker-sectioned SSH round trip, pure best-effort parsing (every
+  field `Option`al — firmware/models differ), pure rendering.
 - `error.rs` — typed errors (`thiserror`).
 
 ## reMarkable domain knowledge

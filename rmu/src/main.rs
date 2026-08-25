@@ -155,6 +155,15 @@ enum Command {
         /// New visible name
         new_name: String,
     },
+    /// Show the tablet's system state (model, firmware, CPU/RAM/disk,
+    /// battery, document counts)
+    Status {
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Permanently delete everything in the device's trash
+    EmptyTrash,
     /// Restart the xochitl UI service on the device
     Restart,
     /// Sync a folder with the tablet, SRC -> DST or --two-way
@@ -858,6 +867,37 @@ fn run_command(client: &Client, cli: &Cli) -> Result<bool> {
         Command::Rename { target, new_name } => {
             let item = client.rename(target, new_name)?;
             info(cli, format!("Renamed to: {}", item.visible_name));
+            Ok(true)
+        }
+        Command::Status { json } => {
+            let status = client.system_status()?;
+            if *json {
+                println!("{}", serde_json::to_string_pretty(&status)?);
+            } else {
+                libremarkable_utils::status::render(&status)
+                    .iter()
+                    .for_each(|line| println!("{line}"));
+            }
+            Ok(false)
+        }
+        Command::EmptyTrash => {
+            let deleted = client.empty_trash()?;
+            if deleted.is_empty() {
+                info(cli, "Trash is already empty.");
+                return Ok(false);
+            }
+            info(cli, format!("Emptied trash: {} item(s):", deleted.len()));
+            deleted.iter().for_each(|item| {
+                info(
+                    cli,
+                    format!(
+                        "  {}{} [{}]",
+                        item.visible_name,
+                        item_suffix(item),
+                        item.uuid
+                    ),
+                );
+            });
             Ok(true)
         }
         Command::Restart => {

@@ -19,6 +19,7 @@ use crate::epub;
 use crate::error::{Error, Result};
 use crate::progress::{NoProgress, Progress};
 use crate::ssh::{SshSession, shell_quote};
+use crate::status::{self, SystemStatus};
 use crate::xochitl::{self, Item, ItemKind};
 
 /// High-level client for one device.
@@ -520,6 +521,25 @@ impl Client {
     pub fn delete_many(&self, item_refs: &[&str], recursive: bool) -> Result<Vec<Item>> {
         let items = self.list_items()?;
         let order = deletion_plan(&items, item_refs, recursive)?;
+        self.execute_deletions(order)
+    }
+
+    /// Permanently delete everything in the device's trash (items the
+    /// UI "deleted" but keeps restorable). Irreversible.
+    pub fn empty_trash(&self) -> Result<Vec<Item>> {
+        let items = self.list_items()?;
+        let trashed: Vec<&str> = items
+            .iter()
+            .filter(|item| item.parent == xochitl::TRASH_PARENT)
+            .map(|item| item.uuid.as_str())
+            .collect();
+        // Trashed folders may still contain children; recursive covers
+        // them, children-first ordering as usual.
+        let order = deletion_plan(&items, &trashed, true)?;
+        self.execute_deletions(order)
+    }
+
+    fn execute_deletions(&self, order: Vec<Item>) -> Result<Vec<Item>> {
         order.iter().try_for_each(|target| {
             self.progress
                 .step(&format!("Deleting '{}'", target.visible_name));
@@ -589,6 +609,18 @@ impl Client {
             last_modified: now,
             ..item
         })
+    }
+
+    /// Gather the device's system state (one SSH round trip for the
+    /// system facts, plus the document listing for the counts).
+    pub fn system_status(&self) -> Result<SystemStatus> {
+        self.progress.step("Reading system state");
+        let marker = format!("===RMU:{}===", uuid::Uuid::new_v4().simple());
+        let output = self.session.run_checked(&status::status_script(&marker))?;
+        let mut system = status::parse_status(&marker, &output);
+        system.documents = Some(status::document_counts(&self.list_items()?));
+        self.progress.finished();
+        Ok(system)
     }
 
     /// Restart xochitl so the device UI reflects filesystem changes.
@@ -886,6 +918,29 @@ mod tests {
         assert!(position("m") < position("b"));
         assert!(position("ph") < position("b"));
         assert_eq!(uuids.len(), 5);
+    }
+
+    #[test]
+    fn deletion_plan_covers_trashed_subtrees() {
+        // A trashed folder still parents its children; emptying the
+        // trash must delete them too, children first.
+        let items = vec![
+            item("tf", "Old Folder", xochitl::TRASH_PARENT, ItemKind::Folder),
+            item("tc", "Inside", "tf", ItemKind::Document),
+            item("td", "Old Doc", xochitl::TRASH_PARENT, ItemKind::Document),
+            item("keep", "Keep", "", ItemKind::Document),
+        ];
+        let trashed: Vec<&str> = items
+            .iter()
+            .filter(|i| i.parent == xochitl::TRASH_PARENT)
+            .map(|i| i.uuid.as_str())
+            .collect();
+        let order = deletion_plan(&items, &trashed, true).unwrap();
+        let uuids: Vec<&str> = order.iter().map(|i| i.uuid.as_str()).collect();
+        let position = |u: &str| uuids.iter().position(|x| *x == u).unwrap();
+        assert!(position("tc") < position("tf"));
+        assert_eq!(uuids.len(), 3);
+        assert!(!uuids.contains(&"keep"));
     }
 
     #[test]
