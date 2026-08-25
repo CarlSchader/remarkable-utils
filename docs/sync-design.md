@@ -1,8 +1,10 @@
 # Design: `rmu sync`
 
-Status: **phase 1 implemented** (`libremarkable-utils/src/sync.rs`,
-`rmu sync`): one-way sync with scp-style endpoints, tablet detection,
-sync-state file, and `--dry-run`. Phases 2–3 (two-way, `--conflict`,
+Status: **phase 1 implemented and device-verified** (see the tested
+checklist in `TODO.md`): one-way sync with scp-style endpoints, tablet
+detection, sync-state file, and `--dry-run`, exercised end-to-end on a
+real tablet including update-in-place annotation preservation, drift
+skips, and interrupt/resume. Phases 2–3 (two-way, `--conflict`,
 `--delete`, generic hosts, tablet↔tablet) remain planned. Update this
 file if the design changes during implementation.
 

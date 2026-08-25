@@ -20,9 +20,9 @@ Planned work, roughly in priority order.
   mapped-`.rmdoc`-pull-only / new-`.rmdoc`-restore rules,
   md/txt→EPUB push with pull loop prevention.
 
-### Testing needed (requires a real device; unit tests can't cover this)
+### Testing (all verified on a real device, 2026-08)
 
-- [ ] **Device smoke test of sync phase 1**, in order:
+- [x] **Device smoke test of sync phase 1**, in order:
   1. `rmu sync --dry-run ./dir remarkable:/SyncTest` (plan looks sane),
   2. push a small tree (pdf + md + nested folder), verify with `rmu ls`,
   3. re-run push — must be a no-op,
@@ -35,11 +35,11 @@ Planned work, roughly in priority order.
   7. draw on a synced notebook, pull — `.rmdoc` must refresh,
   8. interrupt a multi-file sync (Ctrl-C) and re-run — must resume
      without duplicating documents.
-- [ ] Verify `remarkable:/Books` endpoints resolve through a real
+- [x] Verify `remarkable:/Books` endpoints resolve through a real
   `~/.ssh/config` `Host` entry (including a non-22 `Port`).
-- [ ] Confirm probe behavior against a non-tablet ssh host (should fail
+- [x] Confirm probe behavior against a non-tablet ssh host (should fail
   with the "not a reMarkable" message, not hang or misclassify).
-- [ ] Confirm `rmu` still works against the device after the
+- [x] Confirm `rmu` still works against the device after the
   `SshOptions` destination/port refactor (regression check on the
   pre-existing commands: `ls`, `upload`, `download`).
 
