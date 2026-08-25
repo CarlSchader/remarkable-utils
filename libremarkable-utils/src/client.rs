@@ -642,6 +642,14 @@ impl Client {
         })
     }
 
+    /// Delete one document's artifacts by UUID, with **no tree
+    /// logic** — callers (e.g. the sync executor) must not use this on
+    /// folders with children. Use [`Self::delete`] for reference-based
+    /// deletion.
+    pub fn delete_document(&self, uuid: &str) -> Result<()> {
+        self.delete_artifacts(uuid)
+    }
+
     /// Remove `<uuid>`, `<uuid>.*` from the data dir. The `.*` glob is
     /// deliberately outside the quotes; `rm -f` is silent when the
     /// glob matches nothing.

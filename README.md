@@ -86,6 +86,9 @@ resolution:
 rmu sync ./books remarkable:/Books          # PC -> tablet ("push")
 rmu sync remarkable:/Books ./books          # tablet -> PC ("pull")
 rmu sync --dry-run ./books remarkable:/     # show the plan, change nothing
+rmu sync --two-way ./books remarkable:/Books        # bidirectional
+rmu sync --two-way --conflict newest ./b remarkable:/b  # newer side wins
+rmu sync --delete ./books remarkable:/Books # propagate deletions (opt-in)
 ```
 
 Only supported files participate (`.pdf`, `.epub`, `.md`, `.txt`,
@@ -95,7 +98,10 @@ bundles; Markdown/text push as EPUBs; mapped `.rmdoc` files are pull-only
 file in the local root (gitignore it) tracks the path↔document mapping so
 repeated syncs only transfer changes, and anything that changed on the
 destination since the last sync is skipped with a warning, never silently
-overwritten. See `docs/sync-design.md` for the full model.
+overwritten — unless you opt into a `--conflict` policy (`newest`, `src`,
+`dst`). `--delete` only ever removes files the sync itself created or
+tracked; files that were never synced are never deleted. See
+`docs/sync-design.md` for the full model.
 
 Connecting over Wi-Fi or a non-default setup:
 

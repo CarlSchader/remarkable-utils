@@ -21,7 +21,7 @@ use libremarkable_utils::progress::{NoProgress, Progress};
 use libremarkable_utils::ssh::{
     Auth, DEFAULT_SSH_USER, DEFAULT_USB_HOST, SshOptions, SshSession, maybe_run_askpass,
 };
-use libremarkable_utils::sync::{self, Direction, Endpoint};
+use libremarkable_utils::sync::{self, ConflictPolicy, Endpoint, Mode, SyncOptions};
 use libremarkable_utils::xochitl::{self, Item, XOCHITL_DATA_DIR};
 
 /// Password fallback for scripting, used when neither `--password` nor
@@ -153,8 +153,9 @@ enum Command {
     },
     /// Restart the xochitl UI service on the device
     Restart,
-    /// Sync a folder with the tablet, one-way SRC -> DST (scp-style
-    /// endpoints: `[user@]host:path` is remote, resolved via ssh config)
+    /// Sync a folder with the tablet, SRC -> DST or --two-way
+    /// (scp-style endpoints: `[user@]host:path` is remote, resolved
+    /// via ssh config)
     Sync {
         /// Source endpoint, e.g. `./books` or `remarkable:/Books`
         src: String,
@@ -163,10 +164,34 @@ enum Command {
         /// Print the plan without changing anything
         #[arg(long)]
         dry_run: bool,
+        /// Sync in both directions (argument order only matters for
+        /// --conflict src/dst)
+        #[arg(long)]
+        two_way: bool,
+        /// Propagate deletions of previously synced files (never
+        /// touches files that were never synced)
+        #[arg(long)]
+        delete: bool,
+        /// What to do when both sides changed (or unmapped files
+        /// collide): report, newest timestamp wins, or a fixed side
+        #[arg(long, value_enum, default_value_t = ConflictArg::Skip)]
+        conflict: ConflictArg,
         /// Override remote endpoint auto-detection
         #[arg(long, value_enum)]
         remote_kind: Option<RemoteKindArg>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ConflictArg {
+    /// Report conflicts and change nothing (default)
+    Skip,
+    /// The side with the newer timestamp wins (beware clock skew)
+    Newest,
+    /// The first argument's side wins
+    Src,
+    /// The second argument's side wins
+    Dst,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -240,20 +265,24 @@ fn run_sync(cli: &Cli, progress: Arc<dyn Progress>) -> Result<()> {
         src,
         dst,
         dry_run,
+        two_way,
+        delete,
+        conflict,
         remote_kind,
     } = &cli.command
     else {
         unreachable!("run_sync is only called for the sync command");
     };
 
-    // Direction from argument order, endpoint kinds from parsing.
-    let (direction, local_arg, remote) =
+    // Endpoint kinds from parsing; `src_is_local` maps --conflict
+    // src/dst onto local/remote sides.
+    let (src_is_local, local_arg, remote) =
         match (sync::parse_endpoint(src), sync::parse_endpoint(dst)) {
             (Endpoint::Local(local), Endpoint::Remote { destination, path }) => {
-                (Direction::Push, local, (destination, path))
+                (true, local, (destination, path))
             }
             (Endpoint::Remote { destination, path }, Endpoint::Local(local)) => {
-                (Direction::Pull, local, (destination, path))
+                (false, local, (destination, path))
             }
             (Endpoint::Local(_), Endpoint::Local(_)) => {
                 bail!("both endpoints are local; local↔local sync is not supported yet")
@@ -265,11 +294,29 @@ fn run_sync(cli: &Cli, progress: Arc<dyn Progress>) -> Result<()> {
     let (destination, remote_path) = remote;
     let local_root = PathBuf::from(&local_arg);
 
-    match direction {
-        Direction::Push if !local_root.is_dir() => {
+    let mode = match (*two_way, src_is_local) {
+        (true, _) => Mode::TwoWay,
+        (false, true) => Mode::Push,
+        (false, false) => Mode::Pull,
+    };
+    let options = SyncOptions {
+        mode,
+        delete: *delete,
+        conflict: match conflict {
+            ConflictArg::Skip => ConflictPolicy::Skip,
+            ConflictArg::Newest => ConflictPolicy::Newest,
+            ConflictArg::Src if src_is_local => ConflictPolicy::PreferLocal,
+            ConflictArg::Src => ConflictPolicy::PreferRemote,
+            ConflictArg::Dst if src_is_local => ConflictPolicy::PreferRemote,
+            ConflictArg::Dst => ConflictPolicy::PreferLocal,
+        },
+    };
+
+    match mode {
+        Mode::Push if !local_root.is_dir() => {
             bail!("source directory not found: {}", local_root.display())
         }
-        Direction::Pull => std::fs::create_dir_all(&local_root)?,
+        Mode::Pull | Mode::TwoWay => std::fs::create_dir_all(&local_root)?,
         _ => {}
     }
 
@@ -293,11 +340,12 @@ fn run_sync(cli: &Cli, progress: Arc<dyn Progress>) -> Result<()> {
     }
     let client = Client::new(session, cli.xochitl_dir.clone()).with_progress(progress.clone());
 
-    // Resolve the device folder; on push, create it if missing.
+    // Resolve the device folder; when this side can be written to,
+    // create it if missing.
     let mut items = client.list_items()?;
     let root_uuid = match xochitl::resolve_folder_ref(&items, &remote_path) {
         Ok(uuid) => uuid,
-        Err(libremarkable_utils::Error::PathNotFound(_)) if direction == Direction::Push => {
+        Err(libremarkable_utils::Error::PathNotFound(_)) if mode != Mode::Pull => {
             let created = client.mkdir_path(&remote_path, "")?;
             items = client.list_items()?;
             created.uuid
@@ -308,7 +356,7 @@ fn run_sync(cli: &Cli, progress: Arc<dyn Progress>) -> Result<()> {
     let (local_entries, ignored) = sync::local_snapshot(&local_root)?;
     let snapshot = sync::remote_snapshot(&items, &root_uuid);
     let mut state = sync::SyncState::load(&local_root)?;
-    let plan = sync::plan(direction, &local_entries, &snapshot, &state);
+    let plan = sync::plan(options, &local_entries, &snapshot, &state);
 
     if *dry_run {
         // The plan *is* the output in dry-run mode.
@@ -335,15 +383,24 @@ fn run_sync(cli: &Cli, progress: Arc<dyn Progress>) -> Result<()> {
         .skipped
         .iter()
         .for_each(|(path, reason)| info(cli, format!("skipped {path}: {reason}")));
+    outcome
+        .conflicts
+        .iter()
+        .for_each(|(path, reason)| info(cli, format!("conflict {path}: {reason}")));
     info(
         cli,
         format!(
-            "Sync complete: {} uploaded, {} updated, {} downloaded, {} folder(s) created, \
+            "Sync complete: {} uploaded, {} updated, {} downloaded, {} deleted \
+             ({} local / {} device), {} folder(s) created, {} conflict(s), \
              {} skipped, {} unsupported file(s) ignored.",
             outcome.uploaded,
             outcome.updated,
             outcome.downloaded,
+            outcome.deleted_local + outcome.deleted_remote,
+            outcome.deleted_local,
+            outcome.deleted_remote,
             outcome.folders_created,
+            outcome.conflicts.len(),
             outcome.skipped.len(),
             ignored,
         ),

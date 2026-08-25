@@ -1,11 +1,10 @@
 # Design: `rmu sync`
 
 Status: **phase 1 implemented and device-verified** (see the tested
-checklist in `TODO.md`): one-way sync with scp-style endpoints, tablet
-detection, sync-state file, and `--dry-run`, exercised end-to-end on a
-real tablet including update-in-place annotation preservation, drift
-skips, and interrupt/resume. Phases 2–3 (two-way, `--conflict`,
-`--delete`, generic hosts, tablet↔tablet) remain planned. Update this
+checklist in `TODO.md`); **phase 2 implemented, device verification
+pending**: `--two-way`, `--conflict skip|newest|src|dst`, and
+`--delete`, built on a unified per-key three-way decision table.
+Phase 3 (generic hosts, tablet↔tablet) remains planned. Update this
 file if the design changes during implementation.
 
 ## Goal
@@ -187,11 +186,34 @@ A brand-new local `.rmdoc` with no mapping is a deliberate restore
   a pull may re-download an identical payload — correct, occasionally
   wasteful.
 - One-way mode: "conflict" means the *destination* changed since last
-  sync; default is skip + warn rather than silently overwrite.
-- Two-way mode (phase 2): both sides changed → `--conflict` policy;
-  default `skip` reports and loses nothing.
+  sync; default is skip + warn rather than silently overwrite. One
+  asymmetry, on purpose: in **push** mode a remote-only change is
+  silently left alone (the device's `lastModified` moves for benign
+  reasons — annotations — and warning on every push would be noise),
+  while in **pull** mode a local-only change warns (a local mtime
+  moving usually means real edits).
+- Two-way mode: both sides changed → `--conflict` policy; default
+  `skip` reports and loses nothing. `newest` compares local mtime with
+  device `lastModified` (ties go to local; beware clock skew);
+  `src`/`dst` pick a fixed side based on argument order.
+- Policies also apply to **unmapped collisions** (same path on both
+  sides, no state): a resolved winner *adopts* the pairing — the state
+  file maps them and the loser is overwritten. Adoption toward the
+  device only happens for matching types (pdf↔pdf, epub↔epub);
+  handwriting is never overwritten regardless of policy.
+- Deletions (`--delete`) propagate only for **mapped** files — unlike
+  rsync, something that was never synced is never deleted. A deletion
+  racing a change on the other side is a conflict: `skip` reports,
+  `newest` lets the surviving change win (a deletion has no
+  timestamp), `src`/`dst` decide. When the keep-side wins, the stale
+  mapping is forgotten so the survivor becomes an ordinary untracked
+  file. Deleting documents never removes now-empty folders (either
+  side); that's accepted noise for now.
+- Mappings whose files vanished on *both* sides are dropped from the
+  state file (`forget` actions in the plan).
 - First sync (no state): union merge — copy what exists only on one
-  side; same name on both sides with no state to arbitrate = conflict.
+  side; same name on both sides with no state to arbitrate = conflict
+  (resolvable by policy, see adoption above).
 
 ## Architecture
 
@@ -232,7 +254,11 @@ methods.
   endpoint detection, `LocalDir` + `Remarkable` endpoints, one-way with
   state file, `--dry-run`, skip+warn on destination drift, `.rmdoc`
   rules as above.
-- **Phase 2:** `--two-way`, `--conflict` policies, `--delete`.
+- **Phase 2 (implemented):** `--two-way`, `--conflict` policies,
+  `--delete`, unmapped-collision adoption, stale-mapping cleanup. The
+  planner was rewritten as a single per-key decision table over
+  (state, local, remote) presence × mode — one-way modes are now just
+  restricted projections of the same table.
 - **Phase 3:** `RemoteFs` endpoint (pc↔pc, honest-caveat mode),
   tablet↔tablet via bundle streaming. Also candidates: pull annotated
   PDFs as `.rmdoc`, content hashing, watch mode.

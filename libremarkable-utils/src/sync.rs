@@ -395,15 +395,43 @@ impl SyncState {
 // Planner (pure)
 // ---------------------------------------------------------------------------
 
+/// Sync mode. In one-way modes the destination is never treated as a
+/// source of changes; two-way propagates changes in both directions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Direction {
+pub enum Mode {
     /// Local → device.
     Push,
     /// Device → local.
     Pull,
+    /// Bidirectional.
+    TwoWay,
 }
 
-/// One planned operation. `Skip` entries are informational.
+/// What to do when both sides of a mapped file changed (or when
+/// unmapped files collide). `PreferLocal`/`PreferRemote` are produced
+/// by the CLI from `--conflict src|dst` plus the argument order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConflictPolicy {
+    /// Report and touch nothing (default; loses nothing).
+    #[default]
+    Skip,
+    /// The side with the newer timestamp wins (local mtime vs. device
+    /// `lastModified`; ties go to local; beware clock skew).
+    Newest,
+    PreferLocal,
+    PreferRemote,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SyncOptions {
+    pub mode: Mode,
+    /// Propagate deletions of **mapped** files (never-synced files are
+    /// never deleted, unlike rsync `--delete`).
+    pub delete: bool,
+    pub conflict: ConflictPolicy,
+}
+
+/// One planned operation. `Skip`/`Conflict` are informational.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SyncAction {
     CreateRemoteFolder {
@@ -428,6 +456,24 @@ pub enum SyncAction {
         /// Remote `lastModified` at planning time, recorded into state.
         last_modified: i64,
     },
+    /// Only emitted with `--delete`, and only for mapped files.
+    DeleteRemote {
+        path: String,
+        uuid: String,
+    },
+    /// Only emitted with `--delete`, and only for mapped files.
+    DeleteLocal {
+        path: String,
+    },
+    /// Drop a stale state mapping (e.g. both sides gone).
+    Forget {
+        path: String,
+    },
+    /// A conflict the policy did not resolve; nothing is changed.
+    Conflict {
+        path: String,
+        reason: String,
+    },
     Skip {
         path: String,
         reason: String,
@@ -444,114 +490,171 @@ impl Plan {
     pub fn changes(&self) -> usize {
         self.actions
             .iter()
-            .filter(|action| !matches!(action, SyncAction::Skip { .. }))
+            .filter(|action| {
+                !matches!(
+                    action,
+                    SyncAction::Skip { .. } | SyncAction::Conflict { .. }
+                )
+            })
             .count()
     }
 }
 
+/// Which side a conflict resolved to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Winner {
+    Local,
+    Remote,
+}
+
+/// Resolve a conflict between a local version (`local_ms`) and a
+/// remote version (`remote_ms`). Deleted sides pass `i64::MIN` so
+/// `Newest` lets the surviving change win.
+fn winner(policy: ConflictPolicy, local_ms: i64, remote_ms: i64) -> Option<Winner> {
+    match policy {
+        ConflictPolicy::Skip => None,
+        ConflictPolicy::PreferLocal => Some(Winner::Local),
+        ConflictPolicy::PreferRemote => Some(Winner::Remote),
+        ConflictPolicy::Newest => Some(if local_ms >= remote_ms {
+            Winner::Local
+        } else {
+            Winner::Remote
+        }),
+    }
+}
+
+fn can_write_remote(mode: Mode) -> bool {
+    matches!(mode, Mode::Push | Mode::TwoWay)
+}
+
+fn can_write_local(mode: Mode) -> bool {
+    matches!(mode, Mode::Pull | Mode::TwoWay)
+}
+
+/// Per-key view of the three-way diff.
+struct View<'a> {
+    local: Option<&'a LocalEntry>,
+    remote: Option<&'a RemoteDoc>,
+    state: Option<&'a StateEntry>,
+}
+
+impl View<'_> {
+    fn empty() -> Self {
+        View {
+            local: None,
+            remote: None,
+            state: None,
+        }
+    }
+}
+
+/// Name-collision guards for upload candidates.
+struct Guards {
+    /// (dir, name) pairs already occupied on the device.
+    taken: std::collections::HashSet<(String, String)>,
+    /// Upload candidates per (dir, name); >1 means local files compete
+    /// for the same device name (e.g. `n.md` + `n.pdf`).
+    upload_counts: HashMap<(String, String), usize>,
+}
+
+/// Action buckets, concatenated in execution-safe order: folders →
+/// transfers → deletions → forgets → notes.
+#[derive(Default)]
+struct Buckets {
+    transfers: Vec<SyncAction>,
+    deletes: Vec<SyncAction>,
+    forgets: Vec<SyncAction>,
+    notes: Vec<SyncAction>,
+}
+
 /// Compute the ordered action plan. Pure: no I/O.
 pub fn plan(
-    direction: Direction,
+    options: SyncOptions,
     local: &[LocalEntry],
     remote: &RemoteSnapshot,
     state: &SyncState,
 ) -> Plan {
-    let mut plan = match direction {
-        Direction::Push => plan_push(local, remote, state),
-        Direction::Pull => plan_pull(local, remote, state),
-    };
-    plan.actions.extend(remote.skips.iter().cloned());
-    plan
-}
-
-fn plan_push(local: &[LocalEntry], remote: &RemoteSnapshot, state: &SyncState) -> Plan {
+    let local_by_path: HashMap<&str, &LocalEntry> =
+        local.iter().map(|e| (e.rel_path.as_str(), e)).collect();
     let docs_by_uuid: HashMap<&str, &RemoteDoc> =
         remote.docs.iter().map(|d| (d.uuid.as_str(), d)).collect();
-    // Existing (dir, name) pairs on the device: docs and folders.
-    let taken: std::collections::HashSet<(String, String)> = remote
-        .docs
+    let mapped_uuids: std::collections::HashSet<&str> =
+        state.entries.values().map(|st| st.uuid.as_str()).collect();
+
+    let mut buckets = Buckets {
+        notes: remote.skips.clone(),
+        ..Buckets::default()
+    };
+
+    // Unified per-key views (BTreeMap: deterministic order).
+    let mut views: BTreeMap<String, View> = state
+        .entries
         .iter()
-        .map(|d| (d.rel_dir.clone(), d.name.clone()))
-        .chain(remote.folders.keys().filter(|p| !p.is_empty()).map(|path| {
-            let (dir, name) = path.rsplit_once('/').unwrap_or(("", path));
-            (dir.to_string(), name.to_string())
-        }))
+        .map(|(key, st)| {
+            (
+                key.clone(),
+                View {
+                    local: local_by_path.get(key.as_str()).copied(),
+                    remote: docs_by_uuid.get(st.uuid.as_str()).copied(),
+                    state: Some(st),
+                },
+            )
+        })
         .collect();
-    // Local files competing for the same device name (e.g. notes.md +
-    // notes.pdf): count unmapped targets per (dir, stem).
-    let target_counts: HashMap<(String, String), usize> = local
+    local
         .iter()
         .filter(|entry| !state.entries.contains_key(&entry.rel_path))
-        .fold(HashMap::new(), |mut counts, entry| {
-            let (dir, stem) = split_target(&entry.rel_path);
-            *counts.entry((dir.to_string(), stem)).or_default() += 1;
-            counts
+        .for_each(|entry| {
+            views
+                .entry(entry.rel_path.clone())
+                .or_insert_with(View::empty)
+                .local = Some(entry);
+        });
+    remote
+        .docs
+        .iter()
+        .filter(|doc| !mapped_uuids.contains(doc.uuid.as_str()))
+        .for_each(|doc| {
+            let key = doc.local_rel_path();
+            let view = views.entry(key.clone()).or_insert_with(View::empty);
+            if view.state.is_some() || view.remote.is_some() {
+                buckets.notes.push(SyncAction::Skip {
+                    path: key,
+                    reason: "target path is already tracked by another document".to_string(),
+                });
+            } else {
+                view.remote = Some(doc);
+            }
         });
 
-    let mut actions: Vec<SyncAction> = Vec::new();
-    local.iter().for_each(|entry| {
-        let (dir, stem) = split_target(&entry.rel_path);
-        let mapped = state
-            .entries
-            .get(&entry.rel_path)
-            .and_then(|st| docs_by_uuid.get(st.uuid.as_str()).map(|doc| (st, *doc)));
-        match mapped {
-            Some((st, doc)) => {
-                let local_changed =
-                    entry.size != st.local_size || entry.mtime_ms != st.local_mtime_ms;
-                let remote_changed = doc.last_modified != st.remote_last_modified;
-                if !local_changed {
-                    return;
-                }
-                if st.kind == DocKind::Rmdoc {
-                    actions.push(SyncAction::Skip {
-                        path: entry.rel_path.clone(),
-                        reason: "mapped .rmdoc files are pull-only (the tablet's ink wins)"
-                            .to_string(),
-                    });
-                } else if remote_changed {
-                    actions.push(SyncAction::Skip {
-                        path: entry.rel_path.clone(),
-                        reason: "destination changed since last sync".to_string(),
-                    });
-                } else {
-                    actions.push(SyncAction::UpdateRemote {
-                        local: entry.rel_path.clone(),
-                        kind: entry.kind,
-                        uuid: st.uuid.clone(),
-                    });
-                }
-            }
-            // Unmapped, or the mapped document vanished from the device
-            // (rsync-without-`--delete` semantics: recopy).
-            None => {
-                let key = (dir.to_string(), stem.clone());
-                if taken.contains(&key) {
-                    actions.push(SyncAction::Skip {
-                        path: entry.rel_path.clone(),
-                        reason: "an item with this name already exists on the device \
-                                 (no sync state to match it)"
-                            .to_string(),
-                    });
-                } else if target_counts.get(&key).copied().unwrap_or(0) > 1 {
-                    actions.push(SyncAction::Skip {
-                        path: entry.rel_path.clone(),
-                        reason: "multiple local files map to the same device name".to_string(),
-                    });
-                } else {
-                    actions.push(SyncAction::Upload {
-                        local: entry.rel_path.clone(),
-                        kind: entry.kind,
-                        remote_dir: dir.to_string(),
-                        name: stem,
-                    });
-                }
-            }
-        }
-    });
+    let guards = Guards {
+        taken: remote
+            .docs
+            .iter()
+            .map(|d| (d.rel_dir.clone(), d.name.clone()))
+            .chain(remote.folders.keys().filter(|p| !p.is_empty()).map(|path| {
+                let (dir, name) = path.rsplit_once('/').unwrap_or(("", path));
+                (dir.to_string(), name.to_string())
+            }))
+            .collect(),
+        upload_counts: views
+            .values()
+            .filter(|v| v.local.is_some() && v.remote.is_none())
+            .fold(HashMap::new(), |mut counts, view| {
+                let entry = view.local.expect("filtered on local");
+                let (dir, stem) = split_target(&entry.rel_path);
+                *counts.entry((dir.to_string(), stem)).or_default() += 1;
+                counts
+            }),
+    };
+
+    views
+        .iter()
+        .for_each(|(key, view)| decide(options, key, view, &guards, &mut buckets));
 
     // Folder creation for upload targets, parents before children.
-    let mut needed: Vec<String> = actions
+    let mut needed: Vec<String> = buckets
+        .transfers
         .iter()
         .filter_map(|action| match action {
             SyncAction::Upload { remote_dir, .. } => Some(remote_dir.as_str()),
@@ -562,13 +665,16 @@ fn plan_push(local: &[LocalEntry], remote: &RemoteSnapshot, state: &SyncState) -
         .collect();
     needed.sort();
     needed.dedup();
-    let folder_actions: Vec<SyncAction> = needed
-        .into_iter()
-        .map(|rel_dir| SyncAction::CreateRemoteFolder { rel_dir })
-        .collect();
 
     Plan {
-        actions: folder_actions.into_iter().chain(actions).collect(),
+        actions: needed
+            .into_iter()
+            .map(|rel_dir| SyncAction::CreateRemoteFolder { rel_dir })
+            .chain(buckets.transfers)
+            .chain(buckets.deletes)
+            .chain(buckets.forgets)
+            .chain(buckets.notes)
+            .collect(),
     }
 }
 
@@ -584,86 +690,333 @@ fn path_prefixes(path: &str) -> Vec<String> {
         .collect()
 }
 
-fn plan_pull(local: &[LocalEntry], remote: &RemoteSnapshot, state: &SyncState) -> Plan {
-    let local_by_path: HashMap<&str, &LocalEntry> =
-        local.iter().map(|e| (e.rel_path.as_str(), e)).collect();
-    let state_by_uuid: HashMap<&str, (&String, &StateEntry)> = state
-        .entries
-        .iter()
-        .map(|(key, st)| (st.uuid.as_str(), (key, st)))
-        .collect();
+/// The decision table: one key, three-way presence, mode + options.
+fn decide(options: SyncOptions, key: &str, view: &View, guards: &Guards, out: &mut Buckets) {
+    match (view.state, view.local, view.remote) {
+        (Some(st), Some(entry), Some(doc)) => mapped_both(options, key, st, entry, doc, out),
+        (Some(st), Some(entry), None) => mapped_remote_gone(options, key, st, entry, guards, out),
+        (Some(st), None, Some(doc)) => mapped_local_gone(options, key, st, doc, out),
+        // Both sides gone: the mapping is stale.
+        (Some(_), None, None) => out.forgets.push(SyncAction::Forget {
+            path: key.to_string(),
+        }),
+        (None, Some(entry), None) => {
+            if can_write_remote(options.mode) {
+                upload_with_guards(key, entry, guards, out);
+            }
+            // Pull: untracked destination files stay untouched.
+        }
+        (None, None, Some(doc)) => {
+            if can_write_local(options.mode) {
+                out.transfers.push(download(key, doc));
+            }
+            // Push: untracked device documents stay untouched.
+        }
+        (None, Some(entry), Some(doc)) => collision(options, key, entry, doc, out),
+        (None, None, None) => unreachable!("views are only built from existing entries"),
+    }
+}
 
-    let actions = remote
-        .docs
-        .iter()
-        .filter_map(|doc| {
-            match state_by_uuid.get(doc.uuid.as_str()) {
-                Some((key, st)) => {
-                    let remote_changed = doc.last_modified != st.remote_last_modified;
-                    // Text imports have no local representation of
-                    // device-side changes; pull is a documented no-op.
-                    if matches!(st.kind, DocKind::Markdown | DocKind::Text) {
-                        return remote_changed.then(|| SyncAction::Skip {
-                            path: (*key).clone(),
-                            reason: "text import; device-side changes are not pulled".to_string(),
-                        });
-                    }
-                    match local_by_path.get(key.as_str()) {
-                        // Deleted locally: recopy (rsync semantics).
-                        None => Some(SyncAction::Download {
-                            local: (*key).clone(),
-                            uuid: doc.uuid.clone(),
-                            doc_type: doc.doc_type,
-                            size_bytes: doc.size_bytes,
-                            last_modified: doc.last_modified,
-                        }),
-                        Some(entry) => {
-                            let local_changed =
-                                entry.size != st.local_size || entry.mtime_ms != st.local_mtime_ms;
-                            match (remote_changed, local_changed) {
-                                (false, false) => None,
-                                (false, true) => Some(SyncAction::Skip {
-                                    path: (*key).clone(),
-                                    reason: "destination changed since last sync".to_string(),
-                                }),
-                                (true, false) => Some(SyncAction::Download {
-                                    local: (*key).clone(),
-                                    uuid: doc.uuid.clone(),
-                                    doc_type: doc.doc_type,
-                                    size_bytes: doc.size_bytes,
-                                    last_modified: doc.last_modified,
-                                }),
-                                (true, true) => Some(SyncAction::Skip {
-                                    path: (*key).clone(),
-                                    reason: "both sides changed since last sync".to_string(),
-                                }),
-                            }
-                        }
-                    }
-                }
-                None => {
-                    let target = doc.local_rel_path();
-                    if local_by_path.contains_key(target.as_str()) {
-                        Some(SyncAction::Skip {
-                            path: target,
-                            reason: "exists on both sides (no sync state to match them)"
-                                .to_string(),
-                        })
-                    } else {
-                        Some(SyncAction::Download {
-                            local: target,
-                            uuid: doc.uuid.clone(),
-                            doc_type: doc.doc_type,
-                            size_bytes: doc.size_bytes,
-                            last_modified: doc.last_modified,
-                        })
-                    }
+/// Mapped, present on both sides: the core three-way diff.
+fn mapped_both(
+    options: SyncOptions,
+    key: &str,
+    st: &StateEntry,
+    entry: &LocalEntry,
+    doc: &RemoteDoc,
+    out: &mut Buckets,
+) {
+    let local_changed = entry.size != st.local_size || entry.mtime_ms != st.local_mtime_ms;
+    let remote_changed = doc.last_modified != st.remote_last_modified;
+    let text_import = matches!(st.kind, DocKind::Markdown | DocKind::Text);
+    // What each side's changes can flow into, given mode and kind.
+    let push_ok = can_write_remote(options.mode) && st.kind != DocKind::Rmdoc;
+    let pull_ok = can_write_local(options.mode) && !text_import;
+
+    match (local_changed, remote_changed) {
+        (false, false) => {}
+        (true, false) => {
+            if push_ok {
+                out.transfers.push(update_remote(key, entry.kind, &st.uuid));
+            } else if can_write_remote(options.mode) {
+                out.notes.push(skip(
+                    key,
+                    "mapped .rmdoc files are pull-only (the tablet's ink wins)",
+                ));
+            } else if !text_import {
+                // Pull mode: destination drift. (Text imports are
+                // expected to change locally; push is their flow.)
+                match winner(options.conflict, entry.mtime_ms, doc.last_modified) {
+                    None => out
+                        .notes
+                        .push(conflict(key, "destination changed since last sync")),
+                    Some(Winner::Remote) => out.transfers.push(download(key, doc)),
+                    Some(Winner::Local) => {} // destination kept
                 }
             }
-        })
-        .collect();
+        }
+        (false, true) => {
+            if pull_ok {
+                out.transfers.push(download(key, doc));
+            } else if can_write_local(options.mode) && text_import {
+                out.notes
+                    .push(skip(key, "text import; device-side changes are not pulled"));
+            }
+            // Push mode: nothing. Remote lastModified moves for benign
+            // reasons (annotations); only local changes push.
+        }
+        (true, true) => match winner(options.conflict, entry.mtime_ms, doc.last_modified) {
+            None => out
+                .notes
+                .push(conflict(key, "both sides changed since last sync")),
+            Some(Winner::Local) => {
+                if push_ok {
+                    out.transfers.push(update_remote(key, entry.kind, &st.uuid));
+                } else if can_write_remote(options.mode) {
+                    out.notes.push(skip(
+                        key,
+                        "mapped .rmdoc files are pull-only (the tablet's ink wins)",
+                    ));
+                }
+                // Pull mode: destination (local) kept.
+            }
+            Some(Winner::Remote) => {
+                if pull_ok {
+                    out.transfers.push(download(key, doc));
+                } else if can_write_local(options.mode) && text_import {
+                    out.notes.push(conflict(
+                        key,
+                        "resolved to the device side, but device-side changes \
+                         cannot be pulled into a text import",
+                    ));
+                }
+                // Push mode: destination (device) kept.
+            }
+        },
+    }
+}
 
-    Plan { actions }
+/// Mapped, but the device copy vanished.
+fn mapped_remote_gone(
+    options: SyncOptions,
+    key: &str,
+    st: &StateEntry,
+    entry: &LocalEntry,
+    guards: &Guards,
+    out: &mut Buckets,
+) {
+    let local_changed = entry.size != st.local_size || entry.mtime_ms != st.local_mtime_ms;
+    match options.mode {
+        // Deleting the *source* is never propagated by a one-way sync;
+        // recopy (rsync semantics).
+        Mode::Push => upload_with_guards(key, entry, guards, out),
+        Mode::Pull => {
+            if !options.delete {
+                return; // stale mapping kept; local file untouched
+            }
+            if !local_changed {
+                out.deletes.push(SyncAction::DeleteLocal {
+                    path: key.to_string(),
+                });
+            } else {
+                // Deleted on the device but changed locally. A deleted
+                // side has no timestamp: pass i64::MIN so Newest lets
+                // the surviving change win.
+                match winner(options.conflict, entry.mtime_ms, i64::MIN) {
+                    None => out
+                        .notes
+                        .push(conflict(key, "deleted on the device but changed locally")),
+                    Some(Winner::Local) => {
+                        out.forgets.push(SyncAction::Forget {
+                            path: key.to_string(),
+                        });
+                        out.notes.push(skip(
+                            key,
+                            "kept local copy of a document deleted on the device",
+                        ));
+                    }
+                    Some(Winner::Remote) => out.deletes.push(SyncAction::DeleteLocal {
+                        path: key.to_string(),
+                    }),
+                }
+            }
+        }
+        Mode::TwoWay => {
+            if !options.delete {
+                upload_with_guards(key, entry, guards, out); // recopy
+            } else if !local_changed {
+                out.deletes.push(SyncAction::DeleteLocal {
+                    path: key.to_string(),
+                });
+            } else {
+                match winner(options.conflict, entry.mtime_ms, i64::MIN) {
+                    None => out
+                        .notes
+                        .push(conflict(key, "deleted on the device but changed locally")),
+                    Some(Winner::Local) => upload_with_guards(key, entry, guards, out),
+                    Some(Winner::Remote) => out.deletes.push(SyncAction::DeleteLocal {
+                        path: key.to_string(),
+                    }),
+                }
+            }
+        }
+    }
+}
+
+/// Mapped, but the local copy vanished.
+fn mapped_local_gone(
+    options: SyncOptions,
+    key: &str,
+    st: &StateEntry,
+    doc: &RemoteDoc,
+    out: &mut Buckets,
+) {
+    let remote_changed = doc.last_modified != st.remote_last_modified;
+    match options.mode {
+        // Source still has it: recopy.
+        Mode::Pull => out.transfers.push(download(key, doc)),
+        Mode::Push => {
+            if !options.delete {
+                return; // device keeps the document
+            }
+            if !remote_changed {
+                out.deletes.push(SyncAction::DeleteRemote {
+                    path: key.to_string(),
+                    uuid: doc.uuid.clone(),
+                });
+            } else {
+                match winner(options.conflict, i64::MIN, doc.last_modified) {
+                    None => out
+                        .notes
+                        .push(conflict(key, "deleted locally but changed on the device")),
+                    Some(Winner::Remote) => {
+                        out.forgets.push(SyncAction::Forget {
+                            path: key.to_string(),
+                        });
+                        out.notes
+                            .push(skip(key, "kept device copy of a locally deleted document"));
+                    }
+                    Some(Winner::Local) => out.deletes.push(SyncAction::DeleteRemote {
+                        path: key.to_string(),
+                        uuid: doc.uuid.clone(),
+                    }),
+                }
+            }
+        }
+        Mode::TwoWay => {
+            if !options.delete {
+                out.transfers.push(download(key, doc)); // recopy
+            } else if !remote_changed {
+                out.deletes.push(SyncAction::DeleteRemote {
+                    path: key.to_string(),
+                    uuid: doc.uuid.clone(),
+                });
+            } else {
+                match winner(options.conflict, i64::MIN, doc.last_modified) {
+                    None => out
+                        .notes
+                        .push(conflict(key, "deleted locally but changed on the device")),
+                    Some(Winner::Remote) => out.transfers.push(download(key, doc)),
+                    Some(Winner::Local) => out.deletes.push(SyncAction::DeleteRemote {
+                        path: key.to_string(),
+                        uuid: doc.uuid.clone(),
+                    }),
+                }
+            }
+        }
+    }
+}
+
+/// Unmapped files at the same path on both sides. Policies may adopt
+/// the pairing (the state file then maps them); `Skip` reports it.
+fn collision(
+    options: SyncOptions,
+    key: &str,
+    entry: &LocalEntry,
+    doc: &RemoteDoc,
+    out: &mut Buckets,
+) {
+    match winner(options.conflict, entry.mtime_ms, doc.last_modified) {
+        None => out.notes.push(conflict(
+            key,
+            "exists on both sides (no sync state to match them)",
+        )),
+        Some(Winner::Local) => {
+            if !can_write_remote(options.mode) {
+                return; // pull: destination (local) kept
+            }
+            match (entry.kind, doc.doc_type) {
+                (DocKind::Pdf, RemoteType::Pdf) | (DocKind::Epub, RemoteType::Epub) => out
+                    .transfers
+                    .push(update_remote(key, entry.kind, &doc.uuid)),
+                _ => out.notes.push(conflict(
+                    key,
+                    "cannot overwrite the device copy (handwriting or mismatched types)",
+                )),
+            }
+        }
+        Some(Winner::Remote) => {
+            if can_write_local(options.mode) {
+                out.transfers.push(download(key, doc));
+            }
+            // Push: destination (device) kept.
+        }
+    }
+}
+
+fn upload_with_guards(key: &str, entry: &LocalEntry, guards: &Guards, out: &mut Buckets) {
+    let (dir, stem) = split_target(key);
+    let target = (dir.to_string(), stem.clone());
+    if guards.taken.contains(&target) {
+        out.notes.push(skip(
+            key,
+            "an item with this name already exists on the device (no sync state to match it)",
+        ));
+    } else if guards.upload_counts.get(&target).copied().unwrap_or(0) > 1 {
+        out.notes.push(skip(
+            key,
+            "multiple local files map to the same device name",
+        ));
+    } else {
+        out.transfers.push(SyncAction::Upload {
+            local: key.to_string(),
+            kind: entry.kind,
+            remote_dir: dir.to_string(),
+            name: stem,
+        });
+    }
+}
+
+fn update_remote(key: &str, kind: DocKind, uuid: &str) -> SyncAction {
+    SyncAction::UpdateRemote {
+        local: key.to_string(),
+        kind,
+        uuid: uuid.to_string(),
+    }
+}
+
+fn download(key: &str, doc: &RemoteDoc) -> SyncAction {
+    SyncAction::Download {
+        local: key.to_string(),
+        uuid: doc.uuid.clone(),
+        doc_type: doc.doc_type,
+        size_bytes: doc.size_bytes,
+        last_modified: doc.last_modified,
+    }
+}
+
+fn skip(key: &str, reason: &str) -> SyncAction {
+    SyncAction::Skip {
+        path: key.to_string(),
+        reason: reason.to_string(),
+    }
+}
+
+fn conflict(key: &str, reason: &str) -> SyncAction {
+    SyncAction::Conflict {
+        path: key.to_string(),
+        reason: reason.to_string(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -677,7 +1030,10 @@ pub struct Outcome {
     pub uploaded: usize,
     pub updated: usize,
     pub downloaded: usize,
+    pub deleted_local: usize,
+    pub deleted_remote: usize,
     pub skipped: Vec<(String, String)>,
+    pub conflicts: Vec<(String, String)>,
     /// Whether the device was modified (drives the xochitl restart).
     pub modified_remote: bool,
 }
@@ -698,7 +1054,10 @@ pub fn execute(
     let mut done = 0usize;
 
     plan.actions.iter().try_for_each(|action| -> Result<()> {
-        if !matches!(action, SyncAction::Skip { .. }) {
+        if !matches!(
+            action,
+            SyncAction::Skip { .. } | SyncAction::Conflict { .. }
+        ) {
             done += 1;
             progress.step(&format!("[{done}/{total}] {}", describe(action)));
         }
@@ -803,6 +1162,31 @@ pub fn execute(
                 )?;
                 outcome.downloaded += 1;
             }
+            SyncAction::DeleteRemote { path, uuid } => {
+                client.delete_document(uuid)?;
+                state.entries.remove(path);
+                state.save(local_root)?;
+                outcome.deleted_remote += 1;
+                outcome.modified_remote = true;
+            }
+            SyncAction::DeleteLocal { path } => {
+                match fs::remove_file(local_root.join(path)) {
+                    Ok(()) => {}
+                    // Already gone: deletion is idempotent.
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => return Err(err.into()),
+                }
+                state.entries.remove(path);
+                state.save(local_root)?;
+                outcome.deleted_local += 1;
+            }
+            SyncAction::Forget { path } => {
+                state.entries.remove(path);
+                state.save(local_root)?;
+            }
+            SyncAction::Conflict { path, reason } => {
+                outcome.conflicts.push((path.clone(), reason.clone()));
+            }
             SyncAction::Skip { path, reason } => {
                 outcome.skipped.push((path.clone(), reason.clone()));
             }
@@ -841,20 +1225,24 @@ fn record_state(
 /// and `--dry-run` output).
 pub fn describe(action: &SyncAction) -> String {
     match action {
-        SyncAction::CreateRemoteFolder { rel_dir } => format!("mkdir   {rel_dir}/"),
+        SyncAction::CreateRemoteFolder { rel_dir } => format!("mkdir    {rel_dir}/"),
         SyncAction::Upload { local, kind, .. } => match kind {
-            DocKind::Markdown | DocKind::Text => format!("upload  {local} (as EPUB)"),
-            DocKind::Rmdoc => format!("restore {local}"),
-            _ => format!("upload  {local}"),
+            DocKind::Markdown | DocKind::Text => format!("upload   {local} (as EPUB)"),
+            DocKind::Rmdoc => format!("restore  {local}"),
+            _ => format!("upload   {local}"),
         },
-        SyncAction::UpdateRemote { local, .. } => format!("update  {local}"),
+        SyncAction::UpdateRemote { local, .. } => format!("update   {local}"),
         SyncAction::Download {
             local, doc_type, ..
         } => match doc_type {
             RemoteType::Notebook => format!("download {local} (notebook bundle)"),
             _ => format!("download {local}"),
         },
-        SyncAction::Skip { path, reason } => format!("skip    {path} ({reason})"),
+        SyncAction::DeleteRemote { path, .. } => format!("delete   {path} (on device)"),
+        SyncAction::DeleteLocal { path } => format!("delete   {path} (local)"),
+        SyncAction::Forget { path } => format!("forget   {path} (stale sync mapping)"),
+        SyncAction::Conflict { path, reason } => format!("conflict {path} ({reason})"),
+        SyncAction::Skip { path, reason } => format!("skip     {path} ({reason})"),
     }
 }
 
@@ -908,11 +1296,55 @@ mod tests {
         }
     }
 
+    fn push() -> SyncOptions {
+        SyncOptions {
+            mode: Mode::Push,
+            delete: false,
+            conflict: ConflictPolicy::Skip,
+        }
+    }
+
+    fn pull() -> SyncOptions {
+        SyncOptions {
+            mode: Mode::Pull,
+            delete: false,
+            conflict: ConflictPolicy::Skip,
+        }
+    }
+
+    fn two_way() -> SyncOptions {
+        SyncOptions {
+            mode: Mode::TwoWay,
+            delete: false,
+            conflict: ConflictPolicy::Skip,
+        }
+    }
+
+    fn with_delete(mut options: SyncOptions) -> SyncOptions {
+        options.delete = true;
+        options
+    }
+
+    fn with_policy(mut options: SyncOptions, conflict: ConflictPolicy) -> SyncOptions {
+        options.conflict = conflict;
+        options
+    }
+
     fn skips(plan: &Plan) -> Vec<&str> {
         plan.actions
             .iter()
             .filter_map(|a| match a {
                 SyncAction::Skip { path, .. } => Some(path.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn conflicts(plan: &Plan) -> Vec<&str> {
+        plan.actions
+            .iter()
+            .filter_map(|a| match a {
+                SyncAction::Conflict { path, .. } => Some(path.as_str()),
                 _ => None,
             })
             .collect()
@@ -1005,7 +1437,7 @@ mod tests {
             local("top.pdf", DocKind::Pdf, 20, 2),
         ];
         let snapshot = remote_snapshot(&[], "");
-        let plan = plan(Direction::Push, &locals, &snapshot, &SyncState::default());
+        let plan = plan(push(), &locals, &snapshot, &SyncState::default());
         assert_eq!(
             plan.actions,
             vec![
@@ -1039,7 +1471,7 @@ mod tests {
         state
             .entries
             .insert("n.pdf".to_string(), entry("u1", DocKind::Pdf, 10, 1, 5));
-        let plan = plan(Direction::Push, &locals, &snapshot, &state);
+        let plan = plan(push(), &locals, &snapshot, &state);
         assert!(plan.actions.is_empty());
     }
 
@@ -1051,7 +1483,7 @@ mod tests {
         state
             .entries
             .insert("n.md".to_string(), entry("u1", DocKind::Markdown, 10, 1, 5));
-        let plan = plan(Direction::Push, &locals, &snapshot, &state);
+        let plan = plan(push(), &locals, &snapshot, &state);
         assert_eq!(
             plan.actions,
             vec![SyncAction::UpdateRemote {
@@ -1063,15 +1495,15 @@ mod tests {
     }
 
     #[test]
-    fn push_both_changed_is_conflict_skip() {
+    fn push_both_changed_is_conflict() {
         let locals = vec![local("n.pdf", DocKind::Pdf, 99, 9)];
         let snapshot = remote_snapshot(&[doc("u1", "n", "", "pdf", 6)], "");
         let mut state = SyncState::default();
         state
             .entries
             .insert("n.pdf".to_string(), entry("u1", DocKind::Pdf, 10, 1, 5));
-        let plan = plan(Direction::Push, &locals, &snapshot, &state);
-        assert_eq!(skips(&plan), ["n.pdf"]);
+        let plan = plan(push(), &locals, &snapshot, &state);
+        assert_eq!(conflicts(&plan), ["n.pdf"]);
     }
 
     #[test]
@@ -1082,7 +1514,7 @@ mod tests {
         state
             .entries
             .insert("n.rmdoc".to_string(), entry("u1", DocKind::Rmdoc, 10, 1, 5));
-        let plan = plan(Direction::Push, &locals, &snapshot, &state);
+        let plan = plan(push(), &locals, &snapshot, &state);
         assert_eq!(skips(&plan), ["n.rmdoc"]);
     }
 
@@ -1090,7 +1522,7 @@ mod tests {
     fn push_unmapped_rmdoc_is_a_restore() {
         let locals = vec![local("backup.rmdoc", DocKind::Rmdoc, 10, 1)];
         let snapshot = remote_snapshot(&[], "");
-        let plan = plan(Direction::Push, &locals, &snapshot, &SyncState::default());
+        let plan = plan(push(), &locals, &snapshot, &SyncState::default());
         assert_eq!(
             plan.actions,
             vec![SyncAction::Upload {
@@ -1106,7 +1538,7 @@ mod tests {
     fn push_name_taken_on_device_skips() {
         let locals = vec![local("n.pdf", DocKind::Pdf, 10, 1)];
         let snapshot = remote_snapshot(&[doc("other", "n", "", "epub", 5)], "");
-        let plan = plan(Direction::Push, &locals, &snapshot, &SyncState::default());
+        let plan = plan(push(), &locals, &snapshot, &SyncState::default());
         assert_eq!(skips(&plan), ["n.pdf"]);
     }
 
@@ -1114,7 +1546,7 @@ mod tests {
     fn push_folder_name_collision_skips() {
         let locals = vec![local("n.pdf", DocKind::Pdf, 10, 1)];
         let snapshot = remote_snapshot(&[folder("f", "n", "")], "");
-        let plan = plan(Direction::Push, &locals, &snapshot, &SyncState::default());
+        let plan = plan(push(), &locals, &snapshot, &SyncState::default());
         assert_eq!(skips(&plan), ["n.pdf"]);
     }
 
@@ -1125,7 +1557,7 @@ mod tests {
             local("n.pdf", DocKind::Pdf, 10, 1),
         ];
         let snapshot = remote_snapshot(&[], "");
-        let plan = plan(Direction::Push, &locals, &snapshot, &SyncState::default());
+        let plan = plan(push(), &locals, &snapshot, &SyncState::default());
         assert_eq!(skips(&plan).len(), 2);
     }
 
@@ -1137,7 +1569,7 @@ mod tests {
         state
             .entries
             .insert("n.pdf".to_string(), entry("gone", DocKind::Pdf, 10, 1, 5));
-        let plan = plan(Direction::Push, &locals, &snapshot, &state);
+        let plan = plan(push(), &locals, &snapshot, &state);
         assert!(matches!(plan.actions[0], SyncAction::Upload { .. }));
     }
 
@@ -1151,7 +1583,7 @@ mod tests {
             doc("d2", "Sketch", "", "notebook", 6),
         ];
         let snapshot = remote_snapshot(&items, "");
-        let plan = plan(Direction::Pull, &[], &snapshot, &SyncState::default());
+        let plan = plan(pull(), &[], &snapshot, &SyncState::default());
         let downloads: Vec<&str> = plan
             .actions
             .iter()
@@ -1171,12 +1603,12 @@ mod tests {
             .entries
             .insert("n.md".to_string(), entry("u1", DocKind::Markdown, 10, 1, 5));
         let locals = vec![local("n.md", DocKind::Markdown, 10, 1)];
-        let plan = plan(Direction::Pull, &locals, &snapshot, &state);
+        let plan = plan(pull(), &locals, &snapshot, &state);
         assert_eq!(skips(&plan), ["n.md"]); // warned, not downloaded
 
         // Unchanged remote: fully silent.
         let snapshot = remote_snapshot(&[doc("u1", "n", "", "epub", 5)], "");
-        let plan = super::plan(Direction::Pull, &locals, &snapshot, &state);
+        let plan = super::plan(pull(), &locals, &snapshot, &state);
         assert!(plan.actions.is_empty());
     }
 
@@ -1188,7 +1620,7 @@ mod tests {
             .entries
             .insert("n.rmdoc".to_string(), entry("u1", DocKind::Rmdoc, 10, 1, 5));
         let locals = vec![local("n.rmdoc", DocKind::Rmdoc, 10, 1)];
-        let plan = plan(Direction::Pull, &locals, &snapshot, &state);
+        let plan = plan(pull(), &locals, &snapshot, &state);
         assert!(matches!(
             plan.actions[0],
             SyncAction::Download {
@@ -1200,7 +1632,7 @@ mod tests {
     }
 
     #[test]
-    fn pull_conflicts_and_drift_skip() {
+    fn pull_conflicts_and_drift_are_reported() {
         // Both changed.
         let snapshot = remote_snapshot(&[doc("u1", "n", "", "pdf", 9)], "");
         let mut state = SyncState::default();
@@ -1208,13 +1640,13 @@ mod tests {
             .entries
             .insert("n.pdf".to_string(), entry("u1", DocKind::Pdf, 10, 1, 5));
         let locals = vec![local("n.pdf", DocKind::Pdf, 99, 9)];
-        let plan = plan(Direction::Pull, &locals, &snapshot, &state);
-        assert_eq!(skips(&plan), ["n.pdf"]);
+        let plan = plan(pull(), &locals, &snapshot, &state);
+        assert_eq!(conflicts(&plan), ["n.pdf"]);
 
         // Destination (local) drift only.
         let snapshot = remote_snapshot(&[doc("u1", "n", "", "pdf", 5)], "");
-        let plan = super::plan(Direction::Pull, &locals, &snapshot, &state);
-        assert_eq!(skips(&plan), ["n.pdf"]);
+        let plan = super::plan(pull(), &locals, &snapshot, &state);
+        assert_eq!(conflicts(&plan), ["n.pdf"]);
     }
 
     #[test]
@@ -1224,16 +1656,347 @@ mod tests {
         state
             .entries
             .insert("n.pdf".to_string(), entry("u1", DocKind::Pdf, 10, 1, 5));
-        let plan = plan(Direction::Pull, &[], &snapshot, &state);
+        let plan = plan(pull(), &[], &snapshot, &state);
         assert!(matches!(plan.actions[0], SyncAction::Download { .. }));
     }
 
     #[test]
-    fn pull_unmapped_local_collision_skips() {
+    fn pull_unmapped_local_collision_conflicts() {
         let snapshot = remote_snapshot(&[doc("u1", "n", "", "pdf", 5)], "");
         let locals = vec![local("n.pdf", DocKind::Pdf, 10, 1)];
-        let plan = plan(Direction::Pull, &locals, &snapshot, &SyncState::default());
-        assert_eq!(skips(&plan), ["n.pdf"]);
+        let plan = plan(pull(), &locals, &snapshot, &SyncState::default());
+        assert_eq!(conflicts(&plan), ["n.pdf"]);
+    }
+
+    // ---- two-way planning -------------------------------------------------
+
+    #[test]
+    fn two_way_first_sync_merges_both_directions() {
+        let locals = vec![local("only-local.pdf", DocKind::Pdf, 10, 1)];
+        let snapshot = remote_snapshot(&[doc("u1", "only-remote", "", "notebook", 5)], "");
+        let plan = plan(two_way(), &locals, &snapshot, &SyncState::default());
+        assert!(plan.actions.iter().any(|a| matches!(
+            a,
+            SyncAction::Upload { local, .. } if local == "only-local.pdf"
+        )));
+        assert!(plan.actions.iter().any(|a| matches!(
+            a,
+            SyncAction::Download { local, .. } if local == "only-remote.rmdoc"
+        )));
+    }
+
+    #[test]
+    fn two_way_propagates_each_side() {
+        let mut state = SyncState::default();
+        state
+            .entries
+            .insert("a.pdf".to_string(), entry("ua", DocKind::Pdf, 10, 1, 5));
+        state
+            .entries
+            .insert("b.pdf".to_string(), entry("ub", DocKind::Pdf, 10, 1, 5));
+        let locals = vec![
+            local("a.pdf", DocKind::Pdf, 99, 9), // local changed
+            local("b.pdf", DocKind::Pdf, 10, 1), // unchanged
+        ];
+        let snapshot = remote_snapshot(
+            &[doc("ua", "a", "", "pdf", 5), doc("ub", "b", "", "pdf", 9)], // ub changed
+            "",
+        );
+        let plan = plan(two_way(), &locals, &snapshot, &state);
+        assert_eq!(
+            plan.actions,
+            vec![
+                SyncAction::UpdateRemote {
+                    local: "a.pdf".to_string(),
+                    kind: DocKind::Pdf,
+                    uuid: "ua".to_string()
+                },
+                SyncAction::Download {
+                    local: "b.pdf".to_string(),
+                    uuid: "ub".to_string(),
+                    doc_type: RemoteType::Pdf,
+                    size_bytes: Some(100),
+                    last_modified: 9
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn two_way_conflict_policies() {
+        let mut state = SyncState::default();
+        state
+            .entries
+            .insert("n.pdf".to_string(), entry("u1", DocKind::Pdf, 10, 1, 5));
+        let snapshot = remote_snapshot(&[doc("u1", "n", "", "pdf", 50)], "");
+        let locals = vec![local("n.pdf", DocKind::Pdf, 99, 100)]; // local newer
+
+        // Default: conflict, nothing happens.
+        let plan_skip = plan(two_way(), &locals, &snapshot, &state);
+        assert_eq!(conflicts(&plan_skip), ["n.pdf"]);
+
+        // Newest: local (mtime 100 > lastModified 50) wins.
+        let plan_newest = plan(
+            with_policy(two_way(), ConflictPolicy::Newest),
+            &locals,
+            &snapshot,
+            &state,
+        );
+        assert!(matches!(
+            plan_newest.actions[0],
+            SyncAction::UpdateRemote { .. }
+        ));
+
+        // Newest with remote newer: download.
+        let snapshot_newer = remote_snapshot(&[doc("u1", "n", "", "pdf", 500)], "");
+        let plan_remote = plan(
+            with_policy(two_way(), ConflictPolicy::Newest),
+            &locals,
+            &snapshot_newer,
+            &state,
+        );
+        assert!(matches!(
+            plan_remote.actions[0],
+            SyncAction::Download { .. }
+        ));
+
+        // Explicit sides.
+        let plan_local = plan(
+            with_policy(two_way(), ConflictPolicy::PreferLocal),
+            &locals,
+            &snapshot,
+            &state,
+        );
+        assert!(matches!(
+            plan_local.actions[0],
+            SyncAction::UpdateRemote { .. }
+        ));
+        let plan_remote = plan(
+            with_policy(two_way(), ConflictPolicy::PreferRemote),
+            &locals,
+            &snapshot,
+            &state,
+        );
+        assert!(matches!(
+            plan_remote.actions[0],
+            SyncAction::Download { .. }
+        ));
+    }
+
+    #[test]
+    fn two_way_rmdoc_conflict_can_only_resolve_to_device() {
+        let mut state = SyncState::default();
+        state
+            .entries
+            .insert("n.rmdoc".to_string(), entry("u1", DocKind::Rmdoc, 10, 1, 5));
+        let snapshot = remote_snapshot(&[doc("u1", "n", "", "notebook", 50)], "");
+        let locals = vec![local("n.rmdoc", DocKind::Rmdoc, 99, 100)];
+
+        // Local can never win for handwriting, even when preferred.
+        let plan_local = plan(
+            with_policy(two_way(), ConflictPolicy::PreferLocal),
+            &locals,
+            &snapshot,
+            &state,
+        );
+        assert_eq!(skips(&plan_local), ["n.rmdoc"]);
+        let plan_remote = plan(
+            with_policy(two_way(), ConflictPolicy::PreferRemote),
+            &locals,
+            &snapshot,
+            &state,
+        );
+        assert!(matches!(
+            plan_remote.actions[0],
+            SyncAction::Download { .. }
+        ));
+    }
+
+    // ---- deletions --------------------------------------------------------
+
+    #[test]
+    fn push_delete_propagates_local_deletion() {
+        let snapshot = remote_snapshot(&[doc("u1", "n", "", "pdf", 5)], "");
+        let mut state = SyncState::default();
+        state
+            .entries
+            .insert("n.pdf".to_string(), entry("u1", DocKind::Pdf, 10, 1, 5));
+
+        // Without --delete: device keeps the document.
+        let plan_keep = plan(push(), &[], &snapshot, &state);
+        assert!(plan_keep.actions.is_empty());
+
+        // With --delete: remove on device.
+        let plan_delete = plan(with_delete(push()), &[], &snapshot, &state);
+        assert_eq!(
+            plan_delete.actions,
+            vec![SyncAction::DeleteRemote {
+                path: "n.pdf".to_string(),
+                uuid: "u1".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn push_delete_vs_remote_change_is_conflict() {
+        let snapshot = remote_snapshot(&[doc("u1", "n", "", "pdf", 9)], ""); // changed
+        let mut state = SyncState::default();
+        state
+            .entries
+            .insert("n.pdf".to_string(), entry("u1", DocKind::Pdf, 10, 1, 5));
+
+        let plan_skip = plan(with_delete(push()), &[], &snapshot, &state);
+        assert_eq!(conflicts(&plan_skip), ["n.pdf"]);
+
+        // Deletion side preferred: delete anyway.
+        let plan_del = plan(
+            with_policy(with_delete(push()), ConflictPolicy::PreferLocal),
+            &[],
+            &snapshot,
+            &state,
+        );
+        assert!(matches!(
+            plan_del.actions[0],
+            SyncAction::DeleteRemote { .. }
+        ));
+
+        // Change side preferred (and Newest): keep the device copy,
+        // forget the mapping.
+        let plan_keep = plan(
+            with_policy(with_delete(push()), ConflictPolicy::Newest),
+            &[],
+            &snapshot,
+            &state,
+        );
+        assert!(
+            plan_keep
+                .actions
+                .iter()
+                .any(|a| matches!(a, SyncAction::Forget { .. }))
+        );
+    }
+
+    #[test]
+    fn pull_delete_propagates_device_deletion() {
+        let snapshot = remote_snapshot(&[], ""); // doc gone from device
+        let mut state = SyncState::default();
+        state
+            .entries
+            .insert("n.pdf".to_string(), entry("u1", DocKind::Pdf, 10, 1, 5));
+        let locals = vec![local("n.pdf", DocKind::Pdf, 10, 1)]; // unchanged
+
+        let plan_keep = plan(pull(), &locals, &snapshot, &state);
+        assert!(plan_keep.actions.is_empty());
+
+        let plan_delete = plan(with_delete(pull()), &locals, &snapshot, &state);
+        assert_eq!(
+            plan_delete.actions,
+            vec![SyncAction::DeleteLocal {
+                path: "n.pdf".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn two_way_deletion_vs_change() {
+        // Deleted on device, changed locally.
+        let snapshot = remote_snapshot(&[], "");
+        let mut state = SyncState::default();
+        state
+            .entries
+            .insert("n.pdf".to_string(), entry("u1", DocKind::Pdf, 10, 1, 5));
+        let locals = vec![local("n.pdf", DocKind::Pdf, 99, 9)]; // changed
+
+        let plan_skip = plan(with_delete(two_way()), &locals, &snapshot, &state);
+        assert_eq!(conflicts(&plan_skip), ["n.pdf"]);
+
+        // Newest: the surviving change wins → restore to device.
+        let plan_restore = plan(
+            with_policy(with_delete(two_way()), ConflictPolicy::Newest),
+            &locals,
+            &snapshot,
+            &state,
+        );
+        assert!(matches!(plan_restore.actions[0], SyncAction::Upload { .. }));
+
+        // Deletion side preferred: delete locally.
+        let plan_del = plan(
+            with_policy(with_delete(two_way()), ConflictPolicy::PreferRemote),
+            &locals,
+            &snapshot,
+            &state,
+        );
+        assert!(matches!(
+            plan_del.actions[0],
+            SyncAction::DeleteLocal { .. }
+        ));
+    }
+
+    #[test]
+    fn forget_when_both_sides_gone() {
+        let snapshot = remote_snapshot(&[], "");
+        let mut state = SyncState::default();
+        state
+            .entries
+            .insert("n.pdf".to_string(), entry("u1", DocKind::Pdf, 10, 1, 5));
+        let plan = plan(two_way(), &[], &snapshot, &state);
+        assert_eq!(
+            plan.actions,
+            vec![SyncAction::Forget {
+                path: "n.pdf".to_string()
+            }]
+        );
+    }
+
+    // ---- unmapped collisions (adoption) ------------------------------------
+
+    #[test]
+    fn collision_adoption_by_policy() {
+        let snapshot = remote_snapshot(&[doc("u1", "n", "", "pdf", 50)], "");
+        let locals = vec![local("n.pdf", DocKind::Pdf, 10, 100)]; // local newer
+
+        // Default: conflict.
+        let plan_skip = plan(two_way(), &locals, &snapshot, &SyncState::default());
+        assert_eq!(conflicts(&plan_skip), ["n.pdf"]);
+
+        // Newest: local wins → adopt the device doc and overwrite it.
+        let plan_adopt = plan(
+            with_policy(two_way(), ConflictPolicy::Newest),
+            &locals,
+            &snapshot,
+            &SyncState::default(),
+        );
+        assert_eq!(
+            plan_adopt.actions,
+            vec![SyncAction::UpdateRemote {
+                local: "n.pdf".to_string(),
+                kind: DocKind::Pdf,
+                uuid: "u1".to_string()
+            }]
+        );
+
+        // Remote preferred: download over the local file (adopts too).
+        let plan_pull = plan(
+            with_policy(two_way(), ConflictPolicy::PreferRemote),
+            &locals,
+            &snapshot,
+            &SyncState::default(),
+        );
+        assert!(matches!(plan_pull.actions[0], SyncAction::Download { .. }));
+    }
+
+    #[test]
+    fn collision_never_overwrites_handwriting() {
+        // Local n.rmdoc vs device notebook "n": local can never win.
+        let snapshot = remote_snapshot(&[doc("u1", "n", "", "notebook", 50)], "");
+        let locals = vec![local("n.rmdoc", DocKind::Rmdoc, 10, 100)];
+        let plan = plan(
+            with_policy(two_way(), ConflictPolicy::PreferLocal),
+            &locals,
+            &snapshot,
+            &SyncState::default(),
+        );
+        assert_eq!(conflicts(&plan), ["n.rmdoc"]);
     }
 
     // ---- helpers ----------------------------------------------------------

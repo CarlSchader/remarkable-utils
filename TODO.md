@@ -43,14 +43,37 @@ Planned work, roughly in priority order.
   `SshOptions` destination/port refactor (regression check on the
   pre-existing commands: `ls`, `upload`, `download`).
 
+### Done (phase 2)
+
+- [x] `--two-way`: bidirectional sync; argument order only matters for
+  `--conflict src|dst` mapping.
+- [x] `--conflict skip|newest|src|dst`: applies to both-changed
+  conflicts, destination drift, deletion-vs-change races, and unmapped
+  same-path collisions (which *adopt* the pairing into state when
+  resolved; handwriting is never overwritten).
+- [x] `--delete`: propagates deletions of **mapped** files only
+  (never-synced files are never deleted); deletion-vs-change is a
+  conflict; stale mappings are forgotten.
+- [x] Planner rewritten as a unified per-key three-way decision table;
+  11 new unit tests (59 total).
+
+### Testing needed (phase 2, requires a real device)
+
+- [ ] Two-way smoke test: seed both sides, `--two-way --dry-run`, then
+  run; verify uploads and downloads in one pass and an idempotent
+  re-run.
+- [ ] Conflict policies: change a synced pdf on both sides; verify
+  `--conflict skip` reports, `newest` picks the right side, `src`/`dst`
+  respect argument order.
+- [ ] `--delete`: delete locally, push with `--delete` (device copy
+  removed); delete a *changed* device doc's local copy and verify the
+  conflict is reported, not silently resolved.
+- [ ] Unmapped-collision adoption: same pdf on both sides with no
+  state, `--conflict newest`; verify it maps rather than duplicates.
+- [ ] Interrupted two-way sync resumes cleanly (state saved per action).
+
 ### Next dev steps
 
-- [ ] **Phase 2 — two-way sync**: `--two-way` flag (argument order stops
-  mattering), `--conflict skip|newest|src|dst` policies (planner gains a
-  `Conflict` action with a resolution instead of bare `Skip`), and
-  opt-in `--delete` propagation (needs the state file to distinguish
-  "deleted since last sync" from "never existed"; deletions ordered
-  last).
 - [ ] **Phase 3 — more endpoint pairings**: introduce the endpoint
   trait (snapshot/read/write/mkdir/delete) once `RemoteFs` gives it a
   second implementation; generic ssh-host sync (`--remote-kind fs`
