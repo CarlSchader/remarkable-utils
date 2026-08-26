@@ -487,6 +487,38 @@ impl Client {
         Ok(destination)
     }
 
+    /// SHA-256 payload hashes for the given `(uuid, extension)`
+    /// pairs, in **one** SSH round trip (busybox `sha256sum`).
+    /// Missing payload files and hosts without `sha256sum` simply
+    /// drop out of the result — callers treat absent hashes as
+    /// "unknown", never as an error.
+    pub fn payload_hashes(
+        &self,
+        targets: &[(String, &'static str)],
+    ) -> Result<std::collections::HashMap<String, String>> {
+        if targets.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        self.progress.step(&format!(
+            "Hashing {} payload(s) on the device",
+            targets.len()
+        ));
+        let files = targets
+            .iter()
+            .map(|(uuid, ext)| format!("{} \\\n", shell_quote(&format!("{uuid}.{ext}"))))
+            .collect::<String>();
+        let script = format!(
+            "cd {dir} || exit 9\n\
+             command -v sha256sum >/dev/null 2>&1 || exit 0\n\
+             for f in {files}; do [ -e \"$f\" ] && sha256sum -- \"$f\"; done\n\
+             exit 0\n",
+            dir = shell_quote(&self.dir),
+        );
+        let output = self.session.run_checked(&script)?;
+        self.progress.finished();
+        Ok(parse_payload_hashes(&output))
+    }
+
     /// Stream every artifact of an item (`<uuid>`, `<uuid>.*`) from the
     /// device as one tar. The `.*` glob is deliberately outside the
     /// quotes; `[ -e ]` filters unmatched glob literals, and busybox
@@ -756,6 +788,19 @@ impl Client {
     }
 }
 
+/// Parse `sha256sum` output lines (`HASH  uuid.ext`) into
+/// `uuid -> hash`.
+fn parse_payload_hashes(output: &str) -> std::collections::HashMap<String, String> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let (hash, file) = line.split_once(char::is_whitespace)?;
+            let uuid = file.trim().trim_start_matches('*').rsplit_once('.')?.0;
+            (!hash.is_empty()).then(|| (uuid.to_string(), hash.to_string()))
+        })
+        .collect()
+}
+
 /// Visible name for an upload: explicit override or the file stem.
 fn default_name(visible_name: Option<&str>, local: &Path) -> String {
     visible_name.map(str::to_string).unwrap_or_else(|| {
@@ -937,6 +982,25 @@ mod tests {
             item("ph", "Physics", "b", ItemKind::Document),
             item("n", "Notes", "", ItemKind::Document),
         ]
+    }
+
+    #[test]
+    fn payload_hash_parsing() {
+        let output = "\
+abc123  11111111-aaaa-bbbb-cccc-000000000001.pdf
+def456  11111111-aaaa-bbbb-cccc-000000000002.epub
+garbage line
+";
+        let hashes = parse_payload_hashes(output);
+        assert_eq!(
+            hashes.get("11111111-aaaa-bbbb-cccc-000000000001"),
+            Some(&"abc123".to_string())
+        );
+        assert_eq!(
+            hashes.get("11111111-aaaa-bbbb-cccc-000000000002"),
+            Some(&"def456".to_string())
+        );
+        assert_eq!(hashes.len(), 2);
     }
 
     #[test]

@@ -22,8 +22,9 @@ use crate::progress::Progress;
 use crate::ssh::{SshSession, shell_quote};
 use crate::xochitl::{self, Item};
 
-/// Name of the sync-state file kept in the local sync root.
-pub const STATE_FILE_NAME: &str = ".rmu-sync.json";
+/// Name of the **legacy** in-tree state file (pre-v2 sync). No longer
+/// read or written; used only to warn users that it can be deleted.
+pub const LEGACY_STATE_FILE_NAME: &str = ".rmu-sync.json";
 
 // ---------------------------------------------------------------------------
 // Endpoints
@@ -117,6 +118,9 @@ pub struct LocalEntry {
     pub kind: DocKind,
     pub size: u64,
     pub mtime_ms: i64,
+    /// SHA-256 of the content; filled by [`attach_hashes`] (`None`
+    /// when the endpoint cannot hash).
+    pub hash: Option<String>,
 }
 
 /// Walk a local sync root, collecting syncable files. Dotfiles and
@@ -161,6 +165,7 @@ pub fn local_snapshot(root: &Path) -> Result<(Vec<LocalEntry>, usize)> {
                         kind,
                         size: metadata.len(),
                         mtime_ms: mtime_ms(&metadata),
+                        hash: None,
                     });
                 }
                 None => *ignored += 1,
@@ -173,6 +178,47 @@ pub fn local_snapshot(root: &Path) -> Result<(Vec<LocalEntry>, usize)> {
     let mut ignored = 0;
     walk(root, "", &mut entries, &mut ignored)?;
     Ok((entries, ignored))
+}
+
+/// SHA-256 of a byte slice, lowercase hex.
+pub fn hash_bytes(data: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(data))
+}
+
+/// SHA-256 of a file, streamed (large payloads never fully in memory).
+pub fn hash_file(path: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut fs::File::open(path)?, &mut hasher)?;
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// The cached hash for a local entry, when its stat stamp says the
+/// content cannot have changed since last sync (Unison fastcheck).
+pub fn cached_hash(entry: &LocalEntry, state: &SyncState) -> Option<String> {
+    state.entries.get(&entry.rel_path).and_then(|st| {
+        (st.local_size == entry.size && st.local_mtime_ms == entry.mtime_ms)
+            .then(|| st.local_hash.clone())
+            .flatten()
+    })
+}
+
+/// Fill in content hashes for a snapshot: stamp-matched entries reuse
+/// the archive's hash (no I/O); everything else is hashed by the
+/// endpoint. Thin I/O shell over [`cached_hash`].
+pub fn attach_hashes(
+    fs_side: &dyn FsEndpoint,
+    entries: &mut [LocalEntry],
+    state: &SyncState,
+) -> Result<()> {
+    entries.iter_mut().try_for_each(|entry| {
+        entry.hash = match cached_hash(entry, state) {
+            Some(hash) => Some(hash),
+            None => fs_side.content_hash(&entry.rel_path)?,
+        };
+        Ok(())
+    })
 }
 
 fn mtime_ms(metadata: &fs::Metadata) -> i64 {
@@ -223,6 +269,9 @@ pub struct RemoteDoc {
     pub doc_type: RemoteType,
     pub last_modified: i64,
     pub size_bytes: Option<u64>,
+    /// SHA-256 of the payload file, when it was (lazily) fetched —
+    /// see [`device_hash_candidates`]. Always `None` for notebooks.
+    pub payload_hash: Option<String>,
 }
 
 impl RemoteDoc {
@@ -303,6 +352,7 @@ pub fn remote_snapshot(items: &[Item], root_uuid: &str) -> RemoteSnapshot {
                 doc_type,
                 last_modified: item.last_modified,
                 size_bytes: item.size_bytes,
+                payload_hash: None,
             });
         });
     }
@@ -356,11 +406,21 @@ pub struct StateEntry {
     /// B-side size for fs↔fs pairs (absent for device pairs).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_size: Option<u64>,
+    /// SHA-256 of the local file at last sync. The stat stamp
+    /// (mtime+size) gates re-hashing, Unison-fastcheck style: a file
+    /// whose stamp matches is never re-read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_hash: Option<String>,
+    /// SHA-256 of the device payload (`<uuid>.pdf`/`.epub`) at last
+    /// sync. Absent for notebooks/bundles.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_hash: Option<String>,
 }
 
-/// The sync-state file: `local rel path ↔ device UUID` plus what both
+/// The sync archive: `local rel path ↔ device UUID` plus what both
 /// sides looked like at last sync. Enables three-way diffing; see
-/// `docs/sync-design.md`.
+/// `docs/sync-design.md`. Stored under `$XDG_STATE_HOME/rmu/`, keyed
+/// by the endpoint pair — never inside the synced tree.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct SyncState {
     pub version: u32,
@@ -370,32 +430,52 @@ pub struct SyncState {
 impl SyncState {
     pub fn parse(text: &str) -> Result<Self> {
         serde_json::from_str(text).map_err(|source| Error::Json {
-            path: STATE_FILE_NAME.to_string(),
+            path: "sync state".to_string(),
             source,
         })
     }
 
     pub fn serialize(&self) -> Result<String> {
         serde_json::to_string_pretty(self).map_err(|source| Error::Json {
-            path: STATE_FILE_NAME.to_string(),
+            path: "sync state".to_string(),
             source,
         })
     }
 
-    /// Load from the state-holding endpoint; missing file = fresh state.
-    pub fn load_from(fs: &dyn FsEndpoint) -> Result<Self> {
-        match fs.read_state()? {
-            Some(text) => Self::parse(&text),
-            None => Ok(Self {
-                version: 1,
+    /// Load from a state file; missing file = fresh state.
+    pub fn load(path: &Path) -> Result<Self> {
+        if !path.exists() {
+            return Ok(Self {
+                version: 2,
                 entries: BTreeMap::new(),
-            }),
+            });
         }
+        Self::parse(&fs::read_to_string(path)?)
     }
 
-    pub fn save_to(&self, fs: &dyn FsEndpoint) -> Result<()> {
-        fs.write_state(&self.serialize()?)
+    /// Save atomically (temp + rename), creating parent directories.
+    pub fn save(&self, path: &Path) -> Result<()> {
+        write_atomically(path, self.serialize()?.as_bytes())
     }
+}
+
+/// Write via a sibling temp file + atomic rename so a crash never
+/// leaves a truncated file.
+fn write_atomically(path: &Path, data: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, data)?;
+    Ok(fs::rename(&tmp, path)?)
+}
+
+/// Where the archive for a pair of sync endpoints lives:
+/// `$XDG_STATE_HOME/rmu/` (or `~/.local/state/rmu/`), keyed
+/// order-independently by the two endpoint labels so `push` and
+/// `pull` over the same pair share state.
+pub fn sync_state_path(label_a: &str, label_b: &str) -> PathBuf {
+    state_dir().join(format!("sync-{}.json", pair_key_hash(label_a, label_b)))
 }
 
 // ---------------------------------------------------------------------------
@@ -423,9 +503,9 @@ pub trait FsEndpoint {
     fn remove_dir(&self, rel_dir: &str) -> Result<bool>;
     /// (size, mtime in ms).
     fn stat(&self, rel_path: &str) -> Result<(u64, i64)>;
-    /// Read the sync-state file; `None` if absent.
-    fn read_state(&self) -> Result<Option<String>>;
-    fn write_state(&self, text: &str) -> Result<()>;
+    /// SHA-256 of a file's content, if this endpoint can compute it
+    /// cheaply enough to be worth it.
+    fn content_hash(&self, rel_path: &str) -> Result<Option<String>>;
     /// For local endpoints: the real path, enabling streamed transfers
     /// instead of in-memory buffering.
     fn as_local_path(&self, rel_path: &str) -> Option<PathBuf> {
@@ -498,16 +578,8 @@ impl FsEndpoint for LocalFs {
         Ok((metadata.len(), mtime_ms(&metadata)))
     }
 
-    fn read_state(&self) -> Result<Option<String>> {
-        let path = self.root.join(STATE_FILE_NAME);
-        if !path.exists() {
-            return Ok(None);
-        }
-        Ok(Some(fs::read_to_string(path)?))
-    }
-
-    fn write_state(&self, text: &str) -> Result<()> {
-        Ok(fs::write(self.root.join(STATE_FILE_NAME), text)?)
+    fn content_hash(&self, rel_path: &str) -> Result<Option<String>> {
+        hash_file(&self.root.join(rel_path)).map(Some)
     }
 
     fn as_local_path(&self, rel_path: &str) -> Option<PathBuf> {
@@ -634,23 +706,21 @@ impl FsEndpoint for SshFs {
         }
     }
 
-    fn read_state(&self) -> Result<Option<String>> {
-        let output = self
-            .session
-            .run(&format!("cat {}", shell_quote(&self.join(STATE_FILE_NAME))))?;
-        match output.status.code() {
-            Some(0) => Ok(Some(String::from_utf8_lossy(&output.stdout).into_owned())),
-            // Missing file (cat exits 1/2 depending on the shell).
-            Some(1) | Some(2) => Ok(None),
-            code => Err(Error::Remote {
-                status: code.unwrap_or(-1),
-                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-            }),
+    fn content_hash(&self, rel_path: &str) -> Result<Option<String>> {
+        // One round trip per file; callers hash lazily (only files
+        // whose stat stamp moved), so this stays proportional to the
+        // number of *changes*.
+        let output = self.session.run(&format!(
+            "sha256sum -- {} 2>/dev/null",
+            shell_quote(&self.join(rel_path))
+        ))?;
+        if !output.status.success() {
+            return Ok(None); // no sha256sum on the host, or file gone
         }
-    }
-
-    fn write_state(&self, text: &str) -> Result<()> {
-        self.write(STATE_FILE_NAME, text.as_bytes())
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .split_whitespace()
+            .next()
+            .map(str::to_string))
     }
 }
 
@@ -682,6 +752,7 @@ fn parse_fs_listing(output: &str) -> (Vec<LocalEntry>, usize) {
                     kind,
                     size,
                     mtime_ms: mtime_s * 1000,
+                    hash: None,
                 }),
                 None => {
                     ignored += 1;
@@ -745,11 +816,15 @@ pub enum SyncAction {
         kind: DocKind,
         remote_dir: String,
         name: String,
+        /// Content hash of the local file (recorded into state; for
+        /// pdf/epub the uploaded payload is byte-identical).
+        hash: Option<String>,
     },
     UpdateRemote {
         local: String,
         kind: DocKind,
         uuid: String,
+        hash: Option<String>,
     },
     Download {
         local: String,
@@ -793,6 +868,28 @@ pub enum SyncAction {
         path: String,
         uuid: String,
         last_modified: i64,
+    },
+    /// Pair an unmapped local file with an unmapped device document
+    /// whose content is **hash-verified identical** (e.g. after state
+    /// loss). State-only; no transfer, no policy needed.
+    Adopt {
+        path: String,
+        kind: DocKind,
+        uuid: String,
+        last_modified: i64,
+        hash: String,
+    },
+    /// A mapped file whose stamp moved but whose content did not
+    /// (touched file, or device `lastModified` bumped by annotations).
+    /// Updates the recorded stamps so the next run is silent; no
+    /// transfer.
+    Refresh {
+        path: String,
+        kind: DocKind,
+        uuid: String,
+        last_modified: i64,
+        local_hash: Option<String>,
+        payload_hash: Option<String>,
     },
     /// A conflict the policy did not resolve; nothing is changed.
     Conflict {
@@ -893,6 +990,73 @@ struct Buckets {
     deletes: Vec<SyncAction>,
     forgets: Vec<SyncAction>,
     notes: Vec<SyncAction>,
+}
+
+/// Whether a document kind mirrors its payload byte-for-byte between
+/// the fs side and the device (notebooks/bundles do not).
+fn payload_mirrored(doc_type: RemoteType) -> bool {
+    matches!(doc_type, RemoteType::Pdf | RemoteType::Epub)
+}
+
+/// Which device payloads are worth hashing before planning (lazy,
+/// batched by the caller into one round trip). Pure. Candidates:
+/// - mapped docs whose `lastModified` moved while a recorded payload
+///   hash exists (annotation-only changes can then skip the download);
+/// - unmapped docs whose pull path collides with an unmapped local
+///   file of the same payload kind (hash-verified adoption).
+pub fn device_hash_candidates(
+    local: &[LocalEntry],
+    remote: &RemoteSnapshot,
+    state: &SyncState,
+) -> Vec<(String, &'static str)> {
+    let local_by_path: HashMap<&str, &LocalEntry> =
+        local.iter().map(|e| (e.rel_path.as_str(), e)).collect();
+    let mapped_uuids: std::collections::HashSet<&str> =
+        state.entries.values().map(|st| st.uuid.as_str()).collect();
+    let by_uuid: HashMap<&str, &RemoteDoc> =
+        remote.docs.iter().map(|d| (d.uuid.as_str(), d)).collect();
+
+    let mapped = state.entries.values().filter_map(|st| {
+        let doc = by_uuid.get(st.uuid.as_str())?;
+        (payload_mirrored(doc.doc_type)
+            && st.payload_hash.is_some()
+            && doc.last_modified != st.remote_last_modified)
+            .then_some(*doc)
+    });
+    let adoption = remote
+        .docs
+        .iter()
+        .filter(|doc| payload_mirrored(doc.doc_type) && !mapped_uuids.contains(doc.uuid.as_str()))
+        .filter(|doc| {
+            local_by_path
+                .get(doc.local_rel_path().as_str())
+                .is_some_and(|entry| {
+                    !state.entries.contains_key(&entry.rel_path)
+                        && kind_matches(entry.kind, doc.doc_type)
+                })
+        });
+
+    let mut out: Vec<(String, &'static str)> = mapped
+        .chain(adoption)
+        .map(|doc| {
+            let ext = match doc.doc_type {
+                RemoteType::Pdf => "pdf",
+                RemoteType::Epub => "epub",
+                RemoteType::Notebook => unreachable!("filtered to mirrored payloads"),
+            };
+            (doc.uuid.clone(), ext)
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Attach lazily fetched payload hashes to a snapshot.
+pub fn attach_payload_hashes(remote: &mut RemoteSnapshot, hashes: &HashMap<String, String>) {
+    remote.docs.iter_mut().for_each(|doc| {
+        doc.payload_hash = hashes.get(&doc.uuid).cloned();
+    });
 }
 
 /// Compute the ordered action plan. Pure: no I/O.
@@ -1215,17 +1379,41 @@ fn mapped_both(
     doc: &RemoteDoc,
     out: &mut Buckets,
 ) {
-    let local_changed = entry.size != st.local_size || entry.mtime_ms != st.local_mtime_ms;
-    let remote_changed = doc.last_modified != st.remote_last_modified;
+    let stamp_local = entry.size != st.local_size || entry.mtime_ms != st.local_mtime_ms;
+    let stamp_remote = doc.last_modified != st.remote_last_modified;
+    // Content verdicts override stamp verdicts when hashes are known:
+    // a touched-but-identical file, or a device `lastModified` bumped
+    // by annotations, is not a change worth transferring.
+    let same_local_content =
+        entry.hash.is_some() && st.local_hash.is_some() && entry.hash == st.local_hash;
+    let same_remote_content = doc.payload_hash.is_some()
+        && st.payload_hash.is_some()
+        && doc.payload_hash == st.payload_hash;
+    let local_changed = stamp_local && !same_local_content;
+    let remote_changed = stamp_remote && !same_remote_content;
     // What each side's changes can flow into, given mode and kind.
     let push_ok = can_write_remote(options.mode) && st.kind != DocKind::Rmdoc;
     let pull_ok = can_write_local(options.mode);
+
+    // Stamps moved but content did not (on every side that moved):
+    // record the new stamps so the next run does not re-hash.
+    if !local_changed && !remote_changed && (stamp_local || stamp_remote) {
+        out.rebinds.push(SyncAction::Refresh {
+            path: key.to_string(),
+            kind: st.kind,
+            uuid: st.uuid.clone(),
+            last_modified: doc.last_modified,
+            local_hash: entry.hash.clone().or_else(|| st.local_hash.clone()),
+            payload_hash: doc.payload_hash.clone().or_else(|| st.payload_hash.clone()),
+        });
+        return;
+    }
 
     match (local_changed, remote_changed) {
         (false, false) => {}
         (true, false) => {
             if push_ok {
-                out.transfers.push(update_remote(key, entry.kind, &st.uuid));
+                out.transfers.push(update_remote(key, entry, &st.uuid));
             } else if can_write_remote(options.mode) {
                 out.notes.push(skip(
                     key,
@@ -1255,7 +1443,7 @@ fn mapped_both(
                 .push(conflict(key, "both sides changed since last sync")),
             Some(Winner::Local) => {
                 if push_ok {
-                    out.transfers.push(update_remote(key, entry.kind, &st.uuid));
+                    out.transfers.push(update_remote(key, entry, &st.uuid));
                 } else if can_write_remote(options.mode) {
                     out.notes.push(skip(
                         key,
@@ -1414,6 +1602,22 @@ fn collision(
     doc: &RemoteDoc,
     out: &mut Buckets,
 ) {
+    // Hash-verified identical content: adopt the pairing silently,
+    // regardless of mode or policy (state-only, loses nothing). This
+    // is what makes archive loss benign.
+    if let (Some(local_hash), Some(payload_hash)) = (&entry.hash, &doc.payload_hash)
+        && local_hash == payload_hash
+        && kind_matches(entry.kind, doc.doc_type)
+    {
+        out.rebinds.push(SyncAction::Adopt {
+            path: key.to_string(),
+            kind: entry.kind,
+            uuid: doc.uuid.clone(),
+            last_modified: doc.last_modified,
+            hash: local_hash.clone(),
+        });
+        return;
+    }
     match winner(options.conflict, entry.mtime_ms, doc.last_modified) {
         None => out.notes.push(conflict(
             key,
@@ -1424,9 +1628,9 @@ fn collision(
                 return; // pull: destination (local) kept
             }
             match (entry.kind, doc.doc_type) {
-                (DocKind::Pdf, RemoteType::Pdf) | (DocKind::Epub, RemoteType::Epub) => out
-                    .transfers
-                    .push(update_remote(key, entry.kind, &doc.uuid)),
+                (DocKind::Pdf, RemoteType::Pdf) | (DocKind::Epub, RemoteType::Epub) => {
+                    out.transfers.push(update_remote(key, entry, &doc.uuid))
+                }
                 _ => out.notes.push(conflict(
                     key,
                     "cannot overwrite the device copy (handwriting or mismatched types)",
@@ -1461,15 +1665,17 @@ fn upload_with_guards(key: &str, entry: &LocalEntry, guards: &Guards, out: &mut 
             kind: entry.kind,
             remote_dir: dir.to_string(),
             name: stem,
+            hash: entry.hash.clone(),
         });
     }
 }
 
-fn update_remote(key: &str, kind: DocKind, uuid: &str) -> SyncAction {
+fn update_remote(key: &str, entry: &LocalEntry, uuid: &str) -> SyncAction {
     SyncAction::UpdateRemote {
         local: key.to_string(),
-        kind,
+        kind: entry.kind,
         uuid: uuid.to_string(),
+        hash: entry.hash.clone(),
     }
 }
 
@@ -1530,6 +1736,7 @@ pub fn execute(
     plan: &Plan,
     folders: &mut BTreeMap<String, String>,
     state: &mut SyncState,
+    state_path: &Path,
 ) -> Result<Outcome> {
     let total = plan.changes();
     let mut outcome = Outcome::default();
@@ -1560,6 +1767,7 @@ pub fn execute(
                 kind,
                 remote_dir,
                 name,
+                hash,
             } => {
                 let parent_uuid = folders
                     .get(remote_dir)
@@ -1591,11 +1799,29 @@ pub fn execute(
                         client.restore_bundle(rmdoc, &parent_uuid, name)?
                     }
                 };
-                record_state(state, fs_side, local, *kind, &item.uuid, item.last_modified)?;
+                // pdf/epub payloads are byte-identical to the local
+                // file, so the local hash doubles as the payload hash.
+                let payload = payload_mirrored_kind(*kind).then(|| hash.clone()).flatten();
+                record_state(
+                    state,
+                    state_path,
+                    fs_side,
+                    local,
+                    *kind,
+                    &item.uuid,
+                    item.last_modified,
+                    hash.clone(),
+                    payload,
+                )?;
                 outcome.uploaded += 1;
                 outcome.modified_remote = true;
             }
-            SyncAction::UpdateRemote { local, kind, uuid } => {
+            SyncAction::UpdateRemote {
+                local,
+                kind,
+                uuid,
+                hash,
+            } => {
                 let last_modified = match (kind, fs_side.as_local_path(local)) {
                     (DocKind::Pdf, Some(path)) => {
                         client.update_payload_from_file(uuid, "pdf", &path)?
@@ -1612,7 +1838,18 @@ pub fn execute(
                     // The planner never emits this.
                     (DocKind::Rmdoc, _) => unreachable!("mapped .rmdoc files are pull-only"),
                 };
-                record_state(state, fs_side, local, *kind, uuid, last_modified)?;
+                let payload = payload_mirrored_kind(*kind).then(|| hash.clone()).flatten();
+                record_state(
+                    state,
+                    state_path,
+                    fs_side,
+                    local,
+                    *kind,
+                    uuid,
+                    last_modified,
+                    hash.clone(),
+                    payload,
+                )?;
                 outcome.updated += 1;
                 outcome.modified_remote = true;
             }
@@ -1650,27 +1887,36 @@ pub fn execute(
                         &client.download_payload_bytes(uuid, "epub", *size_bytes)?,
                     )?,
                 }
+                // Hash what we just wrote: for pdf/epub it is also
+                // the payload hash (byte-identical by construction).
+                let written_hash = fs_side.content_hash(local)?;
+                let payload = payload_mirrored(*doc_type)
+                    .then(|| written_hash.clone())
+                    .flatten();
                 record_state(
                     state,
+                    state_path,
                     fs_side,
                     local,
                     doc_type.pulled_kind(),
                     uuid,
                     *last_modified,
+                    written_hash,
+                    payload,
                 )?;
                 outcome.downloaded += 1;
             }
             SyncAction::DeleteRemote { path, uuid } => {
                 client.delete_document(uuid)?;
                 state.entries.remove(path);
-                state.save_to(fs_side)?;
+                state.save(state_path)?;
                 outcome.deleted_remote += 1;
                 outcome.modified_remote = true;
             }
             SyncAction::DeleteLocal { path } => {
                 fs_side.remove(path)?;
                 state.entries.remove(path);
-                state.save_to(fs_side)?;
+                state.save(state_path)?;
                 outcome.deleted_local += 1;
             }
             SyncAction::DeleteRemoteFolder { rel_dir, uuid } => {
@@ -1690,7 +1936,55 @@ pub fn execute(
             }
             SyncAction::Forget { path } => {
                 state.entries.remove(path);
-                state.save_to(fs_side)?;
+                state.save(state_path)?;
+            }
+            SyncAction::Adopt {
+                path,
+                kind,
+                uuid,
+                last_modified,
+                hash,
+            } => {
+                let (size, mtime) = fs_side.stat(path)?;
+                state.entries.insert(
+                    path.clone(),
+                    StateEntry {
+                        uuid: uuid.clone(),
+                        kind: *kind,
+                        local_size: size,
+                        local_mtime_ms: mtime,
+                        remote_last_modified: *last_modified,
+                        remote_size: None,
+                        local_hash: Some(hash.clone()),
+                        // Verified equal to the local hash by the planner.
+                        payload_hash: Some(hash.clone()),
+                    },
+                );
+                state.save(state_path)?;
+            }
+            SyncAction::Refresh {
+                path,
+                kind,
+                uuid,
+                last_modified,
+                local_hash,
+                payload_hash,
+            } => {
+                let (size, mtime) = fs_side.stat(path)?;
+                state.entries.insert(
+                    path.clone(),
+                    StateEntry {
+                        uuid: uuid.clone(),
+                        kind: *kind,
+                        local_size: size,
+                        local_mtime_ms: mtime,
+                        remote_last_modified: *last_modified,
+                        remote_size: None,
+                        local_hash: local_hash.clone(),
+                        payload_hash: payload_hash.clone(),
+                    },
+                );
+                state.save(state_path)?;
             }
             SyncAction::Rebind {
                 path,
@@ -1700,8 +1994,10 @@ pub fn execute(
                 if let Some(entry) = state.entries.get_mut(path) {
                     entry.uuid = uuid.clone();
                     entry.remote_last_modified = *last_modified;
+                    // The replacement's payload was never hashed.
+                    entry.payload_hash = None;
                 }
-                state.save_to(fs_side)?;
+                state.save(state_path)?;
                 // A rebind means a previous interrupted run wrote this
                 // document to the device and likely died before its
                 // xochitl restart — without one now, the document stays
@@ -1723,14 +2019,23 @@ pub fn execute(
     Ok(outcome)
 }
 
+/// Payload-mirrored [`DocKind`]s (see [`payload_mirrored`]).
+fn payload_mirrored_kind(kind: DocKind) -> bool {
+    matches!(kind, DocKind::Pdf | DocKind::Epub)
+}
+
 /// Stat the fs-side file and persist the new state entry.
+#[allow(clippy::too_many_arguments)]
 fn record_state(
     state: &mut SyncState,
+    state_path: &Path,
     fs_side: &dyn FsEndpoint,
     rel_path: &str,
     kind: DocKind,
     uuid: &str,
     remote_last_modified: i64,
+    local_hash: Option<String>,
+    payload_hash: Option<String>,
 ) -> Result<()> {
     let (size, mtime) = fs_side.stat(rel_path)?;
     state.entries.insert(
@@ -1742,9 +2047,11 @@ fn record_state(
             local_mtime_ms: mtime,
             remote_last_modified,
             remote_size: None,
+            local_hash,
+            payload_hash,
         },
     );
-    state.save_to(fs_side)
+    state.save(state_path)
 }
 
 // ---------------------------------------------------------------------------
@@ -1967,6 +2274,7 @@ pub fn execute_files(
     progress: &dyn Progress,
     plan: &[FileAction],
     state: &mut SyncState,
+    state_path: &Path,
 ) -> Result<FileOutcome> {
     let total = plan
         .iter()
@@ -1993,9 +2301,11 @@ pub fn execute_files(
                 local_mtime_ms: a_mtime,
                 remote_last_modified: b_mtime,
                 remote_size: Some(b_size),
+                local_hash: None,
+                payload_hash: None,
             },
         );
-        state.save_to(a)
+        state.save(state_path)
     };
 
     plan.iter().try_for_each(|action| -> Result<()> {
@@ -2017,18 +2327,18 @@ pub fn execute_files(
             FileAction::DeleteA { path } => {
                 a.remove(path)?;
                 state.entries.remove(path);
-                state.save_to(a)?;
+                state.save(state_path)?;
                 outcome.deleted_a += 1;
             }
             FileAction::DeleteB { path } => {
                 b.remove(path)?;
                 state.entries.remove(path);
-                state.save_to(a)?;
+                state.save(state_path)?;
                 outcome.deleted_b += 1;
             }
             FileAction::Forget { path } => {
                 state.entries.remove(path);
-                state.save_to(a)?;
+                state.save(state_path)?;
             }
             FileAction::Conflict { path, reason } => {
                 outcome.conflicts.push((path.clone(), reason.clone()));
@@ -2099,14 +2409,11 @@ impl PairState {
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
         let text = serde_json::to_string_pretty(self).map_err(|source| Error::Json {
             path: path.display().to_string(),
             source,
         })?;
-        Ok(fs::write(path, text)?)
+        write_atomically(path, text.as_bytes())
     }
 }
 
@@ -2114,17 +2421,30 @@ impl PairState {
 /// initiating computer: `$XDG_STATE_HOME/rmu/` (or `~/.local/state/rmu/`),
 /// keyed order-independently by the endpoint pair.
 pub fn pair_state_path(endpoint_a: &str, endpoint_b: &str) -> PathBuf {
-    let (first, second) = if endpoint_a <= endpoint_b {
-        (endpoint_a, endpoint_b)
-    } else {
-        (endpoint_b, endpoint_a)
-    };
-    let hash = fnv1a(&format!("{first}\n{second}"));
+    state_dir().join(format!(
+        "sync-pair-{}.json",
+        pair_key_hash(endpoint_a, endpoint_b)
+    ))
+}
+
+/// The rmu state directory: `$XDG_STATE_HOME/rmu` (or
+/// `~/.local/state/rmu`).
+fn state_dir() -> PathBuf {
     let base = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
         .unwrap_or_else(|| PathBuf::from("."));
-    base.join("rmu").join(format!("sync-pair-{hash:016x}.json"))
+    base.join("rmu")
+}
+
+/// Order-independent stable hash of an endpoint pair.
+fn pair_key_hash(label_a: &str, label_b: &str) -> String {
+    let (first, second) = if label_a <= label_b {
+        (label_a, label_b)
+    } else {
+        (label_b, label_a)
+    };
+    format!("{:016x}", fnv1a(&format!("{first}\n{second}")))
 }
 
 /// FNV-1a: tiny, dependency-free, and stable across releases (unlike
@@ -2556,6 +2876,12 @@ pub fn describe(action: &SyncAction) -> String {
         SyncAction::Rebind { path, .. } => {
             format!("rebind   {path} (re-linked to replacement on device)")
         }
+        SyncAction::Adopt { path, .. } => {
+            format!("adopt    {path} (identical content on both sides; state only)")
+        }
+        SyncAction::Refresh { path, .. } => {
+            format!("refresh  {path} (content unchanged; state only)")
+        }
         SyncAction::Conflict { path, reason } => format!("conflict {path} ({reason})"),
         SyncAction::Skip { path, reason } => format!("skip     {path} ({reason})"),
     }
@@ -2598,7 +2924,13 @@ mod tests {
             kind,
             size,
             mtime_ms: mtime,
+            hash: None,
         }
+    }
+
+    fn with_hash(mut entry: LocalEntry, hash: &str) -> LocalEntry {
+        entry.hash = Some(hash.to_string());
+        entry
     }
 
     fn entry(uuid: &str, kind: DocKind, size: u64, mtime: i64, remote: i64) -> StateEntry {
@@ -2609,6 +2941,24 @@ mod tests {
             local_mtime_ms: mtime,
             remote_last_modified: remote,
             remote_size: None,
+            local_hash: None,
+            payload_hash: None,
+        }
+    }
+
+    fn entry_hashed(
+        uuid: &str,
+        kind: DocKind,
+        size: u64,
+        mtime: i64,
+        remote: i64,
+        local_hash: &str,
+        payload_hash: &str,
+    ) -> StateEntry {
+        StateEntry {
+            local_hash: Some(local_hash.to_string()),
+            payload_hash: Some(payload_hash.to_string()),
+            ..entry(uuid, kind, size, mtime, remote)
         }
     }
 
@@ -2767,13 +3117,15 @@ mod tests {
                     local: "a/b/notes.epub".to_string(),
                     kind: DocKind::Epub,
                     remote_dir: "a/b".to_string(),
-                    name: "notes".to_string()
+                    name: "notes".to_string(),
+                    hash: None
                 },
                 SyncAction::Upload {
                     local: "top.pdf".to_string(),
                     kind: DocKind::Pdf,
                     remote_dir: String::new(),
-                    name: "top".to_string()
+                    name: "top".to_string(),
+                    hash: None
                 },
             ]
         );
@@ -2805,7 +3157,8 @@ mod tests {
             vec![SyncAction::UpdateRemote {
                 local: "n.epub".to_string(),
                 kind: DocKind::Epub,
-                uuid: "u1".to_string()
+                uuid: "u1".to_string(),
+                hash: None
             }]
         );
     }
@@ -2845,7 +3198,8 @@ mod tests {
                 local: "backup.rmdoc".to_string(),
                 kind: DocKind::Rmdoc,
                 remote_dir: String::new(),
-                name: "backup".to_string()
+                name: "backup".to_string(),
+                hash: None
             }]
         );
     }
@@ -3008,7 +3362,8 @@ mod tests {
                 SyncAction::UpdateRemote {
                     local: "a.pdf".to_string(),
                     kind: DocKind::Pdf,
-                    uuid: "ua".to_string()
+                    uuid: "ua".to_string(),
+                    hash: None
                 },
                 SyncAction::Download {
                     local: "b.pdf".to_string(),
@@ -3109,6 +3464,149 @@ mod tests {
             plan_remote.actions[0],
             SyncAction::Download { .. }
         ));
+    }
+
+    // ---- content hashes (fastcheck, refresh, adoption) ---------------------
+
+    #[test]
+    fn cached_hash_gates_rehashing() {
+        let mut state = SyncState::default();
+        state.entries.insert(
+            "n.pdf".to_string(),
+            entry_hashed("u1", DocKind::Pdf, 10, 1, 5, "abc", "abc"),
+        );
+        // Stamp matches: reuse without I/O.
+        assert_eq!(
+            cached_hash(&local("n.pdf", DocKind::Pdf, 10, 1), &state),
+            Some("abc".to_string())
+        );
+        // Stamp moved: must re-hash.
+        assert_eq!(
+            cached_hash(&local("n.pdf", DocKind::Pdf, 10, 9), &state),
+            None
+        );
+        // Unknown file: must hash.
+        assert_eq!(
+            cached_hash(&local("x.pdf", DocKind::Pdf, 10, 1), &state),
+            None
+        );
+    }
+
+    #[test]
+    fn touched_but_identical_local_file_refreshes_instead_of_uploading() {
+        let snapshot = remote_snapshot(&[doc("u1", "n", "", "pdf", 5)], "");
+        let mut state = SyncState::default();
+        state.entries.insert(
+            "n.pdf".to_string(),
+            entry_hashed("u1", DocKind::Pdf, 10, 1, 5, "abc", "abc"),
+        );
+        // mtime moved, content identical.
+        let locals = vec![with_hash(local("n.pdf", DocKind::Pdf, 10, 9), "abc")];
+        let plan_refresh = plan(push(), &locals, &snapshot, &state);
+        assert!(matches!(
+            plan_refresh.actions[0],
+            SyncAction::Refresh { .. }
+        ));
+        assert_eq!(plan_refresh.actions.len(), 1);
+
+        // Content actually changed: normal update.
+        let locals = vec![with_hash(local("n.pdf", DocKind::Pdf, 10, 9), "zzz")];
+        let plan_update = plan(push(), &locals, &snapshot, &state);
+        assert!(matches!(
+            plan_update.actions[0],
+            SyncAction::UpdateRemote { .. }
+        ));
+    }
+
+    #[test]
+    fn annotation_only_remote_change_refreshes_instead_of_downloading() {
+        // lastModified moved (annotations) but the payload hash did not.
+        let mut items_snapshot = remote_snapshot(&[doc("u1", "n", "", "pdf", 9)], "");
+        items_snapshot.docs[0].payload_hash = Some("abc".to_string());
+        let mut state = SyncState::default();
+        state.entries.insert(
+            "n.pdf".to_string(),
+            entry_hashed("u1", DocKind::Pdf, 10, 1, 5, "abc", "abc"),
+        );
+        let locals = vec![with_hash(local("n.pdf", DocKind::Pdf, 10, 1), "abc")];
+        let plan_refresh = plan(pull(), &locals, &items_snapshot, &state);
+        assert!(matches!(
+            plan_refresh.actions[0],
+            SyncAction::Refresh {
+                last_modified: 9,
+                ..
+            }
+        ));
+        assert_eq!(plan_refresh.actions.len(), 1);
+
+        // Payload hash unknown: conservative, downloads as before.
+        let snapshot = remote_snapshot(&[doc("u1", "n", "", "pdf", 9)], "");
+        let plan_dl = plan(pull(), &locals, &snapshot, &state);
+        assert!(matches!(plan_dl.actions[0], SyncAction::Download { .. }));
+    }
+
+    #[test]
+    fn identical_unmapped_content_is_adopted_without_policy() {
+        // Same path, no state (archive lost), hash-verified identical:
+        // silently re-paired even under the default Skip policy.
+        let mut snapshot = remote_snapshot(&[doc("u1", "n", "", "pdf", 5)], "");
+        snapshot.docs[0].payload_hash = Some("abc".to_string());
+        let locals = vec![with_hash(local("n.pdf", DocKind::Pdf, 10, 1), "abc")];
+        let plan_adopt = plan(two_way(), &locals, &snapshot, &SyncState::default());
+        assert_eq!(
+            plan_adopt.actions,
+            vec![SyncAction::Adopt {
+                path: "n.pdf".to_string(),
+                kind: DocKind::Pdf,
+                uuid: "u1".to_string(),
+                last_modified: 5,
+                hash: "abc".to_string()
+            }]
+        );
+
+        // Different content: stays a conflict under Skip.
+        let locals = vec![with_hash(local("n.pdf", DocKind::Pdf, 10, 1), "zzz")];
+        let plan_conflict = plan(two_way(), &locals, &snapshot, &SyncState::default());
+        assert_eq!(conflicts(&plan_conflict), ["n.pdf"]);
+    }
+
+    #[test]
+    fn device_hash_candidates_are_lazy() {
+        let mut state = SyncState::default();
+        state.entries.insert(
+            "changed.pdf".to_string(),
+            entry_hashed("u1", DocKind::Pdf, 10, 1, 5, "a", "a"),
+        );
+        state.entries.insert(
+            "same.pdf".to_string(),
+            entry_hashed("u2", DocKind::Pdf, 10, 1, 5, "b", "b"),
+        );
+        let items = vec![
+            doc("u1", "changed", "", "pdf", 9),   // lastModified moved
+            doc("u2", "same", "", "pdf", 5),      // unchanged
+            doc("u3", "twin", "", "epub", 5),     // unmapped, local twin
+            doc("u4", "lonely", "", "pdf", 5),    // unmapped, no local twin
+            doc("u5", "note", "", "notebook", 9), // never hashed
+        ];
+        let snapshot = remote_snapshot(&items, "");
+        let locals = vec![local("twin.epub", DocKind::Epub, 10, 1)];
+        let wanted = device_hash_candidates(&locals, &snapshot, &state);
+        assert_eq!(
+            wanted,
+            [("u1".to_string(), "pdf"), ("u3".to_string(), "epub")]
+        );
+    }
+
+    #[test]
+    fn sync_state_path_is_order_independent() {
+        assert_eq!(
+            sync_state_path("/home/u/books", "rm:/Books"),
+            sync_state_path("rm:/Books", "/home/u/books")
+        );
+        assert_ne!(
+            sync_state_path("/home/u/books", "rm:/Books"),
+            sync_state_path("/home/u/books", "rm:/Other")
+        );
     }
 
     // ---- deletions --------------------------------------------------------
@@ -3458,7 +3956,8 @@ mod tests {
             vec![SyncAction::UpdateRemote {
                 local: "n.pdf".to_string(),
                 kind: DocKind::Pdf,
-                uuid: "u1".to_string()
+                uuid: "u1".to_string(),
+                hash: None
             }]
         );
 
@@ -3591,6 +4090,8 @@ mod tests {
             local_mtime_ms: a_mtime,
             remote_last_modified: b_mtime,
             remote_size: Some(b_size),
+            local_hash: None,
+            payload_hash: None,
         }
     }
 

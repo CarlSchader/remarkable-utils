@@ -9,7 +9,7 @@
 
 use std::fs;
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -280,6 +280,9 @@ enum BuiltSide {
     Fs {
         endpoint: Box<dyn FsEndpoint>,
         is_local: bool,
+        /// Stable identity for archive keying (canonical local path,
+        /// or `destination:path` for ssh hosts).
+        identity: String,
     },
     Tablet {
         client: Box<Client>,
@@ -298,10 +301,21 @@ fn build_side(
     remote_kind: Option<RemoteKindArg>,
 ) -> Result<BuiltSide> {
     match endpoint {
-        Endpoint::Local(path) => Ok(BuiltSide::Fs {
-            endpoint: Box::new(LocalFs::new(path)),
-            is_local: true,
-        }),
+        Endpoint::Local(path) => {
+            // Canonicalize so `./books`, `books`, and the absolute
+            // path all key the same archive. Falls back to the raw
+            // path when the directory does not exist yet (pull into
+            // a fresh directory).
+            let identity = fs::canonicalize(&path)
+                .unwrap_or_else(|_| PathBuf::from(&path))
+                .display()
+                .to_string();
+            Ok(BuiltSide::Fs {
+                endpoint: Box::new(LocalFs::new(path)),
+                is_local: true,
+                identity,
+            })
+        }
         Endpoint::Remote { destination, path } => {
             let session = make_session(cli, &destination)?;
             let is_tablet = match remote_kind {
@@ -323,6 +337,7 @@ fn build_side(
                 })
             } else {
                 Ok(BuiltSide::Fs {
+                    identity: format!("{destination}:{}", path.trim_end_matches('/')),
                     endpoint: Box::new(SshFs::new(session, path, progress.clone())),
                     is_local: false,
                 })
@@ -352,25 +367,53 @@ fn run_sync(cli: &Cli, progress: Arc<dyn Progress>) -> Result<()> {
     match (src_side, dst_side) {
         (
             BuiltSide::Fs {
-                endpoint, is_local, ..
+                endpoint, identity, ..
             },
-            BuiltSide::Tablet { client, path, .. },
+            BuiltSide::Tablet {
+                client,
+                path,
+                destination,
+            },
         ) => {
-            let _ = is_local;
+            let state_path =
+                sync::sync_state_path(&identity, &tablet_identity(&destination, &path));
             run_device_sync(
-                cli, &progress, &*endpoint, &client, &path, true, *two_way, *delete, *conflict,
+                cli,
+                &progress,
+                &*endpoint,
+                &client,
+                &path,
+                &state_path,
+                true,
+                *two_way,
+                *delete,
+                *conflict,
                 *dry_run,
             )
         }
         (
-            BuiltSide::Tablet { client, path, .. },
+            BuiltSide::Tablet {
+                client,
+                path,
+                destination,
+            },
             BuiltSide::Fs {
-                endpoint, is_local, ..
+                endpoint, identity, ..
             },
         ) => {
-            let _ = is_local;
+            let state_path =
+                sync::sync_state_path(&identity, &tablet_identity(&destination, &path));
             run_device_sync(
-                cli, &progress, &*endpoint, &client, &path, false, *two_way, *delete, *conflict,
+                cli,
+                &progress,
+                &*endpoint,
+                &client,
+                &path,
+                &state_path,
+                false,
+                *two_way,
+                *delete,
+                *conflict,
                 *dry_run,
             )
         }
@@ -378,16 +421,18 @@ fn run_sync(cli: &Cli, progress: Arc<dyn Progress>) -> Result<()> {
             BuiltSide::Fs {
                 endpoint: src_ep,
                 is_local: src_local,
+                identity: src_id,
             },
             BuiltSide::Fs {
                 endpoint: dst_ep,
                 is_local: dst_local,
+                identity: dst_id,
             },
         ) => run_files_sync(
             cli,
             &progress,
-            (src_ep, src_local),
-            (dst_ep, dst_local),
+            (src_ep, src_local, src_id),
+            (dst_ep, dst_local, dst_id),
             *two_way,
             *delete,
             *conflict,
@@ -415,6 +460,11 @@ fn run_sync(cli: &Cli, progress: Arc<dyn Progress>) -> Result<()> {
             *dry_run,
         ),
     }
+}
+
+/// Stable archive-keying identity for a tablet endpoint.
+fn tablet_identity(destination: &str, path: &str) -> String {
+    format!("{destination}:{}", path.trim_end_matches('/'))
 }
 
 /// Sync between two tablets via `.rmdoc` bundle streaming.
@@ -548,6 +598,7 @@ fn run_device_sync(
     fs_side: &dyn FsEndpoint,
     client: &Client,
     remote_path: &str,
+    state_path: &Path,
     fs_is_src: bool,
     two_way: bool,
     delete: bool,
@@ -585,11 +636,22 @@ fn run_device_sync(
         Err(err) => return Err(err.into()),
     };
 
-    let (fs_entries, ignored) = fs_side
+    let (mut fs_entries, ignored) = fs_side
         .snapshot()
         .with_context(|| format!("reading {}", fs_side.label()))?;
-    let snapshot = sync::remote_snapshot(&items, &root_uuid);
-    let mut state = sync::SyncState::load_from(fs_side)?;
+    let mut snapshot = sync::remote_snapshot(&items, &root_uuid);
+    let mut state = sync::SyncState::load(state_path)?;
+    warn_legacy_state(cli, fs_side);
+
+    // Content hashes: local files stamp-gated against the archive
+    // (unchanged files are never re-read), device payloads lazily,
+    // in one batched round trip, only where a decision needs one.
+    sync::attach_hashes(fs_side, &mut fs_entries, &state)
+        .with_context(|| format!("hashing files in {}", fs_side.label()))?;
+    let wanted = sync::device_hash_candidates(&fs_entries, &snapshot, &state);
+    let payload_hashes = client.payload_hashes(&wanted)?;
+    sync::attach_payload_hashes(&mut snapshot, &payload_hashes);
+
     let plan = sync::plan(options, &fs_entries, &snapshot, &state);
 
     if dry_run {
@@ -611,6 +673,7 @@ fn run_device_sync(
         &plan,
         &mut folders,
         &mut state,
+        state_path,
     )?;
 
     outcome
@@ -662,20 +725,21 @@ fn run_device_sync(
 fn run_files_sync(
     cli: &Cli,
     progress: &Arc<dyn Progress>,
-    src: (Box<dyn FsEndpoint>, bool),
-    dst: (Box<dyn FsEndpoint>, bool),
+    src: (Box<dyn FsEndpoint>, bool, String),
+    dst: (Box<dyn FsEndpoint>, bool, String),
     two_way: bool,
     delete: bool,
     conflict: ConflictArg,
     dry_run: bool,
 ) -> Result<()> {
-    let (src_ep, src_local) = src;
-    let (dst_ep, dst_local) = dst;
+    let (src_ep, src_local, src_id) = src;
+    let (dst_ep, dst_local, dst_id) = dst;
 
-    // The state file lives on side "A": the local side when exactly
-    // one side is local, otherwise the first argument's side. Keep
-    // argument order consistent for non-local pairs so state is found.
+    // Side "A" is the local side when exactly one side is local,
+    // otherwise the first argument's side. The archive itself lives
+    // on this machine either way, keyed order-independently.
     let a_is_src = src_local || !dst_local;
+    let state_path = sync::sync_state_path(&src_id, &dst_id);
     let (a, b) = if a_is_src {
         (src_ep, dst_ep)
     } else {
@@ -709,7 +773,8 @@ fn run_files_sync(
     let (b_entries, b_ignored) = b
         .snapshot()
         .with_context(|| format!("reading {}", b.label()))?;
-    let mut state = sync::SyncState::load_from(&*a)?;
+    let mut state = sync::SyncState::load(&state_path)?;
+    warn_legacy_state(cli, &*a);
     let plan = sync::plan_files(options, &a_entries, &b_entries, &state);
 
     info(cli, format!("A = {}, B = {}", a.label(), b.label()));
@@ -722,7 +787,7 @@ fn run_files_sync(
         return Ok(());
     }
 
-    let outcome = sync::execute_files(&*a, &*b, &**progress, &plan, &mut state)?;
+    let outcome = sync::execute_files(&*a, &*b, &**progress, &plan, &mut state, &state_path)?;
     outcome
         .conflicts
         .iter()
@@ -753,6 +818,24 @@ fn map_conflict(conflict: ConflictArg, src_is_local_side: bool) -> ConflictPolic
         ConflictArg::Src => ConflictPolicy::PreferRemote,
         ConflictArg::Dst if src_is_local_side => ConflictPolicy::PreferRemote,
         ConflictArg::Dst => ConflictPolicy::PreferLocal,
+    }
+}
+
+/// One-time nudge: sync state moved out of the synced tree; an old
+/// in-root `.rmu-sync.json` is ignored and can be deleted.
+fn warn_legacy_state(cli: &Cli, fs_side: &dyn FsEndpoint) {
+    if let Some(root) = fs_side.as_local_path("")
+        && root.join(sync::LEGACY_STATE_FILE_NAME).exists()
+    {
+        info(
+            cli,
+            format!(
+                "note: sync state now lives under ~/.local/state/rmu; the legacy {} in {} \
+                 is ignored and can be deleted",
+                sync::LEGACY_STATE_FILE_NAME,
+                fs_side.label(),
+            ),
+        );
     }
 }
 

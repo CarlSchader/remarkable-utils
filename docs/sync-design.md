@@ -1,20 +1,25 @@
-# Design: `rmu sync`
+# Design: `rmu sync` (v2 — content-addressed)
 
-Status: **phases 1–2 implemented and device-verified** (see the tested
-checklists in `TODO.md`); **phase 3 implemented, device verification
-pending**: the `FsEndpoint` abstraction (local dirs + generic ssh
-hosts), fs↔fs sync in every pairing (verified end-to-end for
-local↔local), and tablet↔tablet sync via bundle streaming. Update this
-file if the design changes during implementation.
+Status: **v1 phases 1–3 implemented and device-verified** (one-way,
+two-way, `--delete`, conflict policies, fs↔fs, tablet↔tablet). **v2
+phase 1 implemented, device verification pending**: content hashing,
+the XDG archive, refresh/adoption. v2 phases 2–4 are planned below.
+Update this file as phases land.
+
+The v2 redesign borrows deliberately from the
+[Unison file synchronizer](https://github.com/bcpierce00/unison)
+(archives, fastcheck, fingerprint-verified pairing) while keeping
+rmu's defining constraint: **no remote agent** — the tablet side is
+busybox ssh and batched shell scripts only.
 
 ## Goal
 
 Sync a local directory with a folder (or the root) of the reMarkable's
-logical filesystem, in either direction — or eventually between any two
-endpoints. Only supported file types participate; everything else is left
-untouched. Implemented as an `rmu` subcommand (not a separate binary) so it
-reuses the SSH session, auth flags, transfer machinery, conversions, and
-progress reporting.
+logical filesystem, in either direction — or between any two endpoints.
+Only supported file types participate (`.pdf`, `.epub`, `.rmdoc`);
+everything else is left untouched. Implemented as an `rmu` subcommand so
+it reuses the SSH session, auth flags, transfer machinery, and progress
+reporting.
 
 ## CLI
 
@@ -22,291 +27,179 @@ progress reporting.
 rmu sync <SRC> <DST>                  # one-way: copy changes from SRC to DST
 rmu sync ./books remarkable:/books    # PC -> tablet ("push")
 rmu sync remarkable:/books ./books    # tablet -> PC ("pull")
-rmu sync --two-way ./books remarkable:/books   # phase 2: bidirectional
+rmu sync --two-way ./books remarkable:/books   # bidirectional
 ```
-
-Flags:
 
 | Flag | Meaning |
 |---|---|
 | `--dry-run` | Print the action plan (stdout), change nothing |
 | `--delete` | Propagate deletions (opt-in, rsync-style) |
-| `--two-way` | Bidirectional; argument order stops mattering (phase 2) |
-| `--conflict skip\|newest\|src\|dst` | Conflict policy; default `skip` (phase 2) |
-| `--remote-kind remarkable\|fs` | Override endpoint auto-detection (escape hatch) |
+| `--two-way` | Bidirectional; argument order stops mattering |
+| `--conflict skip\|newest\|src\|dst` | Conflict policy; default `skip` |
+| `--remote-kind remarkable\|fs` | Override endpoint auto-detection |
 
-Implementation notes (phase 1):
-
-- A push whose device folder does not exist creates it (`mkdir -p`
-  semantics); a pull creates the local root directory.
-- Only folders that will receive synced content are created — a local
-  directory containing nothing but unsupported files does not produce
-  an empty device folder.
-- A mapped file deleted on the *destination* is recopied
-  (rsync-without-`--delete` semantics), on both push and pull.
-- The regular `--host`/`--user` flags are ignored by sync; `--port`
-  (now optional everywhere) is only passed to ssh when given, so ssh
-  config `Port` works.
-
-Direction is determined by **argument order**, exactly like `scp`/`rsync`:
-the first argument is the source, the second the destination. There are no
-`--push`/`--pull` flags.
-
-### Endpoint syntax (scp conventions)
-
-Remote endpoints use scp syntax: `[user@]host:path`.
-
-- An argument is remote iff it contains a `:` **before the first `/`**
-  (`./weird:name` is local; prefix a colon-containing local path with `./`).
-- `user@host:path` splits at the first `:`. An empty path after `:` means
-  the endpoint root.
-- The host string is handed to the system `ssh` binary verbatim, so
-  **ssh config resolution comes for free**: `remarkable:/books` uses
-  whatever `Host remarkable` resolves to (`HostName`, `User`, `Port`,
-  `IdentityFile`, `ProxyJump`, ...). No `user@` means ssh config (or ssh's
-  defaults) picks the user — sync does not force `root@`.
-- The global `--host`/`--user` flags do **not** apply to sync (endpoints
-  are self-contained); the connection flags (`-i`, `-o`, `--password*`,
-  `--no-multiplex`) apply to every ssh endpoint.
+Direction is determined by **argument order**, exactly like `scp`/
+`rsync`. Endpoints use scp syntax (`[user@]host:path`, remote iff a `:`
+appears before the first `/`); the host string goes to the system `ssh`
+binary verbatim, so ssh config resolution comes for free. Remote
+endpoints are classified at runtime with one probe (`test -d
+<xochitl-dir> && test -e /usr/bin/xochitl`).
 
 ## Endpoint model
 
-Sync is defined over **two endpoints of three possible kinds**, not
-hardcoded "local vs. tablet":
+| Kind | Listing | Identity / change signal |
+|---|---|---|
+| `LocalDir` | filesystem walk | content hash; stat stamp gates re-hashing |
+| `Remarkable` (ssh) | `Client::list_items` logical tree | item UUID + `lastModified` + lazy payload hash |
+| `RemoteFs` (ssh, generic host) | remote `find`-based walk | rel path + mtime/size (hashes on demand via `sha256sum`) |
 
-| Kind | Listing | Identity / change signal | Conversions |
-|---|---|---|---|
-| `LocalDir` | filesystem walk | rel path + mtime/size | — |
-| `Remarkable` (ssh) | `Client::list_items` logical tree | item UUID + `lastModified` | notebook→`.rmdoc` from device |
-| `RemoteFs` (ssh, generic host) | remote `find`-based walk | rel path + mtime/size | — |
+Supported pairings: local↔tablet (the core feature), tablet↔tablet
+(`.rmdoc` bundle streaming, full fidelity), and fs↔fs (feature-poor
+rsync, exists for consistency).
 
-Conversion rules activate only when **exactly one side is a
-`Remarkable`**. Supported pairings:
+## Identity: content-addressed, not path-keyed
 
-- **local ↔ tablet** — the core feature (phase 1).
-- **tablet ↔ tablet** — copy documents between devices via `.rmdoc`
-  bundle streaming (full fidelity: notebooks, annotations,
-  everything). Identity is the **logical path** (folder path + name);
-  each side has its own UUID per document, recorded in a pair-state
-  file kept on the initiating computer
-  (`$XDG_STATE_HOME/rmu/sync-pair-<hash>.json`, keyed
-  order-independently by the endpoint pair). A side counts as changed
-  when its UUID *or* `lastModified` moved — a replaced document is
-  just a changed document. "Updating" replaces the destination copy
-  wholesale (delete + fresh restore): bundles carry everything and ink
-  cannot be merged. Consequence: renaming a folder re-keys its
-  contents (delete + recopy on next `--delete` sync; conflicts
-  otherwise).
-- **local ↔ generic host / pc ↔ pc** — plain file-tree sync via
-  `SshFs`/`LocalFs`. Honest caveats: for pure file trees this is a
-  feature-poor rsync (no delta transfer, and bytes flow through the
-  initiating machine even for ssh↔ssh pairs); it syncs only the
-  supported document types, and exists for consistency — use rsync for
-  general file trees.
+The v1 design keyed everything by relative path in a state file inside
+the sync root. That made moves look like delete+create, made state loss
+catastrophic, and put the state file in `git clean`'s blast radius. v2
+treats sync as a three-way diff over **three trees** — the archive
+(last agreed state), side A now, side B now — with content identity as
+the primary signal:
 
-### Runtime tablet detection
+- **fs entries**: SHA-256 of the content. The stat stamp (mtime+size)
+  gates re-hashing, Unison-fastcheck style: a file whose stamp matches
+  the archive is never re-read. Hashes are recorded into the archive on
+  every transfer, so steady-state syncs hash nothing.
+- **device entries**: UUID (a stronger identity than paths, and the
+  device provides it for free) + `lastModified` + payload hash. Payload
+  hashes are computed **lazily and batched**: one `sha256sum` round trip
+  per sync, covering only the documents where a decision actually needs
+  one (see below). The tablet's CPU is slow; eager whole-library hashing
+  would take minutes, lazy hashing takes seconds.
+- **paths are properties, not identities** — the groundwork for move
+  detection (phase 2).
 
-Each remote endpoint is classified with one probe command after
-connecting (connection multiplexing makes this near-free — the probe
-shares the master connection with the transfers that follow):
+Payload hashes are only meaningful for **payload-mirrored** kinds
+(pdf/epub, where the device payload is byte-identical to the local
+file). Notebooks/bundles are never hashed; their rules are unchanged.
 
-```sh
-test -d <xochitl-dir> && test -e /usr/bin/xochitl
-```
+### What the lazy device hashing covers (`device_hash_candidates`)
 
-The xochitl data dir (honoring `--xochitl-dir`) + binary is the signal
-(present on rM1, rM2, and Paper Pro — same software stack). Probe exit 1
-means "reachable but not a tablet"; ssh exit 255 is a connection error
-and fails the sync. `--remote-kind` overrides detection. Corroborating
-signals (os-release / device-tree strings) were considered and dropped
-as unnecessary; revisit only if the single probe misfires in practice.
+1. **Mapped docs whose `lastModified` moved** while the archive has a
+   payload hash: annotating a PDF bumps `lastModified` without touching
+   the payload. If the fresh hash matches the recorded one, the plan
+   emits `refresh` (state-only) instead of a re-download. This fixes
+   v1's documented "correct, occasionally wasteful" behavior.
+2. **Unmapped path collisions** (same pull path on both sides, no
+   archive entry — typically after archive loss): if the local hash and
+   the payload hash agree and the kinds match, the plan emits `adopt`
+   (state-only) — the pairing is re-established silently, under any
+   conflict policy, in any mode. **Archive loss is benign**: only
+   genuinely divergent files surface as conflicts.
 
-## The core problem: identity, not transfer
+Symmetrically, a touched-but-identical local file (`touch`, re-save)
+produces `refresh`, not a re-upload.
 
-Transfer is solved by existing code. The hard part is knowing that local
-`Name.rmdoc` *is* device document `abc-123`, because the conversions are
-asymmetric:
+## The archive
 
-- Notebooks pull as `Name.rmdoc`, which uploads back under a *fresh UUID*
-  by design — a loop.
-- The device allows duplicate sibling names; filesystems do not.
-
-### Sync state file
-
-A versioned JSON state file (`.rmu-sync.json`) records, per synced entry:
+A versioned JSON file per endpoint pair recording, per synced entry:
 
 ```
 relative path <-> device UUID,
-last-synced local mtime+size,
-last-synced remote lastModified
+last-synced local mtime+size and SHA-256,
+last-synced device lastModified and payload SHA-256
 ```
 
-This enables true **three-way diffing** (last-synced state vs. src now
-vs. dst now), which is what distinguishes "unchanged", "changed on one
-side", "changed on both" (conflict), and — with `--delete` — "deleted
-since last sync" vs. "never existed". It also breaks the notebook loop
-above: a state-mapped `Name.rmdoc` knows its device document, so a pull
-only happens when the device side actually changed.
+Placement: `$XDG_STATE_HOME/rmu/sync-<pairhash>.json` (or
+`~/.local/state/rmu/`), keyed **order-independently** by the two
+endpoint identities (canonicalized local path; `destination:path` for
+remote endpoints), so push and pull over the same pair share one
+archive. Never inside the synced tree: no git pollution, no accidental
+deletion, overlapping roots each get their own archive. tablet↔tablet
+pair-state files live in the same directory (`sync-pair-<hash>.json`).
 
-Placement (phase 1): in the local sync root. When tablet↔tablet lands
-(phase 3), state moves to the initiating computer, keyed by the
-endpoint pair. Users should gitignore it. Written **incrementally after
-each action** so an interrupted sync resumes cleanly.
+Written **incrementally after each action** (temp file + atomic rename)
+so an interrupted sync resumes cleanly. A legacy in-root
+`.rmu-sync.json` is ignored (a note suggests deleting it); hash
+adoption re-pairs its contents on the first v2 run.
 
-## What syncs (local ↔ tablet)
+Consequences accepted: moving a synced directory to a new path starts a
+fresh archive (adoption re-pairs it on first contact); two machines
+syncing the same tree keep independent archives (as Unison does).
 
-| Local file | Toward tablet | From tablet |
-|---|---|---|
-| `.pdf` / `.epub` | upload; **update-in-place** if mapped (overwrite `<uuid>.<ext>`, bump `lastModified` — preserves annotations and location) | download payload when remote changed |
-| `.rmdoc` | **new/unmapped file only** — treated as a restore (fresh UUID), then mapped. Mapped `.rmdoc`s are never pushed back (see below) | notebooks pull as `Name.rmdoc` when `lastModified` moved |
-| anything else | ignored, left in place | n/a |
+## Update detection and planning
 
-Device folders map to directories, created as needed in both directions.
-Excluded from sync: trash and orphan items, duplicate sibling names, and
-names that don't sanitize to a valid filename — skip with a warning,
-consistent with the repo-wide "never guess on ambiguity" invariant.
+Pure planner, thin executor (repo convention). Inputs: local snapshot
+(with hashes attached), device snapshot (with lazy payload hashes
+attached), archive, mode/policy. Output: an ordered `Vec<SyncAction>`.
 
-### Why mapped `.rmdoc`s are pull-only
+Per key, the three-way presence table (archive × local × remote)
+decides; when stamps moved, content verdicts override stamp verdicts:
 
-1. An `.rmdoc` is an opaque backup (zipped `.rm` stroke data). Nothing on
-   a computer edits it, so a *mapped* local `.rmdoc` differing from the
-   device means it is stale (fix: pull) or corrupted (pushing it back
-   would be exactly wrong).
-2. Stroke data cannot be merged. If the tablet was drawn on since the
-   last pull, versions have diverged and someone's ink gets destroyed.
-   The tablet is the only writer of notebook content, so the tablet wins.
-3. `upload_rmdoc` re-targets to a fresh UUID by design (restores must not
-   collide with a live original). Pushing a mapped `.rmdoc` back would
-   therefore *duplicate*, not update — and the next pull would hit a
-   duplicate-sibling ambiguity.
+- both stamps clean → nothing
+- stamp moved, content identical (hash known) → `refresh` (state-only)
+- content changed on one side → transfer toward the other (mode
+  permitting); update-in-place preserves annotations and tree location
+- content changed on both → `--conflict` policy; default `skip` loses
+  nothing
+- unmapped collision, hash-identical → `adopt`; hash-different →
+  policy (adoption toward the device only for matching payload types;
+  handwriting is never overwritten)
+- mapped, one side gone → recopy or (with `--delete`) delete; a
+  deletion racing a change is a conflict
+- both gone → `forget`
 
-A brand-new local `.rmdoc` with no mapping is a deliberate restore
-(user copied a backup in) and is pushed as one.
+Ordering: state-only actions (rebind/adopt/refresh) → folder creates →
+transfers → deletions (docs, then folders emptied *by this plan*,
+children first; pre-existing empty folders are never touched) →
+forgets → notes.
 
-## Change detection and conflicts
+Unchanged v1 rules that remain data-safety invariants:
 
-- Local/RemoteFs changed: mtime+size differs from state. (Content hashing
-  deliberately omitted from the MVP; can be added behind the same planner
-  interface later.)
-- Remarkable changed: `lastModified` differs from state. Caveat:
-  annotating a PDF bumps `lastModified` without changing the payload, so
-  a pull may re-download an identical payload — correct, occasionally
-  wasteful.
-- One-way mode: "conflict" means the *destination* changed since last
-  sync; default is skip + warn rather than silently overwrite. One
-  asymmetry, on purpose: in **push** mode a remote-only change is
-  silently left alone (the device's `lastModified` moves for benign
-  reasons — annotations — and warning on every push would be noise),
-  while in **pull** mode a local-only change warns (a local mtime
-  moving usually means real edits).
-- Two-way mode: both sides changed → `--conflict` policy; default
-  `skip` reports and loses nothing. `newest` compares local mtime with
-  device `lastModified` (ties go to local; beware clock skew);
-  `src`/`dst` pick a fixed side based on argument order.
-- Policies also apply to **unmapped collisions** (same path on both
-  sides, no state): a resolved winner *adopts* the pairing — the state
-  file maps them and the loser is overwritten. Adoption toward the
-  device only happens for matching types (pdf↔pdf, epub↔epub);
-  handwriting is never overwritten regardless of policy.
-- Deletions (`--delete`) propagate only for **mapped** files — unlike
-  rsync, something that was never synced is never deleted. A deletion
-  racing a change on the other side is a conflict: `skip` reports,
-  `newest` lets the surviving change win (a deletion has no
-  timestamp), `src`/`dst` decide. When the keep-side wins, the stale
-  mapping is forgotten so the survivor becomes an ordinary untracked
-  file. For fs↔tablet, a folder emptied *by this plan's deletions* is
-  deleted too (children before parents; never the sync root). Only
-  folders that lost content to the plan qualify — a pre-existing empty
-  folder was never synced, so it is never touched. Device-side folder
-  deletes are planner-verified against the full snapshot (skipped
-  items count as occupants); local-side directory deletes execute as
-  remove-if-empty, so files sync cannot see (unsupported types,
-  dotfiles) keep a directory alive. fs↔fs and tablet↔tablet syncs
-  still leave emptied folders behind; that's accepted noise for now.
-- Mappings whose files vanished on *both* sides are dropped from the
-  state file (`forget` actions in the plan).
-- **Interrupted-sync recovery.** State is written after each transfer,
-  so a kill between "device write finished" and "state saved" leaves a
-  dangling mapping plus an unmapped device document. Two defenses:
-  uploads write `.metadata` **last** (both the register sequence and
-  the `.rmdoc` tar entry order), so an interruption mid-write leaves
-  invisible orphan files rather than a visible half-document; and the
-  planner **rebinds** a dangling mapping to a same-name, same-kind
-  unmapped document (state-only `rebind` action, ordered first) instead
-  of wedging on name collisions. A rebound document whose
-  `lastModified` differs from the recorded one is treated as a normal
-  remote change (e.g. pull re-downloads it). Because a rebind implies a
-  previous run wrote to the device and likely died before its xochitl
-  restart, rebinds count as device modifications — the resume run
-  restarts xochitl so the recovered document actually appears in the
-  UI.
-- First sync (no state): union merge — copy what exists only on one
-  side; same name on both sides with no state to arbitrate = conflict
-  (resolvable by policy, see adoption above).
+- Mapped `.rmdoc`s are pull-only (ink cannot be merged; the tablet is
+  the only writer of notebook content). A brand-new local `.rmdoc` is a
+  deliberate restore (fresh UUID).
+- Trash, orphans, duplicate sibling names, and unusable filenames are
+  excluded with warnings — never guessed.
+- `--delete` only propagates deletions of **mapped** files.
+- Uploads write `.metadata` last, so interruption leaves invisible
+  orphans, not half-documents; dangling mappings **rebind** to
+  same-name same-kind successors.
 
-## Architecture
+## Executor
 
-Following repo conventions (pure logic separated from I/O):
+Applies actions in order, emits `Progress` steps, saves the archive
+after every action, restarts xochitl **once** at the end (via
+`reset-failed` first — see `AGENTS.md`). Transfers record fresh hashes
+into the archive: for pdf/epub the uploaded/downloaded bytes are the
+payload, so one hash serves both sides.
 
-1. **`libremarkable-utils/src/sync.rs` — pure planner.** Inputs: the
-   local snapshot (`LocalEntry` list), the device snapshot
-   (`RemoteSnapshot`), previous state, and the direction. Output:
-   ordered `Vec<SyncAction>`: `CreateRemoteFolder`, `Upload`,
-   `UpdateRemote`, `Download`, `Skip { path, reason }`. Conflicts are
-   expressed as `Skip` with an explanatory reason in phase 1; a
-   dedicated `Conflict` variant with a resolution arrives with the
-   phase-2 `--conflict` policies. `Delete*` actions arrive with
-   `--delete`. Zero I/O — exhaustively unit-tested with fabricated
-   snapshots (creates/updates/conflicts/loop-prevention/duplicate
-   names/first-sync/recopy).
-2. **Executor.** Applies actions in dependency order (folders before
-   contents; deletions last, once they exist), emits `Progress` steps
-   (`"[3/17] upload notes.pdf"`), writes state incrementally, and
-   restarts xochitl **once** at the end, not per file.
-3. **Endpoint abstraction (phase 3).** The file-tree side is a
-   `FsEndpoint` trait (`snapshot`/`read`/`write`/`remove`/`stat` +
-   state-file I/O) with two implementations: `LocalFs` and `SshFs`
-   (generic ssh host; POSIX commands, GNU/BSD `stat` probed inline).
-   `as_local_path` lets local endpoints keep streamed transfers; ssh
-   endpoints buffer documents through memory. The device side is not
-   an `FsEndpoint` — it has a logical document model instead.
-4. **Three planners, one decision table.** The symmetric pairings
-   (fs↔fs `plan_files`, tablet↔tablet `plan_docs`) share one
-   side-agnostic three-way table (`decide_pair`: presence × changed ×
-   mode × policy). The fs↔tablet planner keeps its own table because
-   its rules are inherently asymmetric (conversions, rmdoc pull-only).
-5. **State placement.** fs↔tablet: on the fs side. fs↔fs: on the
-   local side when exactly one side is local, otherwise the first
-   argument's side (keep argument order consistent for such pairs).
-   tablet↔tablet: on the initiating computer, order-independent.
-3. **CLI.** `--dry-run` renders the plan to stdout (that *is* the
-   output); summary and progress to stderr, honoring `--quiet`, per the
-   repo's output discipline.
+## Roadmap
 
-New `Client` primitive required: `update_payload(uuid, source)` —
-overwrite an existing document's payload file and bump `lastModified`
-(preserves annotations and tree location). Small; composes existing ssh
-methods.
-
-## Phasing
-
-- **Phase 1 (MVP):** `rmu sync <SRC> <DST>`, scp endpoint syntax,
-  endpoint detection, `LocalDir` + `Remarkable` endpoints, one-way with
-  state file, `--dry-run`, skip+warn on destination drift, `.rmdoc`
-  rules as above.
-- **Phase 2 (implemented):** `--two-way`, `--conflict` policies,
-  `--delete`, unmapped-collision adoption, stale-mapping cleanup. The
-  planner was rewritten as a single per-key decision table over
-  (state, local, remote) presence × mode — one-way modes are now just
-  restricted projections of the same table.
-- **Phase 3 (implemented):** `FsEndpoint` trait (`LocalFs`, `SshFs`),
-  generic-host and pc↔pc sync (`plan_files`/`execute_files` over the
-  shared `decide_pair` table), tablet↔tablet via bundle streaming
-  (`plan_docs`/`execute_docs`, pair-state on the initiating machine).
-  `--remote-kind` now selects between tablet and generic-host for any
-  remote endpoint.
-- **Later candidates:** pull annotated PDFs as `.rmdoc`, content
-  hashing, watch mode, delta transfer for fs↔fs.
+- **v2 phase 1 (implemented):** sha2; XDG archive with atomic writes;
+  stamp-gated local hashing; lazy batched device payload hashing;
+  `refresh` and `adopt` actions; legacy state-file warning.
+- **v2 phase 2 (planned): unified planner + move detection.** One
+  `Entry`/`Snapshot` model for both endpoint kinds; a single three-way
+  decision table (the md/txt conversion asymmetry is gone) with folders
+  as first-class entries; file-level move detection (vanished hash +
+  appeared hash, strict 1:1, filename tie-break, ambiguity → note) —
+  device moves become one metadata write (annotations preserved, zero
+  bytes); copy-by-fingerprint (new local file whose hash matches an
+  existing payload → on-device `cp` instead of upload).
+- **v2 phase 3 (planned):** folder-level move pairing (device folders
+  have UUIDs; a folder rename is one metadata write for the whole
+  subtree); incremental device listing (stat all `.metadata`/`.content`
+  first, cat only what changed since the cached listing — no-op syncs
+  of large libraries stop re-reading every JSON).
+- **v2 phase 4 (candidates):** bounded transfer pipelining over the
+  multiplexed connection (measure first); watch mode (local notify +
+  cheap device polling); `--paranoid` full re-hash; exclude patterns;
+  `--dry-run --json`.
+- **Explicitly out of scope:** rsync-style block-delta transfer — it
+  requires simultaneous computation on both ends, i.e. a remote agent,
+  which rmu deliberately does not have. Payloads are replaced wholesale
+  in practice, so the value would be low anyway.
 
 Testing: the planner carries the correctness burden in unit tests; the
 executor is verified against a real device, `--dry-run` first.

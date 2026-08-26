@@ -16,11 +16,14 @@
 
 ### Next dev steps
 
-- [ ] Sync niceties: content hashing as an alternative
-  change signal (mtime/size lies on some filesystems), exclude patterns,
-  a `--pull-bundles` mode (annotated PDFs as `.rmdoc` instead of bare
-  payload), and a machine-readable `--dry-run --json` plan.
-- [ ] Try to remove dependence on `.rmu-sync.json` files. Try and do whatever `git` does. This may require hashing files.
-- [ ] Move/rename detection for sync: content hashes in the state file
-  (git-style), `MoveRemote` (metadata-only, preserves annotations) and
-  `MoveLocal` actions instead of delete+reupload.
+- [x] Sync v2 phase 1: content hashing (stat-gated local, lazy batched
+  device payloads), XDG archive keyed by endpoint pair, refresh/adopt
+  actions (archive loss is now benign). Device verification pending.
+- [ ] Sync v2 phase 2: unified planner (`Entry`/`Snapshot`, one
+  three-way table, folders as entries), file-level move detection
+  (metadata-only device moves), copy-by-fingerprint.
+- [ ] Sync v2 phase 3: folder-level move pairing, incremental device
+  listing (stat first, cat only changes).
+- [ ] Sync v2 phase 4 candidates: bounded transfer pipelining, watch
+  mode, `--paranoid` re-hash, exclude patterns, `--dry-run --json`,
+  `--pull-bundles` (annotated PDFs as `.rmdoc`).

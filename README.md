@@ -111,15 +111,20 @@ file tree. Tablet↔tablet sync streams `.rmdoc` bundles between devices, so
 notebooks and annotations arrive intact.
 
 Only supported files participate (`.pdf`, `.epub`, `.rmdoc`); everything
-else is left alone. Notebooks pull as `.rmdoc`
-bundles; mapped `.rmdoc` files are pull-only
-(handwriting can't be merged — the tablet wins). A `.rmu-sync.json` state
-file in the local root (gitignore it) tracks the path↔document mapping so
-repeated syncs only transfer changes, and anything that changed on the
-destination since the last sync is skipped with a warning, never silently
-overwritten — unless you opt into a `--conflict` policy (`newest`, `src`,
-`dst`). `--delete` only ever removes files the sync itself created or
-tracked; files that were never synced are never deleted. See
+else is left alone. Notebooks pull as `.rmdoc` bundles; mapped `.rmdoc`
+files are pull-only (handwriting can't be merged — the tablet wins).
+
+Sync keeps an archive per endpoint pair under `~/.local/state/rmu/`
+(never inside the synced tree) recording what both sides looked like at
+last sync, including content hashes: repeated syncs only transfer real
+changes — touched-but-identical files and annotation-only device
+changes are recognized by hash and skipped. If the archive is ever
+lost, identical files re-pair automatically; only genuinely divergent
+files surface. Anything that changed on the destination since the last
+sync is skipped with a warning, never silently overwritten — unless
+you opt into a `--conflict` policy (`newest`, `src`, `dst`).
+`--delete` only ever removes files the sync itself created or tracked;
+files that were never synced are never deleted. See
 `docs/sync-design.md` for the full model.
 
 Connecting over Wi-Fi or a non-default setup:

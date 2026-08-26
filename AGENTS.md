@@ -67,12 +67,14 @@ This repository is **open source** (dual-licensed MIT OR Apache-2.0):
   these as indicatif bars on stderr. New long-running `Client`
   operations must emit steps and call `finished()` on completion.
 - `sync.rs` — `rmu sync`: scp-style endpoint parsing, the `FsEndpoint`
-  trait (`LocalFs`, `SshFs`), snapshots, sync-state files, **pure**
+  trait (`LocalFs`, `SshFs`), snapshots, content hashing (stat-gated
+  local hashes; lazy batched device payload hashes), the XDG archive
+  (`$XDG_STATE_HOME/rmu/`, never inside the synced tree), **pure**
   planners (heavily unit-tested), and thin executors. Three pairings:
-  fs↔tablet (its own asymmetric decision table: conversions, rmdoc
+  fs↔tablet (its own asymmetric decision table: rmdoc
   pull-only), and fs↔fs + tablet↔tablet (one
   shared symmetric table, `decide_pair`). Keep planner logic pure; see
-  `docs/sync-design.md` for semantics and state-file placement rules.
+  `docs/sync-design.md` for semantics and archive placement rules.
 - `status.rs` — device system state (`rmu status`): one
   marker-sectioned SSH round trip, pure best-effort parsing (every
   field `Option`al — firmware/models differ), pure rendering.
