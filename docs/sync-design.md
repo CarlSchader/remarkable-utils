@@ -218,8 +218,15 @@ A brand-new local `.rmdoc` with no mapping is a deliberate restore
   `newest` lets the surviving change win (a deletion has no
   timestamp), `src`/`dst` decide. When the keep-side wins, the stale
   mapping is forgotten so the survivor becomes an ordinary untracked
-  file. Deleting documents never removes now-empty folders (either
-  side); that's accepted noise for now.
+  file. For fs↔tablet, a folder emptied *by this plan's deletions* is
+  deleted too (children before parents; never the sync root). Only
+  folders that lost content to the plan qualify — a pre-existing empty
+  folder was never synced, so it is never touched. Device-side folder
+  deletes are planner-verified against the full snapshot (skipped
+  items count as occupants); local-side directory deletes execute as
+  remove-if-empty, so files sync cannot see (unsupported types,
+  dotfiles) keep a directory alive. fs↔fs and tablet↔tablet syncs
+  still leave emptied folders behind; that's accepted noise for now.
 - Mappings whose files vanished on *both* sides are dropped from the
   state file (`forget` actions in the plan).
 - **Interrupted-sync recovery.** State is written after each transfer,

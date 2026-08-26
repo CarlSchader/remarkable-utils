@@ -624,8 +624,8 @@ fn run_device_sync(
         cli,
         format!(
             "Sync complete: {} uploaded, {} updated, {} downloaded, {} deleted \
-             ({} local / {} device), {} folder(s) created, {} conflict(s), \
-             {} skipped, {} unsupported file(s) ignored.",
+             ({} local / {} device), {} folder(s) created, {} emptied folder(s) \
+             removed, {} conflict(s), {} skipped, {} unsupported file(s) ignored.",
             outcome.uploaded,
             outcome.updated,
             outcome.downloaded,
@@ -633,6 +633,7 @@ fn run_device_sync(
             outcome.deleted_local,
             outcome.deleted_remote,
             outcome.folders_created,
+            outcome.deleted_local_dirs + outcome.deleted_remote_folders,
             outcome.conflicts.len(),
             outcome.skipped.len(),
             ignored,

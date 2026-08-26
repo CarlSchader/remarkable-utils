@@ -422,6 +422,10 @@ pub trait FsEndpoint {
     fn write(&self, rel_path: &str, data: &[u8]) -> Result<()>;
     /// Remove a file; idempotent.
     fn remove(&self, rel_path: &str) -> Result<()>;
+    /// Remove a directory **only if empty**; returns whether it was
+    /// removed. Missing or non-empty directories are left alone
+    /// without error — the emptiness check is the safety mechanism.
+    fn remove_dir(&self, rel_dir: &str) -> Result<bool>;
     /// (size, mtime in ms).
     fn stat(&self, rel_path: &str) -> Result<(u64, i64)>;
     /// Read the sync-state file; `None` if absent.
@@ -475,6 +479,21 @@ impl FsEndpoint for LocalFs {
         match fs::remove_file(self.root.join(rel_path)) {
             Ok(()) => Ok(()),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    fn remove_dir(&self, rel_dir: &str) -> Result<bool> {
+        match fs::remove_dir(self.root.join(rel_dir)) {
+            Ok(()) => Ok(true),
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+                ) =>
+            {
+                Ok(false)
+            }
             Err(err) => Err(err.into()),
         }
     }
@@ -591,6 +610,16 @@ impl FsEndpoint for SshFs {
         self.session
             .run_checked(&format!("rm -f -- {}", shell_quote(&self.join(rel_path))))?;
         Ok(())
+    }
+
+    fn remove_dir(&self, rel_dir: &str) -> Result<bool> {
+        // POSIX rmdir refuses non-empty directories; that refusal is
+        // the safety mechanism, so a non-zero exit is "kept", not an
+        // error.
+        let output = self
+            .session
+            .run(&format!("rmdir -- {}", shell_quote(&self.join(rel_dir))))?;
+        Ok(output.status.success())
     }
 
     fn stat(&self, rel_path: &str) -> Result<(u64, i64)> {
@@ -743,6 +772,20 @@ pub enum SyncAction {
     /// Only emitted with `--delete`, and only for mapped files.
     DeleteLocal {
         path: String,
+    },
+    /// Remove a device folder emptied by this plan's deletions.
+    /// Only emitted with `--delete`; ordered after document
+    /// deletions, children before parents.
+    DeleteRemoteFolder {
+        rel_dir: String,
+        uuid: String,
+    },
+    /// Remove a local directory emptied by this plan's deletions.
+    /// Only emitted with `--delete`; executed as remove-if-empty, so
+    /// a directory still holding files sync cannot see (unsupported
+    /// types, dotfiles) survives.
+    DeleteLocalDir {
+        rel_dir: String,
     },
     /// Drop a stale state mapping (e.g. both sides gone).
     Forget {
@@ -973,6 +1016,10 @@ pub fn plan(
         .iter()
         .for_each(|(key, view)| decide(options, key, view, &guards, &mut buckets));
 
+    if options.delete {
+        append_dir_deletes(options, local, remote, &docs_by_uuid, &mut buckets);
+    }
+
     // Folder creation for upload targets, parents before children.
     let mut needed: Vec<String> = buckets
         .transfers
@@ -1016,6 +1063,116 @@ fn kind_matches(kind: DocKind, doc_type: RemoteType) -> bool {
             )
             | (DocKind::Rmdoc, RemoteType::Notebook)
     )
+}
+
+/// With `--delete`, a folder emptied *by this plan's deletions* is
+/// deleted too (children before parents), on whichever side lost the
+/// documents. Only folders that lost content to this plan qualify —
+/// a pre-existing empty folder was never synced, so it is never
+/// touched (the "never delete what was never synced" invariant).
+fn append_dir_deletes(
+    options: SyncOptions,
+    local: &[LocalEntry],
+    remote: &RemoteSnapshot,
+    docs_by_uuid: &HashMap<&str, &RemoteDoc>,
+    buckets: &mut Buckets,
+) {
+    /// `sub` (a dir or file path) is at or below directory `dir`.
+    fn within(dir: &str, sub: &str) -> bool {
+        sub == dir
+            || (sub.len() > dir.len() && sub.starts_with(dir) && sub.as_bytes()[dir.len()] == b'/')
+    }
+
+    let deleted_local: std::collections::HashSet<String> = buckets
+        .deletes
+        .iter()
+        .filter_map(|action| match action {
+            SyncAction::DeleteLocal { path } => Some(path.clone()),
+            _ => None,
+        })
+        .collect();
+    let deleted_uuids: std::collections::HashSet<String> = buckets
+        .deletes
+        .iter()
+        .filter_map(|action| match action {
+            SyncAction::DeleteRemote { uuid, .. } => Some(uuid.clone()),
+            _ => None,
+        })
+        .collect();
+    // Local files that survive this plan (deleted ones excluded).
+    let surviving_local: Vec<&str> = local
+        .iter()
+        .map(|entry| entry.rel_path.as_str())
+        .filter(|path| !deleted_local.contains(*path))
+        .collect();
+
+    // Device folders emptied by this plan's `DeleteRemote` actions.
+    // Reverse lexicographic order visits subfolders before their
+    // parents, so a parent emptied only via a condemned child is
+    // caught too.
+    let mut condemned: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    if can_write_remote(options.mode) {
+        let deleted_dirs: Vec<&str> = deleted_uuids
+            .iter()
+            .filter_map(|uuid| docs_by_uuid.get(uuid.as_str()))
+            .map(|doc| doc.rel_dir.as_str())
+            .collect();
+        remote
+            .folders
+            .iter()
+            .rev()
+            .filter(|(dir, _)| !dir.is_empty())
+            .for_each(|(dir, uuid)| {
+                let lost_content = deleted_dirs.iter().any(|d| within(dir, d));
+                let occupied = remote.docs.iter().any(|doc| {
+                    !deleted_uuids.contains(&doc.uuid) && within(dir, &doc.rel_dir)
+                }) || remote.skips.iter().any(|action| {
+                    matches!(action, SyncAction::Skip { path, .. } if within(dir, path))
+                }) || remote.folders.keys().any(|sub| {
+                    sub != dir && within(dir, sub) && !condemned.contains(sub.as_str())
+                }) || surviving_local.iter().any(|path| within(dir, path));
+                if lost_content && !occupied {
+                    condemned.insert(dir.as_str());
+                    buckets.deletes.push(SyncAction::DeleteRemoteFolder {
+                        rel_dir: dir.clone(),
+                        uuid: uuid.clone(),
+                    });
+                }
+            });
+    }
+
+    // Local directories emptied by this plan's `DeleteLocal` actions.
+    // The planner only names candidates; the executor removes a
+    // directory only if it is actually empty (files sync cannot see
+    // keep it alive).
+    if can_write_local(options.mode) {
+        let download_targets: Vec<&str> = buckets
+            .transfers
+            .iter()
+            .filter_map(|action| match action {
+                SyncAction::Download { local, .. } => Some(local.as_str()),
+                _ => None,
+            })
+            .collect();
+        let mut candidates: Vec<String> = deleted_local
+            .iter()
+            .filter_map(|path| path.rsplit_once('/').map(|(dir, _)| dir))
+            .flat_map(path_prefixes)
+            .collect();
+        candidates.sort();
+        candidates.dedup();
+        candidates
+            .into_iter()
+            .rev()
+            .filter(|dir| {
+                let alive_on_device =
+                    remote.folders.contains_key(dir) && !condemned.contains(dir.as_str());
+                !alive_on_device
+                    && !surviving_local.iter().any(|path| within(dir, path))
+                    && !download_targets.iter().any(|path| within(dir, path))
+            })
+            .for_each(|rel_dir| buckets.deletes.push(SyncAction::DeleteLocalDir { rel_dir }));
+    }
 }
 
 /// All non-empty prefixes of a relative dir path: `a/b/c` → `a`,
@@ -1372,6 +1529,10 @@ pub struct Outcome {
     pub downloaded: usize,
     pub deleted_local: usize,
     pub deleted_remote: usize,
+    /// Emptied device folders removed (`--delete`).
+    pub deleted_remote_folders: usize,
+    /// Emptied local directories removed (`--delete`).
+    pub deleted_local_dirs: usize,
     pub skipped: Vec<(String, String)>,
     pub conflicts: Vec<(String, String)>,
     /// Whether the device was modified (drives the xochitl restart).
@@ -1553,6 +1714,21 @@ pub fn execute(
                 state.entries.remove(path);
                 state.save_to(fs_side)?;
                 outcome.deleted_local += 1;
+            }
+            SyncAction::DeleteRemoteFolder { rel_dir, uuid } => {
+                // The planner guarantees this folder has no children
+                // left once the preceding deletions ran.
+                client.delete_document(uuid)?;
+                folders.remove(rel_dir);
+                outcome.deleted_remote_folders += 1;
+                outcome.modified_remote = true;
+            }
+            SyncAction::DeleteLocalDir { rel_dir } => {
+                // Remove-if-empty: files sync cannot see (unsupported
+                // types, dotfiles) keep the directory alive.
+                if fs_side.remove_dir(rel_dir)? {
+                    outcome.deleted_local_dirs += 1;
+                }
             }
             SyncAction::Forget { path } => {
                 state.entries.remove(path);
@@ -2424,6 +2600,12 @@ pub fn describe(action: &SyncAction) -> String {
         },
         SyncAction::DeleteRemote { path, .. } => format!("delete   {path} (on device)"),
         SyncAction::DeleteLocal { path } => format!("delete   {path} (local)"),
+        SyncAction::DeleteRemoteFolder { rel_dir, .. } => {
+            format!("rmdir    {rel_dir}/ (emptied, on device)")
+        }
+        SyncAction::DeleteLocalDir { rel_dir } => {
+            format!("rmdir    {rel_dir}/ (emptied, local, if empty)")
+        }
         SyncAction::Forget { path } => format!("forget   {path} (stale sync mapping)"),
         SyncAction::Rebind { path, .. } => {
             format!("rebind   {path} (re-linked to replacement on device)")
@@ -3082,6 +3264,194 @@ mod tests {
             vec![SyncAction::DeleteLocal {
                 path: "n.pdf".to_string()
             }]
+        );
+    }
+
+    #[test]
+    fn push_delete_removes_emptied_folders_children_first() {
+        let items = vec![
+            folder("a", "A", ""),
+            folder("b", "B", "a"),
+            doc("u1", "n", "b", "pdf", 5),
+        ];
+        let snapshot = remote_snapshot(&items, "");
+        let mut state = SyncState::default();
+        state
+            .entries
+            .insert("A/B/n.pdf".to_string(), entry("u1", DocKind::Pdf, 10, 1, 5));
+
+        // Without --delete nothing happens (existing semantics).
+        assert!(plan(push(), &[], &snapshot, &state).actions.is_empty());
+
+        // With --delete: the document, then the emptied folders,
+        // children before parents. The sync root is never deleted.
+        let plan_delete = plan(with_delete(push()), &[], &snapshot, &state);
+        assert_eq!(
+            plan_delete.actions,
+            vec![
+                SyncAction::DeleteRemote {
+                    path: "A/B/n.pdf".to_string(),
+                    uuid: "u1".to_string()
+                },
+                SyncAction::DeleteRemoteFolder {
+                    rel_dir: "A/B".to_string(),
+                    uuid: "b".to_string()
+                },
+                SyncAction::DeleteRemoteFolder {
+                    rel_dir: "A".to_string(),
+                    uuid: "a".to_string()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn push_delete_keeps_folders_with_surviving_content() {
+        // Folder A keeps an untracked device doc; folder C keeps
+        // skipped (duplicate-name) items; folder D keeps a local file.
+        let items = vec![
+            folder("a", "A", ""),
+            doc("u1", "n", "a", "pdf", 5),
+            doc("u2", "untracked", "a", "pdf", 5),
+            folder("c", "C", ""),
+            doc("u3", "m", "c", "pdf", 5),
+            doc("d1", "dup", "c", "pdf", 5),
+            doc("d2", "dup", "c", "epub", 5),
+            folder("d", "D", ""),
+            doc("u4", "k", "d", "pdf", 5),
+        ];
+        let snapshot = remote_snapshot(&items, "");
+        let mut state = SyncState::default();
+        state
+            .entries
+            .insert("A/n.pdf".to_string(), entry("u1", DocKind::Pdf, 10, 1, 5));
+        state
+            .entries
+            .insert("C/m.pdf".to_string(), entry("u3", DocKind::Pdf, 10, 1, 5));
+        state
+            .entries
+            .insert("D/k.pdf".to_string(), entry("u4", DocKind::Pdf, 10, 1, 5));
+        let locals = vec![local("D/other.pdf", DocKind::Pdf, 10, 1)];
+
+        let plan = plan(with_delete(push()), &locals, &snapshot, &state);
+        assert_eq!(
+            plan.actions
+                .iter()
+                .filter(|a| matches!(a, SyncAction::DeleteRemote { .. }))
+                .count(),
+            3
+        );
+        assert!(
+            !plan
+                .actions
+                .iter()
+                .any(|a| matches!(a, SyncAction::DeleteRemoteFolder { .. }))
+        );
+    }
+
+    #[test]
+    fn push_delete_ignores_preexisting_empty_folders() {
+        // "Empty" lost nothing to this plan: it was never synced, so
+        // it is never deleted — even though it is empty and absent
+        // locally.
+        let items = vec![folder("e", "Empty", ""), doc("u1", "n", "", "pdf", 5)];
+        let snapshot = remote_snapshot(&items, "");
+        let mut state = SyncState::default();
+        state
+            .entries
+            .insert("n.pdf".to_string(), entry("u1", DocKind::Pdf, 10, 1, 5));
+
+        let plan = plan(with_delete(push()), &[], &snapshot, &state);
+        assert_eq!(
+            plan.actions,
+            vec![SyncAction::DeleteRemote {
+                path: "n.pdf".to_string(),
+                uuid: "u1".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn pull_delete_removes_emptied_local_dirs() {
+        // The document and its folder are gone from the device.
+        let snapshot = remote_snapshot(&[], "");
+        let mut state = SyncState::default();
+        state
+            .entries
+            .insert("A/B/n.pdf".to_string(), entry("u1", DocKind::Pdf, 10, 1, 5));
+        let locals = vec![local("A/B/n.pdf", DocKind::Pdf, 10, 1)]; // unchanged
+
+        let plan_delete = plan(with_delete(pull()), &locals, &snapshot, &state);
+        assert_eq!(
+            plan_delete.actions,
+            vec![
+                SyncAction::DeleteLocal {
+                    path: "A/B/n.pdf".to_string()
+                },
+                SyncAction::DeleteLocalDir {
+                    rel_dir: "A/B".to_string()
+                },
+                SyncAction::DeleteLocalDir {
+                    rel_dir: "A".to_string()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn pull_delete_keeps_local_dirs_alive_on_device() {
+        // The document is gone but its folder still exists on the
+        // device: the local directory mirrors it and stays.
+        let snapshot = remote_snapshot(&[folder("a", "A", "")], "");
+        let mut state = SyncState::default();
+        state
+            .entries
+            .insert("A/n.pdf".to_string(), entry("u1", DocKind::Pdf, 10, 1, 5));
+        let locals = vec![local("A/n.pdf", DocKind::Pdf, 10, 1)];
+
+        let plan_delete = plan(with_delete(pull()), &locals, &snapshot, &state);
+        assert_eq!(
+            plan_delete.actions,
+            vec![SyncAction::DeleteLocal {
+                path: "A/n.pdf".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn two_way_delete_removes_folders_emptied_on_both_sides() {
+        // Local n.pdf was deleted; the device folder empties and goes;
+        // the local dir for a device-side deletion goes too.
+        let items = vec![folder("a", "A", ""), doc("u1", "n", "a", "pdf", 5)];
+        let snapshot = remote_snapshot(&items, "");
+        let mut state = SyncState::default();
+        state
+            .entries
+            .insert("A/n.pdf".to_string(), entry("u1", DocKind::Pdf, 10, 1, 5));
+        state
+            .entries
+            .insert("B/m.pdf".to_string(), entry("u2", DocKind::Pdf, 10, 1, 5));
+        let locals = vec![local("B/m.pdf", DocKind::Pdf, 10, 1)];
+
+        let plan = plan(with_delete(two_way()), &locals, &snapshot, &state);
+        assert_eq!(
+            plan.actions,
+            vec![
+                SyncAction::DeleteRemote {
+                    path: "A/n.pdf".to_string(),
+                    uuid: "u1".to_string()
+                },
+                SyncAction::DeleteLocal {
+                    path: "B/m.pdf".to_string()
+                },
+                SyncAction::DeleteRemoteFolder {
+                    rel_dir: "A".to_string(),
+                    uuid: "a".to_string()
+                },
+                SyncAction::DeleteLocalDir {
+                    rel_dir: "B".to_string()
+                },
+            ]
         );
     }
 
