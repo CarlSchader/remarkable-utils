@@ -17,7 +17,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::bundle;
 use crate::client::Client;
-use crate::epub::{self, TextKind};
 use crate::error::{Error, Result};
 use crate::progress::Progress;
 use crate::ssh::{SshSession, shell_quote};
@@ -87,8 +86,6 @@ pub fn probe_remarkable(session: &SshSession, xochitl_dir: &str) -> Result<bool>
 pub enum DocKind {
     Pdf,
     Epub,
-    Markdown,
-    Text,
     Rmdoc,
 }
 
@@ -97,8 +94,6 @@ impl DocKind {
         match ext {
             "pdf" => Some(Self::Pdf),
             "epub" => Some(Self::Epub),
-            "md" | "markdown" => Some(Self::Markdown),
-            "txt" => Some(Self::Text),
             "rmdoc" => Some(Self::Rmdoc),
             _ => None,
         }
@@ -108,7 +103,7 @@ impl DocKind {
     pub fn device_file_type(self) -> &'static str {
         match self {
             Self::Pdf => "pdf",
-            Self::Epub | Self::Markdown | Self::Text => "epub",
+            Self::Epub => "epub",
             Self::Rmdoc => "notebook",
         }
     }
@@ -117,7 +112,7 @@ impl DocKind {
 /// A syncable local file (directories are implicit in the paths).
 #[derive(Debug, Clone)]
 pub struct LocalEntry {
-    /// Relative path with `/` separators, e.g. `Books/notes.md`.
+    /// Relative path with `/` separators, e.g. `Books/notes.pdf`.
     pub rel_path: String,
     pub kind: DocKind,
     pub size: u64,
@@ -883,7 +878,7 @@ struct Guards {
     /// (dir, name) pairs already occupied on the device.
     taken: std::collections::HashSet<(String, String)>,
     /// Upload candidates per (dir, name); >1 means local files compete
-    /// for the same device name (e.g. `n.md` + `n.pdf`).
+    /// for the same device name (e.g. `n.epub` + `n.pdf`).
     upload_counts: HashMap<(String, String), usize>,
 }
 
@@ -1057,10 +1052,7 @@ fn kind_matches(kind: DocKind, doc_type: RemoteType) -> bool {
     matches!(
         (kind, doc_type),
         (DocKind::Pdf, RemoteType::Pdf)
-            | (
-                DocKind::Epub | DocKind::Markdown | DocKind::Text,
-                RemoteType::Epub
-            )
+            | (DocKind::Epub, RemoteType::Epub)
             | (DocKind::Rmdoc, RemoteType::Notebook)
     )
 }
@@ -1225,10 +1217,9 @@ fn mapped_both(
 ) {
     let local_changed = entry.size != st.local_size || entry.mtime_ms != st.local_mtime_ms;
     let remote_changed = doc.last_modified != st.remote_last_modified;
-    let text_import = matches!(st.kind, DocKind::Markdown | DocKind::Text);
     // What each side's changes can flow into, given mode and kind.
     let push_ok = can_write_remote(options.mode) && st.kind != DocKind::Rmdoc;
-    let pull_ok = can_write_local(options.mode) && !text_import;
+    let pull_ok = can_write_local(options.mode);
 
     match (local_changed, remote_changed) {
         (false, false) => {}
@@ -1240,9 +1231,8 @@ fn mapped_both(
                     key,
                     "mapped .rmdoc files are pull-only (the tablet's ink wins)",
                 ));
-            } else if !text_import {
-                // Pull mode: destination drift. (Text imports are
-                // expected to change locally; push is their flow.)
+            } else {
+                // Pull mode: destination drift.
                 match winner(options.conflict, entry.mtime_ms, doc.last_modified) {
                     None => out
                         .notes
@@ -1255,9 +1245,6 @@ fn mapped_both(
         (false, true) => {
             if pull_ok {
                 out.transfers.push(download(key, doc));
-            } else if can_write_local(options.mode) && text_import {
-                out.notes
-                    .push(skip(key, "text import; device-side changes are not pulled"));
             }
             // Push mode: nothing. Remote lastModified moves for benign
             // reasons (annotations); only local changes push.
@@ -1280,12 +1267,6 @@ fn mapped_both(
             Some(Winner::Remote) => {
                 if pull_ok {
                     out.transfers.push(download(key, doc));
-                } else if can_write_local(options.mode) && text_import {
-                    out.notes.push(conflict(
-                        key,
-                        "resolved to the device side, but device-side changes \
-                         cannot be pulled into a text import",
-                    ));
                 }
                 // Push mode: destination (device) kept.
             }
@@ -1605,18 +1586,6 @@ pub fn execute(
                         name,
                         "epub",
                     )?,
-                    (DocKind::Markdown, _) => client.store_text_source(
-                        &read_utf8(fs_side, local)?,
-                        &parent_uuid,
-                        name,
-                        TextKind::Markdown,
-                    )?,
-                    (DocKind::Text, _) => client.store_text_source(
-                        &read_utf8(fs_side, local)?,
-                        &parent_uuid,
-                        name,
-                        TextKind::Plain,
-                    )?,
                     (DocKind::Rmdoc, _) => {
                         let rmdoc = bundle::parse_rmdoc(&fs_side.read(local)?)?;
                         client.restore_bundle(rmdoc, &parent_uuid, name)?
@@ -1639,17 +1608,6 @@ pub fn execute(
                     }
                     (DocKind::Epub, None) => {
                         client.update_payload_bytes(uuid, "epub", &fs_side.read(local)?)?
-                    }
-                    (DocKind::Markdown | DocKind::Text, _) => {
-                        let (_, stem) = split_target(local);
-                        let text_kind = if *kind == DocKind::Markdown {
-                            TextKind::Markdown
-                        } else {
-                            TextKind::Plain
-                        };
-                        let source = read_utf8(fs_side, local)?;
-                        let bytes = epub::text_to_epub(&stem, text_kind, &source)?;
-                        client.update_payload_bytes(uuid, "epub", &bytes)?
                     }
                     // The planner never emits this.
                     (DocKind::Rmdoc, _) => unreachable!("mapped .rmdoc files are pull-only"),
@@ -1763,17 +1721,6 @@ pub fn execute(
 
     progress.finished();
     Ok(outcome)
-}
-
-/// Read a file from an fs endpoint as UTF-8 (text imports are UTF-8
-/// only; anything else is rejected rather than mangled).
-fn read_utf8(fs_side: &dyn FsEndpoint, rel_path: &str) -> Result<String> {
-    String::from_utf8(fs_side.read(rel_path)?).map_err(|_| {
-        Error::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("{rel_path} is not valid UTF-8"),
-        ))
-    })
 }
 
 /// Stat the fs-side file and persist the new state entry.
@@ -2587,7 +2534,6 @@ pub fn describe(action: &SyncAction) -> String {
     match action {
         SyncAction::CreateRemoteFolder { rel_dir } => format!("mkdir    {rel_dir}/"),
         SyncAction::Upload { local, kind, .. } => match kind {
-            DocKind::Markdown | DocKind::Text => format!("upload   {local} (as EPUB)"),
             DocKind::Rmdoc => format!("restore  {local}"),
             _ => format!("upload   {local}"),
         },
@@ -2803,7 +2749,7 @@ mod tests {
     #[test]
     fn push_first_sync_uploads_and_creates_folders() {
         let locals = vec![
-            local("a/b/notes.md", DocKind::Markdown, 10, 1),
+            local("a/b/notes.epub", DocKind::Epub, 10, 1),
             local("top.pdf", DocKind::Pdf, 20, 2),
         ];
         let snapshot = remote_snapshot(&[], "");
@@ -2818,8 +2764,8 @@ mod tests {
                     rel_dir: "a/b".to_string()
                 },
                 SyncAction::Upload {
-                    local: "a/b/notes.md".to_string(),
-                    kind: DocKind::Markdown,
+                    local: "a/b/notes.epub".to_string(),
+                    kind: DocKind::Epub,
                     remote_dir: "a/b".to_string(),
                     name: "notes".to_string()
                 },
@@ -2847,18 +2793,18 @@ mod tests {
 
     #[test]
     fn push_local_change_updates_in_place() {
-        let locals = vec![local("n.md", DocKind::Markdown, 99, 9)];
+        let locals = vec![local("n.epub", DocKind::Epub, 99, 9)];
         let snapshot = remote_snapshot(&[doc("u1", "n", "", "epub", 5)], "");
         let mut state = SyncState::default();
         state
             .entries
-            .insert("n.md".to_string(), entry("u1", DocKind::Markdown, 10, 1, 5));
+            .insert("n.epub".to_string(), entry("u1", DocKind::Epub, 10, 1, 5));
         let plan = plan(push(), &locals, &snapshot, &state);
         assert_eq!(
             plan.actions,
             vec![SyncAction::UpdateRemote {
-                local: "n.md".to_string(),
-                kind: DocKind::Markdown,
+                local: "n.epub".to_string(),
+                kind: DocKind::Epub,
                 uuid: "u1".to_string()
             }]
         );
@@ -2923,7 +2869,7 @@ mod tests {
     #[test]
     fn push_duplicate_local_targets_skip() {
         let locals = vec![
-            local("n.md", DocKind::Markdown, 10, 1),
+            local("n.epub", DocKind::Epub, 10, 1),
             local("n.pdf", DocKind::Pdf, 10, 1),
         ];
         let snapshot = remote_snapshot(&[], "");
@@ -2963,23 +2909,6 @@ mod tests {
             })
             .collect();
         assert_eq!(downloads, ["Books/Paper.pdf", "Sketch.rmdoc"]);
-    }
-
-    #[test]
-    fn pull_mapped_text_import_is_noop_and_warns_on_remote_change() {
-        let snapshot = remote_snapshot(&[doc("u1", "n", "", "epub", 9)], "");
-        let mut state = SyncState::default();
-        state
-            .entries
-            .insert("n.md".to_string(), entry("u1", DocKind::Markdown, 10, 1, 5));
-        let locals = vec![local("n.md", DocKind::Markdown, 10, 1)];
-        let plan = plan(pull(), &locals, &snapshot, &state);
-        assert_eq!(skips(&plan), ["n.md"]); // warned, not downloaded
-
-        // Unchanged remote: fully silent.
-        let snapshot = remote_snapshot(&[doc("u1", "n", "", "epub", 5)], "");
-        let plan = super::plan(pull(), &locals, &snapshot, &state);
-        assert!(plan.actions.is_empty());
     }
 
     #[test]
@@ -3628,7 +3557,7 @@ mod tests {
     #[test]
     fn files_first_sync_copies_toward_destination() {
         let a = vec![local("x/a.pdf", DocKind::Pdf, 10, 1)];
-        let b = vec![local("y/b.md", DocKind::Markdown, 20, 2)];
+        let b = vec![local("y/b.epub", DocKind::Epub, 20, 2)];
 
         // Push: only A-side files copy.
         let plan = plan_files(push(), &a, &b, &SyncState::default());
@@ -3648,7 +3577,7 @@ mod tests {
                     path: "x/a.pdf".to_string()
                 },
                 FileAction::CopyToA {
-                    path: "y/b.md".to_string()
+                    path: "y/b.epub".to_string()
                 },
             ]
         );
@@ -3912,16 +3841,16 @@ mod tests {
     fn fs_listing_parses_and_filters() {
         let output = "\
 1024 1700000000 ./docs/paper.pdf\n\
-99 1700000001 ./notes/with space.md\n\
+99 1700000001 ./notes/with space.epub\n\
 5 1700000002 ./.hidden/secret.pdf\n\
 7 1700000003 ./script.py\n\
 not a valid line\n";
         let (entries, ignored) = parse_fs_listing(output);
         let paths: Vec<&str> = entries.iter().map(|e| e.rel_path.as_str()).collect();
-        assert_eq!(paths, ["docs/paper.pdf", "notes/with space.md"]);
+        assert_eq!(paths, ["docs/paper.pdf", "notes/with space.epub"]);
         assert_eq!(entries[0].size, 1024);
         assert_eq!(entries[0].mtime_ms, 1_700_000_000_000);
-        assert_eq!(entries[1].kind, DocKind::Markdown);
+        assert_eq!(entries[1].kind, DocKind::Epub);
         assert_eq!(ignored, 1); // script.py; dotdirs skipped silently
     }
 
@@ -3931,7 +3860,7 @@ not a valid line\n";
     fn prefix_and_target_helpers() {
         assert_eq!(path_prefixes(""), Vec::<String>::new());
         assert_eq!(path_prefixes("a/b/c"), ["a", "a/b", "a/b/c"]);
-        assert_eq!(split_target("a/b/notes.md"), ("a/b", "notes".to_string()));
+        assert_eq!(split_target("a/b/notes.pdf"), ("a/b", "notes".to_string()));
         assert_eq!(split_target("top.pdf"), ("", "top".to_string()));
     }
 }

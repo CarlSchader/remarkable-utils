@@ -15,7 +15,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde_json::Value;
 
 use crate::bundle;
-use crate::epub;
 use crate::error::{Error, Result};
 use crate::progress::{NoProgress, Progress};
 use crate::ssh::{SshSession, shell_quote};
@@ -115,9 +114,6 @@ impl Client {
     /// - `.pdf` / `.epub`: uploaded as-is.
     /// - `.rmdoc`: bundle restore, re-targeted to a fresh UUID so
     ///   re-importing a download never collides with the original.
-    /// - `.md` / `.markdown` / `.txt`: converted to EPUB on the host
-    ///   (the device cannot render text files — see
-    ///   `docs/text-import.md`).
     pub fn upload(
         &self,
         local: &Path,
@@ -135,10 +131,6 @@ impl Client {
         match extension.as_str() {
             "pdf" | "epub" => self.upload_payload(local, parent_ref, visible_name, &extension),
             "rmdoc" => self.upload_rmdoc(local, parent_ref, visible_name),
-            "md" | "markdown" => {
-                self.upload_text(local, parent_ref, visible_name, epub::TextKind::Markdown)
-            }
-            "txt" => self.upload_text(local, parent_ref, visible_name, epub::TextKind::Plain),
             _ => Err(Error::UnsupportedFileType(extension)),
         }
     }
@@ -214,48 +206,6 @@ impl Client {
             file_type,
             Some(data.len() as u64),
         )
-    }
-
-    /// Convert a `.md`/`.txt` file to EPUB and upload it. The document
-    /// lands on the device as a regular EPUB; conversion is one-way.
-    fn upload_text(
-        &self,
-        local: &Path,
-        parent_ref: &str,
-        visible_name: Option<&str>,
-        kind: epub::TextKind,
-    ) -> Result<Item> {
-        let items = self.list_items()?;
-        let parent = xochitl::resolve_folder_ref(&items, parent_ref)?;
-        let name = default_name(visible_name, local);
-        xochitl::ensure_no_conflict(&items, &parent, &name, None)?;
-        self.store_text(local, &parent, &name, kind)
-    }
-
-    /// Convert and store a text file as EPUB under `parent_uuid`
-    /// **without conflict checks**.
-    pub fn store_text(
-        &self,
-        local: &Path,
-        parent_uuid: &str,
-        name: &str,
-        kind: epub::TextKind,
-    ) -> Result<Item> {
-        let source = std::fs::read_to_string(local)?;
-        self.store_text_source(&source, parent_uuid, name, kind)
-    }
-
-    /// [`Self::store_text`] from in-memory source text.
-    pub fn store_text_source(
-        &self,
-        source: &str,
-        parent_uuid: &str,
-        name: &str,
-        kind: epub::TextKind,
-    ) -> Result<Item> {
-        self.progress.step("Converting to EPUB");
-        let epub_bytes = epub::text_to_epub(name, kind, source)?;
-        self.store_payload_bytes(&epub_bytes, parent_uuid, name, "epub")
     }
 
     /// Write the metadata/content/pagedata files that make an uploaded

@@ -77,7 +77,7 @@ hardcoded "local vs. tablet":
 | Kind | Listing | Identity / change signal | Conversions |
 |---|---|---|---|
 | `LocalDir` | filesystem walk | rel path + mtime/size | — |
-| `Remarkable` (ssh) | `Client::list_items` logical tree | item UUID + `lastModified` | md/txt→EPUB toward device; notebook→`.rmdoc` from device |
+| `Remarkable` (ssh) | `Client::list_items` logical tree | item UUID + `lastModified` | notebook→`.rmdoc` from device |
 | `RemoteFs` (ssh, generic host) | remote `find`-based walk | rel path + mtime/size | — |
 
 Conversion rules activate only when **exactly one side is a
@@ -124,14 +124,11 @@ as unnecessary; revisit only if the single probe misfires in practice.
 ## The core problem: identity, not transfer
 
 Transfer is solved by existing code. The hard part is knowing that local
-`notes.md` *is* device document `abc-123`, because the conversions are
+`Name.rmdoc` *is* device document `abc-123`, because the conversions are
 asymmetric:
 
-- `notes.md` uploads as an **EPUB** named "notes"; a naive pull would
-  bring back `notes.epub` next to `notes.md`, and the next push would
-  duplicate it — a loop.
 - Notebooks pull as `Name.rmdoc`, which uploads back under a *fresh UUID*
-  by design — another loop.
+  by design — a loop.
 - The device allows duplicate sibling names; filesystems do not.
 
 ### Sync state file
@@ -147,9 +144,9 @@ last-synced remote lastModified
 This enables true **three-way diffing** (last-synced state vs. src now
 vs. dst now), which is what distinguishes "unchanged", "changed on one
 side", "changed on both" (conflict), and — with `--delete` — "deleted
-since last sync" vs. "never existed". It also breaks both loops above:
-a state-mapped `notes.md` knows its device EPUB, and a device-side EPUB
-payload never changes on its own, so pull is a no-op for it.
+since last sync" vs. "never existed". It also breaks the notebook loop
+above: a state-mapped `Name.rmdoc` knows its device document, so a pull
+only happens when the device side actually changed.
 
 Placement (phase 1): in the local sync root. When tablet↔tablet lands
 (phase 3), state moves to the initiating computer, keyed by the
@@ -161,7 +158,6 @@ each action** so an interrupted sync resumes cleanly.
 | Local file | Toward tablet | From tablet |
 |---|---|---|
 | `.pdf` / `.epub` | upload; **update-in-place** if mapped (overwrite `<uuid>.<ext>`, bump `lastModified` — preserves annotations and location) | download payload when remote changed |
-| `.md` / `.txt` | convert → EPUB; update-in-place replaces the generated payload | never pulled *as* md/txt; the state mapping makes pull a no-op |
 | `.rmdoc` | **new/unmapped file only** — treated as a restore (fresh UUID), then mapped. Mapped `.rmdoc`s are never pushed back (see below) | notebooks pull as `Name.rmdoc` when `lastModified` moved |
 | anything else | ignored, left in place | n/a |
 
@@ -265,7 +261,7 @@ Following repo conventions (pure logic separated from I/O):
    names/first-sync/recopy).
 2. **Executor.** Applies actions in dependency order (folders before
    contents; deletions last, once they exist), emits `Progress` steps
-   (`"[3/17] upload notes.md"`), writes state incrementally, and
+   (`"[3/17] upload notes.pdf"`), writes state incrementally, and
    restarts xochitl **once** at the end, not per file.
 3. **Endpoint abstraction (phase 3).** The file-tree side is a
    `FsEndpoint` trait (`snapshot`/`read`/`write`/`remove`/`stat` +
@@ -278,8 +274,7 @@ Following repo conventions (pure logic separated from I/O):
    (fs↔fs `plan_files`, tablet↔tablet `plan_docs`) share one
    side-agnostic three-way table (`decide_pair`: presence × changed ×
    mode × policy). The fs↔tablet planner keeps its own table because
-   its rules are inherently asymmetric (conversions, rmdoc pull-only,
-   text-import one-way).
+   its rules are inherently asymmetric (conversions, rmdoc pull-only).
 5. **State placement.** fs↔tablet: on the fs side. fs↔fs: on the
    local side when exactly one side is local, otherwise the first
    argument's side (keep argument order consistent for such pairs).

@@ -53,7 +53,7 @@ pub enum Error {
     FolderNotEmpty(String),
 
     /// Upload of a file type the device cannot render.
-    #[error("unsupported file type '{0}': only .pdf, .epub, .rmdoc, .md, and .txt are supported")]
+    #[error("unsupported file type '{0}': only .pdf, .epub, and .rmdoc are supported")]
     UnsupportedFileType(String),
 
     /// The root pseudo-folder is not a valid target here.
@@ -83,10 +83,6 @@ pub enum Error {
     /// Failed to build an `.rmdoc` bundle.
     #[error("bundle: {0}")]
     Bundle(String),
-
-    /// Failed to build an EPUB from a text import.
-    #[error("epub: {0}")]
-    Epub(String),
 
     /// xochitl did not come back after a restart attempt.
     #[error("failed to restart xochitl: {0}")]

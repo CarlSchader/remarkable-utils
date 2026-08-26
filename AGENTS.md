@@ -61,10 +61,6 @@ This repository is **open source** (dual-licensed MIT OR Apache-2.0):
 - `client.rs` — high-level operations composing the two. `list_items`
   fetches all metadata in a single SSH round trip (batched remote script
   with a per-call random marker); keep new operations batched too.
-- `epub.rs` — minimal EPUB 3 generation for `.md`/`.txt` imports (the
-  device renders only notebooks/PDF/EPUB). Pure bytes-to-bytes;
-  raw HTML in Markdown is escaped, never passed through (xochitl's
-  EPUB reader needs well-formed XHTML). See `docs/text-import.md`.
 - `progress.rs` — observer trait for progress events (`step`, `bytes`,
   `bytes_done`, `finished`). The **library never prints**; `rmu` renders
   these as indicatif bars on stderr. New long-running `Client`
@@ -73,7 +69,7 @@ This repository is **open source** (dual-licensed MIT OR Apache-2.0):
   trait (`LocalFs`, `SshFs`), snapshots, sync-state files, **pure**
   planners (heavily unit-tested), and thin executors. Three pairings:
   fs↔tablet (its own asymmetric decision table: conversions, rmdoc
-  pull-only, text-import one-way), and fs↔fs + tablet↔tablet (one
+  pull-only), and fs↔fs + tablet↔tablet (one
   shared symmetric table, `decide_pair`). Keep planner logic pure; see
   `docs/sync-design.md` for semantics and state-file placement rules.
 - `status.rs` — device system state (`rmu status`): one
@@ -85,8 +81,6 @@ This repository is **open source** (dual-licensed MIT OR Apache-2.0):
 
 Read `docs/notebook-data.md` first — it documents the storage model,
 `fileType` nuances, the `.rm` page format, and `.rmdoc` bundles.
-`docs/text-import.md` covers how `.md`/`.txt` uploads work (host-side
-EPUB conversion) and their sharp edges.
 
 - Default USB connection: `root@10.11.99.1`; documents live under
   `/home/root/.local/share/remarkable/xochitl` (`XOCHITL_DATA_DIR`).
@@ -103,9 +97,8 @@ EPUB conversion) and their sharp edges.
 - When read-modify-writing `.metadata`, preserve unknown fields
   (`Client::update_metadata`); different firmware versions have different
   field sets, and timestamps appear as both strings and numbers.
-- Uploads accept `.pdf`/`.epub` payloads, `.rmdoc` bundles, and
-  `.md`/`.txt` (converted to EPUB host-side); reject other types.
-  Bundle restores must always use a **fresh UUID** (the original may
+- Uploads accept `.pdf`/`.epub` payloads and `.rmdoc` bundles; reject
+  other types. Bundle restores must always use a **fresh UUID** (the original may
   still exist on the device) and preserve unknown metadata fields.
 - Native notebooks (`fileType` `"notebook"`, or `""` on older firmware —
   normalized to `"notebook"` in `item_from_metadata`) have **no payload

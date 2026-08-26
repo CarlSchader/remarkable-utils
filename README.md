@@ -44,8 +44,6 @@ rmu mkdir Algebra --parent Books/Math
 rmu upload ./sample.pdf                            # to root
 rmu upload ./sample.pdf --parent Books/Math -n "Linear Algebra"
 rmu upload ./backup.rmdoc --parent Notes           # restore an .rmdoc bundle
-rmu upload ./notes.md -n "Meeting Notes"           # markdown -> EPUB on the fly
-rmu upload ./log.txt                               # plain text -> EPUB too
 
 rmu download "Books/Math/Linear Algebra"           # to ./Linear Algebra.pdf
 rmu download Books/Physics ./downloads/
@@ -64,11 +62,9 @@ rmu empty-trash                          # permanently delete trashed items
 
 Targets are logical paths or item UUIDs; ambiguous paths are rejected
 instead of guessed. Uploads accept `.pdf` and `.epub` (what the device
-renders natively), `.rmdoc` bundles, and `.md`/`.txt` — text files are
-converted to EPUB on your machine at upload time, since the tablet cannot
-render them directly (see `docs/text-import.md`; the conversion is
-one-way). After write operations `rmu` restarts xochitl so changes appear
-on the device (`--no-restart` to skip).
+renders natively) and `.rmdoc` bundles. After write operations `rmu`
+restarts xochitl so changes appear on the device (`--no-restart` to
+skip).
 
 Native handwritten notebooks have no single payload file on the device, so
 `rmu download` fetches them as `.rmdoc` bundles — a zip of the raw file set
@@ -102,9 +98,9 @@ tablet (logical document sync with conversions); anything else is a plain
 file tree. Tablet↔tablet sync streams `.rmdoc` bundles between devices, so
 notebooks and annotations arrive intact.
 
-Only supported files participate (`.pdf`, `.epub`, `.md`, `.txt`,
-`.rmdoc`); everything else is left alone. Notebooks pull as `.rmdoc`
-bundles; Markdown/text push as EPUBs; mapped `.rmdoc` files are pull-only
+Only supported files participate (`.pdf`, `.epub`, `.rmdoc`); everything
+else is left alone. Notebooks pull as `.rmdoc`
+bundles; mapped `.rmdoc` files are pull-only
 (handwriting can't be merged — the tablet wins). A `.rmu-sync.json` state
 file in the local root (gitignore it) tracks the path↔document mapping so
 repeated syncs only transfer changes, and anything that changed on the
