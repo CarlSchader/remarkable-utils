@@ -120,9 +120,10 @@ enum Command {
         #[arg(long, default_value = "")]
         parent: String,
     },
-    /// Download a document (notebooks download as .rmdoc bundles)
+    /// Download documents (notebooks download as .rmdoc bundles)
     Download {
-        /// Document UUID or logical path
+        /// Document UUID, logical path, or glob pattern (quote it so
+        /// your shell doesn't expand it), e.g. 'Books/vol-*'
         target: String,
         /// Local file path or directory (default: current directory)
         output: Option<PathBuf>,
@@ -133,17 +134,17 @@ enum Command {
     },
     /// Delete documents or folders
     Rm {
-        /// Item UUIDs or logical paths (all validated before anything
-        /// is deleted)
+        /// Item UUIDs, logical paths, or glob patterns (all validated
+        /// before anything is deleted), e.g. 'Books/vol-*'
         #[arg(required = true)]
         targets: Vec<String>,
         /// Delete non-empty folders recursively
         #[arg(short, long)]
         recursive: bool,
     },
-    /// Move an item into another folder
+    /// Move items into another folder
     Mv {
-        /// Item UUID or logical path
+        /// Item UUID, logical path, or glob pattern
         target: String,
         /// Destination folder (UUID or logical path); '/' for root
         destination: String,
@@ -824,9 +825,11 @@ fn run_command(client: &Client, cli: &Cli) -> Result<bool> {
             output,
             bundle,
         } => {
-            let destination = client.download(target, output.as_deref(), *bundle)?;
+            let destinations = client.download_matching(target, output.as_deref(), *bundle)?;
             info(cli, "Downloaded to:");
-            println!("{}", destination.display());
+            destinations
+                .iter()
+                .for_each(|path| println!("{}", path.display()));
             Ok(false)
         }
         Command::Rm { targets, recursive } => {
@@ -850,19 +853,21 @@ fn run_command(client: &Client, cli: &Cli) -> Result<bool> {
             target,
             destination,
         } => {
-            let item = client.move_item(target, destination)?;
-            info(
-                cli,
-                format!(
-                    "Moved '{}' to {}",
-                    item.visible_name,
-                    if item.parent.is_empty() {
-                        "(root)"
-                    } else {
-                        &item.parent
-                    }
-                ),
-            );
+            let moved = client.move_items(target, destination)?;
+            moved.iter().for_each(|item| {
+                info(
+                    cli,
+                    format!(
+                        "Moved '{}' to {}",
+                        item.visible_name,
+                        if item.parent.is_empty() {
+                            "(root)"
+                        } else {
+                            &item.parent
+                        }
+                    ),
+                );
+            });
             Ok(true)
         }
         Command::Rename { target, new_name } => {

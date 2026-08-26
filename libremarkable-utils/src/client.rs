@@ -412,10 +412,58 @@ impl Client {
         if !item.is_document() {
             return Err(Error::NotADocument(item_ref.to_string()));
         }
+        self.download_item(item, output, bundle)
+    }
 
+    /// Download one document — or every document matching a glob
+    /// pattern. With multiple matches, `output` must be a directory
+    /// (or absent = current directory), matched folders are skipped
+    /// (`Books/*` downloads Books' documents; `Books/**` recurses),
+    /// and colliding output file names are rejected before anything
+    /// is transferred.
+    pub fn download_matching(
+        &self,
+        item_ref: &str,
+        output: Option<&Path>,
+        bundle: bool,
+    ) -> Result<Vec<PathBuf>> {
+        let items = self.list_items()?;
+        let uuids = xochitl::expand_refs(&items, &[item_ref])?;
+        let docs: Vec<&Item> = uuids
+            .iter()
+            .filter_map(|uuid| items.iter().find(|item| &item.uuid == uuid))
+            .filter(|item| item.is_document())
+            .collect();
+        if docs.is_empty() {
+            return Err(Error::NotADocument(item_ref.to_string()));
+        }
+        if docs.len() > 1 {
+            if let Some(path) = output
+                && !path.is_dir()
+            {
+                return Err(Error::OutputNotADirectory(path.to_path_buf()));
+            }
+            // Reject up-front if two matched documents would land on
+            // the same local file name.
+            let mut names = std::collections::HashSet::new();
+            for doc in &docs {
+                if !names.insert(download_filename(doc, bundle)) {
+                    return Err(Error::NameConflict {
+                        name: doc.visible_name.clone(),
+                        parent: "the output directory".to_string(),
+                    });
+                }
+            }
+        }
+        docs.iter()
+            .map(|doc| self.download_item(doc, output, bundle))
+            .collect()
+    }
+
+    fn download_item(&self, item: &Item, output: Option<&Path>, bundle: bool) -> Result<PathBuf> {
         let is_notebook = matches!(item.file_type.as_deref(), None | Some("notebook"));
         if bundle || is_notebook {
-            let destination = resolve_destination(output, &format!("{}.rmdoc", item.visible_name));
+            let destination = resolve_destination(output, &download_filename(item, bundle));
             self.progress
                 .step(&format!("Downloading '{}'", item.visible_name));
             let tar_bytes = self.fetch_item_tar(&item.uuid)?;
@@ -426,8 +474,7 @@ impl Client {
         }
 
         let extension = item.file_type.as_deref().expect("payload types are Some");
-        let destination =
-            resolve_destination(output, &format!("{}.{extension}", item.visible_name));
+        let destination = resolve_destination(output, &download_filename(item, bundle));
         self.progress
             .step(&format!("Downloading '{}'", item.visible_name));
         self.session.download_remote_file(
@@ -463,14 +510,18 @@ impl Client {
         self.delete_many(&[item_ref], recursive)
     }
 
-    /// Delete several documents/folders in one pass. Every reference
-    /// is resolved against a single listing **before anything is
-    /// deleted**, so one bad target aborts the whole command instead
-    /// of leaving it half-done. Overlapping targets (one inside
-    /// another) are deduplicated; children are removed before parents.
+    /// Delete several documents/folders in one pass. References may
+    /// be UUIDs, logical paths, or glob patterns (`*`, `?`, `[...]`,
+    /// `**`). Every reference is resolved against a single listing
+    /// **before anything is deleted**, so one bad target aborts the
+    /// whole command instead of leaving it half-done. Overlapping
+    /// targets (one inside another) are deduplicated; children are
+    /// removed before parents.
     pub fn delete_many(&self, item_refs: &[&str], recursive: bool) -> Result<Vec<Item>> {
         let items = self.list_items()?;
-        let order = deletion_plan(&items, item_refs, recursive)?;
+        let uuids = xochitl::expand_refs(&items, item_refs)?;
+        let refs: Vec<&str> = uuids.iter().map(String::as_str).collect();
+        let order = deletion_plan(&items, &refs, recursive)?;
         self.execute_deletions(order)
     }
 
@@ -501,33 +552,51 @@ impl Client {
 
     /// Move an item into another folder (root allowed).
     pub fn move_item(&self, item_ref: &str, destination_ref: &str) -> Result<Item> {
-        let items = self.list_items()?;
-        let item = xochitl::resolve_item_ref(&items, item_ref)?.clone();
-        let destination = xochitl::resolve_folder_ref(&items, destination_ref)?;
+        let mut moved = self.move_items(item_ref, destination_ref)?;
+        moved
+            .pop()
+            .ok_or_else(|| Error::PathNotFound(item_ref.to_string()))
+    }
 
-        if item.uuid == destination {
+    /// Move one item — or everything matching a glob pattern — into
+    /// another folder (root allowed). All targets are validated
+    /// against a single listing **before anything is written**; items
+    /// already in the destination are returned unchanged.
+    pub fn move_items(&self, item_ref: &str, destination_ref: &str) -> Result<Vec<Item>> {
+        let items = self.list_items()?;
+        let destination = xochitl::resolve_folder_ref(&items, destination_ref)?;
+        let uuids = xochitl::expand_refs(&items, &[item_ref])?;
+        if uuids.contains(&destination) {
             return Err(Error::MoveIntoSelf);
         }
-        if item.is_folder() && xochitl::is_descendant(&items, &destination, &item.uuid) {
-            return Err(Error::MoveIntoDescendant);
+        let plan = xochitl::plan_moves(&items, &uuids, &destination)?;
+        if plan.is_empty() {
+            // Everything already in place: report the matched items.
+            return Ok(uuids
+                .iter()
+                .filter_map(|uuid| items.iter().find(|item| &item.uuid == uuid))
+                .cloned()
+                .collect());
         }
-        if item.parent == destination {
-            return Ok(item);
-        }
-        xochitl::ensure_no_conflict(&items, &destination, &item.visible_name, Some(&item.uuid))?;
 
         let now = now_ms();
-        self.progress.step("Updating metadata");
-        self.update_metadata(&item.uuid, |metadata| {
-            metadata.insert("parent".to_string(), Value::String(destination.clone()));
-            metadata.insert("lastModified".to_string(), Value::String(now.to_string()));
+        plan.iter().try_for_each(|item| {
+            self.progress
+                .step(&format!("Moving '{}'", item.visible_name));
+            self.update_metadata(&item.uuid, |metadata| {
+                metadata.insert("parent".to_string(), Value::String(destination.clone()));
+                metadata.insert("lastModified".to_string(), Value::String(now.to_string()));
+            })
         })?;
         self.progress.finished();
-        Ok(Item {
-            parent: destination,
-            last_modified: now,
-            ..item
-        })
+        Ok(plan
+            .into_iter()
+            .map(|item| Item {
+                parent: destination.clone(),
+                last_modified: now,
+                ..item.clone()
+            })
+            .collect())
     }
 
     /// Rename a document or folder.
@@ -695,6 +764,21 @@ fn default_name(visible_name: Option<&str>, local: &Path) -> String {
             .map(|stem| stem.to_string_lossy().into_owned())
             .unwrap_or_else(|| "untitled".to_string())
     })
+}
+
+/// Local file name a download of `item` produces (notebooks and
+/// forced bundles land as `.rmdoc`, payloads keep their extension).
+fn download_filename(item: &Item, bundle: bool) -> String {
+    let is_notebook = matches!(item.file_type.as_deref(), None | Some("notebook"));
+    if bundle || is_notebook {
+        format!("{}.rmdoc", item.visible_name)
+    } else {
+        format!(
+            "{}.{}",
+            item.visible_name,
+            item.file_type.as_deref().expect("payload types are Some")
+        )
+    }
 }
 
 /// Default to `filename` in the current directory; an existing local

@@ -266,6 +266,220 @@ pub fn resolve_folder_ref(items: &[Item], folder_ref: &str) -> Result<String> {
     Ok(item.uuid.clone())
 }
 
+/// Whether a reference contains glob metacharacters (`*`, `?`, `[`).
+pub fn is_glob(reference: &str) -> bool {
+    reference.contains(['*', '?', '['])
+}
+
+/// Match one glob segment (no `/`) against one path segment.
+/// Supports `*`, `?`, and character classes `[...]` / `[!...]` with
+/// ranges; an unterminated `[` matches a literal `[` (shell rule).
+fn segment_match(pattern: &[char], text: &[char]) -> bool {
+    /// The parsed class: pattern remainder, negation, member ranges.
+    type Class<'a> = (&'a [char], bool, Vec<(char, char)>);
+
+    /// Parse a class at `pattern[0] == '['`; `None` when unterminated.
+    fn parse_class(pattern: &[char]) -> Option<Class<'_>> {
+        let (negated, mut i) = if pattern.first() == Some(&'!') {
+            (true, 1)
+        } else {
+            (false, 0)
+        };
+        let mut ranges = Vec::new();
+        // A `]` in first position is a literal member.
+        let mut first = true;
+        while let Some(&c) = pattern.get(i) {
+            if c == ']' && !first {
+                return Some((&pattern[i + 1..], negated, ranges));
+            }
+            first = false;
+            if pattern.get(i + 1) == Some(&'-') && pattern.get(i + 2).is_some_and(|&e| e != ']') {
+                ranges.push((c, pattern[i + 2]));
+                i += 3;
+            } else {
+                ranges.push((c, c));
+                i += 1;
+            }
+        }
+        None
+    }
+
+    match pattern.split_first() {
+        None => text.is_empty(),
+        Some(('*', rest)) => (0..=text.len()).any(|skip| segment_match(rest, &text[skip..])),
+        Some(('?', rest)) => text
+            .split_first()
+            .is_some_and(|(_, text_rest)| segment_match(rest, text_rest)),
+        Some(('[', class_rest)) => match parse_class(class_rest) {
+            Some((rest, negated, ranges)) => text.split_first().is_some_and(|(&c, text_rest)| {
+                let member = ranges.iter().any(|&(lo, hi)| lo <= c && c <= hi);
+                member != negated && segment_match(rest, text_rest)
+            }),
+            // Unterminated class: literal '['.
+            None => text
+                .split_first()
+                .is_some_and(|(&c, text_rest)| c == '[' && segment_match(class_rest, text_rest)),
+        },
+        Some((&expected, rest)) => text
+            .split_first()
+            .is_some_and(|(&c, text_rest)| c == expected && segment_match(rest, text_rest)),
+    }
+}
+
+/// Match glob pattern segments against path segments. `*`/`?`/classes
+/// never cross a `/`. A bare `**` segment in the middle matches any
+/// number of segments (including none, so `a/**/b` matches `a/b`); a
+/// *trailing* `**` matches everything **inside** a folder but not the
+/// folder itself (gitignore semantics — `rm 'Books/**'` empties Books
+/// without deleting it).
+fn match_segments(pattern: &[&str], path: &[&str]) -> bool {
+    match pattern.split_first() {
+        None => path.is_empty(),
+        Some((&"**", [])) => !path.is_empty(),
+        Some((&"**", rest)) => (0..=path.len()).any(|skip| match_segments(rest, &path[skip..])),
+        Some((first, rest)) => path.split_first().is_some_and(|(segment, path_rest)| {
+            let pattern_chars: Vec<char> = first.chars().collect();
+            let segment_chars: Vec<char> = segment.chars().collect();
+            segment_match(&pattern_chars, &segment_chars) && match_segments(rest, path_rest)
+        }),
+    }
+}
+
+/// Split a reference/pattern into normalized path segments (leading
+/// and trailing `/` and empty segments dropped).
+fn path_segments(reference: &str) -> Vec<&str> {
+    reference
+        .split('/')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect()
+}
+
+/// All items **reachable from the root** whose logical path matches
+/// the glob pattern (trash and orphan items never match, same as
+/// exact path resolution). Duplicate-named siblings that both match
+/// are both returned — a pattern means "everything that matches",
+/// unlike an exact path, where ambiguity is rejected. Errors when
+/// nothing matches.
+pub fn resolve_glob<'a>(items: &'a [Item], pattern: &str) -> Result<Vec<&'a Item>> {
+    let pattern_segments = path_segments(pattern);
+    if pattern_segments.is_empty() {
+        return Err(Error::RootTarget);
+    }
+
+    fn walk<'a>(
+        children: &HashMap<&str, Vec<&'a Item>>,
+        parent: &str,
+        prefix: &mut Vec<&'a str>,
+        pattern: &[&str],
+        matched: &mut Vec<&'a Item>,
+    ) {
+        children
+            .get(parent)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .for_each(|item| {
+                prefix.push(item.visible_name.as_str());
+                if match_segments(pattern, prefix) {
+                    matched.push(item);
+                }
+                if item.is_folder() {
+                    walk(children, &item.uuid, prefix, pattern, matched);
+                }
+                prefix.pop();
+            });
+    }
+
+    let mut matched = Vec::new();
+    walk(
+        &children_map(items, false),
+        "",
+        &mut Vec::new(),
+        &pattern_segments,
+        &mut matched,
+    );
+    if matched.is_empty() {
+        return Err(Error::PathNotFound(pattern.to_string()));
+    }
+    Ok(matched)
+}
+
+/// Expand a mixed list of exact references and glob patterns into
+/// UUIDs against one listing. Exact resolution is tried first, so an
+/// item whose name literally contains glob metacharacters stays
+/// addressable; only when that fails and the reference contains
+/// metacharacters is it treated as a pattern.
+pub fn expand_refs(items: &[Item], item_refs: &[&str]) -> Result<Vec<String>> {
+    item_refs.iter().try_fold(Vec::new(), |mut out, reference| {
+        match resolve_item_ref(items, reference) {
+            Ok(item) => out.push(item.uuid.clone()),
+            Err(exact_err) => {
+                if !is_glob(reference) {
+                    return Err(exact_err);
+                }
+                out.extend(
+                    resolve_glob(items, reference)?
+                        .iter()
+                        .map(|item| item.uuid.clone()),
+                );
+            }
+        }
+        Ok(out)
+    })
+}
+
+/// Validate moving `uuids` into `destination_uuid`, returning the
+/// items that actually need moving (already-in-place ones drop out).
+/// Everything is checked before anything is written: self-moves,
+/// folder cycles, and name conflicts in the destination — including
+/// conflicts *among* the moved set itself.
+pub fn plan_moves<'a>(
+    items: &'a [Item],
+    uuids: &[String],
+    destination_uuid: &str,
+) -> Result<Vec<&'a Item>> {
+    let moving: Vec<&Item> = uuids
+        .iter()
+        .map(|uuid| {
+            items
+                .iter()
+                .find(|item| &item.uuid == uuid)
+                .ok_or_else(|| Error::PathNotFound(uuid.clone()))
+        })
+        .collect::<Result<_>>()?;
+    let needed: Vec<&Item> = moving
+        .into_iter()
+        .filter(|item| item.parent != destination_uuid)
+        .collect();
+
+    needed.iter().try_fold(
+        HashSet::<&str>::new(),
+        |mut names, item| -> Result<HashSet<&str>> {
+            if item.uuid == destination_uuid {
+                return Err(Error::MoveIntoSelf);
+            }
+            if item.is_folder() && is_descendant(items, destination_uuid, &item.uuid) {
+                return Err(Error::MoveIntoDescendant);
+            }
+            ensure_no_conflict(
+                items,
+                destination_uuid,
+                &item.visible_name,
+                Some(&item.uuid),
+            )?;
+            if !names.insert(item.visible_name.as_str()) {
+                return Err(Error::NameConflict {
+                    name: item.visible_name.clone(),
+                    parent: display_parent(destination_uuid).to_string(),
+                });
+            }
+            Ok(names)
+        },
+    )?;
+    Ok(needed)
+}
+
 /// Find a uniquely-named child of `parent_uuid`, if any.
 pub fn find_child<'a>(
     items: &'a [Item],
@@ -656,5 +870,167 @@ mod tests {
         // Missing .content entirely: do not guess.
         let item = item_from_metadata("u", &metadata, None, None).unwrap();
         assert_eq!(item.file_type, None);
+    }
+
+    // ---- globs -------------------------------------------------------------
+
+    fn glob(pattern: &str, path: &str) -> bool {
+        let pattern_segments: Vec<&str> = path_segments(pattern);
+        let segments: Vec<&str> = path_segments(path);
+        match_segments(&pattern_segments, &segments)
+    }
+
+    #[test]
+    fn glob_matching_rules() {
+        // `*` and `?` within a segment.
+        assert!(glob("math-*", "math-books-vol-1"));
+        assert!(glob("*.pdf", "a.pdf"));
+        assert!(glob("vol-?", "vol-1"));
+        assert!(!glob("vol-?", "vol-10"));
+        assert!(glob("*", "anything"));
+
+        // `*` never crosses `/`.
+        assert!(!glob("*", "Books/Math"));
+        assert!(glob("Books/*", "Books/Math"));
+        assert!(!glob("Books/*", "Books/Math/Deep"));
+
+        // `**` crosses segment boundaries. Trailing `**` = everything
+        // *inside* the folder, not the folder itself (gitignore rule);
+        // mid-pattern `**` matches zero or more segments.
+        assert!(glob("Books/**", "Books/Math"));
+        assert!(glob("Books/**", "Books/Math/Deep"));
+        assert!(!glob("Books/**", "Books"));
+        assert!(glob("**/Deep", "Books/Math/Deep"));
+        assert!(glob("Books/**/Deep", "Books/Deep"));
+
+        // Character classes: sets, ranges, negation, literal `]`.
+        assert!(glob("vol-[12]", "vol-1"));
+        assert!(!glob("vol-[12]", "vol-3"));
+        assert!(glob("vol-[0-9]", "vol-7"));
+        assert!(glob("vol-[!0-9]", "vol-x"));
+        assert!(!glob("vol-[!0-9]", "vol-7"));
+        assert!(glob("a[]]b", "a]b"));
+
+        // Unterminated `[` is a literal (shell rule).
+        assert!(glob("a[b", "a[b"));
+
+        // Case-sensitive.
+        assert!(!glob("books/*", "Books/Math"));
+    }
+
+    #[test]
+    fn glob_resolution_scopes_and_errors() {
+        let items = sample();
+        let names = |matched: Vec<&Item>| -> Vec<String> {
+            matched.iter().map(|i| i.visible_name.clone()).collect()
+        };
+
+        // Documents and folders both match.
+        assert_eq!(
+            names(resolve_glob(&items, "Books/*").unwrap()),
+            ["Math", "Physics"]
+        );
+        // `**` recurses.
+        assert_eq!(
+            names(resolve_glob(&items, "Books/**").unwrap()),
+            ["Math", "Linear Algebra", "Physics"]
+        );
+        // Leading slash is fine.
+        assert_eq!(names(resolve_glob(&items, "/N*").unwrap()), ["Notes"]);
+        // No matches: error, never an empty no-op.
+        assert!(matches!(
+            resolve_glob(&items, "Books/z*"),
+            Err(Error::PathNotFound(_))
+        ));
+        // Bare `/` is not a target.
+        assert!(matches!(resolve_glob(&items, "/"), Err(Error::RootTarget)));
+
+        // Trash and orphan items never match.
+        let mut with_trash = sample();
+        with_trash.push(doc("t", "Trashed", "trash", "pdf"));
+        assert!(matches!(
+            resolve_glob(&with_trash, "Trash*"),
+            Err(Error::PathNotFound(_))
+        ));
+
+        // Duplicate-named siblings both match a pattern (a pattern
+        // means "everything that matches", unlike an exact path).
+        let mut dupes = sample();
+        dupes.push(doc("ph2", "Physics", "b", "pdf"));
+        assert_eq!(resolve_glob(&dupes, "Books/Phys*").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn expand_refs_prefers_exact_matches() {
+        // An item literally named with a metacharacter is addressed
+        // exactly, not treated as a pattern.
+        let mut items = sample();
+        items.push(doc("star", "vol-*", "b", "pdf"));
+        items.push(doc("v1", "vol-1", "b", "pdf"));
+        assert_eq!(
+            expand_refs(&items, &["Books/vol-*"]).unwrap(),
+            ["star".to_string()]
+        );
+
+        // Without an exact match the pattern expands.
+        let items = {
+            let mut items = sample();
+            items.push(doc("v1", "vol-1", "b", "pdf"));
+            items.push(doc("v2", "vol-2", "b", "pdf"));
+            items
+        };
+        assert_eq!(
+            expand_refs(&items, &["Books/vol-*"]).unwrap(),
+            ["v1".to_string(), "v2".to_string()]
+        );
+
+        // Mixed exact and glob refs; non-glob misses stay hard errors.
+        assert_eq!(
+            expand_refs(&items, &["ph", "Books/vol-*"]).unwrap().len(),
+            3
+        );
+        assert!(matches!(
+            expand_refs(&items, &["Books/Nope"]),
+            Err(Error::PathNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn plan_moves_validates_everything_up_front() {
+        let items = sample();
+
+        // Plain move.
+        let plan = plan_moves(&items, &["la".to_string()], "b").unwrap();
+        assert_eq!(plan[0].uuid, "la");
+
+        // Already in place: drops out.
+        assert!(
+            plan_moves(&items, &["la".to_string()], "m")
+                .unwrap()
+                .is_empty()
+        );
+
+        // Folder cycle.
+        assert!(matches!(
+            plan_moves(&items, &["b".to_string()], "m"),
+            Err(Error::MoveIntoDescendant)
+        ));
+
+        // Name conflict with an existing destination child.
+        let mut items2 = sample();
+        items2.push(doc("ph2", "Physics", "n", "pdf"));
+        assert!(matches!(
+            plan_moves(&items2, &["ph2".to_string()], "b"),
+            Err(Error::NameConflict { .. })
+        ));
+
+        // Name conflict *within* the moved set.
+        let mut items3 = sample();
+        items3.push(doc("x1", "Same", "b", "pdf"));
+        items3.push(doc("x2", "Same", "m", "pdf"));
+        assert!(matches!(
+            plan_moves(&items3, &["x1".to_string(), "x2".to_string()], "n"),
+            Err(Error::NameConflict { .. })
+        ));
     }
 }

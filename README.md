@@ -49,19 +49,31 @@ rmu download "Books/Math/Linear Algebra"           # to ./Linear Algebra.pdf
 rmu download Books/Physics ./downloads/
 rmu download "Notes/Meeting Notes"                 # notebooks -> .rmdoc bundle
 rmu download Books/Physics --bundle                # force .rmdoc (incl. annotations)
+rmu download 'Books/vol-*' ./downloads/            # glob -> every match
 
 rmu mv "Books/Physics" Notes             # move into another folder
 rmu mv Notes/Physics /                   # move to root
+rmu mv 'Books/math-*' Archive            # move every match
 rmu rename Notes/Physics "Physics II"
 
 rmu rm "Books/Math/Linear Algebra"
 rmu rm Books --recursive                 # delete non-empty folder
 rmu rm old.pdf drafts notes.epub -r      # several at once (all validated first)
+rmu rm 'Books/math-books-volumes-*'      # glob delete
+rmu rm 'Drafts/**'                       # empty a folder (keeps the folder)
 rmu empty-trash                          # permanently delete trashed items
 ```
 
 Targets are logical paths or item UUIDs; ambiguous paths are rejected
-instead of guessed. Uploads accept `.pdf` and `.epub` (what the device
+instead of guessed. `rm`, `mv`, and `download` also take glob patterns
+matched against logical paths (quote them so your shell doesn't expand
+them locally): `*`, `?`, and `[...]` match within one path segment,
+`**` crosses segments, and a trailing `**` matches everything *inside*
+a folder without the folder itself. An item whose name literally
+contains a glob character is still addressed exactly — exact matches
+win over pattern expansion. A pattern that matches nothing is an
+error, and everything a pattern expands to is validated before
+anything is written. Uploads accept `.pdf` and `.epub` (what the device
 renders natively) and `.rmdoc` bundles. After write operations `rmu`
 restarts xochitl so changes appear on the device (`--no-restart` to
 skip).

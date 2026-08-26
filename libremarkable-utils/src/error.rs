@@ -72,6 +72,10 @@ pub enum Error {
     #[error("file not found: {}", .0.display())]
     FileNotFound(PathBuf),
 
+    /// Multiple downloads need a directory to land in.
+    #[error("multiple matches: output must be an existing directory, got {}", .0.display())]
+    OutputNotADirectory(PathBuf),
+
     /// Attempted to move an item into itself.
     #[error("cannot move an item into itself")]
     MoveIntoSelf,

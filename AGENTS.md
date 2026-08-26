@@ -56,8 +56,9 @@ This repository is **open source** (dual-licensed MIT OR Apache-2.0):
   (`maybe_run_askpass` must be called first thing in `main`); the
   password travels via environment, never argv.
 - `xochitl.rs` — on-device file formats and **pure** tree logic (path/UUID
-  resolution, ambiguity rejection, conflict/cycle checks, rendering).
-  Keep this module I/O-free so it stays unit-testable without a device.
+  resolution, glob matching/expansion, ambiguity rejection,
+  conflict/cycle checks, rendering). Keep this module I/O-free so it
+  stays unit-testable without a device.
 - `client.rs` — high-level operations composing the two. `list_items`
   fetches all metadata in a single SSH round trip (batched remote script
   with a per-call random marker); keep new operations batched too.
@@ -140,7 +141,10 @@ nix build .#rmu                    # build the CLI via crane
   smoke-test order is: `ls` → `mkdir` → `upload` → `download` → `mv` →
   `rename` → `rm` on a scratch folder.
 - Ambiguous logical paths must be rejected, never guessed — this is a
-  data-safety invariant, not a convenience choice.
+  data-safety invariant, not a convenience choice. Glob patterns are
+  the sanctioned way to address multiple items (`rm`/`mv`/`download`);
+  exact-name resolution always wins over pattern expansion, and a
+  pattern that matches nothing is an error.
 
 ## Conventions
 
