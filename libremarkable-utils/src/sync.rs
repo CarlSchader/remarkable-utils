@@ -82,7 +82,7 @@ pub fn probe_remarkable(session: &SshSession, xochitl_dir: &str) -> Result<bool>
 // ---------------------------------------------------------------------------
 
 /// Syncable file kinds, by local extension.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DocKind {
     Pdf,
@@ -497,6 +497,8 @@ pub trait FsEndpoint {
     fn write(&self, rel_path: &str, data: &[u8]) -> Result<()>;
     /// Remove a file; idempotent.
     fn remove(&self, rel_path: &str) -> Result<()>;
+    /// Move/rename a file, creating target parent directories.
+    fn rename(&self, from: &str, to: &str) -> Result<()>;
     /// Remove a directory **only if empty**; returns whether it was
     /// removed. Missing or non-empty directories are left alone
     /// without error — the emptiness check is the safety mechanism.
@@ -556,6 +558,14 @@ impl FsEndpoint for LocalFs {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(err) => Err(err.into()),
         }
+    }
+
+    fn rename(&self, from: &str, to: &str) -> Result<()> {
+        let target = self.root.join(to);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        Ok(fs::rename(self.root.join(from), target)?)
     }
 
     fn remove_dir(&self, rel_dir: &str) -> Result<bool> {
@@ -676,6 +686,18 @@ impl FsEndpoint for SshFs {
     fn remove(&self, rel_path: &str) -> Result<()> {
         self.session
             .run_checked(&format!("rm -f -- {}", shell_quote(&self.join(rel_path))))?;
+        Ok(())
+    }
+
+    fn rename(&self, from: &str, to: &str) -> Result<()> {
+        let to_path = self.join(to);
+        let parent = to_path.rsplit_once('/').map(|(dir, _)| dir).unwrap_or(".");
+        self.session.run_checked(&format!(
+            "mkdir -p {parent} && mv -- {from} {to}",
+            parent = shell_quote(parent),
+            from = shell_quote(&self.join(from)),
+            to = shell_quote(&to_path),
+        ))?;
         Ok(())
     }
 
@@ -891,6 +913,51 @@ pub enum SyncAction {
         local_hash: Option<String>,
         payload_hash: Option<String>,
     },
+    /// The local file moved (hash-paired with a vanished mapped path):
+    /// relocate the device document with one metadata write. Zero
+    /// bytes transferred, annotations preserved.
+    MoveRemote {
+        from: String,
+        to: String,
+        kind: DocKind,
+        uuid: String,
+        remote_dir: String,
+        name: String,
+        local_hash: Option<String>,
+        payload_hash: Option<String>,
+    },
+    /// The document moved on the device (UUID identity): relocate the
+    /// local file to mirror it. Zero bytes transferred.
+    MoveLocal {
+        from: String,
+        to: String,
+        kind: DocKind,
+        uuid: String,
+        last_modified: i64,
+        local_hash: Option<String>,
+        payload_hash: Option<String>,
+    },
+    /// Create a device document by copying an identical payload that
+    /// is **already on the device** (hash-verified). Nothing uploaded.
+    CopyRemote {
+        local: String,
+        kind: DocKind,
+        from_uuid: String,
+        remote_dir: String,
+        name: String,
+        size_bytes: Option<u64>,
+        hash: String,
+    },
+    /// Materialize a device document by copying an identical local
+    /// file (hash-verified). Nothing downloaded.
+    CopyLocal {
+        from: String,
+        to: String,
+        kind: DocKind,
+        uuid: String,
+        last_modified: i64,
+        hash: String,
+    },
     /// A conflict the policy did not resolve; nothing is changed.
     Conflict {
         path: String,
@@ -970,13 +1037,21 @@ impl View<'_> {
     }
 }
 
-/// Name-collision guards for upload candidates.
+/// Name-collision guards and content indexes for upload candidates.
 struct Guards {
     /// (dir, name) pairs already occupied on the device.
     taken: std::collections::HashSet<(String, String)>,
     /// Upload candidates per (dir, name); >1 means local files compete
     /// for the same device name (e.g. `n.epub` + `n.pdf`).
     upload_counts: HashMap<(String, String), usize>,
+    /// Copy-by-fingerprint sources on the device: payload hash →
+    /// (uuid, kind, size). A new local file whose hash is here is
+    /// materialized by an on-device `cp` instead of an upload.
+    copy_sources: HashMap<String, (String, DocKind, Option<u64>)>,
+    /// Local files by content hash: a new device document whose
+    /// payload hash is here is materialized by a local copy instead
+    /// of a download.
+    local_by_hash: HashMap<String, String>,
 }
 
 /// Action buckets, concatenated in execution-safe order: rebinds →
@@ -986,6 +1061,7 @@ struct Guards {
 #[derive(Default)]
 struct Buckets {
     rebinds: Vec<SyncAction>,
+    moves: Vec<SyncAction>,
     transfers: Vec<SyncAction>,
     deletes: Vec<SyncAction>,
     forgets: Vec<SyncAction>,
@@ -1001,9 +1077,13 @@ fn payload_mirrored(doc_type: RemoteType) -> bool {
 /// Which device payloads are worth hashing before planning (lazy,
 /// batched by the caller into one round trip). Pure. Candidates:
 /// - mapped docs whose `lastModified` moved while a recorded payload
-///   hash exists (annotation-only changes can then skip the download);
+///   hash exists (annotation-only changes and pure device-side moves
+///   can then skip the transfer);
 /// - unmapped docs whose pull path collides with an unmapped local
-///   file of the same payload kind (hash-verified adoption).
+///   file of the same payload kind (hash-verified adoption);
+/// - unmapped docs whose size matches some local file (hash-verified
+///   local copy instead of a download — equal hashes require equal
+///   sizes, so the size check is a free prefilter).
 pub fn device_hash_candidates(
     local: &[LocalEntry],
     remote: &RemoteSnapshot,
@@ -1011,6 +1091,7 @@ pub fn device_hash_candidates(
 ) -> Vec<(String, &'static str)> {
     let local_by_path: HashMap<&str, &LocalEntry> =
         local.iter().map(|e| (e.rel_path.as_str(), e)).collect();
+    let local_sizes: std::collections::HashSet<u64> = local.iter().map(|e| e.size).collect();
     let mapped_uuids: std::collections::HashSet<&str> =
         state.entries.values().map(|st| st.uuid.as_str()).collect();
     let by_uuid: HashMap<&str, &RemoteDoc> =
@@ -1028,12 +1109,16 @@ pub fn device_hash_candidates(
         .iter()
         .filter(|doc| payload_mirrored(doc.doc_type) && !mapped_uuids.contains(doc.uuid.as_str()))
         .filter(|doc| {
-            local_by_path
+            let twin = local_by_path
                 .get(doc.local_rel_path().as_str())
                 .is_some_and(|entry| {
                     !state.entries.contains_key(&entry.rel_path)
                         && kind_matches(entry.kind, doc.doc_type)
-                })
+                });
+            let size_match = doc
+                .size_bytes
+                .is_some_and(|size| local_sizes.contains(&size));
+            twin || size_match
         });
 
     let mut out: Vec<(String, &'static str)> = mapped
@@ -1059,6 +1144,221 @@ pub fn attach_payload_hashes(remote: &mut RemoteSnapshot, hashes: &HashMap<Strin
     });
 }
 
+/// Output of the move-detection pre-pass: the move actions plus
+/// working copies of the archive and local snapshot with moved
+/// entries **re-keyed to their new paths**, so the three-way table
+/// below sees moves as already-agreed facts instead of
+/// delete-and-create pairs.
+struct MovePrepass {
+    actions: Vec<SyncAction>,
+    notes: Vec<SyncAction>,
+    state: SyncState,
+    local: Vec<LocalEntry>,
+}
+
+/// Pair moved files by content identity. Pure.
+///
+/// Local→device (`MoveRemote`): a vanished mapped path and a new
+/// unmapped file with the same hash and kind, strict 1:1 (filename
+/// tie-break); requires the device copy unchanged — a racing device
+/// edit falls back to the ordinary rules. Device→local (`MoveLocal`):
+/// the document UUID *is* the identity, so a mapped doc whose device
+/// path moved simply drags the local file along; the `lastModified`
+/// bump a move causes is absorbed only when the payload hash proves
+/// the content unchanged.
+fn detect_moves(
+    options: SyncOptions,
+    local: &[LocalEntry],
+    remote: &RemoteSnapshot,
+    state: &SyncState,
+) -> MovePrepass {
+    let mut out = MovePrepass {
+        actions: Vec::new(),
+        notes: Vec::new(),
+        state: SyncState {
+            version: state.version,
+            entries: state.entries.clone(),
+        },
+        local: local.to_vec(),
+    };
+    let docs_by_uuid: HashMap<&str, &RemoteDoc> =
+        remote.docs.iter().map(|d| (d.uuid.as_str(), d)).collect();
+    let local_by_path: HashMap<&str, &LocalEntry> =
+        local.iter().map(|e| (e.rel_path.as_str(), e)).collect();
+    let mut claimed_names = device_taken(remote);
+
+    // ---- local moves → MoveRemote --------------------------------------
+    if can_write_remote(options.mode) {
+        // (hash, kind) → vanished mapped paths / new unmapped paths.
+        type Group = (Vec<String>, Vec<String>);
+        let mut groups: BTreeMap<(String, DocKind), Group> = BTreeMap::new();
+        state
+            .entries
+            .iter()
+            .filter(|(key, st)| {
+                !local_by_path.contains_key(key.as_str())
+                    && st.local_hash.is_some()
+                    && docs_by_uuid
+                        .get(st.uuid.as_str())
+                        .is_some_and(|doc| doc.last_modified == st.remote_last_modified)
+            })
+            .for_each(|(key, st)| {
+                let hash = st.local_hash.clone().expect("filtered on Some");
+                groups
+                    .entry((hash, st.kind))
+                    .or_default()
+                    .0
+                    .push(key.clone());
+            });
+        local
+            .iter()
+            .filter(|entry| !state.entries.contains_key(&entry.rel_path))
+            .filter_map(|entry| entry.hash.clone().map(|hash| (entry, hash)))
+            .for_each(|(entry, hash)| {
+                if let Some(group) = groups.get_mut(&(hash, entry.kind)) {
+                    group.1.push(entry.rel_path.clone());
+                }
+            });
+
+        groups.into_values().for_each(|(mut sources, mut targets)| {
+            if targets.is_empty() {
+                return;
+            }
+            // Filename tie-break first, then an unambiguous 1:1 pair.
+            let mut pairs: Vec<(String, String)> = Vec::new();
+            targets.retain(|target| {
+                let stem = split_target(target).1;
+                let matching: Vec<usize> = sources
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, source)| split_target(source).1 == stem)
+                    .map(|(i, _)| i)
+                    .collect();
+                if let [only] = matching[..] {
+                    pairs.push((sources.remove(only), target.clone()));
+                    return false;
+                }
+                true
+            });
+            if let ([source], [target]) = (&sources[..], &targets[..]) {
+                pairs.push((source.clone(), target.clone()));
+                targets.clear();
+            }
+            targets
+                .iter()
+                .filter(|_| !sources.is_empty())
+                .for_each(|target| {
+                    out.notes.push(skip(
+                        target,
+                        "content matches a vanished synced file, but the move \
+                     pairing is ambiguous; treating as a new file",
+                    ));
+                });
+
+            pairs.into_iter().for_each(|(old_key, new_path)| {
+                let st = state.entries[&old_key].clone();
+                let (dir, stem) = split_target(&new_path);
+                let target_name = (dir.to_string(), stem.clone());
+                if claimed_names.contains(&target_name) {
+                    out.notes.push(skip(
+                        &new_path,
+                        "moved file's device name is already taken; treating as a new file",
+                    ));
+                    return;
+                }
+                claimed_names.insert(target_name);
+                let entry = local_by_path[new_path.as_str()];
+                out.actions.push(SyncAction::MoveRemote {
+                    from: old_key.clone(),
+                    to: new_path.clone(),
+                    kind: st.kind,
+                    uuid: st.uuid.clone(),
+                    remote_dir: dir.to_string(),
+                    name: stem,
+                    local_hash: st.local_hash.clone(),
+                    payload_hash: st.payload_hash.clone(),
+                });
+                // Re-key, absorbing the new stat stamp so the table
+                // sees a clean mapped entry at the new path. The
+                // executor records the authoritative state (fresh
+                // device lastModified) when the move runs.
+                out.state.entries.remove(&old_key);
+                out.state.entries.insert(
+                    new_path,
+                    StateEntry {
+                        local_size: entry.size,
+                        local_mtime_ms: entry.mtime_ms,
+                        ..st
+                    },
+                );
+            });
+        });
+    }
+
+    // ---- device moves → MoveLocal ---------------------------------------
+    if can_write_local(options.mode) {
+        state.entries.iter().for_each(|(key, st)| {
+            let Some(doc) = docs_by_uuid.get(st.uuid.as_str()) else {
+                return;
+            };
+            let new_key = doc.local_rel_path();
+            if new_key == *key || !local_by_path.contains_key(key.as_str()) {
+                return;
+            }
+            if local_by_path.contains_key(new_key.as_str())
+                || out.state.entries.contains_key(&new_key)
+            {
+                out.notes.push(skip(
+                    key,
+                    "the device moved this document, but the target local path is occupied",
+                ));
+                return;
+            }
+            // A device move bumps lastModified; absorb the bump only
+            // when the payload hash proves the content unchanged —
+            // otherwise the recorded lastModified stays put so the
+            // table schedules the content transfer at the new path.
+            let verified_same = doc.payload_hash.is_some() && doc.payload_hash == st.payload_hash;
+            let recorded_lm = if verified_same {
+                doc.last_modified
+            } else {
+                st.remote_last_modified
+            };
+            out.actions.push(SyncAction::MoveLocal {
+                from: key.clone(),
+                to: new_key.clone(),
+                kind: st.kind,
+                uuid: st.uuid.clone(),
+                last_modified: recorded_lm,
+                local_hash: st.local_hash.clone(),
+                payload_hash: st.payload_hash.clone(),
+            });
+            let mut new_st = st.clone();
+            new_st.remote_last_modified = recorded_lm;
+            out.state.entries.remove(key);
+            out.state.entries.insert(new_key.clone(), new_st);
+            if let Some(entry) = out.local.iter_mut().find(|e| e.rel_path == *key) {
+                entry.rel_path = new_key;
+            }
+        });
+    }
+
+    out
+}
+
+/// (dir, name) pairs already occupied on the device.
+fn device_taken(remote: &RemoteSnapshot) -> std::collections::HashSet<(String, String)> {
+    remote
+        .docs
+        .iter()
+        .map(|d| (d.rel_dir.clone(), d.name.clone()))
+        .chain(remote.folders.keys().filter(|p| !p.is_empty()).map(|path| {
+            let (dir, name) = path.rsplit_once('/').unwrap_or(("", path));
+            (dir.to_string(), name.to_string())
+        }))
+        .collect()
+}
+
 /// Compute the ordered action plan. Pure: no I/O.
 pub fn plan(
     options: SyncOptions,
@@ -1066,6 +1366,12 @@ pub fn plan(
     remote: &RemoteSnapshot,
     state: &SyncState,
 ) -> Plan {
+    // Move-detection pre-pass: from here on, `state` and `local` are
+    // working copies with moved entries re-keyed to their new paths.
+    let prepass = detect_moves(options, local, remote, state);
+    let state = &prepass.state;
+    let local = &prepass.local[..];
+
     let local_by_path: HashMap<&str, &LocalEntry> =
         local.iter().map(|e| (e.rel_path.as_str(), e)).collect();
     let docs_by_uuid: HashMap<&str, &RemoteDoc> =
@@ -1074,7 +1380,8 @@ pub fn plan(
         state.entries.values().map(|st| st.uuid.as_str()).collect();
 
     let mut buckets = Buckets {
-        notes: remote.skips.clone(),
+        moves: prepass.actions,
+        notes: remote.skips.iter().cloned().chain(prepass.notes).collect(),
         ..Buckets::default()
     };
 
@@ -1151,14 +1458,22 @@ pub fn plan(
         });
 
     let guards = Guards {
-        taken: remote
-            .docs
+        taken: device_taken(remote),
+        // Copy-by-fingerprint sources: mapped, still-present device
+        // docs whose payload is known-unchanged and hash-recorded.
+        copy_sources: state
+            .entries
+            .values()
+            .filter_map(|st| {
+                let doc = docs_by_uuid.get(st.uuid.as_str())?;
+                let hash = st.payload_hash.clone()?;
+                (payload_mirrored(doc.doc_type) && doc.last_modified == st.remote_last_modified)
+                    .then(|| (hash, (st.uuid.clone(), st.kind, doc.size_bytes)))
+            })
+            .collect(),
+        local_by_hash: local
             .iter()
-            .map(|d| (d.rel_dir.clone(), d.name.clone()))
-            .chain(remote.folders.keys().filter(|p| !p.is_empty()).map(|path| {
-                let (dir, name) = path.rsplit_once('/').unwrap_or(("", path));
-                (dir.to_string(), name.to_string())
-            }))
+            .filter_map(|entry| entry.hash.clone().map(|h| (h, entry.rel_path.clone())))
             .collect(),
         upload_counts: views
             .values()
@@ -1179,12 +1494,16 @@ pub fn plan(
         append_dir_deletes(options, local, remote, &docs_by_uuid, &mut buckets);
     }
 
-    // Folder creation for upload targets, parents before children.
+    // Folder creation for upload/move/copy targets, parents before
+    // children.
     let mut needed: Vec<String> = buckets
         .transfers
         .iter()
+        .chain(buckets.moves.iter())
         .filter_map(|action| match action {
-            SyncAction::Upload { remote_dir, .. } => Some(remote_dir.as_str()),
+            SyncAction::Upload { remote_dir, .. }
+            | SyncAction::CopyRemote { remote_dir, .. }
+            | SyncAction::MoveRemote { remote_dir, .. } => Some(remote_dir.as_str()),
             _ => None,
         })
         .flat_map(path_prefixes)
@@ -1202,6 +1521,7 @@ pub fn plan(
                     .into_iter()
                     .map(|rel_dir| SyncAction::CreateRemoteFolder { rel_dir }),
             )
+            .chain(buckets.moves)
             .chain(buckets.transfers)
             .chain(buckets.deletes)
             .chain(buckets.forgets)
@@ -1361,7 +1681,23 @@ fn decide(options: SyncOptions, key: &str, view: &View, guards: &Guards, out: &m
         }
         (None, None, Some(doc)) => {
             if can_write_local(options.mode) {
-                out.transfers.push(download(key, doc));
+                // Identical bytes already exist locally: copy instead
+                // of downloading (hash-verified).
+                if let Some(payload_hash) = &doc.payload_hash
+                    && let Some(from) = guards.local_by_hash.get(payload_hash)
+                    && from != key
+                {
+                    out.transfers.push(SyncAction::CopyLocal {
+                        from: from.clone(),
+                        to: key.to_string(),
+                        kind: doc.doc_type.pulled_kind(),
+                        uuid: doc.uuid.clone(),
+                        last_modified: doc.last_modified,
+                        hash: payload_hash.clone(),
+                    });
+                } else {
+                    out.transfers.push(download(key, doc));
+                }
             }
             // Push: untracked device documents stay untouched.
         }
@@ -1659,6 +1995,23 @@ fn upload_with_guards(key: &str, entry: &LocalEntry, guards: &Guards, out: &mut 
             key,
             "multiple local files map to the same device name",
         ));
+    } else if let Some((from_uuid, source_kind, size_bytes)) = entry
+        .hash
+        .as_ref()
+        .and_then(|hash| guards.copy_sources.get(hash))
+        && *source_kind == entry.kind
+    {
+        // Identical bytes already live on the device: one on-device
+        // `cp` instead of an upload.
+        out.transfers.push(SyncAction::CopyRemote {
+            local: key.to_string(),
+            kind: entry.kind,
+            from_uuid: from_uuid.clone(),
+            remote_dir: dir.to_string(),
+            name: stem,
+            size_bytes: *size_bytes,
+            hash: entry.hash.clone().expect("checked above"),
+        });
     } else {
         out.transfers.push(SyncAction::Upload {
             local: key.to_string(),
@@ -1714,6 +2067,14 @@ pub struct Outcome {
     pub uploaded: usize,
     pub updated: usize,
     pub downloaded: usize,
+    /// Metadata-only device moves (zero bytes transferred).
+    pub moved_remote: usize,
+    /// Local file moves mirroring device-side moves.
+    pub moved_local: usize,
+    /// On-device payload copies (upload avoided).
+    pub copied_remote: usize,
+    /// Local copies of identical content (download avoided).
+    pub copied_local: usize,
     pub deleted_local: usize,
     pub deleted_remote: usize,
     /// Emptied device folders removed (`--delete`).
@@ -1802,7 +2163,7 @@ pub fn execute(
                 // pdf/epub payloads are byte-identical to the local
                 // file, so the local hash doubles as the payload hash.
                 let payload = payload_mirrored_kind(*kind).then(|| hash.clone()).flatten();
-                record_state(
+                record_state_with(
                     state,
                     state_path,
                     fs_side,
@@ -1839,7 +2200,7 @@ pub fn execute(
                     (DocKind::Rmdoc, _) => unreachable!("mapped .rmdoc files are pull-only"),
                 };
                 let payload = payload_mirrored_kind(*kind).then(|| hash.clone()).flatten();
-                record_state(
+                record_state_with(
                     state,
                     state_path,
                     fs_side,
@@ -1893,7 +2254,7 @@ pub fn execute(
                 let payload = payload_mirrored(*doc_type)
                     .then(|| written_hash.clone())
                     .flatten();
-                record_state(
+                record_state_with(
                     state,
                     state_path,
                     fs_side,
@@ -1986,6 +2347,132 @@ pub fn execute(
                 );
                 state.save(state_path)?;
             }
+            SyncAction::MoveRemote {
+                from,
+                to,
+                kind,
+                uuid,
+                remote_dir,
+                name,
+                local_hash,
+                payload_hash,
+            } => {
+                let parent_uuid = folders
+                    .get(remote_dir)
+                    .cloned()
+                    .ok_or_else(|| Error::PathNotFound(remote_dir.to_string()))?;
+                let last_modified = client.move_document(uuid, &parent_uuid, name)?;
+                state.entries.remove(from);
+                record_state_with(
+                    state,
+                    state_path,
+                    fs_side,
+                    to,
+                    *kind,
+                    uuid,
+                    last_modified,
+                    local_hash.clone(),
+                    payload_hash.clone(),
+                )?;
+                outcome.moved_remote += 1;
+                outcome.modified_remote = true;
+            }
+            SyncAction::MoveLocal {
+                from,
+                to,
+                kind,
+                uuid,
+                last_modified,
+                local_hash,
+                payload_hash,
+            } => {
+                fs_side.rename(from, to)?;
+                state.entries.remove(from);
+                record_state_with(
+                    state,
+                    state_path,
+                    fs_side,
+                    to,
+                    *kind,
+                    uuid,
+                    *last_modified,
+                    local_hash.clone(),
+                    payload_hash.clone(),
+                )?;
+                outcome.moved_local += 1;
+            }
+            SyncAction::CopyRemote {
+                local,
+                kind,
+                from_uuid,
+                remote_dir,
+                name,
+                size_bytes,
+                hash,
+            } => {
+                let parent_uuid = folders
+                    .get(remote_dir)
+                    .cloned()
+                    .ok_or_else(|| Error::PathNotFound(remote_dir.to_string()))?;
+                let ext = match kind {
+                    DocKind::Pdf => "pdf",
+                    DocKind::Epub => "epub",
+                    DocKind::Rmdoc => unreachable!("copy sources are payload-mirrored"),
+                };
+                let item = client.copy_payload_on_device(
+                    from_uuid,
+                    ext,
+                    &parent_uuid,
+                    name,
+                    *size_bytes,
+                )?;
+                record_state_with(
+                    state,
+                    state_path,
+                    fs_side,
+                    local,
+                    *kind,
+                    &item.uuid,
+                    item.last_modified,
+                    Some(hash.clone()),
+                    Some(hash.clone()),
+                )?;
+                outcome.copied_remote += 1;
+                outcome.modified_remote = true;
+            }
+            SyncAction::CopyLocal {
+                from,
+                to,
+                kind,
+                uuid,
+                last_modified,
+                hash,
+            } => {
+                match (fs_side.as_local_path(from), fs_side.as_local_path(to)) {
+                    (Some(src), Some(dest)) => {
+                        if let Some(parent) = dest.parent() {
+                            fs::create_dir_all(parent)?;
+                        }
+                        fs::copy(&src, &dest)?;
+                    }
+                    _ => {
+                        let data = fs_side.read(from)?;
+                        fs_side.write(to, &data)?;
+                    }
+                }
+                record_state_with(
+                    state,
+                    state_path,
+                    fs_side,
+                    to,
+                    *kind,
+                    uuid,
+                    *last_modified,
+                    Some(hash.clone()),
+                    Some(hash.clone()),
+                )?;
+                outcome.copied_local += 1;
+            }
             SyncAction::Rebind {
                 path,
                 uuid,
@@ -2026,7 +2513,7 @@ fn payload_mirrored_kind(kind: DocKind) -> bool {
 
 /// Stat the fs-side file and persist the new state entry.
 #[allow(clippy::too_many_arguments)]
-fn record_state(
+fn record_state_with(
     state: &mut SyncState,
     state_path: &Path,
     fs_side: &dyn FsEndpoint,
@@ -2882,6 +3369,18 @@ pub fn describe(action: &SyncAction) -> String {
         SyncAction::Refresh { path, .. } => {
             format!("refresh  {path} (content unchanged; state only)")
         }
+        SyncAction::MoveRemote { from, to, .. } => {
+            format!("move     {from} -> {to} (on device, metadata only)")
+        }
+        SyncAction::MoveLocal { from, to, .. } => {
+            format!("move     {from} -> {to} (local)")
+        }
+        SyncAction::CopyRemote { local, .. } => {
+            format!("copy     {local} (device-side copy of identical payload)")
+        }
+        SyncAction::CopyLocal { from, to, .. } => {
+            format!("copy     {from} -> {to} (local copy of identical content)")
+        }
         SyncAction::Conflict { path, reason } => format!("conflict {path} ({reason})"),
         SyncAction::Skip { path, reason } => format!("skip     {path} ({reason})"),
     }
@@ -3607,6 +4106,265 @@ mod tests {
             sync_state_path("/home/u/books", "rm:/Books"),
             sync_state_path("/home/u/books", "rm:/Other")
         );
+    }
+
+    // ---- moves and copies ---------------------------------------------------
+
+    fn doc_at(uuid: &str, name: &str, parent: &str, file_type: &str, modified: i64) -> Item {
+        doc(uuid, name, parent, file_type, modified)
+    }
+
+    #[test]
+    fn local_move_becomes_metadata_only_device_move() {
+        // n.pdf (mapped, hash h) vanished; a/moved.pdf appeared with
+        // the same hash. Expect: mkdir a, MoveRemote — no upload, no
+        // delete, even with --delete.
+        let snapshot = remote_snapshot(&[doc_at("u1", "n", "", "pdf", 5)], "");
+        let mut state = SyncState::default();
+        state.entries.insert(
+            "n.pdf".to_string(),
+            entry_hashed("u1", DocKind::Pdf, 10, 1, 5, "h", "h"),
+        );
+        let locals = vec![with_hash(local("a/moved.pdf", DocKind::Pdf, 10, 7), "h")];
+
+        let plan = plan(with_delete(push()), &locals, &snapshot, &state);
+        assert_eq!(
+            plan.actions,
+            vec![
+                SyncAction::CreateRemoteFolder {
+                    rel_dir: "a".to_string()
+                },
+                SyncAction::MoveRemote {
+                    from: "n.pdf".to_string(),
+                    to: "a/moved.pdf".to_string(),
+                    kind: DocKind::Pdf,
+                    uuid: "u1".to_string(),
+                    remote_dir: "a".to_string(),
+                    name: "moved".to_string(),
+                    local_hash: Some("h".to_string()),
+                    payload_hash: Some("h".to_string()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn local_move_with_racing_device_change_falls_back() {
+        // Device copy changed since last sync (lm 9 != 5): moving
+        // would mask the change, so the ordinary rules apply instead.
+        let snapshot = remote_snapshot(&[doc_at("u1", "n", "", "pdf", 9)], "");
+        let mut state = SyncState::default();
+        state.entries.insert(
+            "n.pdf".to_string(),
+            entry_hashed("u1", DocKind::Pdf, 10, 1, 5, "h", "h"),
+        );
+        let locals = vec![with_hash(local("moved.pdf", DocKind::Pdf, 10, 7), "h")];
+        let plan = plan(push(), &locals, &snapshot, &state);
+        assert!(
+            !plan
+                .actions
+                .iter()
+                .any(|a| matches!(a, SyncAction::MoveRemote { .. }))
+        );
+    }
+
+    #[test]
+    fn ambiguous_moves_tie_break_by_filename_then_note() {
+        // Two identical files (same hash) moved into a folder: the
+        // stem tie-break pairs both.
+        let items = vec![
+            doc_at("u1", "one", "", "pdf", 5),
+            doc_at("u2", "two", "", "pdf", 5),
+        ];
+        let snapshot = remote_snapshot(&items, "");
+        let mut state = SyncState::default();
+        state.entries.insert(
+            "one.pdf".to_string(),
+            entry_hashed("u1", DocKind::Pdf, 10, 1, 5, "h", "h"),
+        );
+        state.entries.insert(
+            "two.pdf".to_string(),
+            entry_hashed("u2", DocKind::Pdf, 10, 1, 5, "h", "h"),
+        );
+        let locals = vec![
+            with_hash(local("a/one.pdf", DocKind::Pdf, 10, 7), "h"),
+            with_hash(local("a/two.pdf", DocKind::Pdf, 10, 7), "h"),
+        ];
+        let plan_tie = plan(push(), &locals, &snapshot, &state);
+        assert_eq!(
+            plan_tie
+                .actions
+                .iter()
+                .filter(|a| matches!(a, SyncAction::MoveRemote { .. }))
+                .count(),
+            2
+        );
+
+        // Renamed to unrelated names: truly ambiguous — no move, a
+        // note, and (thanks to copy-by-fingerprint) device-side copies
+        // instead of uploads.
+        let locals = vec![
+            with_hash(local("a/x.pdf", DocKind::Pdf, 10, 7), "h"),
+            with_hash(local("a/y.pdf", DocKind::Pdf, 10, 7), "h"),
+        ];
+        let plan_amb = plan(push(), &locals, &snapshot, &state);
+        assert!(
+            !plan_amb
+                .actions
+                .iter()
+                .any(|a| matches!(a, SyncAction::MoveRemote { .. }))
+        );
+        assert_eq!(
+            plan_amb
+                .actions
+                .iter()
+                .filter(|a| matches!(a, SyncAction::CopyRemote { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(skips(&plan_amb).len(), 2);
+    }
+
+    #[test]
+    fn device_move_drags_the_local_file_along() {
+        // Mapped doc u1 moved into device folder A; payload hash
+        // verified unchanged → MoveLocal only, nothing transferred.
+        let items = vec![folder("a", "A", ""), doc_at("u1", "n", "a", "pdf", 9)];
+        let mut snapshot = remote_snapshot(&items, "");
+        snapshot.docs[0].payload_hash = Some("h".to_string());
+        let mut state = SyncState::default();
+        state.entries.insert(
+            "n.pdf".to_string(),
+            entry_hashed("u1", DocKind::Pdf, 10, 1, 5, "h", "h"),
+        );
+        let locals = vec![with_hash(local("n.pdf", DocKind::Pdf, 10, 1), "h")];
+        let plan_move = plan(pull(), &locals, &snapshot, &state);
+        assert_eq!(
+            plan_move.actions,
+            vec![SyncAction::MoveLocal {
+                from: "n.pdf".to_string(),
+                to: "A/n.pdf".to_string(),
+                kind: DocKind::Pdf,
+                uuid: "u1".to_string(),
+                last_modified: 9,
+                local_hash: Some("h".to_string()),
+                payload_hash: Some("h".to_string()),
+            }]
+        );
+
+        // Payload also changed (hash differs): move, then download at
+        // the new path.
+        snapshot.docs[0].payload_hash = Some("zzz".to_string());
+        let plan_both = plan(pull(), &locals, &snapshot, &state);
+        assert!(matches!(plan_both.actions[0], SyncAction::MoveLocal { .. }));
+        assert!(plan_both.actions.iter().any(|a| matches!(
+            a,
+            SyncAction::Download { local, .. } if local == "A/n.pdf"
+        )));
+    }
+
+    #[test]
+    fn device_move_to_occupied_path_is_noted_not_forced() {
+        let items = vec![folder("a", "A", ""), doc_at("u1", "n", "a", "pdf", 9)];
+        let snapshot = remote_snapshot(&items, "");
+        let mut state = SyncState::default();
+        state.entries.insert(
+            "n.pdf".to_string(),
+            entry_hashed("u1", DocKind::Pdf, 10, 1, 5, "h", "h"),
+        );
+        // Target A/n.pdf already exists locally.
+        let locals = vec![
+            with_hash(local("n.pdf", DocKind::Pdf, 10, 1), "h"),
+            with_hash(local("A/n.pdf", DocKind::Pdf, 20, 2), "other"),
+        ];
+        let plan = plan(pull(), &locals, &snapshot, &state);
+        assert!(
+            !plan
+                .actions
+                .iter()
+                .any(|a| matches!(a, SyncAction::MoveLocal { .. }))
+        );
+        assert!(skips(&plan).contains(&"n.pdf"));
+    }
+
+    #[test]
+    fn new_local_file_matching_device_payload_copies_on_device() {
+        // copy.pdf duplicates the mapped n.pdf's content: one on-device
+        // cp instead of an upload.
+        let snapshot = remote_snapshot(&[doc_at("u1", "n", "", "pdf", 5)], "");
+        let mut state = SyncState::default();
+        state.entries.insert(
+            "n.pdf".to_string(),
+            entry_hashed("u1", DocKind::Pdf, 10, 1, 5, "h", "h"),
+        );
+        let locals = vec![
+            with_hash(local("n.pdf", DocKind::Pdf, 10, 1), "h"),
+            with_hash(local("copy.pdf", DocKind::Pdf, 10, 3), "h"),
+        ];
+        let plan = plan(push(), &locals, &snapshot, &state);
+        assert_eq!(
+            plan.actions,
+            vec![SyncAction::CopyRemote {
+                local: "copy.pdf".to_string(),
+                kind: DocKind::Pdf,
+                from_uuid: "u1".to_string(),
+                remote_dir: String::new(),
+                name: "copy".to_string(),
+                size_bytes: Some(100),
+                hash: "h".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn new_device_doc_matching_local_content_copies_locally() {
+        // Device doc "dup" has the same payload hash as the local
+        // n.pdf: local copy instead of a download.
+        let items = vec![
+            doc_at("u1", "n", "", "pdf", 5),
+            doc_at("u2", "dup", "", "pdf", 6),
+        ];
+        let mut snapshot = remote_snapshot(&items, "");
+        snapshot
+            .docs
+            .iter_mut()
+            .find(|d| d.uuid == "u2")
+            .expect("dup doc present")
+            .payload_hash = Some("h".to_string());
+        let mut state = SyncState::default();
+        state.entries.insert(
+            "n.pdf".to_string(),
+            entry_hashed("u1", DocKind::Pdf, 10, 1, 5, "h", "h"),
+        );
+        let locals = vec![with_hash(local("n.pdf", DocKind::Pdf, 10, 1), "h")];
+        let plan = plan(pull(), &locals, &snapshot, &state);
+        assert_eq!(
+            plan.actions,
+            vec![SyncAction::CopyLocal {
+                from: "n.pdf".to_string(),
+                to: "dup.pdf".to_string(),
+                kind: DocKind::Pdf,
+                uuid: "u2".to_string(),
+                last_modified: 6,
+                hash: "h".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn size_prefilter_extends_hash_candidates() {
+        // Unmapped device doc whose size matches a local file is a
+        // hash candidate (potential local copy source).
+        let items = vec![doc_at("u1", "new", "", "pdf", 5)]; // size 100
+        let snapshot = remote_snapshot(&items, "");
+        let locals = vec![local("other.pdf", DocKind::Pdf, 100, 1)];
+        let wanted = device_hash_candidates(&locals, &snapshot, &SyncState::default());
+        assert_eq!(wanted, [("u1".to_string(), "pdf")]);
+
+        // No size match, no path twin: not hashed.
+        let locals = vec![local("other.pdf", DocKind::Pdf, 33, 1)];
+        let wanted = device_hash_candidates(&locals, &snapshot, &SyncState::default());
+        assert!(wanted.is_empty());
     }
 
     // ---- deletions --------------------------------------------------------

@@ -343,6 +343,54 @@ impl Client {
         self.touch_last_modified(uuid)
     }
 
+    /// Relocate/rename a document by UUID **without tree checks** —
+    /// callers (the sync executor) must have validated the destination
+    /// is a real folder and the name is free. Metadata-only: zero
+    /// bytes transferred, annotations preserved. Returns the new
+    /// `lastModified`.
+    pub fn move_document(&self, uuid: &str, parent_uuid: &str, name: &str) -> Result<i64> {
+        let now = now_ms();
+        self.progress
+            .step(&format!("Moving '{name}' (metadata only)"));
+        self.update_metadata(uuid, |metadata| {
+            metadata.insert("parent".to_string(), Value::String(parent_uuid.to_string()));
+            metadata.insert("visibleName".to_string(), Value::String(name.to_string()));
+            metadata.insert("lastModified".to_string(), Value::String(now.to_string()));
+        })?;
+        self.progress.finished();
+        Ok(now)
+    }
+
+    /// Create a new document by copying an existing payload **on the
+    /// device** (the bytes are already there; nothing is uploaded).
+    /// No conflict checks — callers must have verified the name is
+    /// free. The copy happens before registration, so an interruption
+    /// leaves an invisible orphan payload, never a broken document.
+    pub fn copy_payload_on_device(
+        &self,
+        from_uuid: &str,
+        file_type: &str,
+        parent_uuid: &str,
+        name: &str,
+        size_bytes: Option<u64>,
+    ) -> Result<Item> {
+        let doc_uuid = uuid::Uuid::new_v4().to_string();
+        self.progress
+            .step(&format!("Copying payload on device for '{name}'"));
+        self.session.run_checked(&format!(
+            "cp -f {from} {to}",
+            from = shell_quote(&self.remote_path(&format!("{from_uuid}.{file_type}"))),
+            to = shell_quote(&self.remote_path(&format!("{doc_uuid}.{file_type}"))),
+        ))?;
+        self.register_document(
+            doc_uuid,
+            name.to_string(),
+            parent_uuid.to_string(),
+            file_type,
+            size_bytes,
+        )
+    }
+
     fn touch_last_modified(&self, uuid: &str) -> Result<i64> {
         let now = now_ms();
         self.update_metadata(uuid, |metadata| {

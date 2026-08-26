@@ -2,9 +2,10 @@
 
 Status: **v1 phases 1–3 implemented and device-verified** (one-way,
 two-way, `--delete`, conflict policies, fs↔fs, tablet↔tablet). **v2
-phase 1 implemented, device verification pending**: content hashing,
-the XDG archive, refresh/adoption. v2 phases 2–4 are planned below.
-Update this file as phases land.
+phases 1–2 implemented, device verification pending**: content
+hashing, the XDG archive, refresh/adoption, move detection,
+copy-by-fingerprint. v2 phases 3–4 are planned below. Update this
+file as phases land.
 
 The v2 redesign borrows deliberately from the
 [Unison file synchronizer](https://github.com/bcpierce00/unison)
@@ -145,6 +146,10 @@ decides; when stamps moved, content verdicts override stamp verdicts:
 - unmapped collision, hash-identical → `adopt`; hash-different →
   policy (adoption toward the device only for matching payload types;
   handwriting is never overwritten)
+- a vanished mapped path and a new unmapped file with the same hash
+  and kind → `move` (see below)
+- a new file whose content already exists on the destination → `copy`
+  on the destination (nothing transferred)
 - mapped, one side gone → recopy or (with `--delete`) delete; a
   deletion racing a change is a conflict
 - both gone → `forget`
@@ -166,6 +171,50 @@ Unchanged v1 rules that remain data-safety invariants:
   orphans, not half-documents; dangling mappings **rebind** to
   same-name same-kind successors.
 
+## Moves and copies (phase 2)
+
+Move detection runs as a **pre-pass** before the three-way table: it
+pairs moves by content identity and re-keys the working copies of the
+archive and local snapshot, so the table sees moves as already-agreed
+facts instead of delete-and-create pairs.
+
+**Local→device (`MoveRemote`)**: a vanished mapped path and a new
+unmapped file with the same hash and kind, strict 1:1 — filename
+tie-break first, then a single unambiguous pair; anything else gets a
+skip-note and falls back to the ordinary rules (where
+copy-by-fingerprint usually still avoids the upload). Requires the
+device copy unchanged since last sync: a racing device edit would be
+masked by the move's `lastModified` bump, so it falls back instead.
+The move itself is **one metadata write** — zero bytes transferred,
+annotations preserved. Works for `--delete` and non-`--delete` alike
+(the old path is consumed, so no delete/re-upload is planned).
+
+**Device→local (`MoveLocal`)**: the document UUID *is* the identity,
+so a mapped doc whose device path moved simply drags the local file
+along (`rename`). A device move bumps `lastModified`; the bump is
+absorbed only when the lazily fetched payload hash proves the content
+unchanged — otherwise the recorded `lastModified` stays put and the
+table schedules the content transfer at the new path (safe under
+interruption: a resumed run still sees the pending change). An
+occupied target path produces a note, never an overwrite.
+
+**Copy-by-fingerprint** (Unison's trick, adapted):
+
+- push: a new local file whose hash matches a mapped, unchanged device
+  payload becomes an **on-device `cp`** + registration — nothing
+  uploaded. The copy runs before `.metadata` is written and before any
+  deletions execute, so interruption leaves an invisible orphan and
+  ambiguous-move fallbacks can copy from a document that is about to
+  be deleted.
+- pull: a new device document whose (lazily fetched) payload hash
+  matches any local file becomes a **local copy** — nothing
+  downloaded. Device docs are only hashed when their size matches some
+  local file (equal hashes require equal sizes, so the size check is a
+  free prefilter).
+
+Action order: state-only (rebind/adopt/refresh) → folder creates →
+moves → transfers and copies → deletions → forgets → notes.
+
 ## Executor
 
 Applies actions in order, emits `Progress` steps, saves the archive
@@ -179,19 +228,20 @@ payload, so one hash serves both sides.
 - **v2 phase 1 (implemented):** sha2; XDG archive with atomic writes;
   stamp-gated local hashing; lazy batched device payload hashing;
   `refresh` and `adopt` actions; legacy state-file warning.
-- **v2 phase 2 (planned): unified planner + move detection.** One
-  `Entry`/`Snapshot` model for both endpoint kinds; a single three-way
-  decision table (the md/txt conversion asymmetry is gone) with folders
-  as first-class entries; file-level move detection (vanished hash +
-  appeared hash, strict 1:1, filename tie-break, ambiguity → note) —
-  device moves become one metadata write (annotations preserved, zero
-  bytes); copy-by-fingerprint (new local file whose hash matches an
-  existing payload → on-device `cp` instead of upload).
-- **v2 phase 3 (planned):** folder-level move pairing (device folders
-  have UUIDs; a folder rename is one metadata write for the whole
-  subtree); incremental device listing (stat all `.metadata`/`.content`
-  first, cat only what changed since the cached listing — no-op syncs
-  of large libraries stop re-reading every JSON).
+- **v2 phase 2 (implemented):** file-level move detection in both
+  directions (`MoveRemote` = one metadata write; `MoveLocal` = local
+  rename, UUID identity) and copy-by-fingerprint in both directions
+  (`CopyRemote` = on-device `cp`; `CopyLocal` = local copy), with the
+  size prefilter extending lazy device hashing. See "Moves and copies"
+  above.
+- **v2 phase 3 (planned):** unified planner — one `Entry`/`Snapshot`
+  model and a single three-way decision table for all pairings, with
+  folders as first-class entries; folder-level move pairing (device
+  folders have UUIDs; a folder rename is one metadata write for the
+  whole subtree); incremental device listing (stat all
+  `.metadata`/`.content` first, cat only what changed since the cached
+  listing — no-op syncs of large libraries stop re-reading every
+  JSON).
 - **v2 phase 4 (candidates):** bounded transfer pipelining over the
   multiplexed connection (measure first); watch mode (local notify +
   cheap device polling); `--paranoid` full re-hash; exclude patterns;
