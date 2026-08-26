@@ -26,6 +26,9 @@ pub struct Client {
     session: SshSession,
     dir: String,
     progress: Arc<dyn Progress>,
+    /// Local cache file for the incremental listing (see
+    /// [`Self::list_items`]); `None` = always fetch everything.
+    listing_cache: Option<PathBuf>,
 }
 
 impl Client {
@@ -35,6 +38,7 @@ impl Client {
             session,
             dir,
             progress: Arc::new(NoProgress),
+            listing_cache: None,
         }
     }
 
@@ -45,11 +49,35 @@ impl Client {
         self
     }
 
-    /// Load the logical item list in a single SSH round trip.
+    /// Enable the incremental listing cache at the given local path
+    /// (see [`Self::list_items`]).
+    pub fn with_listing_cache(mut self, path: PathBuf) -> Self {
+        self.listing_cache = Some(path);
+        self
+    }
+
+    /// Load the logical item list.
     ///
-    /// One remote script dumps every `.metadata`/`.content` file plus
-    /// payload sizes, delimited by a per-call random marker.
+    /// Without a listing cache: one SSH round trip dumping every
+    /// `.metadata`/`.content` file plus payload sizes, delimited by a
+    /// per-call random marker.
+    ///
+    /// With a cache (see [`Self::with_listing_cache`]): an
+    /// **incremental** listing — round trip 1 stats every relevant
+    /// file (tiny output), round trip 2 fetches only files whose
+    /// mtime+size moved since the cached copy. A no-op sync of a large
+    /// library stops re-reading thousands of JSONs. Any cache problem
+    /// falls back to the full fetch.
     pub fn list_items(&self) -> Result<Vec<Item>> {
+        if let Some(cache_path) = &self.listing_cache
+            && let Ok(items) = self.list_items_incremental(cache_path)
+        {
+            return Ok(items);
+        }
+        self.list_items_full()
+    }
+
+    fn list_items_full(&self) -> Result<Vec<Item>> {
         self.progress.step("Reading document index");
         let marker = format!("===RMU:{}===", uuid::Uuid::new_v4().simple());
         let script = format!(
@@ -70,6 +98,77 @@ impl Client {
         let stdout_bytes = self.session.run_checked_bytes(&script, &*self.progress)?;
         let stdout = String::from_utf8_lossy(&stdout_bytes);
         let items = build_items(&parse_listing(&marker, &stdout));
+        self.progress.finished();
+        Ok(items)
+    }
+
+    fn list_items_incremental(&self, cache_path: &Path) -> Result<Vec<Item>> {
+        self.progress.step("Reading document index (incremental)");
+        // Round trip 1: stat everything relevant. Unmatched globs
+        // arrive as literal names and fail inside stat; harmless.
+        let script = format!(
+            "cd {dir} || exit 9\n\
+             stat -c '%Y %s %n' -- *.metadata *.content *.pdf *.epub 2>/dev/null\n\
+             exit 0\n",
+            dir = shell_quote(&self.dir),
+        );
+        let output = self.session.run_checked(&script)?;
+        let stats = parse_stat_listing(&output);
+
+        let cache = ListingCache::load(cache_path);
+        let (to_fetch, retained) = listing_delta(&cache, &stats);
+
+        // Round trip 2: fetch only changed/new files.
+        let mut fetched: Vec<(String, String)> = Vec::new();
+        if !to_fetch.is_empty() {
+            self.progress.step(&format!(
+                "Fetching {} changed metadata file(s)",
+                to_fetch.len()
+            ));
+            let marker = format!("===RMU:{}===", uuid::Uuid::new_v4().simple());
+            let names = to_fetch
+                .iter()
+                .map(|name| format!("{} ", shell_quote(name)))
+                .collect::<String>();
+            let script = format!(
+                "cd {dir} || exit 9\n\
+                 for f in {names}; do\n\
+                 [ -f \"$f\" ] || continue\n\
+                 printf '\\n%s %s\\n' {marker} \"$f\"\n\
+                 cat \"$f\"\n\
+                 done\n",
+                dir = shell_quote(&self.dir),
+                marker = shell_quote(&marker),
+            );
+            let stdout_bytes = self.session.run_checked_bytes(&script, &*self.progress)?;
+            let stdout = String::from_utf8_lossy(&stdout_bytes);
+            fetched = parse_marked_sections(&marker, &stdout);
+        }
+
+        // Merge into a Listing; payload sizes come from the stats.
+        let mut listing = Listing::default();
+        retained
+            .into_iter()
+            .chain(fetched.iter().cloned())
+            .for_each(|(name, body)| {
+                if let Some(uuid) = name.strip_suffix(".metadata") {
+                    listing.metadata.insert(uuid.to_string(), body);
+                } else if let Some(uuid) = name.strip_suffix(".content") {
+                    listing.content.insert(uuid.to_string(), body);
+                }
+            });
+        listing.sizes = stats
+            .iter()
+            .filter(|(name, ..)| name.ends_with(".pdf") || name.ends_with(".epub"))
+            .map(|(name, _, size)| (name.clone(), *size))
+            .collect();
+
+        // Persist the refreshed cache (best effort; a failed write
+        // only costs speed next time).
+        let refreshed = ListingCache::from_listing(&stats, &listing);
+        let _ = refreshed.save(cache_path);
+
+        let items = build_items(&listing);
         self.progress.finished();
         Ok(items)
     }
@@ -932,10 +1031,9 @@ struct Listing {
     sizes: HashMap<String, u64>,
 }
 
-fn parse_listing(marker: &str, output: &str) -> Listing {
-    // Group lines into (section name, body) pairs, then fold the
-    // sections into the listing maps.
-    let sections = output
+/// Split marker-delimited output into `(section name, body)` pairs.
+fn parse_marked_sections(marker: &str, output: &str) -> Vec<(String, String)> {
+    output
         .lines()
         .fold(Vec::<(String, String)>::new(), |mut sections, line| {
             match line
@@ -951,11 +1049,127 @@ fn parse_listing(marker: &str, output: &str) -> Listing {
                 }
             }
             sections
-        });
+        })
+}
 
-    sections
-        .into_iter()
-        .fold(Listing::default(), |mut listing, (name, body)| {
+/// Parse `stat -c '%Y %s %n'` lines into `(name, mtime, size)`.
+fn parse_stat_listing(output: &str) -> Vec<(String, i64, u64)> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let (mtime, rest) = line.split_once(' ')?;
+            let (size, name) = rest.split_once(' ')?;
+            Some((
+                name.trim().to_string(),
+                mtime.trim().parse().ok()?,
+                size.trim().parse().ok()?,
+            ))
+        })
+        .collect()
+}
+
+/// The on-disk cache behind the incremental listing: per
+/// `.metadata`/`.content` file, the stat signature and the file body
+/// as of the last fetch. Staleness caveat: a rewrite within the same
+/// second that keeps the size is invisible — the same trade every
+/// stat-cache makes (git index, Unison fastcheck).
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct ListingCache {
+    version: u32,
+    files: std::collections::BTreeMap<String, CachedFile>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct CachedFile {
+    mtime: i64,
+    size: u64,
+    body: String,
+}
+
+impl ListingCache {
+    /// Best effort: any problem yields an empty cache (= full fetch).
+    fn load(path: &Path) -> Self {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default()
+    }
+
+    fn save(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let tmp = path.with_extension("tmp");
+        std::fs::write(
+            &tmp,
+            serde_json::to_string(self).map_err(|source| Error::Json {
+                path: path.display().to_string(),
+                source,
+            })?,
+        )?;
+        Ok(std::fs::rename(&tmp, path)?)
+    }
+
+    /// Rebuild the cache from fresh stats + the merged listing bodies.
+    fn from_listing(stats: &[(String, i64, u64)], listing: &Listing) -> Self {
+        let body_of = |name: &str| -> Option<String> {
+            name.strip_suffix(".metadata")
+                .and_then(|uuid| listing.metadata.get(uuid))
+                .or_else(|| {
+                    name.strip_suffix(".content")
+                        .and_then(|uuid| listing.content.get(uuid))
+                })
+                .cloned()
+        };
+        Self {
+            version: 1,
+            files: stats
+                .iter()
+                .filter_map(|(name, mtime, size)| {
+                    body_of(name).map(|body| {
+                        (
+                            name.clone(),
+                            CachedFile {
+                                mtime: *mtime,
+                                size: *size,
+                                body,
+                            },
+                        )
+                    })
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Which `.metadata`/`.content` files must be fetched (signature
+/// moved or unknown) vs. reused from the cache. Files that vanished
+/// from the device simply drop out. Pure.
+fn listing_delta(
+    cache: &ListingCache,
+    stats: &[(String, i64, u64)],
+) -> (Vec<String>, Vec<(String, String)>) {
+    stats
+        .iter()
+        .filter(|(name, ..)| name.ends_with(".metadata") || name.ends_with(".content"))
+        .fold(
+            (Vec::new(), Vec::new()),
+            |(mut fetch, mut retained), (name, mtime, size)| {
+                match cache.files.get(name) {
+                    Some(cached) if cached.mtime == *mtime && cached.size == *size => {
+                        retained.push((name.clone(), cached.body.clone()));
+                    }
+                    _ => fetch.push(name.clone()),
+                }
+                (fetch, retained)
+            },
+        )
+}
+
+fn parse_listing(marker: &str, output: &str) -> Listing {
+    parse_marked_sections(marker, output).into_iter().fold(
+        Listing::default(),
+        |mut listing, (name, body)| {
             if name == "__sizes__" {
                 listing.sizes.extend(
                     body.lines()
@@ -973,7 +1187,8 @@ fn parse_listing(marker: &str, output: &str) -> Listing {
                 listing.content.insert(uuid.to_string(), body);
             }
             listing
-        })
+        },
+    )
 }
 
 fn build_items(listing: &Listing) -> Vec<Item> {
@@ -1030,6 +1245,43 @@ mod tests {
             item("ph", "Physics", "b", ItemKind::Document),
             item("n", "Notes", "", ItemKind::Document),
         ]
+    }
+
+    #[test]
+    fn stat_listing_parses_and_delta_selects_changes() {
+        let stats = parse_stat_listing(
+            "1700000000 120 aaa.metadata\n\
+             1700000000 80 aaa.content\n\
+             1700000005 999 aaa.pdf\n\
+             1700000001 130 bbb.metadata\n\
+             not a stat line\n",
+        );
+        assert_eq!(stats.len(), 4);
+        assert_eq!(stats[2], ("aaa.pdf".to_string(), 1_700_000_005, 999));
+
+        let mut cache = ListingCache::default();
+        cache.files.insert(
+            "aaa.metadata".to_string(),
+            CachedFile {
+                mtime: 1_700_000_000,
+                size: 120,
+                body: "cached-body".to_string(),
+            },
+        );
+        // aaa.metadata unchanged -> retained; aaa.content + bbb.metadata
+        // unknown -> fetched; the payload file is not a fetch target.
+        let (fetch, retained) = listing_delta(&cache, &stats);
+        assert_eq!(fetch, ["aaa.content", "bbb.metadata"]);
+        assert_eq!(
+            retained,
+            [("aaa.metadata".to_string(), "cached-body".to_string())]
+        );
+
+        // Signature moved -> re-fetched.
+        cache.files.get_mut("aaa.metadata").unwrap().mtime = 1;
+        let (fetch, retained) = listing_delta(&cache, &stats);
+        assert_eq!(fetch.len(), 3);
+        assert!(retained.is_empty());
     }
 
     #[test]

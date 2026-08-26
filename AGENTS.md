@@ -60,8 +60,9 @@ This repository is **open source** (dual-licensed MIT OR Apache-2.0):
   conflict/cycle checks, rendering). Keep this module I/O-free so it
   stays unit-testable without a device.
 - `client.rs` — high-level operations composing the two. `list_items`
-  fetches all metadata in a single SSH round trip (batched remote script
-  with a per-call random marker); keep new operations batched too.
+  fetches metadata in batched round trips (with a listing cache it is
+  incremental: stat everything, cat only changes); keep new
+  operations batched too.
 - `progress.rs` — observer trait for progress events (`step`, `bytes`,
   `bytes_done`, `finished`). The **library never prints**; `rmu` renders
   these as indicatif bars on stderr. New long-running `Client`

@@ -2,10 +2,10 @@
 
 Status: **v1 phases 1–3 implemented and device-verified** (one-way,
 two-way, `--delete`, conflict policies, fs↔fs, tablet↔tablet). **v2
-phases 1–2 implemented, device verification pending**: content
-hashing, the XDG archive, refresh/adoption, move detection,
-copy-by-fingerprint. v2 phases 3–4 are planned below. Update this
-file as phases land.
+phases 1–3 implemented, device verification pending**: content
+hashing, the XDG archive, refresh/adoption, file- and folder-level
+move detection, copy-by-fingerprint, incremental device listing.
+Update this file as phases land.
 
 The v2 redesign borrows deliberately from the
 [Unison file synchronizer](https://github.com/bcpierce00/unison)
@@ -178,6 +178,17 @@ pairs moves by content identity and re-keys the working copies of the
 archive and local snapshot, so the table sees moves as already-agreed
 facts instead of delete-and-create pairs.
 
+**Folder-level (`MoveRemoteFolder`)**: when *every* mapped file under
+a device folder vanished locally and reappeared under one new prefix
+at the same relative sub-paths with the same hashes and kinds, the
+whole folder is relocated with **one** metadata write — the subtree
+follows, the folder keeps its UUID (and any device-side folder
+metadata). Nested moves pair the outermost folder only; partial moves,
+taken target names, and ambiguous targets fall back to file-level
+handling with a note. Device→local folder moves need no special
+pairing: each contained doc is UUID-identified and resolves to a cheap
+per-file local rename.
+
 **Local→device (`MoveRemote`)**: a vanished mapped path and a new
 unmapped file with the same hash and kind, strict 1:1 — filename
 tie-break first, then a single unambiguous pair; anything else gets a
@@ -213,7 +224,29 @@ occupied target path produces a note, never an overwrite.
   free prefilter).
 
 Action order: state-only (rebind/adopt/refresh) → folder creates →
-moves → transfers and copies → deletions → forgets → notes.
+moves (folders first) → transfers and copies → deletions → forgets →
+notes.
+
+## Incremental device listing (phase 3)
+
+`Client::list_items` with a listing cache
+(`$XDG_STATE_HOME/rmu/listing-<hash>.json`, keyed by ssh destination +
+xochitl dir) becomes change-scaled, Unison-archive style:
+
+1. Round trip 1: `stat -c '%Y %s %n'` over every
+   `.metadata`/`.content`/payload file — tiny output, one exec.
+2. Round trip 2 (only when needed): `cat` exactly the files whose
+   mtime+size moved since the cached copy; everything else is reused
+   from the cache. Payload sizes come from the stat pass for free
+   (the full fetch needed a `wc -c` loop).
+
+A no-op listing of a large library stops re-reading thousands of
+JSONs. The cache is best-effort: any load problem falls back to the
+full fetch, any save problem only costs speed next run. Staleness
+caveat (same trade as the git index / Unison fastcheck): a rewrite
+within the same second that keeps the file size is invisible until
+the next change. `rmu sync` and the regular commands both use the
+cache; every run re-stats, so rmu's own writes are always seen.
 
 ## Executor
 
@@ -234,18 +267,20 @@ payload, so one hash serves both sides.
   (`CopyRemote` = on-device `cp`; `CopyLocal` = local copy), with the
   size prefilter extending lazy device hashing. See "Moves and copies"
   above.
-- **v2 phase 3 (planned):** unified planner — one `Entry`/`Snapshot`
-  model and a single three-way decision table for all pairings, with
-  folders as first-class entries; folder-level move pairing (device
-  folders have UUIDs; a folder rename is one metadata write for the
-  whole subtree); incremental device listing (stat all
-  `.metadata`/`.content` first, cat only what changed since the cached
-  listing — no-op syncs of large libraries stop re-reading every
-  JSON).
+- **v2 phase 3 (implemented):** folder-level move pairing
+  (`MoveRemoteFolder`, one metadata write per moved folder) and the
+  incremental device listing (above).
 - **v2 phase 4 (candidates):** bounded transfer pipelining over the
   multiplexed connection (measure first); watch mode (local notify +
   cheap device polling); `--paranoid` full re-hash; exclude patterns;
   `--dry-run --json`.
+- **Refactor candidate, deliberately deferred:** collapsing the three
+  planners into one `Entry`/`Snapshot` model with a single three-way
+  table. The md/txt-conversion asymmetry that motivated it is gone and
+  the remaining duplication is modest; a big rewrite of
+  device-verified planning logic should happen on its own, not
+  bundled with feature work. Revisit when the duplication actually
+  blocks a feature.
 - **Explicitly out of scope:** rsync-style block-delta transfer — it
   requires simultaneous computation on both ends, i.e. a remote agent,
   which rmu deliberately does not have. Payloads are replaced wholesale

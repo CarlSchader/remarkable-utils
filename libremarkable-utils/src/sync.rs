@@ -283,7 +283,7 @@ impl RemoteDoc {
 }
 
 /// The synced subtree of the device.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct RemoteSnapshot {
     pub docs: Vec<RemoteDoc>,
     /// Folder rel path → UUID; `""` maps to the sync root folder.
@@ -926,6 +926,18 @@ pub enum SyncAction {
         local_hash: Option<String>,
         payload_hash: Option<String>,
     },
+    /// An entire local folder moved/renamed (every mapped file under
+    /// it reappeared under the new prefix, hash-verified): relocate
+    /// the device folder with **one** metadata write — the whole
+    /// subtree follows, the folder keeps its UUID.
+    MoveRemoteFolder {
+        from_dir: String,
+        to_dir: String,
+        uuid: String,
+        /// Parent of `to_dir` (`""` = sync root).
+        remote_dir: String,
+        name: String,
+    },
     /// The document moved on the device (UUID identity): relocate the
     /// local file to mirror it. Zero bytes transferred.
     MoveLocal {
@@ -1154,6 +1166,7 @@ struct MovePrepass {
     notes: Vec<SyncAction>,
     state: SyncState,
     local: Vec<LocalEntry>,
+    remote: RemoteSnapshot,
 }
 
 /// Pair moved files by content identity. Pure.
@@ -1180,6 +1193,7 @@ fn detect_moves(
             entries: state.entries.clone(),
         },
         local: local.to_vec(),
+        remote: remote.clone(),
     };
     let docs_by_uuid: HashMap<&str, &RemoteDoc> =
         remote.docs.iter().map(|d| (d.uuid.as_str(), d)).collect();
@@ -1187,12 +1201,119 @@ fn detect_moves(
         local.iter().map(|e| (e.rel_path.as_str(), e)).collect();
     let mut claimed_names = device_taken(remote);
 
+    // ---- local folder moves → MoveRemoteFolder --------------------------
+    //
+    // A whole folder moved when *every* mapped file under it vanished
+    // locally and reappeared under one new prefix at the same relative
+    // sub-paths with the same hashes and kinds. One metadata write
+    // relocates the device folder (UUID kept, subtree follows); the
+    // adjusted copies are rewritten so the file-level pass and the
+    // table below see nothing left to do.
+    if can_write_remote(options.mode) {
+        let mut moved_prefixes: Vec<String> = Vec::new();
+        let folder_list: Vec<(String, String)> = remote
+            .folders
+            .iter()
+            .filter(|(dir, _)| !dir.is_empty())
+            .map(|(dir, uuid)| (dir.clone(), uuid.clone()))
+            .collect();
+        folder_list.into_iter().for_each(|(from_dir, folder_uuid)| {
+            if moved_prefixes.iter().any(|p| path_under(p, &from_dir)) {
+                return;
+            }
+            let mapped: Vec<(&String, &StateEntry)> = state
+                .entries
+                .iter()
+                .filter(|(key, _)| path_under(&from_dir, key))
+                .collect();
+            if mapped.is_empty()
+                || mapped.iter().any(|(_, st)| st.local_hash.is_none())
+                || local.iter().any(|e| path_under(&from_dir, &e.rel_path))
+            {
+                return;
+            }
+            // Hypothesize target prefixes from the first mapped file,
+            // then verify every other one against each hypothesis.
+            let sub0 = mapped[0]
+                .0
+                .strip_prefix(&format!("{from_dir}/"))
+                .expect("filtered on prefix")
+                .to_string();
+            let hash0 = mapped[0].1.local_hash.clone().expect("filtered on Some");
+            let verifies = |g: &str| -> bool {
+                !g.is_empty()
+                    && !out.remote.folders.contains_key(g)
+                    && !state.entries.keys().any(|k| path_under(g, k) || k == g)
+                    && mapped.iter().all(|(key, st)| {
+                        let sub = key
+                            .strip_prefix(&format!("{from_dir}/"))
+                            .expect("filtered on prefix");
+                        local_by_path
+                            .get(join_rel(g, sub).as_str())
+                            .is_some_and(|e| {
+                                !state.entries.contains_key(&e.rel_path)
+                                    && e.kind == st.kind
+                                    && e.hash.is_some()
+                                    && e.hash == st.local_hash
+                            })
+                    })
+            };
+            let mut candidates: Vec<String> = local
+                .iter()
+                .filter(|e| {
+                    !state.entries.contains_key(&e.rel_path)
+                        && e.kind == mapped[0].1.kind
+                        && e.hash.as_deref() == Some(hash0.as_str())
+                })
+                .filter_map(|e| {
+                    e.rel_path
+                        .strip_suffix(&sub0)
+                        .and_then(|prefix| prefix.strip_suffix('/'))
+                        .map(str::to_string)
+                })
+                .filter(|g| verifies(g))
+                .collect();
+            candidates.sort();
+            candidates.dedup();
+            match &candidates[..] {
+                [to_dir] => {
+                    let (parent, name) = to_dir.rsplit_once('/').unwrap_or(("", to_dir));
+                    let target_name = (parent.to_string(), name.to_string());
+                    if claimed_names.contains(&target_name) {
+                        out.notes.push(skip(
+                            to_dir,
+                            "moved folder's device name is already taken; \
+                             treating contents as new files",
+                        ));
+                        return;
+                    }
+                    claimed_names.insert(target_name);
+                    out.actions.push(SyncAction::MoveRemoteFolder {
+                        from_dir: from_dir.clone(),
+                        to_dir: to_dir.clone(),
+                        uuid: folder_uuid,
+                        remote_dir: parent.to_string(),
+                        name: name.to_string(),
+                    });
+                    rewrite_prefix(&mut out, &from_dir, to_dir, &local_by_path);
+                    moved_prefixes.push(from_dir);
+                }
+                [] => {}
+                _ => out.notes.push(skip(
+                    &from_dir,
+                    "every file under this folder moved, but multiple target \
+                     folders match; treating contents as new files",
+                )),
+            }
+        });
+    }
+
     // ---- local moves → MoveRemote --------------------------------------
     if can_write_remote(options.mode) {
         // (hash, kind) → vanished mapped paths / new unmapped paths.
         type Group = (Vec<String>, Vec<String>);
         let mut groups: BTreeMap<(String, DocKind), Group> = BTreeMap::new();
-        state
+        out.state
             .entries
             .iter()
             .filter(|(key, st)| {
@@ -1212,7 +1333,7 @@ fn detect_moves(
             });
         local
             .iter()
-            .filter(|entry| !state.entries.contains_key(&entry.rel_path))
+            .filter(|entry| !out.state.entries.contains_key(&entry.rel_path))
             .filter_map(|entry| entry.hash.clone().map(|hash| (entry, hash)))
             .for_each(|(entry, hash)| {
                 if let Some(group) = groups.get_mut(&(hash, entry.kind)) {
@@ -1256,7 +1377,7 @@ fn detect_moves(
                 });
 
             pairs.into_iter().for_each(|(old_key, new_path)| {
-                let st = state.entries[&old_key].clone();
+                let st = out.state.entries[&old_key].clone();
                 let (dir, stem) = split_target(&new_path);
                 let target_name = (dir.to_string(), stem.clone());
                 if claimed_names.contains(&target_name) {
@@ -1297,19 +1418,33 @@ fn detect_moves(
 
     // ---- device moves → MoveLocal ---------------------------------------
     if can_write_local(options.mode) {
-        state.entries.iter().for_each(|(key, st)| {
-            let Some(doc) = docs_by_uuid.get(st.uuid.as_str()) else {
+        // Consult the *adjusted* snapshot so device paths already
+        // rewritten by a folder move are not re-processed.
+        let adjusted_docs: HashMap<String, (String, i64, Option<String>)> = out
+            .remote
+            .docs
+            .iter()
+            .map(|d| {
+                (
+                    d.uuid.clone(),
+                    (d.local_rel_path(), d.last_modified, d.payload_hash.clone()),
+                )
+            })
+            .collect();
+        let keys: Vec<String> = out.state.entries.keys().cloned().collect();
+        keys.into_iter().for_each(|key| {
+            let st = out.state.entries[&key].clone();
+            let Some((new_key, last_modified, payload_hash)) = adjusted_docs.get(&st.uuid) else {
                 return;
             };
-            let new_key = doc.local_rel_path();
-            if new_key == *key || !local_by_path.contains_key(key.as_str()) {
+            if *new_key == key || !local_by_path.contains_key(key.as_str()) {
                 return;
             }
             if local_by_path.contains_key(new_key.as_str())
-                || out.state.entries.contains_key(&new_key)
+                || out.state.entries.contains_key(new_key)
             {
                 out.notes.push(skip(
-                    key,
+                    &key,
                     "the device moved this document, but the target local path is occupied",
                 ));
                 return;
@@ -1318,9 +1453,9 @@ fn detect_moves(
             // when the payload hash proves the content unchanged —
             // otherwise the recorded lastModified stays put so the
             // table schedules the content transfer at the new path.
-            let verified_same = doc.payload_hash.is_some() && doc.payload_hash == st.payload_hash;
+            let verified_same = payload_hash.is_some() && *payload_hash == st.payload_hash;
             let recorded_lm = if verified_same {
-                doc.last_modified
+                *last_modified
             } else {
                 st.remote_last_modified
             };
@@ -1335,15 +1470,67 @@ fn detect_moves(
             });
             let mut new_st = st.clone();
             new_st.remote_last_modified = recorded_lm;
-            out.state.entries.remove(key);
+            out.state.entries.remove(&key);
             out.state.entries.insert(new_key.clone(), new_st);
-            if let Some(entry) = out.local.iter_mut().find(|e| e.rel_path == *key) {
-                entry.rel_path = new_key;
+            if let Some(entry) = out.local.iter_mut().find(|e| e.rel_path == key) {
+                entry.rel_path = new_key.clone();
             }
         });
     }
 
     out
+}
+
+/// Rewrite a folder prefix across the pre-pass working copies: state
+/// keys, device folder paths, and doc directories all move from
+/// `from_dir/...` to `to_dir/...`. Stat stamps are absorbed from the
+/// local files now at the new paths so the table sees clean entries;
+/// the executor re-stats when the move runs.
+fn rewrite_prefix(
+    out: &mut MovePrepass,
+    from_dir: &str,
+    to_dir: &str,
+    local_by_path: &HashMap<&str, &LocalEntry>,
+) {
+    let rekey = |path: &str| -> Option<String> {
+        path.strip_prefix(&format!("{from_dir}/"))
+            .map(|sub| join_rel(to_dir, sub))
+    };
+    let moved_keys: Vec<String> = out
+        .state
+        .entries
+        .keys()
+        .filter(|key| path_under(from_dir, key))
+        .cloned()
+        .collect();
+    moved_keys.into_iter().for_each(|old_key| {
+        let mut st = out.state.entries.remove(&old_key).expect("key listed");
+        let new_key = rekey(&old_key).expect("filtered on prefix");
+        if let Some(entry) = local_by_path.get(new_key.as_str()) {
+            st.local_size = entry.size;
+            st.local_mtime_ms = entry.mtime_ms;
+        }
+        out.state.entries.insert(new_key, st);
+    });
+    out.remote.folders = std::mem::take(&mut out.remote.folders)
+        .into_iter()
+        .map(|(dir, uuid)| {
+            if dir == from_dir {
+                (to_dir.to_string(), uuid)
+            } else if let Some(new_dir) = rekey(&dir) {
+                (new_dir, uuid)
+            } else {
+                (dir, uuid)
+            }
+        })
+        .collect();
+    out.remote.docs.iter_mut().for_each(|doc| {
+        if doc.rel_dir == from_dir {
+            doc.rel_dir = to_dir.to_string();
+        } else if let Some(new_dir) = rekey(&doc.rel_dir) {
+            doc.rel_dir = new_dir;
+        }
+    });
 }
 
 /// (dir, name) pairs already occupied on the device.
@@ -1366,11 +1553,13 @@ pub fn plan(
     remote: &RemoteSnapshot,
     state: &SyncState,
 ) -> Plan {
-    // Move-detection pre-pass: from here on, `state` and `local` are
-    // working copies with moved entries re-keyed to their new paths.
+    // Move-detection pre-pass: from here on, `state`, `local`, and
+    // `remote` are working copies with moved entries re-keyed to
+    // their new paths (folder moves rewrite whole prefixes).
     let prepass = detect_moves(options, local, remote, state);
     let state = &prepass.state;
     let local = &prepass.local[..];
+    let remote = &prepass.remote;
 
     let local_by_path: HashMap<&str, &LocalEntry> =
         local.iter().map(|e| (e.rel_path.as_str(), e)).collect();
@@ -1503,7 +1692,8 @@ pub fn plan(
         .filter_map(|action| match action {
             SyncAction::Upload { remote_dir, .. }
             | SyncAction::CopyRemote { remote_dir, .. }
-            | SyncAction::MoveRemote { remote_dir, .. } => Some(remote_dir.as_str()),
+            | SyncAction::MoveRemote { remote_dir, .. }
+            | SyncAction::MoveRemoteFolder { remote_dir, .. } => Some(remote_dir.as_str()),
             _ => None,
         })
         .flat_map(path_prefixes)
@@ -1649,6 +1839,11 @@ fn append_dir_deletes(
             })
             .for_each(|rel_dir| buckets.deletes.push(SyncAction::DeleteLocalDir { rel_dir }));
     }
+}
+
+/// `sub` (a dir or file path) is strictly below directory `dir`.
+fn path_under(dir: &str, sub: &str) -> bool {
+    sub.len() > dir.len() && sub.starts_with(dir) && sub.as_bytes()[dir.len()] == b'/'
 }
 
 /// All non-empty prefixes of a relative dir path: `a/b/c` → `a`,
@@ -2069,6 +2264,8 @@ pub struct Outcome {
     pub downloaded: usize,
     /// Metadata-only device moves (zero bytes transferred).
     pub moved_remote: usize,
+    /// Whole device folders moved with one metadata write.
+    pub moved_folders: usize,
     /// Local file moves mirroring device-side moves.
     pub moved_local: usize,
     /// On-device payload copies (upload avoided).
@@ -2375,6 +2572,59 @@ pub fn execute(
                     payload_hash.clone(),
                 )?;
                 outcome.moved_remote += 1;
+                outcome.modified_remote = true;
+            }
+            SyncAction::MoveRemoteFolder {
+                from_dir,
+                to_dir,
+                uuid,
+                remote_dir,
+                name,
+            } => {
+                let parent_uuid = folders
+                    .get(remote_dir)
+                    .cloned()
+                    .ok_or_else(|| Error::PathNotFound(remote_dir.to_string()))?;
+                client.move_document(uuid, &parent_uuid, name)?;
+                // Re-key the folder map (the whole subtree followed).
+                *folders = std::mem::take(folders)
+                    .into_iter()
+                    .map(|(dir, folder_uuid)| {
+                        let new_dir = if dir == *from_dir {
+                            to_dir.clone()
+                        } else if let Some(sub) = dir.strip_prefix(&format!("{from_dir}/")) {
+                            join_rel(to_dir, sub)
+                        } else {
+                            dir
+                        };
+                        (new_dir, folder_uuid)
+                    })
+                    .collect();
+                // Re-key every archive entry under the moved prefix,
+                // refreshing local stamps from the files' new homes.
+                let moved_keys: Vec<String> = state
+                    .entries
+                    .keys()
+                    .filter(|key| path_under(from_dir, key))
+                    .cloned()
+                    .collect();
+                moved_keys
+                    .into_iter()
+                    .try_for_each(|old_key| -> Result<()> {
+                        let mut entry = state.entries.remove(&old_key).expect("key listed");
+                        let sub = old_key
+                            .strip_prefix(&format!("{from_dir}/"))
+                            .expect("filtered on prefix");
+                        let new_key = join_rel(to_dir, sub);
+                        if let Ok((size, mtime)) = fs_side.stat(&new_key) {
+                            entry.local_size = size;
+                            entry.local_mtime_ms = mtime;
+                        }
+                        state.entries.insert(new_key, entry);
+                        Ok(())
+                    })?;
+                state.save(state_path)?;
+                outcome.moved_folders += 1;
                 outcome.modified_remote = true;
             }
             SyncAction::MoveLocal {
@@ -2914,6 +3164,15 @@ pub fn pair_state_path(endpoint_a: &str, endpoint_b: &str) -> PathBuf {
     ))
 }
 
+/// Where the incremental listing cache for a device lives (keyed by
+/// ssh destination + xochitl dir, so profiles never collide).
+pub fn listing_cache_path(destination: &str, xochitl_dir: &str) -> PathBuf {
+    state_dir().join(format!(
+        "listing-{:016x}.json",
+        fnv1a(&format!("{destination}\n{xochitl_dir}"))
+    ))
+}
+
 /// The rmu state directory: `$XDG_STATE_HOME/rmu` (or
 /// `~/.local/state/rmu`).
 fn state_dir() -> PathBuf {
@@ -3371,6 +3630,11 @@ pub fn describe(action: &SyncAction) -> String {
         }
         SyncAction::MoveRemote { from, to, .. } => {
             format!("move     {from} -> {to} (on device, metadata only)")
+        }
+        SyncAction::MoveRemoteFolder {
+            from_dir, to_dir, ..
+        } => {
+            format!("move     {from_dir}/ -> {to_dir}/ (device folder, one metadata write)")
         }
         SyncAction::MoveLocal { from, to, .. } => {
             format!("move     {from} -> {to} (local)")
@@ -4367,6 +4631,167 @@ mod tests {
         assert!(wanted.is_empty());
     }
 
+    #[test]
+    fn whole_folder_move_is_one_metadata_write() {
+        // Device folder A holds two mapped docs; locally A/ became B/
+        // wholesale. Expect exactly one MoveRemoteFolder — no per-file
+        // moves, no uploads, no deletes (with --delete too).
+        let items = vec![
+            folder("fa", "A", ""),
+            doc_at("u1", "x", "fa", "pdf", 5),
+            doc_at("u2", "y", "fa", "pdf", 6),
+        ];
+        let snapshot = remote_snapshot(&items, "");
+        let mut state = SyncState::default();
+        state.entries.insert(
+            "A/x.pdf".to_string(),
+            entry_hashed("u1", DocKind::Pdf, 10, 1, 5, "hx", "hx"),
+        );
+        state.entries.insert(
+            "A/y.pdf".to_string(),
+            entry_hashed("u2", DocKind::Pdf, 11, 2, 6, "hy", "hy"),
+        );
+        let locals = vec![
+            with_hash(local("B/x.pdf", DocKind::Pdf, 10, 1), "hx"),
+            with_hash(local("B/y.pdf", DocKind::Pdf, 11, 2), "hy"),
+        ];
+        let plan = plan(with_delete(push()), &locals, &snapshot, &state);
+        assert_eq!(
+            plan.actions,
+            vec![SyncAction::MoveRemoteFolder {
+                from_dir: "A".to_string(),
+                to_dir: "B".to_string(),
+                uuid: "fa".to_string(),
+                remote_dir: String::new(),
+                name: "B".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn nested_folder_move_pairs_the_outermost_folder() {
+        // A/Sub moved as part of A → B: only A is paired; the subtree
+        // follows for free.
+        let items = vec![
+            folder("fa", "A", ""),
+            folder("fs", "Sub", "fa"),
+            doc_at("u1", "x", "fa", "pdf", 5),
+            doc_at("u2", "y", "fs", "pdf", 6),
+        ];
+        let snapshot = remote_snapshot(&items, "");
+        let mut state = SyncState::default();
+        state.entries.insert(
+            "A/x.pdf".to_string(),
+            entry_hashed("u1", DocKind::Pdf, 10, 1, 5, "hx", "hx"),
+        );
+        state.entries.insert(
+            "A/Sub/y.pdf".to_string(),
+            entry_hashed("u2", DocKind::Pdf, 11, 2, 6, "hy", "hy"),
+        );
+        let locals = vec![
+            with_hash(local("B/x.pdf", DocKind::Pdf, 10, 1), "hx"),
+            with_hash(local("B/Sub/y.pdf", DocKind::Pdf, 11, 2), "hy"),
+        ];
+        let plan = plan(push(), &locals, &snapshot, &state);
+        assert_eq!(
+            plan.actions
+                .iter()
+                .filter(|a| matches!(a, SyncAction::MoveRemoteFolder { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(plan.actions.len(), 1);
+    }
+
+    #[test]
+    fn partial_folder_move_falls_back_to_file_moves() {
+        // Only one of two files left folder A: not a folder move — the
+        // single file gets a file-level metadata move instead.
+        let items = vec![
+            folder("fa", "A", ""),
+            doc_at("u1", "x", "fa", "pdf", 5),
+            doc_at("u2", "y", "fa", "pdf", 6),
+        ];
+        let snapshot = remote_snapshot(&items, "");
+        let mut state = SyncState::default();
+        state.entries.insert(
+            "A/x.pdf".to_string(),
+            entry_hashed("u1", DocKind::Pdf, 10, 1, 5, "hx", "hx"),
+        );
+        state.entries.insert(
+            "A/y.pdf".to_string(),
+            entry_hashed("u2", DocKind::Pdf, 11, 2, 6, "hy", "hy"),
+        );
+        let locals = vec![
+            with_hash(local("A/x.pdf", DocKind::Pdf, 10, 1), "hx"), // stayed
+            with_hash(local("B/y.pdf", DocKind::Pdf, 11, 2), "hy"), // moved
+        ];
+        let plan = plan(push(), &locals, &snapshot, &state);
+        assert!(
+            !plan
+                .actions
+                .iter()
+                .any(|a| matches!(a, SyncAction::MoveRemoteFolder { .. }))
+        );
+        assert!(plan.actions.iter().any(|a| matches!(
+            a,
+            SyncAction::MoveRemote { from, .. } if from == "A/y.pdf"
+        )));
+    }
+
+    #[test]
+    fn folder_move_to_taken_name_falls_back() {
+        // Target folder B already exists on the device: no folder
+        // move; file-level moves into the existing B instead.
+        let items = vec![
+            folder("fa", "A", ""),
+            folder("fb", "B", ""),
+            doc_at("u1", "x", "fa", "pdf", 5),
+        ];
+        let snapshot = remote_snapshot(&items, "");
+        let mut state = SyncState::default();
+        state.entries.insert(
+            "A/x.pdf".to_string(),
+            entry_hashed("u1", DocKind::Pdf, 10, 1, 5, "hx", "hx"),
+        );
+        let locals = vec![with_hash(local("B/x.pdf", DocKind::Pdf, 10, 1), "hx")];
+        let plan = plan(push(), &locals, &snapshot, &state);
+        assert!(
+            !plan
+                .actions
+                .iter()
+                .any(|a| matches!(a, SyncAction::MoveRemoteFolder { .. }))
+        );
+        assert!(plan.actions.iter().any(|a| matches!(
+            a,
+            SyncAction::MoveRemote { to, .. } if to == "B/x.pdf"
+        )));
+    }
+
+    #[test]
+    fn ambiguous_folder_move_is_noted() {
+        // Two identical candidate target folders: cannot decide.
+        let items = vec![folder("fa", "A", ""), doc_at("u1", "x", "fa", "pdf", 5)];
+        let snapshot = remote_snapshot(&items, "");
+        let mut state = SyncState::default();
+        state.entries.insert(
+            "A/x.pdf".to_string(),
+            entry_hashed("u1", DocKind::Pdf, 10, 1, 5, "hx", "hx"),
+        );
+        let locals = vec![
+            with_hash(local("B/x.pdf", DocKind::Pdf, 10, 1), "hx"),
+            with_hash(local("C/x.pdf", DocKind::Pdf, 10, 1), "hx"),
+        ];
+        let plan = plan(push(), &locals, &snapshot, &state);
+        assert!(
+            !plan
+                .actions
+                .iter()
+                .any(|a| matches!(a, SyncAction::MoveRemoteFolder { .. }))
+        );
+        assert!(skips(&plan).contains(&"A"));
+    }
+
     // ---- deletions --------------------------------------------------------
 
     #[test]
@@ -4837,6 +5262,23 @@ mod tests {
                     path: "y/b.epub".to_string()
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn files_delete_propagates_a_side_deletion() {
+        let mut state = SyncState::default();
+        state
+            .entries
+            .insert("doc.pdf".to_string(), file_entry(11, 100, 200, 11));
+        let a: Vec<LocalEntry> = vec![];
+        let b = vec![local("doc.pdf", DocKind::Pdf, 11, 200)];
+        let plan = plan_files(with_delete(push()), &a, &b, &state);
+        assert_eq!(
+            plan,
+            vec![FileAction::DeleteB {
+                path: "doc.pdf".to_string()
+            }]
         );
     }
 

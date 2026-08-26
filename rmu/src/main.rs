@@ -256,7 +256,9 @@ fn make_session(cli: &Cli, destination: &str) -> Result<SshSession> {
 fn run_regular(cli: &Cli, progress: Arc<dyn Progress>) -> Result<()> {
     let destination = format!("{}@{}", cli.user, cli.host);
     let session = make_session(cli, &destination)?;
-    let client = Client::new(session, cli.xochitl_dir.clone()).with_progress(progress.clone());
+    let client = Client::new(session, cli.xochitl_dir.clone())
+        .with_progress(progress.clone())
+        .with_listing_cache(sync::listing_cache_path(&destination, &cli.xochitl_dir));
 
     let modified = run_command(&client, cli)?;
     if modified {
@@ -302,14 +304,7 @@ fn build_side(
 ) -> Result<BuiltSide> {
     match endpoint {
         Endpoint::Local(path) => {
-            // Canonicalize so `./books`, `books`, and the absolute
-            // path all key the same archive. Falls back to the raw
-            // path when the directory does not exist yet (pull into
-            // a fresh directory).
-            let identity = fs::canonicalize(&path)
-                .unwrap_or_else(|_| PathBuf::from(&path))
-                .display()
-                .to_string();
+            let identity = canonical_identity(&path);
             Ok(BuiltSide::Fs {
                 endpoint: Box::new(LocalFs::new(path)),
                 is_local: true,
@@ -330,7 +325,11 @@ fn build_side(
                 Ok(BuiltSide::Tablet {
                     client: Box::new(
                         Client::new(session, cli.xochitl_dir.clone())
-                            .with_progress(progress.clone()),
+                            .with_progress(progress.clone())
+                            .with_listing_cache(sync::listing_cache_path(
+                                &destination,
+                                &cli.xochitl_dir,
+                            )),
                     ),
                     path,
                     destination,
@@ -460,6 +459,31 @@ fn run_sync(cli: &Cli, progress: Arc<dyn Progress>) -> Result<()> {
             *dry_run,
         ),
     }
+}
+
+/// Canonical identity of a local path for archive keying, so
+/// `./books`, `books`, and the absolute path all find the same
+/// archive — **including before the directory exists** (pull into a
+/// fresh dir): the deepest existing ancestor is canonicalized (which
+/// also resolves symlinks like macOS `/var` → `/private/var`) and the
+/// missing tail is appended.
+fn canonical_identity(path: &str) -> String {
+    fn canon(path: &Path) -> PathBuf {
+        fs::canonicalize(path).unwrap_or_else(|_| match (path.parent(), path.file_name()) {
+            (Some(parent), Some(name)) if !parent.as_os_str().is_empty() => {
+                canon(parent).join(name)
+            }
+            _ => path.to_path_buf(),
+        })
+    }
+    let joined;
+    let absolute = if Path::new(path).is_absolute() {
+        Path::new(path)
+    } else {
+        joined = std::env::current_dir().unwrap_or_default().join(path);
+        &joined
+    };
+    canon(absolute).display().to_string()
 }
 
 /// Stable archive-keying identity for a tablet endpoint.
