@@ -123,7 +123,12 @@ pair-state files live in the same directory (`sync-pair-<hash>.json`).
 
 For local↔local and SSH↔SSH filesystem pairs, side A is the
 lexicographically smaller endpoint identity, independent of argument
-order. These pairs use `sync-<pairhash>.files-v1.json` to distinguish
+order. SSH filesystem identities retain `/` for the filesystem root:
+`host:` (login directory) and `host:/` (root) are distinct even on the
+same host. Other trailing separators are ignored as before. This changes
+the archive key for filesystem pairs containing an SSH root; the old key
+is not reused because it could refer to the login directory instead.
+Same-kind pairs use `sync-<pairhash>.files-v1.json` to distinguish
 stable roles from older archives whose A/B orientation was not recorded.
 Those older archives are left untouched and ignored with a warning when
 starting the new archive. Review `--dry-run` before explicitly choosing a
@@ -131,8 +136,9 @@ conflict policy to establish a new baseline: existing files on both sides
 conflict by default (even if identical), and previously deleted files may
 be recopied rather than deleted. Unresolved files remain unmapped. Avoid
 alternating old and new binaries, which maintain independent histories.
-Local↔SSH retains its existing archive and local-A role; filesystem↔tablet
-and tablet↔tablet roles are unchanged. One-way direction and `--conflict
+Local↔SSH retains its local-A role and, except for the corrected SSH-root
+identity, its existing archive; filesystem↔tablet and tablet↔tablet roles
+are unchanged. One-way direction and `--conflict
 src|dst` always refer to CLI argument order, not archive side order.
 
 Written **incrementally after each action** (temp file + atomic rename)

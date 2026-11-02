@@ -17,6 +17,7 @@ static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
 enum Pair {
     Local,
     Ssh,
+    SshHomeRoot,
     Mixed,
 }
 
@@ -47,12 +48,43 @@ impl Fixture {
              exec sh -c \"$3\"\n",
         )
         .unwrap();
+        if matches!(pair, Pair::SshHomeRoot) {
+            // Never execute the supplied shell command here: absolute paths
+            // must address the synthetic root, not the machine running tests.
+            fs::write(
+                &ssh,
+                r#"#!/bin/sh
+[ "$#" = 3 ] && [ "$1" = -- ] && [ "$2" = mock-same ] || exit 98
+stamp() {
+    stat -c "$1" -- "$3" 2>/dev/null || stat -f "$2" "$3"
+}
+case "$3" in
+    'mkdir -p .'|'mkdir -p /') exit 0 ;;
+    'cat book.pdf') exec cat "$MOCK_HOME/book.pdf" ;;
+    'cat /book.pdf') exec cat "$MOCK_ROOT/book.pdf" ;;
+    'mkdir -p . && cat > book.pdf') cat > "$MOCK_HOME/book.pdf"; exit $? ;;
+    "stat -c '%s %Y' -- book.pdf "*)
+        stamp '%s %Y' '%z %m' "$MOCK_HOME/book.pdf"; exit $? ;;
+    "stat -c '%s %Y' -- /book.pdf "*)
+        stamp '%s %Y' '%z %m' "$MOCK_ROOT/book.pdf"; exit $? ;;
+    'cd . || exit 9'*) cd "$MOCK_HOME" || exit 9 ;;
+    'cd / || exit 9'*) cd "$MOCK_ROOT" || exit 9 ;;
+    *) printf 'unexpected mock command: %s\n' "$3" >&2; exit 99 ;;
+esac
+if [ -f book.pdf ]; then
+    stamp '%s %Y ./book.pdf' '%z %m ./book.pdf' book.pdf
+fi
+"#,
+            )
+            .unwrap();
+        }
         fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).unwrap();
         let local = |i: usize| paths[i].display().to_string();
         let remote = |i: usize| format!("mock-{}:{}", ["a", "b"][i], paths[i].display());
         let endpoints = match pair {
             Pair::Local => [local(0), local(1)],
             Pair::Ssh => [remote(0), remote(1)],
+            Pair::SshHomeRoot => ["mock-same:".to_string(), "mock-same:/".to_string()],
             Pair::Mixed => [local(0), remote(1)],
         };
         Self {
@@ -70,6 +102,8 @@ impl Fixture {
         let output = Command::new(env!("CARGO_BIN_EXE_rmu"))
             .env("XDG_STATE_HOME", self.root.join("state"))
             .env("HOME", &self.root)
+            .env("MOCK_HOME", &self.paths[0])
+            .env("MOCK_ROOT", &self.paths[1])
             .env("PATH", path)
             .env_remove("RMU_SSH_PASSWORD")
             .env_remove("RMU_ASKPASS_MODE")
@@ -179,6 +213,30 @@ fn local_pair_reversal_preserves_stamps_and_one_way_direction() {
 #[test]
 fn ssh_pair_reversal_preserves_stamps_and_one_way_direction() {
     exercise_reversal(Pair::Ssh);
+}
+
+#[test]
+fn same_host_home_and_root_keep_roles_on_actual_reversed_second_run() {
+    [0, 1].into_iter().for_each(|src| {
+        let fixture = Fixture::new(Pair::SshHomeRoot);
+        fixture.write(1, "book.pdf", b"original", 1_000_000_000);
+        fixture.sync(src, &["--two-way"]);
+        fixture.assert_bytes(0, "book.pdf", b"original");
+        let archive = fixture.archive();
+        let state = read_state(&archive);
+        let entry = &state["entries"]["book.pdf"];
+        assert_ne!(entry["local_mtime_ms"], entry["remote_last_modified"]);
+        let before = fs::read(&archive).unwrap();
+
+        // The second invocation really executes sync, with arguments reversed.
+        let output = fixture.sync(1 - src, &["--two-way"]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("0 conflict(s)"), "{stderr}");
+        assert_eq!(fs::read(&archive).unwrap(), before);
+        fixture.assert_noop(src);
+        fixture.assert_noop(1 - src);
+        assert_eq!(fixture.archive(), archive);
+    });
 }
 
 #[test]

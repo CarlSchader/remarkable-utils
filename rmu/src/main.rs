@@ -335,8 +335,17 @@ fn build_side(
                     destination,
                 })
             } else {
+                // An empty SSH path is the login directory, not the filesystem
+                // root. Keep `/` distinct when removing trailing separators so
+                // same-host home/root pairs have stable, different identities.
+                let trimmed = path.trim_end_matches('/');
+                let identity_path = if trimmed.is_empty() && !path.is_empty() {
+                    "/"
+                } else {
+                    trimmed
+                };
                 Ok(BuiltSide::Fs {
-                    identity: format!("{destination}:{}", path.trim_end_matches('/')),
+                    identity: format!("{destination}:{identity_path}"),
                     endpoint: Box::new(SshFs::new(session, path, progress.clone())),
                     is_local: false,
                 })
