@@ -165,7 +165,11 @@ Unchanged v1 rules that remain data-safety invariants:
   the only writer of notebook content). A brand-new local `.rmdoc` is a
   deliberate restore (fresh UUID).
 - Trash, orphans, duplicate sibling names, and unusable filenames are
-  excluded with warnings — never guessed.
+  excluded with warnings — never guessed. Duplicate/unusable names and
+  unsupported document types retain exclusion markers for their UUIDs
+  and paths (including folder subtrees). Affected mappings are left
+  unchanged, not treated as deletions or rebound to another document;
+  transfers into excluded paths are blocked until the exclusion clears.
 - `--delete` only propagates deletions of **mapped** files.
 - Uploads write `.metadata` last, so interruption leaves invisible
   orphans, not half-documents; dangling mappings **rebind** to

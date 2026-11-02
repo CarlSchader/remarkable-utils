@@ -290,6 +290,25 @@ pub struct RemoteSnapshot {
     pub folders: BTreeMap<String, String>,
     /// Items excluded up-front (duplicate names, unusable names, ...).
     pub skips: Vec<SyncAction>,
+    /// Present but unsafe to sync, including descendants of excluded folders.
+    pub excluded_uuids: std::collections::HashSet<String>,
+    /// Excluded logical names. Neither these paths nor paths below them are
+    /// safe targets, even when the previously mapped UUID is now absent.
+    pub excluded_paths: std::collections::BTreeSet<String>,
+}
+
+impl RemoteSnapshot {
+    fn excludes_path(&self, path: &str) -> bool {
+        self.excluded_paths
+            .iter()
+            .any(|excluded| path == excluded || path_under(excluded, path))
+    }
+
+    fn excludes_local(&self, path: &str, state: Option<&StateEntry>) -> bool {
+        let (dir, name) = split_target(path);
+        self.excludes_path(&join_rel(dir, &name))
+            || state.is_some_and(|st| self.excluded_uuids.contains(&st.uuid))
+    }
 }
 
 /// Build the device-side snapshot from a full listing, scoped to the
@@ -299,6 +318,29 @@ pub struct RemoteSnapshot {
 pub fn remote_snapshot(items: &[Item], root_uuid: &str) -> RemoteSnapshot {
     fn usable_name(name: &str) -> bool {
         !name.is_empty() && !name.contains('/') && !name.starts_with('.') && name != ".."
+    }
+
+    fn exclude(
+        children: &HashMap<&str, Vec<&Item>>,
+        item: &Item,
+        path: String,
+        reason: String,
+        snapshot: &mut RemoteSnapshot,
+    ) {
+        fn mark_subtree(
+            children: &HashMap<&str, Vec<&Item>>,
+            uuid: &str,
+            excluded: &mut std::collections::HashSet<String>,
+        ) {
+            if excluded.insert(uuid.to_string()) {
+                children.get(uuid).into_iter().flatten().for_each(|child| {
+                    mark_subtree(children, &child.uuid, excluded);
+                });
+            }
+        }
+        mark_subtree(children, &item.uuid, &mut snapshot.excluded_uuids);
+        snapshot.excluded_paths.insert(path.clone());
+        snapshot.skips.push(SyncAction::Skip { path, reason });
     }
 
     fn walk(
@@ -315,17 +357,23 @@ pub fn remote_snapshot(items: &[Item], root_uuid: &str) -> RemoteSnapshot {
         kids.iter().for_each(|item| {
             let path = join_rel(rel_dir, &item.visible_name);
             if name_counts[item.visible_name.as_str()] > 1 {
-                snapshot.skips.push(SyncAction::Skip {
+                exclude(
+                    children,
+                    item,
                     path,
-                    reason: "duplicate sibling name on device".to_string(),
-                });
+                    "duplicate sibling name on device".to_string(),
+                    snapshot,
+                );
                 return;
             }
             if !usable_name(&item.visible_name) {
-                snapshot.skips.push(SyncAction::Skip {
+                exclude(
+                    children,
+                    item,
                     path,
-                    reason: "name is not usable as a filename".to_string(),
-                });
+                    "name is not usable as a filename".to_string(),
+                    snapshot,
+                );
                 return;
             }
             if item.is_folder() {
@@ -338,10 +386,13 @@ pub fn remote_snapshot(items: &[Item], root_uuid: &str) -> RemoteSnapshot {
                 Some("epub") => RemoteType::Epub,
                 Some("notebook") | None => RemoteType::Notebook,
                 Some(other) => {
-                    snapshot.skips.push(SyncAction::Skip {
+                    exclude(
+                        children,
+                        item,
                         path,
-                        reason: format!("unsupported document type '{other}'"),
-                    });
+                        format!("unsupported document type '{other}'"),
+                        snapshot,
+                    );
                     return;
                 }
             };
@@ -1227,6 +1278,13 @@ fn detect_moves(
                 .filter(|(key, _)| path_under(&from_dir, key))
                 .collect();
             if mapped.is_empty()
+                || remote
+                    .excluded_paths
+                    .iter()
+                    .any(|path| path_under(&from_dir, path))
+                || mapped
+                    .iter()
+                    .any(|(key, st)| remote.excludes_local(key, Some(st)))
                 || mapped.iter().any(|(_, st)| st.local_hash.is_none())
                 || local.iter().any(|e| path_under(&from_dir, &e.rel_path))
             {
@@ -1242,6 +1300,7 @@ fn detect_moves(
             let hash0 = mapped[0].1.local_hash.clone().expect("filtered on Some");
             let verifies = |g: &str| -> bool {
                 !g.is_empty()
+                    && !remote.excludes_path(g)
                     && !out.remote.folders.contains_key(g)
                     && !state.entries.keys().any(|k| path_under(g, k) || k == g)
                     && mapped.iter().all(|(key, st)| {
@@ -1318,6 +1377,7 @@ fn detect_moves(
             .iter()
             .filter(|(key, st)| {
                 !local_by_path.contains_key(key.as_str())
+                    && !remote.excludes_local(key, Some(st))
                     && st.local_hash.is_some()
                     && docs_by_uuid
                         .get(st.uuid.as_str())
@@ -1333,7 +1393,10 @@ fn detect_moves(
             });
         local
             .iter()
-            .filter(|entry| !out.state.entries.contains_key(&entry.rel_path))
+            .filter(|entry| {
+                !out.state.entries.contains_key(&entry.rel_path)
+                    && !remote.excludes_local(&entry.rel_path, None)
+            })
             .filter_map(|entry| entry.hash.clone().map(|hash| (entry, hash)))
             .for_each(|(entry, hash)| {
                 if let Some(group) = groups.get_mut(&(hash, entry.kind)) {
@@ -1437,7 +1500,11 @@ fn detect_moves(
             let Some((new_key, last_modified, payload_hash)) = adjusted_docs.get(&st.uuid) else {
                 return;
             };
-            if *new_key == key || !local_by_path.contains_key(key.as_str()) {
+            if *new_key == key
+                || !local_by_path.contains_key(key.as_str())
+                || remote.excludes_local(&key, Some(&st))
+                || remote.excludes_local(new_key, None)
+            {
                 return;
             }
             if local_by_path.contains_key(new_key.as_str())
@@ -1590,7 +1657,7 @@ pub fn plan(
         .iter()
         .map(|(key, st)| {
             let mut remote_doc = docs_by_uuid.get(st.uuid.as_str()).copied();
-            if remote_doc.is_none() {
+            if remote_doc.is_none() && !remote.excludes_local(key, Some(st)) {
                 // The mapped document vanished. If a same-name,
                 // same-kind unmapped document took its place (typical
                 // after an interrupted sync uploaded but never saved
@@ -1675,9 +1742,16 @@ pub fn plan(
             }),
     };
 
-    views
-        .iter()
-        .for_each(|(key, view)| decide(options, key, view, &guards, &mut buckets));
+    views.iter().for_each(|(key, view)| {
+        if remote.excludes_local(key, view.state) {
+            buckets.notes.push(skip(
+                key,
+                "device entry or target is excluded; preserving the sync mapping",
+            ));
+        } else {
+            decide(options, key, view, &guards, &mut buckets);
+        }
+    });
 
     if options.delete {
         append_dir_deletes(options, local, remote, &docs_by_uuid, &mut buckets);
@@ -3283,6 +3357,19 @@ pub fn plan_docs(
         let doc_a = a_by_key.get(key).copied();
         let doc_b = b_by_key.get(key).copied();
         let st = state.entries.get(key);
+        if a.excludes_path(key)
+            || b.excludes_path(key)
+            || st.is_some_and(|s| {
+                a.excluded_uuids.contains(&s.uuid_a) || b.excluded_uuids.contains(&s.uuid_b)
+            })
+        {
+            notes.push(DocAction::Conflict {
+                key: key.to_string(),
+                reason: "device entry or target is excluded; preserving the sync mapping"
+                    .to_string(),
+            });
+            return;
+        }
         // Changed = replaced (uuid drift) or modified (lastModified).
         let a_view = doc_a.map(|d| {
             let changed = st.is_none_or(|s| s.uuid_a != d.uuid || s.lm_a != d.last_modified);
@@ -3843,6 +3930,10 @@ mod tests {
         assert_eq!(snapshot.docs[0].local_rel_path(), "Note.rmdoc");
         assert_eq!(snapshot.skips.len(), 3); // two duplicates + one bad name
         assert_eq!(snapshot.folders[""], "b");
+        assert!(snapshot.excluded_uuids.contains("d1"));
+        assert!(snapshot.excluded_uuids.contains("d2"));
+        assert!(snapshot.excluded_uuids.contains("bad"));
+        assert!(!snapshot.excluded_uuids.contains("outside"));
     }
 
     #[test]
@@ -3855,6 +3946,305 @@ mod tests {
         let snapshot = remote_snapshot(&items, "");
         assert_eq!(snapshot.folders["A/B"], "bb");
         assert_eq!(snapshot.docs[0].local_rel_path(), "A/B/Deep.pdf");
+    }
+
+    // Each case retains the mapped UUID (u1), but excludes it from docs.
+    // Renamed cases also leave a usable successor at the archived path:
+    // UUID exclusion must prevent rebinding/replacing that successor.
+    fn excluded_cases() -> Vec<(&'static str, Vec<Item>)> {
+        vec![
+            (
+                "n",
+                vec![doc("u1", "n", "", "pdf", 5), doc("dup", "n", "", "pdf", 5)],
+            ),
+            (
+                "A/B/n",
+                vec![
+                    folder("a", "A", ""),
+                    folder("dup", "A", ""),
+                    folder("b", "B", "a"),
+                    doc("u1", "n", "b", "pdf", 5),
+                ],
+            ),
+            ("n", vec![doc("u1", "n", "", "unsupported", 5)]),
+            (
+                "n",
+                vec![
+                    doc("u1", ".hidden", "", "pdf", 5),
+                    doc("new", "n", "", "pdf", 9),
+                ],
+            ),
+            (
+                "A/n",
+                vec![folder("a", ".hidden", ""), doc("u1", "n", "a", "pdf", 5)],
+            ),
+            (
+                "n",
+                vec![
+                    doc("u1", "moved", "", "pdf", 5),
+                    doc("dup", "moved", "", "pdf", 5),
+                    doc("new", "n", "", "pdf", 9),
+                ],
+            ),
+        ]
+    }
+
+    #[test]
+    fn excluded_mappings_never_transfer_delete_move_or_rebind() {
+        excluded_cases().into_iter().for_each(|(key, items)| {
+            let path = format!("{key}.pdf");
+            let snapshot = remote_snapshot(&items, "");
+            assert!(snapshot.excluded_uuids.contains("u1"));
+            let mut state = SyncState::default();
+            state.entries.insert(
+                path.clone(),
+                entry_hashed("u1", DocKind::Pdf, 100, 1, 5, "h", "h"),
+            );
+            [push(), pull(), two_way()].into_iter().for_each(|mode| {
+                [false, true].into_iter().for_each(|delete| {
+                    [
+                        ConflictPolicy::Skip,
+                        ConflictPolicy::Newest,
+                        ConflictPolicy::PreferLocal,
+                        ConflictPolicy::PreferRemote,
+                    ]
+                    .into_iter()
+                    .for_each(|conflict| {
+                        // Unchanged, edited, and absent local copies must all
+                        // preserve the mapping rather than infer deletion.
+                        [
+                            vec![local(&path, DocKind::Pdf, 100, 1)],
+                            vec![local(&path, DocKind::Pdf, 200, 99)],
+                            vec![],
+                        ]
+                        .into_iter()
+                        .for_each(|locals| {
+                            let result = plan(
+                                SyncOptions {
+                                    delete,
+                                    conflict,
+                                    ..mode
+                                },
+                                &locals,
+                                &snapshot,
+                                &state,
+                            );
+                            assert!(
+                                result
+                                    .actions
+                                    .iter()
+                                    .all(|a| matches!(a, SyncAction::Skip { .. })),
+                                "{key}: {:?}",
+                                result.actions
+                            );
+                        });
+                    });
+                });
+            });
+        });
+    }
+
+    #[test]
+    fn duplicate_documents_and_subtrees_preserve_successful_sync_across_runs() {
+        [false, true].into_iter().for_each(|nested| {
+            let (key, mut items) = if nested {
+                (
+                    "A/B/n.pdf",
+                    vec![
+                        folder("a", "A", ""),
+                        folder("b", "B", "a"),
+                        doc("u1", "n", "b", "pdf", 5),
+                    ],
+                )
+            } else {
+                ("n.pdf", vec![doc("u1", "n", "", "pdf", 5)])
+            };
+            let clean = remote_snapshot(&items, "");
+            let initial = plan(pull(), &[], &clean, &SyncState::default());
+            assert!(
+                initial
+                    .actions
+                    .iter()
+                    .any(|a| matches!(a, SyncAction::Download { local, .. } if local == key))
+            );
+            // Archive and local copy produced by the successful initial download.
+            let mut state = SyncState::default();
+            state
+                .entries
+                .insert(key.to_string(), entry("u1", DocKind::Pdf, 100, 1, 5));
+            let locals = vec![local(key, DocKind::Pdf, 100, 1)];
+            assert!(plan(pull(), &locals, &clean, &state).actions.is_empty());
+            items.push(if nested {
+                folder("dup", "A", "")
+            } else {
+                doc("dup", "n", "", "pdf", 5)
+            });
+            let excluded = remote_snapshot(&items, "");
+            (0..2).for_each(|_| {
+                let result = plan(with_delete(pull()), &locals, &excluded, &state);
+                assert!(
+                    result
+                        .actions
+                        .iter()
+                        .all(|a| matches!(a, SyncAction::Skip { .. }))
+                );
+                // A skipped run writes no new entry; round-trip the retained archive.
+                state = serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+            });
+            assert!(
+                plan(with_delete(pull()), &locals, &clean, &state)
+                    .actions
+                    .is_empty()
+            );
+            let gone = remote_snapshot(&[], "");
+            assert!(
+                plan(with_delete(pull()), &locals, &gone, &state)
+                    .actions
+                    .iter()
+                    .any(|a| matches!(a, SyncAction::DeleteLocal { path } if path == key))
+            );
+        });
+    }
+
+    #[test]
+    fn excluded_paths_block_new_targets_and_absent_descendant_mappings() {
+        let snapshot = remote_snapshot(
+            &[
+                folder("a", "A", ""),
+                folder("dup", "A", ""),
+                doc("unsupported", "n", "", "unsupported", 5),
+            ],
+            "",
+        );
+        // No live UUID to match: the excluded subtree still makes absence unknown.
+        ["A/missing.pdf", "n.pdf"].into_iter().for_each(|key| {
+            let locals = vec![local(key, DocKind::Pdf, 100, 1)];
+            let mut state = SyncState::default();
+            state
+                .entries
+                .insert(key.to_string(), entry("gone", DocKind::Pdf, 100, 1, 5));
+            [push(), pull(), two_way()].into_iter().for_each(|options| {
+                [&state, &SyncState::default()]
+                    .into_iter()
+                    .for_each(|archive| {
+                        let result = plan(with_delete(options), &locals, &snapshot, archive);
+                        assert!(
+                            result
+                                .actions
+                                .iter()
+                                .all(|a| matches!(a, SyncAction::Skip { .. }))
+                        );
+                    });
+                let result = plan(with_delete(options), &[], &snapshot, &state);
+                assert!(
+                    result
+                        .actions
+                        .iter()
+                        .all(|a| matches!(a, SyncAction::Skip { .. }))
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn exclusions_do_not_block_unrelated_true_deletions() {
+        let snapshot = remote_snapshot(
+            &[doc("u1", "n", "", "pdf", 5), doc("dup", "n", "", "pdf", 5)],
+            "",
+        );
+        let locals = vec![
+            local("n.pdf", DocKind::Pdf, 100, 1),
+            local("gone.pdf", DocKind::Pdf, 100, 1),
+        ];
+        let mut state = SyncState::default();
+        state
+            .entries
+            .insert("n.pdf".to_string(), entry("u1", DocKind::Pdf, 100, 1, 5));
+        state.entries.insert(
+            "gone.pdf".to_string(),
+            entry("gone", DocKind::Pdf, 100, 1, 5),
+        );
+        let result = plan(with_delete(pull()), &locals, &snapshot, &state);
+        let changes: Vec<_> = result
+            .actions
+            .into_iter()
+            .filter(|a| !matches!(a, SyncAction::Skip { .. }))
+            .collect();
+        assert_eq!(
+            changes,
+            vec![SyncAction::DeleteLocal {
+                path: "gone.pdf".to_string()
+            }]
+        );
+
+        let peer = remote_snapshot(
+            &[
+                doc("peer", "n", "", "pdf", 5),
+                doc("gone-peer", "gone", "", "pdf", 5),
+            ],
+            "",
+        );
+        let mut state = PairState::default();
+        state
+            .entries
+            .insert("n".to_string(), pair_entry("u1", 5, "peer", 5));
+        state
+            .entries
+            .insert("gone".to_string(), pair_entry("gone", 5, "gone-peer", 5));
+        let changes: Vec<_> = plan_docs(with_delete(two_way()), &snapshot, &peer, &state)
+            .into_iter()
+            .filter(|a| !matches!(a, DocAction::Conflict { .. }))
+            .collect();
+        assert_eq!(
+            changes,
+            vec![DocAction::DeleteOnB {
+                key: "gone".to_string(),
+                uuid: "gone-peer".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn excluded_contents_and_targets_block_move_prepass() {
+        let mut state = SyncState::default();
+        state.entries.insert(
+            "A/n.pdf".to_string(),
+            entry_hashed("u1", DocKind::Pdf, 100, 1, 5, "h", "h"),
+        );
+        let locals = vec![with_hash(local("B/n.pdf", DocKind::Pdf, 100, 1), "h")];
+        let cases = [
+            // A folder move must not carry excluded, even untracked, content.
+            vec![
+                folder("a", "A", ""),
+                doc("u1", "n", "a", "pdf", 5),
+                doc("bad", "bad", "a", "unsupported", 5),
+            ],
+            // Neither folder nor file moves may target an excluded subtree.
+            vec![
+                folder("a", "A", ""),
+                doc("u1", "n", "a", "pdf", 5),
+                folder("b", "B", ""),
+                folder("dup", "B", ""),
+            ],
+        ];
+        cases.into_iter().enumerate().for_each(|(index, items)| {
+            let result = plan(push(), &locals, &remote_snapshot(&items, ""), &state);
+            assert!(
+                !result
+                    .actions
+                    .iter()
+                    .any(|a| matches!(a, SyncAction::MoveRemoteFolder { .. }))
+            );
+            if index == 1 {
+                assert!(!result.actions.iter().any(|a| matches!(
+                    a,
+                    SyncAction::MoveRemote { .. }
+                        | SyncAction::Upload { .. }
+                        | SyncAction::CopyRemote { .. }
+                        | SyncAction::CreateRemoteFolder { .. }
+                )));
+            }
+        });
     }
 
     // ---- push planning ----------------------------------------------------
@@ -5526,6 +5916,131 @@ mod tests {
                 key: "n".to_string()
             }]
         );
+    }
+
+    #[test]
+    fn docs_excluded_mappings_block_both_sides_and_preserve_archives() {
+        excluded_cases().into_iter().for_each(|(key, items)| {
+            let excluded = remote_snapshot(&items, "");
+            let (dir, name) = key.rsplit_once('/').unwrap_or(("", key));
+            let peer = RemoteSnapshot {
+                docs: vec![RemoteDoc {
+                    rel_dir: dir.to_string(),
+                    name: name.to_string(),
+                    uuid: "peer".to_string(),
+                    doc_type: RemoteType::Pdf,
+                    last_modified: 5,
+                    size_bytes: Some(100),
+                    payload_hash: None,
+                }],
+                ..RemoteSnapshot::default()
+            };
+            [false, true].into_iter().for_each(|reverse| {
+                let (a, b, entry) = if reverse {
+                    (&peer, &excluded, pair_entry("peer", 5, "u1", 5))
+                } else {
+                    (&excluded, &peer, pair_entry("u1", 5, "peer", 5))
+                };
+                let mut state = PairState::default();
+                state.entries.insert(key.to_string(), entry);
+                [push(), pull(), two_way()].into_iter().for_each(|mode| {
+                    [false, true].into_iter().for_each(|delete| {
+                        [
+                            ConflictPolicy::Skip,
+                            ConflictPolicy::Newest,
+                            ConflictPolicy::PreferLocal,
+                            ConflictPolicy::PreferRemote,
+                        ]
+                        .into_iter()
+                        .for_each(|conflict| {
+                            let result = plan_docs(
+                                SyncOptions {
+                                    delete,
+                                    conflict,
+                                    ..mode
+                                },
+                                a,
+                                b,
+                                &state,
+                            );
+                            assert!(
+                                result
+                                    .iter()
+                                    .all(|a| matches!(a, DocAction::Conflict { .. })),
+                                "{key}: {result:?}"
+                            );
+                        });
+                    });
+                });
+            });
+        });
+    }
+
+    #[test]
+    fn docs_duplicate_subtrees_preserve_successful_sync_across_runs() {
+        [false, true].into_iter().for_each(|nested| {
+            let (key, mut items) = if nested {
+                (
+                    "A/n",
+                    vec![folder("a", "A", ""), doc("u1", "n", "a", "pdf", 5)],
+                )
+            } else {
+                ("n", vec![doc("u1", "n", "", "pdf", 5)])
+            };
+            let clean = remote_snapshot(&items, "");
+            let empty = remote_snapshot(&[], "");
+            assert!(
+                plan_docs(push(), &clean, &empty, &PairState::default())
+                    .iter()
+                    .any(|a| matches!(a, DocAction::CopyToB { key: k, .. } if k == key))
+            );
+            let mut peer = clean.clone();
+            peer.docs[0].uuid = "peer".to_string();
+            let mut state = PairState::default();
+            state
+                .entries
+                .insert(key.to_string(), pair_entry("u1", 5, "peer", 5));
+            assert!(plan_docs(two_way(), &clean, &peer, &state).is_empty());
+            items.push(if nested {
+                folder("dup", "A", "")
+            } else {
+                doc("dup", "n", "", "pdf", 5)
+            });
+            let excluded = remote_snapshot(&items, "");
+            (0..2).for_each(|_| {
+                let result = plan_docs(with_delete(two_way()), &excluded, &peer, &state);
+                assert!(
+                    result
+                        .iter()
+                        .all(|a| matches!(a, DocAction::Conflict { .. }))
+                );
+                state = serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+            });
+            assert!(plan_docs(with_delete(two_way()), &clean, &peer, &state).is_empty());
+            assert_eq!(
+                plan_docs(with_delete(two_way()), &empty, &peer, &state),
+                vec![DocAction::DeleteOnB {
+                    key: key.to_string(),
+                    uuid: "peer".to_string()
+                }]
+            );
+            // Neither a missing descendant UUID nor loss of the archive licenses
+            // copying into an ambiguous destination subtree.
+            items.retain(|item| item.uuid != "u1");
+            if !nested {
+                items.push(doc("dup2", "n", "", "pdf", 5));
+            }
+            let excluded = remote_snapshot(&items, "");
+            [&state, &PairState::default()]
+                .into_iter()
+                .for_each(|archive| {
+                    assert!(
+                        plan_docs(two_way(), &excluded, &peer, archive)
+                            .iter()
+                            .all(|a| matches!(a, DocAction::Conflict { .. }))
+                    );
+                });
+        });
     }
 
     #[test]
