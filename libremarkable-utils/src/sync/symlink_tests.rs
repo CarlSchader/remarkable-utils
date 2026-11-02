@@ -312,7 +312,31 @@ fn tablet_sync_fast_paths_reject_collisions_before_copy_move_or_download() {
         );
         actions.into_iter().for_each(|action| {
             let mut state = SyncState::default();
+            // MoveLocal operates on an existing mapping. Seed a real agreed
+            // baseline so the executor reaches the symlink guard, rather than
+            // rejecting an invalid unmapped move before attempting the rename.
+            if let SyncAction::MoveLocal { from, uuid, .. } = &action {
+                let (size, mtime) = endpoint.stat(from).unwrap();
+                let hash = endpoint.content_hash(from).unwrap();
+                state.entries.insert(
+                    from.clone(),
+                    StateEntry {
+                        uuid: uuid.clone(),
+                        kind: DocKind::Pdf,
+                        local_size: size,
+                        local_mtime_ms: mtime,
+                        remote_last_modified: 0,
+                        remote_pending: false,
+                        remote_size: None,
+                        local_hash: hash.clone(),
+                        payload_hash: hash,
+                    },
+                );
+            }
             let state_path = f.0.join("archive.json");
+            state.save(&state_path).unwrap();
+            let baseline = state.serialize().unwrap();
+            let archive_before = fs::read(&state_path).unwrap();
             let error = execute(
                 &client,
                 &NoProgress,
@@ -327,8 +351,8 @@ fn tablet_sync_fast_paths_reject_collisions_before_copy_move_or_download() {
             .unwrap_err();
             // Must fail locally, not by attempting the intentionally disabled SSH.
             assert!(error.to_string().contains("unsafe sync path"), "{error}");
-            assert!(state.entries.is_empty());
-            assert!(!state_path.exists());
+            assert_eq!(state.serialize().unwrap(), baseline);
+            assert_eq!(fs::read(&state_path).unwrap(), archive_before);
             f.assert_untouched();
         });
     });
