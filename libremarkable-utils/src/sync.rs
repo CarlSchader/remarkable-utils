@@ -668,6 +668,43 @@ impl FsEndpoint for LocalFs {
         Ok(fs::create_dir_all(&self.root)?)
     }
 
+    fn root_exists(&self) -> Result<bool> {
+        // Strip trailing separators/dots so lstat sees a dangling root link
+        // itself, rather than following it. Keep `..` components intact.
+        let root: PathBuf = self.root.components().collect();
+        root.ancestors()
+            .enumerate()
+            .find_map(|(depth, path)| {
+                let path = if path.as_os_str().is_empty() {
+                    Path::new(".")
+                } else {
+                    path
+                };
+                match fs::symlink_metadata(path) {
+                    // Follow an existing link only after identifying it. A
+                    // dangling link is an error, not a creatable missing root.
+                    // Valid directory links at/above the root remain supported.
+                    Ok(_) => Some(
+                        fs::metadata(path)
+                            .and_then(|metadata| {
+                                if metadata.is_dir() {
+                                    Ok(depth == 0)
+                                } else {
+                                    Err(std::io::Error::new(
+                                        std::io::ErrorKind::NotADirectory,
+                                        format!("not a sync root directory: {}", path.display()),
+                                    ))
+                                }
+                            })
+                            .map_err(Error::from),
+                    ),
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(err) => Some(Err(err.into())),
+                }
+            })
+            .unwrap_or(Ok(false))
+    }
+
     fn snapshot(&self) -> Result<(Vec<LocalEntry>, usize)> {
         local_snapshot(&self.root)
     }

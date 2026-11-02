@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -166,7 +166,16 @@ exec sh -c "$command"
             fs::read_dir(path).unwrap().for_each(|entry| {
                 let path = entry.unwrap().path();
                 let key = path.strip_prefix(root).unwrap().to_path_buf();
-                if path.is_dir() {
+                if path.is_symlink() {
+                    result.insert(
+                        key,
+                        fs::read_link(path)
+                            .unwrap()
+                            .as_os_str()
+                            .as_encoded_bytes()
+                            .to_vec(),
+                    );
+                } else if path.is_dir() {
                     result.insert(key, Vec::new());
                     walk(root, &path, result);
                 } else {
@@ -447,6 +456,84 @@ fn invalid_filesystem_ancestors_are_not_treated_as_missing() {
                 "{kind:?}, inaccessible={inaccessible}"
             );
             assert_eq!(before, fixture.trees());
+        });
+    });
+}
+
+#[test]
+fn dangling_local_roots_and_ancestors_are_errors_in_preview_and_execution() {
+    KINDS.into_iter().for_each(|src_kind| {
+        [
+            "root",
+            "root-slash",
+            "root-dot",
+            "ancestor",
+            "deep-ancestor",
+        ]
+        .into_iter()
+        .for_each(|location| {
+            let fixture = Fixture::new();
+            let src = fixture.endpoint(src_kind, "a", true, true);
+            let mut dst = fixture.endpoint(Kind::Local, "b", false, false);
+            let host = fixture.0.join("trees/b");
+            if location.starts_with("root") {
+                fs::create_dir(host.join("parent")).unwrap();
+                symlink("absent", host.join("parent/root")).unwrap();
+                if location == "root-slash" {
+                    dst.push('/');
+                } else if location == "root-dot" {
+                    dst.push_str("/.");
+                }
+            } else {
+                symlink("absent", host.join("parent")).unwrap();
+                if location == "deep-ancestor" {
+                    dst.push_str("/deep/root");
+                }
+            }
+            let before = fixture.trees();
+            [&["--dry-run"][..], &["--dry-run"][..], &[][..]]
+                .into_iter()
+                .for_each(|flags| {
+                    let output = fixture.run(&src, &dst, flags, false);
+                    assert!(
+                        !output.status.success(),
+                        "{src_kind:?}, {location}, {flags:?}: {}",
+                        String::from_utf8_lossy(&output.stdout)
+                    );
+                    assert!(!String::from_utf8_lossy(&output.stdout).contains("mkdir root"));
+                    assert_eq!(before, fixture.trees());
+                });
+        });
+    });
+}
+
+#[test]
+fn valid_local_root_and_ancestor_symlinks_remain_supported() {
+    KINDS.into_iter().for_each(|src_kind| {
+        [false, true].into_iter().for_each(|ancestor| {
+            let fixture = Fixture::new();
+            let src = fixture.endpoint(src_kind, "a", true, true);
+            let dst = fixture.endpoint(Kind::Local, "b", false, false);
+            let host = fixture.0.join("trees/b");
+            fs::create_dir(host.join("target")).unwrap();
+            if ancestor {
+                // The root is genuinely missing beneath a valid directory link.
+                symlink("target", host.join("parent")).unwrap();
+            } else {
+                fs::create_dir(host.join("parent")).unwrap();
+                symlink("../target", host.join("parent/root")).unwrap();
+            }
+            let before = fixture.trees();
+            let plan = success(&fixture.run(&src, &dst, &["--dry-run"], false));
+            assert_eq!(plan.contains("mkdir root"), ancestor, "{plan}");
+            assert!(plan.contains("nested/book"), "{plan}");
+            assert_eq!(before, fixture.trees());
+            success(&fixture.run(&src, &dst, &[], false));
+            fixture.assert_nested_copy(Kind::Local, "b");
+            let after = fixture.trees();
+            let plan = success(&fixture.run(&src, &dst, &["--dry-run"], false));
+            assert!(!plan.contains("mkdir root"), "{plan}");
+            assert_eq!(after, fixture.trees());
         });
     });
 }
