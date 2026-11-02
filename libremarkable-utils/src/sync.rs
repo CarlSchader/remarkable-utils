@@ -22,6 +22,9 @@ use crate::progress::Progress;
 use crate::ssh::{SshSession, shell_quote};
 use crate::xochitl::{self, Item};
 
+#[cfg(all(test, unix))]
+mod symlink_tests;
+
 /// Name of the **legacy** in-tree state file (pre-v2 sync). No longer
 /// read or written; used only to warn users that it can be deleted.
 pub const LEGACY_STATE_FILE_NAME: &str = ".rmu-sync.json";
@@ -508,8 +511,15 @@ pub trait FsEndpoint {
     /// SHA-256 of a file's content, if this endpoint can compute it
     /// cheaply enough to be worth it.
     fn content_hash(&self, rel_path: &str) -> Result<Option<String>>;
-    /// For local endpoints: the real path, enabling streamed transfers
-    /// instead of in-memory buffering.
+    /// Prepare a local output path for a streamed write, rejecting symlinks
+    /// below the endpoint root and creating missing parent directories.
+    /// Endpoints without this fast path use `write` instead.
+    fn prepare_local_write(&self, rel_path: &str) -> Result<Option<PathBuf>> {
+        let _ = rel_path;
+        Ok(None)
+    }
+    /// For local endpoints: the real path, enabling streamed reads.
+    /// This is not a validated output path; use `prepare_local_write` to write.
     fn as_local_path(&self, rel_path: &str) -> Option<PathBuf> {
         let _ = rel_path;
         None
@@ -525,6 +535,58 @@ impl LocalFs {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
     }
+}
+
+/// Require a nonempty, root-relative path before checking filesystem entries.
+/// In particular, `..` must not undo a checked component.
+fn sync_path_parts(rel_path: &str) -> Result<Vec<&str>> {
+    let parts: Vec<_> = rel_path.split('/').collect();
+    if parts.iter().any(|part| {
+        part.is_empty()
+            || *part == "."
+            || *part == ".."
+            || !matches!(
+                Path::new(part).components().next(),
+                Some(std::path::Component::Normal(_))
+            )
+            || part.contains('\0')
+    }) {
+        return Err(Error::InvalidName(format!("unsafe sync path: {rel_path}")));
+    }
+    Ok(parts)
+}
+
+/// Check every component beneath the selected root, including dangling links.
+/// The root itself may deliberately be a symlink (as may its own ancestors).
+/// These write-time checks reject collisions omitted by snapshots; they are
+/// not a sandbox against concurrent, hostile filesystem namespace changes.
+fn checked_local_path(root: &Path, rel_path: &str) -> Result<PathBuf> {
+    let parts = sync_path_parts(rel_path)?;
+    parts.iter().enumerate().try_fold(
+        root.to_path_buf(),
+        |path, (index, part)| -> Result<PathBuf> {
+            let path = path.join(part);
+            match fs::symlink_metadata(&path) {
+                Ok(meta) => {
+                    let valid_type = if index + 1 == parts.len() {
+                        meta.is_file()
+                    } else {
+                        meta.is_dir()
+                    };
+                    if meta.file_type().is_symlink() || !valid_type {
+                        return Err(std::io::Error::other(format!(
+                            "unsafe sync path (symlink or wrong file type): {}",
+                            path.display()
+                        ))
+                        .into());
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err.into()),
+            }
+            Ok(path)
+        },
+    )
 }
 
 impl FsEndpoint for LocalFs {
@@ -545,10 +607,7 @@ impl FsEndpoint for LocalFs {
     }
 
     fn write(&self, rel_path: &str, data: &[u8]) -> Result<()> {
-        let path = self.root.join(rel_path);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
+        let path = self.prepare_local_write(rel_path)?.expect("local endpoint");
         Ok(fs::write(path, data)?)
     }
 
@@ -561,11 +620,9 @@ impl FsEndpoint for LocalFs {
     }
 
     fn rename(&self, from: &str, to: &str) -> Result<()> {
-        let target = self.root.join(to);
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        Ok(fs::rename(self.root.join(from), target)?)
+        let source = checked_local_path(&self.root, from)?;
+        let target = self.prepare_local_write(to)?.expect("local endpoint");
+        Ok(fs::rename(source, target)?)
     }
 
     fn remove_dir(&self, rel_dir: &str) -> Result<bool> {
@@ -590,6 +647,15 @@ impl FsEndpoint for LocalFs {
 
     fn content_hash(&self, rel_path: &str) -> Result<Option<String>> {
         hash_file(&self.root.join(rel_path)).map(Some)
+    }
+
+    fn prepare_local_write(&self, rel_path: &str) -> Result<Option<PathBuf>> {
+        let path = checked_local_path(&self.root, rel_path)?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        // Check again after directory creation, immediately before the write.
+        checked_local_path(&self.root, rel_path).map(Some)
     }
 
     fn as_local_path(&self, rel_path: &str) -> Option<PathBuf> {
@@ -626,6 +692,35 @@ impl SshFs {
         }
     }
 
+    /// Enter the selected root, then reject links in every relative component
+    /// in the same shell invocation as the mutation (not just at snapshot time).
+    fn mutation_preamble(&self) -> String {
+        format!(
+            "mkdir -p {root} && cd {root} || exit 9\n",
+            root = shell_quote(&self.root_for_shell())
+        )
+    }
+
+    fn write_command(&self, rel_path: &str) -> Result<String> {
+        let guard = shell_path_guard(rel_path, true)?;
+        Ok(format!(
+            "{}{guard}cat > {}",
+            self.mutation_preamble(),
+            shell_quote(&format!("./{rel_path}"))
+        ))
+    }
+
+    fn rename_command(&self, from: &str, to: &str) -> Result<String> {
+        let source_guard = shell_path_guard(from, false)?;
+        let target_guard = shell_path_guard(to, true)?;
+        Ok(format!(
+            "{}{source_guard}{target_guard}mv -- {from} {to}",
+            self.mutation_preamble(),
+            from = shell_quote(&format!("./{from}")),
+            to = shell_quote(&format!("./{to}")),
+        ))
+    }
+
     fn root_for_shell(&self) -> String {
         if self.root.is_empty() {
             ".".to_string()
@@ -633,6 +728,35 @@ impl SshFs {
             self.root.clone()
         }
     }
+}
+
+/// POSIX shell counterpart of `checked_local_path`. Each parent is checked
+/// before mkdir can traverse it. `-L` also catches dangling symlinks; checking
+/// the leaf type prevents `mv` from treating a directory as a target container.
+fn shell_path_guard(rel_path: &str, create_parents: bool) -> Result<String> {
+    let parts = sync_path_parts(rel_path)?;
+    let (_, script) = parts.iter().enumerate().fold(
+        (String::from("."), String::new()),
+        |(mut path, mut script), (index, part)| {
+            path.push('/');
+            path.push_str(part);
+            let quoted = shell_quote(&path);
+            let is_parent = index + 1 < parts.len();
+            let kind = if is_parent { "d" } else { "f" };
+            script.push_str(&format!(
+                "if [ -L {quoted} ] || {{ [ -e {quoted} ] && [ ! -{kind} {quoted} ]; }}; then\n\
+                 printf '%s\\n' {message} >&2; exit 9\nfi\n",
+                message = shell_quote(&format!(
+                    "unsafe sync path (symlink or wrong file type): {path}"
+                )),
+            ));
+            if is_parent && create_parents {
+                script.push_str(&format!("mkdir -p {quoted} || exit 9\n"));
+            }
+            (path, script)
+        },
+    );
+    Ok(script)
 }
 
 impl FsEndpoint for SshFs {
@@ -670,17 +794,8 @@ impl FsEndpoint for SshFs {
     }
 
     fn write(&self, rel_path: &str, data: &[u8]) -> Result<()> {
-        let path = self.join(rel_path);
-        let parent = path.rsplit_once('/').map(|(dir, _)| dir).unwrap_or(".");
-        self.session.run_checked_with_stdin(
-            &format!(
-                "mkdir -p {parent} && cat > {path}",
-                parent = shell_quote(parent),
-                path = shell_quote(&path),
-            ),
-            data,
-            &*self.progress,
-        )
+        self.session
+            .run_checked_with_stdin(&self.write_command(rel_path)?, data, &*self.progress)
     }
 
     fn remove(&self, rel_path: &str) -> Result<()> {
@@ -690,14 +805,7 @@ impl FsEndpoint for SshFs {
     }
 
     fn rename(&self, from: &str, to: &str) -> Result<()> {
-        let to_path = self.join(to);
-        let parent = to_path.rsplit_once('/').map(|(dir, _)| dir).unwrap_or(".");
-        self.session.run_checked(&format!(
-            "mkdir -p {parent} && mv -- {from} {to}",
-            parent = shell_quote(parent),
-            from = shell_quote(&self.join(from)),
-            to = shell_quote(&to_path),
-        ))?;
+        self.session.run_checked(&self.rename_command(from, to)?)?;
         Ok(())
     }
 
@@ -2418,21 +2526,16 @@ pub fn execute(
                 size_bytes,
                 last_modified,
             } => {
-                match (doc_type, fs_side.as_local_path(local)) {
-                    (_, Some(dest)) => {
-                        if let Some(parent) = dest.parent() {
-                            fs::create_dir_all(parent)?;
+                match (doc_type, fs_side.prepare_local_write(local)?) {
+                    (_, Some(dest)) => match doc_type {
+                        RemoteType::Notebook => client.download_bundle_to(uuid, &dest)?,
+                        RemoteType::Pdf => {
+                            client.download_payload_to(uuid, "pdf", &dest, *size_bytes)?
                         }
-                        match doc_type {
-                            RemoteType::Notebook => client.download_bundle_to(uuid, &dest)?,
-                            RemoteType::Pdf => {
-                                client.download_payload_to(uuid, "pdf", &dest, *size_bytes)?
-                            }
-                            RemoteType::Epub => {
-                                client.download_payload_to(uuid, "epub", &dest, *size_bytes)?
-                            }
+                        RemoteType::Epub => {
+                            client.download_payload_to(uuid, "epub", &dest, *size_bytes)?
                         }
-                    }
+                    },
                     (RemoteType::Notebook, None) => {
                         fs_side.write(local, &client.download_bundle_bytes(uuid)?)?
                     }
@@ -2698,11 +2801,11 @@ pub fn execute(
                 last_modified,
                 hash,
             } => {
-                match (fs_side.as_local_path(from), fs_side.as_local_path(to)) {
+                match (
+                    fs_side.as_local_path(from),
+                    fs_side.prepare_local_write(to)?,
+                ) {
                     (Some(src), Some(dest)) => {
-                        if let Some(parent) = dest.parent() {
-                            fs::create_dir_all(parent)?;
-                        }
                         fs::copy(&src, &dest)?;
                     }
                     _ => {
