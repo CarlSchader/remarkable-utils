@@ -245,8 +245,15 @@ JSONs. The cache is best-effort: any load problem falls back to the
 full fetch, any save problem only costs speed next run. Staleness
 caveat (same trade as the git index / Unison fastcheck): a rewrite
 within the same second that keeps the file size is invisible until
-the next change. `rmu sync` and the regular commands both use the
-cache; every run re-stats, so rmu's own writes are always seen.
+the next change. Mutations discard the listing cache before changing
+metadata/content or deleting artifacts, including when the remote operation
+later fails; an unremovable cache blocks that mutation. The next listing
+re-fetches the bodies, so rmu's own metadata writes are visible even with
+identical stat signatures. Delete, move, rename, and empty-trash reference
+and tree checks bypass the cache with a single batched full read, protecting
+against external same-stamp changes too. This is not an atomic snapshot or a
+lock against concurrent device edits; ordinary listings and sync snapshots
+retain the stat-fastcheck limitation for external edits.
 
 ## Executor
 
