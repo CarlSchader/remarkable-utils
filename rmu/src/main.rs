@@ -335,8 +335,17 @@ fn build_side(
                     destination,
                 })
             } else {
+                // An empty SSH path is the login directory, not the filesystem
+                // root. Keep `/` distinct when removing trailing separators so
+                // same-host home/root pairs have stable, different identities.
+                let trimmed = path.trim_end_matches('/');
+                let identity_path = if trimmed.is_empty() && !path.is_empty() {
+                    "/"
+                } else {
+                    trimmed
+                };
                 Ok(BuiltSide::Fs {
-                    identity: format!("{destination}:{}", path.trim_end_matches('/')),
+                    identity: format!("{destination}:{identity_path}"),
                     endpoint: Box::new(SshFs::new(session, path, progress.clone())),
                     is_local: false,
                 })
@@ -513,7 +522,9 @@ fn sync_tablet_snapshot(
     path: &str,
     writable: bool,
 ) -> Result<(sync::RemoteSnapshot, bool)> {
-    let items = client.list_items()?;
+    // Both source and destination trees can drive destructive actions by UUID.
+    // Root resolution and planning must therefore bypass cached stat-fastcheck.
+    let items = client.list_items_authoritative()?;
     match xochitl::resolve_folder_ref(&items, path) {
         Ok(uuid) => Ok((sync::remote_snapshot(&items, &uuid), false)),
         Err(libremarkable_utils::Error::PathNotFound(_)) if writable => {
@@ -803,11 +814,36 @@ fn run_files_sync(
     let (src_ep, src_local, src_id) = src;
     let (dst_ep, dst_local, dst_id) = dst;
 
-    // Side "A" is the local side when exactly one side is local,
-    // otherwise the first argument's side. The archive itself lives
-    // on this machine either way, keyed order-independently.
-    let a_is_src = src_local || !dst_local;
-    let state_path = sync::sync_state_path(&src_id, &dst_id);
+    // Keep the existing local-A convention for mixed pairs. Same-kind
+    // pairs use identity order, never argument order: their archive key
+    // is also order-independent, but its stamps belong to specific sides.
+    let same_kind = src_local == dst_local;
+    let a_is_src = if same_kind {
+        src_id <= dst_id
+    } else {
+        src_local
+    };
+    let old_state_path = sync::sync_state_path(&src_id, &dst_id);
+    // Older same-kind archives did not record which endpoint was A.
+    // Isolate the stable-role format rather than guessing that orientation
+    // (or letting older binaries interpret our newly ordered stamps).
+    // Mixed pairs already had stable roles and keep their existing archive.
+    let state_path = if same_kind {
+        old_state_path.with_extension("files-v1.json")
+    } else {
+        old_state_path.clone()
+    };
+    if same_kind && !state_path.exists() && old_state_path.exists() {
+        info(
+            cli,
+            format!(
+                "note: ignoring {}: filesystem archive has unknown side order; \
+                 starting fresh. Review --dry-run before choosing --conflict; \
+                 previous deletions cannot be inferred.",
+                old_state_path.display(),
+            ),
+        );
+    }
     let (a, b) = if a_is_src {
         (src_ep, dst_ep)
     } else {

@@ -65,7 +65,7 @@ impl Client {
     /// With a cache (see [`Self::with_listing_cache`]): an
     /// **incremental** listing — round trip 1 stats every relevant
     /// file (tiny output), round trip 2 fetches only files whose
-    /// mtime+size moved since the cached copy. A no-op sync of a large
+    /// mtime+size moved since the cached copy. A no-op listing of a large
     /// library stops re-reading thousands of JSONs. Any cache problem
     /// falls back to the full fetch.
     pub fn list_items(&self) -> Result<Vec<Item>> {
@@ -74,6 +74,14 @@ impl Client {
         {
             return Ok(items);
         }
+        self.list_items_full()
+    }
+
+    /// Load current metadata/content bodies in one batched read, bypassing
+    /// the listing cache's lossy mtime+size signatures. Use this for mutation
+    /// planning, including sync roots and snapshots consumed by UUID-based
+    /// executors. This is not an atomic snapshot against concurrent edits.
+    pub fn list_items_authoritative(&self) -> Result<Vec<Item>> {
         self.list_items_full()
     }
 
@@ -193,7 +201,9 @@ impl Client {
             return Err(Error::EmptyPath);
         }
 
-        let items = self.list_items()?;
+        // Root creation can be part of destructive sync planning. Do not
+        // reuse an externally renamed folder through a stale cached path.
+        let items = self.list_items_authoritative()?;
         let parent = xochitl::resolve_folder_ref(&items, parent_ref)?;
 
         // Fold each path segment into (known items, current parent),
@@ -400,6 +410,7 @@ impl Client {
 
         let tar_bytes = bundle::rmdoc_to_tar(&rmdoc, &new_uuid)?;
         self.progress.step(&format!("Restoring bundle '{name}'"));
+        self.invalidate_listing_cache()?;
         self.session.run_checked_with_stdin(
             &format!("cd {} && tar -xf -", shell_quote(&self.dir)),
             &tar_bytes,
@@ -707,7 +718,7 @@ impl Client {
     /// targets (one inside another) are deduplicated; children are
     /// removed before parents.
     pub fn delete_many(&self, item_refs: &[&str], recursive: bool) -> Result<Vec<Item>> {
-        let items = self.list_items()?;
+        let items = self.list_items_full()?;
         let uuids = xochitl::expand_refs(&items, item_refs)?;
         let refs: Vec<&str> = uuids.iter().map(String::as_str).collect();
         let order = deletion_plan(&items, &refs, recursive)?;
@@ -717,7 +728,7 @@ impl Client {
     /// Permanently delete everything in the device's trash (items the
     /// UI "deleted" but keeps restorable). Irreversible.
     pub fn empty_trash(&self) -> Result<Vec<Item>> {
-        let items = self.list_items()?;
+        let items = self.list_items_full()?;
         let trashed: Vec<&str> = items
             .iter()
             .filter(|item| item.parent == xochitl::TRASH_PARENT)
@@ -752,7 +763,7 @@ impl Client {
     /// against a single listing **before anything is written**; items
     /// already in the destination are returned unchanged.
     pub fn move_items(&self, item_ref: &str, destination_ref: &str) -> Result<Vec<Item>> {
-        let items = self.list_items()?;
+        let items = self.list_items_full()?;
         let destination = xochitl::resolve_folder_ref(&items, destination_ref)?;
         let uuids = xochitl::expand_refs(&items, &[item_ref])?;
         if uuids.contains(&destination) {
@@ -798,7 +809,7 @@ impl Client {
             return Err(Error::InvalidName("name cannot contain '/'".to_string()));
         }
 
-        let items = self.list_items()?;
+        let items = self.list_items_full()?;
         let item = xochitl::resolve_item_ref(&items, item_ref)?.clone();
         if item.visible_name == name {
             return Ok(item);
@@ -867,7 +878,23 @@ impl Client {
         format!("{}/{}", self.dir, name)
     }
 
+    /// Discard cached bodies before a mutation can change them. Doing this
+    /// before I/O also covers partial writes/deletions and lost SSH replies.
+    /// If an existing cache cannot be removed, fail before changing the device
+    /// rather than leave stale entries for this or a subsequent client.
+    fn invalidate_listing_cache(&self) -> Result<()> {
+        if let Some(path) = &self.listing_cache {
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
+
     fn write_text(&self, name: &str, text: &str) -> Result<()> {
+        self.invalidate_listing_cache()?;
         self.session
             .write_remote_file(&self.remote_path(name), text.as_bytes())
     }
@@ -936,6 +963,7 @@ impl Client {
     /// deliberately outside the quotes; `rm -f` is silent when the
     /// glob matches nothing.
     fn delete_artifacts(&self, uuid: &str) -> Result<()> {
+        self.invalidate_listing_cache()?;
         let quoted = shell_quote(uuid);
         self.session.run_checked(&format!(
             "cd {} && rm -rf -- {quoted} {quoted}.*",
@@ -1106,8 +1134,9 @@ fn parse_stat_listing(output: &str) -> Vec<(String, i64, u64)> {
 /// The on-disk cache behind the incremental listing: per
 /// `.metadata`/`.content` file, the stat signature and the file body
 /// as of the last fetch. Staleness caveat: a rewrite within the same
-/// second that keeps the size is invisible — the same trade every
-/// stat-cache makes (git index, Unison fastcheck).
+/// second that keeps the size is invisible to ordinary listings. Local
+/// mutations invalidate this cache; destructive reference resolution bypasses
+/// it entirely so external same-stamp edits cannot misdirect a mutation.
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 struct ListingCache {
     version: u32,

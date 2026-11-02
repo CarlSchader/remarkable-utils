@@ -121,6 +121,26 @@ archive. Never inside the synced tree: no git pollution, no accidental
 deletion, overlapping roots each get their own archive. tablet↔tablet
 pair-state files live in the same directory (`sync-pair-<hash>.json`).
 
+For local↔local and SSH↔SSH filesystem pairs, side A is the
+lexicographically smaller endpoint identity, independent of argument
+order. SSH filesystem identities retain `/` for the filesystem root:
+`host:` (login directory) and `host:/` (root) are distinct even on the
+same host. Other trailing separators are ignored as before. This changes
+the archive key for filesystem pairs containing an SSH root; the old key
+is not reused because it could refer to the login directory instead.
+Same-kind pairs use `sync-<pairhash>.files-v1.json` to distinguish
+stable roles from older archives whose A/B orientation was not recorded.
+Those older archives are left untouched and ignored with a warning when
+starting the new archive. Review `--dry-run` before explicitly choosing a
+conflict policy to establish a new baseline: existing files on both sides
+conflict by default (even if identical), and previously deleted files may
+be recopied rather than deleted. Unresolved files remain unmapped. Avoid
+alternating old and new binaries, which maintain independent histories.
+Local↔SSH retains its local-A role and, except for the corrected SSH-root
+identity, its existing archive; filesystem↔tablet and tablet↔tablet roles
+are unchanged. One-way direction and `--conflict
+src|dst` always refer to CLI argument order, not archive side order.
+
 Written **incrementally after each action** (temp file + atomic rename)
 so an interrupted sync resumes cleanly. A legacy in-root
 `.rmu-sync.json` is ignored (a note suggests deleting it); hash
@@ -242,7 +262,7 @@ notes.
 
 `Client::list_items` with a listing cache
 (`$XDG_STATE_HOME/rmu/listing-<hash>.json`, keyed by ssh destination +
-xochitl dir) becomes change-scaled, Unison-archive style:
+xochitl dir) provides change-scaled read-only listings, Unison-archive style:
 
 1. Round trip 1: `stat -c '%Y %s %n'` over every
    `.metadata`/`.content`/payload file — tiny output, one exec.
@@ -256,8 +276,24 @@ JSONs. The cache is best-effort: any load problem falls back to the
 full fetch, any save problem only costs speed next run. Staleness
 caveat (same trade as the git index / Unison fastcheck): a rewrite
 within the same second that keeps the file size is invisible until
-the next change. `rmu sync` and the regular commands both use the
-cache; every run re-stats, so rmu's own writes are always seen.
+the next change. Mutations discard the listing cache before changing
+metadata/content or deleting artifacts, including when the remote operation
+later fails; an unremovable cache blocks that mutation. The next listing
+re-fetches the bodies, so rmu's own metadata writes are visible even with
+identical stat signatures. Delete, move, rename, empty-trash, and folder
+creation reference/tree checks bypass the cache with a single batched full
+read, protecting against external same-stamp changes too.
+
+Sync uses `Client::list_items_authoritative` for root resolution and the
+entire tablet snapshot on both sides. Missing writable roots stay virtual
+until execution; creation checks the tree authoritatively again and installs
+the returned UUID directly, without a cached post-create lookup. Authoritative
+snapshots also apply without `--delete` and in dry runs: snapshot contents drive
+overwrite/move decisions and UUID-based executor actions, not just deletions. A cached `/AAAA` renamed externally to `/BBBB` cannot select
+the renamed folder through either root lookup or the folder-creation fallback.
+This trades incremental metadata reads for mutation safety; ordinary listings
+retain stat fastcheck. Neither listing mode provides an atomic snapshot or a
+lock against concurrent device edits.
 
 ## Executor
 
