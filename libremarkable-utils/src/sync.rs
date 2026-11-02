@@ -403,6 +403,10 @@ pub struct StateEntry {
     pub local_mtime_ms: i64,
     /// Device `lastModified`, or the B side's mtime for fs↔fs pairs.
     pub remote_last_modified: i64,
+    /// The UUID was rebound, but the successor's content has not yet
+    /// been reconciled. Its timestamp may equal the old document's.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub remote_pending: bool,
     /// B-side size for fs↔fs pairs (absent for device pairs).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_size: Option<u64>,
@@ -415,6 +419,12 @@ pub struct StateEntry {
     /// sync. Absent for notebooks/bundles.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload_hash: Option<String>,
+}
+
+/// A new UUID is a change signal even when its timestamp is unchanged.
+/// After rebinding, persist that signal until content is reconciled.
+fn remote_stamp_changed(st: &StateEntry, doc: &RemoteDoc) -> bool {
+    st.remote_pending || st.uuid != doc.uuid || doc.last_modified != st.remote_last_modified
 }
 
 /// The sync archive: `local rel path ↔ device UUID` plus what both
@@ -886,9 +896,11 @@ pub enum SyncAction {
     /// Re-link a mapping whose document was replaced on the device by
     /// a same-name, same-kind document (e.g. an interrupted sync that
     /// uploaded but never recorded state). State-only; no transfer.
+    /// Changes identity only, preserving the last agreed content baseline.
     Rebind {
         path: String,
         uuid: String,
+        /// Observed successor stamp, not a new content-agreement baseline.
         last_modified: i64,
     },
     /// Pair an unmapped local file with an unmapped device document
@@ -1088,9 +1100,9 @@ fn payload_mirrored(doc_type: RemoteType) -> bool {
 
 /// Which device payloads are worth hashing before planning (lazy,
 /// batched by the caller into one round trip). Pure. Candidates:
-/// - mapped docs whose `lastModified` moved while a recorded payload
-///   hash exists (annotation-only changes and pure device-side moves
-///   can then skip the transfer);
+/// - mapped docs whose remote stamp changed (including pending UUID
+///   replacements) while a recorded payload hash exists (annotation-only
+///   changes and identical successors can then skip the transfer);
 /// - unmapped docs whose pull path collides with an unmapped local
 ///   file of the same payload kind (hash-verified adoption);
 /// - unmapped docs whose size matches some local file (hash-verified
@@ -1109,12 +1121,22 @@ pub fn device_hash_candidates(
     let by_uuid: HashMap<&str, &RemoteDoc> =
         remote.docs.iter().map(|d| (d.uuid.as_str(), d)).collect();
 
-    let mapped = state.entries.values().filter_map(|st| {
-        let doc = by_uuid.get(st.uuid.as_str())?;
+    let by_target: HashMap<(&str, &str), &RemoteDoc> = remote
+        .docs
+        .iter()
+        .map(|d| ((d.rel_dir.as_str(), d.name.as_str()), d))
+        .collect();
+    let mapped = state.entries.iter().filter_map(|(key, st)| {
+        let (dir, stem) = split_target(key);
+        let doc = by_uuid.get(st.uuid.as_str()).or_else(|| {
+            by_target.get(&(dir, stem.as_str())).filter(|doc| {
+                !mapped_uuids.contains(doc.uuid.as_str()) && kind_matches(st.kind, doc.doc_type)
+            })
+        })?;
         (payload_mirrored(doc.doc_type)
             && st.payload_hash.is_some()
-            && doc.last_modified != st.remote_last_modified)
-            .then_some(*doc)
+            && remote_stamp_changed(st, doc))
+        .then_some(*doc)
     });
     let adoption = remote
         .docs
@@ -1321,7 +1343,7 @@ fn detect_moves(
                     && st.local_hash.is_some()
                     && docs_by_uuid
                         .get(st.uuid.as_str())
-                        .is_some_and(|doc| doc.last_modified == st.remote_last_modified)
+                        .is_some_and(|doc| !remote_stamp_changed(st, doc))
             })
             .for_each(|(key, st)| {
                 let hash = st.local_hash.clone().expect("filtered on Some");
@@ -1437,7 +1459,9 @@ fn detect_moves(
             let Some((new_key, last_modified, payload_hash)) = adjusted_docs.get(&st.uuid) else {
                 return;
             };
-            if *new_key == key || !local_by_path.contains_key(key.as_str()) {
+            // Reconcile a rebound successor before following its moves.
+            // MoveLocal records agreement, which is not yet established.
+            if st.remote_pending || *new_key == key || !local_by_path.contains_key(key.as_str()) {
                 return;
             }
             if local_by_path.contains_key(new_key.as_str())
@@ -1656,7 +1680,7 @@ pub fn plan(
             .filter_map(|st| {
                 let doc = docs_by_uuid.get(st.uuid.as_str())?;
                 let hash = st.payload_hash.clone()?;
-                (payload_mirrored(doc.doc_type) && doc.last_modified == st.remote_last_modified)
+                (payload_mirrored(doc.doc_type) && !remote_stamp_changed(st, doc))
                     .then(|| (hash, (st.uuid.clone(), st.kind, doc.size_bytes)))
             })
             .collect(),
@@ -1911,7 +1935,7 @@ fn mapped_both(
     out: &mut Buckets,
 ) {
     let stamp_local = entry.size != st.local_size || entry.mtime_ms != st.local_mtime_ms;
-    let stamp_remote = doc.last_modified != st.remote_last_modified;
+    let stamp_remote = remote_stamp_changed(st, doc);
     // Content verdicts override stamp verdicts when hashes are known:
     // a touched-but-identical file, or a device `lastModified` bumped
     // by annotations, is not a change worth transferring.
@@ -1932,7 +1956,7 @@ fn mapped_both(
         out.rebinds.push(SyncAction::Refresh {
             path: key.to_string(),
             kind: st.kind,
-            uuid: st.uuid.clone(),
+            uuid: doc.uuid.clone(),
             last_modified: doc.last_modified,
             local_hash: entry.hash.clone().or_else(|| st.local_hash.clone()),
             payload_hash: doc.payload_hash.clone().or_else(|| st.payload_hash.clone()),
@@ -1944,7 +1968,7 @@ fn mapped_both(
         (false, false) => {}
         (true, false) => {
             if push_ok {
-                out.transfers.push(update_remote(key, entry, &st.uuid));
+                out.transfers.push(update_remote(key, entry, &doc.uuid));
             } else if can_write_remote(options.mode) {
                 out.notes.push(skip(
                     key,
@@ -1974,7 +1998,7 @@ fn mapped_both(
                 .push(conflict(key, "both sides changed since last sync")),
             Some(Winner::Local) => {
                 if push_ok {
-                    out.transfers.push(update_remote(key, entry, &st.uuid));
+                    out.transfers.push(update_remote(key, entry, &doc.uuid));
                 } else if can_write_remote(options.mode) {
                     out.notes.push(skip(
                         key,
@@ -2068,7 +2092,7 @@ fn mapped_local_gone(
     doc: &RemoteDoc,
     out: &mut Buckets,
 ) {
-    let remote_changed = doc.last_modified != st.remote_last_modified;
+    let remote_changed = remote_stamp_changed(st, doc);
     match options.mode {
         // Source still has it: recopy.
         Mode::Pull => out.transfers.push(download(key, doc)),
@@ -2512,6 +2536,7 @@ pub fn execute(
                         local_size: size,
                         local_mtime_ms: mtime,
                         remote_last_modified: *last_modified,
+                        remote_pending: false,
                         remote_size: None,
                         local_hash: Some(hash.clone()),
                         // Verified equal to the local hash by the planner.
@@ -2537,6 +2562,7 @@ pub fn execute(
                         local_size: size,
                         local_mtime_ms: mtime,
                         remote_last_modified: *last_modified,
+                        remote_pending: false,
                         remote_size: None,
                         local_hash: local_hash.clone(),
                         payload_hash: payload_hash.clone(),
@@ -2723,16 +2749,12 @@ pub fn execute(
                 )?;
                 outcome.copied_local += 1;
             }
-            SyncAction::Rebind {
-                path,
-                uuid,
-                last_modified,
-            } => {
+            SyncAction::Rebind { path, uuid, .. } => {
                 if let Some(entry) = state.entries.get_mut(path) {
                     entry.uuid = uuid.clone();
-                    entry.remote_last_modified = *last_modified;
-                    // The replacement's payload was never hashed.
-                    entry.payload_hash = None;
+                    // Identity is known, content agreement is not. Keep
+                    // both baselines until a refresh or transfer succeeds.
+                    entry.remote_pending = true;
                 }
                 state.save(state_path)?;
                 // A rebind means a previous interrupted run wrote this
@@ -2783,6 +2805,7 @@ fn record_state_with(
             local_size: size,
             local_mtime_ms: mtime,
             remote_last_modified,
+            remote_pending: false,
             remote_size: None,
             local_hash,
             payload_hash,
@@ -3037,6 +3060,7 @@ pub fn execute_files(
                 local_size: a_size,
                 local_mtime_ms: a_mtime,
                 remote_last_modified: b_mtime,
+                remote_pending: false,
                 remote_size: Some(b_size),
                 local_hash: None,
                 payload_hash: None,
@@ -3703,6 +3727,7 @@ mod tests {
             local_size: size,
             local_mtime_ms: mtime,
             remote_last_modified: remote,
+            remote_pending: false,
             remote_size: None,
             local_hash: None,
             payload_hash: None,
@@ -5202,7 +5227,7 @@ mod tests {
     #[test]
     fn rebind_then_pull_refreshes_content() {
         // Same recovery in pull mode: rebind, then re-download since
-        // the successor's lastModified differs from the recorded one.
+        // the successor's content has not been verified.
         let snapshot = remote_snapshot(&[doc("new-uuid", "n", "", "pdf", 7)], "");
         let mut state = SyncState::default();
         state.entries.insert(
@@ -5213,6 +5238,255 @@ mod tests {
         let plan = plan(pull(), &locals, &snapshot, &state);
         assert!(matches!(plan.actions[0], SyncAction::Rebind { .. }));
         assert!(matches!(plan.actions[1], SyncAction::Download { .. }));
+    }
+
+    /// Real local files and archives; the client is deliberately unable
+    /// to connect. These tests execute only state actions and conflicts.
+    struct RebindFixture {
+        root: PathBuf,
+        fs: LocalFs,
+        client: Client,
+        state_path: PathBuf,
+        state: SyncState,
+        remote: RemoteSnapshot,
+    }
+
+    impl RebindFixture {
+        fn new(last_modified: i64) -> Self {
+            let root = std::env::temp_dir().join(format!("rmu-rebind-{}", uuid::Uuid::new_v4()));
+            let fs = LocalFs::new(root.join("files"));
+            fs.ensure_root().unwrap();
+            fs.write("n.pdf", b"agreed").unwrap();
+            let state_path = root.join("state.json");
+            let mut state = SyncState::default();
+            let hash = hash_bytes(b"agreed");
+            record_state_with(
+                &mut state,
+                &state_path,
+                &fs,
+                "n.pdf",
+                DocKind::Pdf,
+                "old-uuid",
+                5,
+                Some(hash.clone()),
+                Some(hash),
+            )
+            .unwrap();
+            let session = crate::ssh::SshSession::new(crate::ssh::SshOptions {
+                destination: "rebind-test.invalid".to_string(),
+                multiplex: false,
+                extra_options: vec![
+                    "ProxyCommand=false".to_string(),
+                    "BatchMode=yes".to_string(),
+                ],
+                ..Default::default()
+            })
+            .unwrap();
+            Self {
+                root,
+                fs,
+                client: Client::new(session, "/synthetic-xochitl"),
+                state_path,
+                state,
+                remote: remote_snapshot(&[doc("new-uuid", "n", "", "pdf", last_modified)], ""),
+            }
+        }
+
+        fn locals(&self) -> Vec<LocalEntry> {
+            let (mut locals, _) = self.fs.snapshot().unwrap();
+            attach_hashes(&self.fs, &mut locals, &self.state).unwrap();
+            locals
+        }
+
+        fn execute(&mut self, plan: &Plan) -> Outcome {
+            let outcome = execute(
+                &self.client,
+                &crate::progress::NoProgress,
+                &self.fs,
+                plan,
+                &mut BTreeMap::new(),
+                &mut self.state,
+                &self.state_path,
+            )
+            .unwrap();
+            // Every next planner pass uses the persisted archive, as a
+            // new invocation would, rather than only the in-memory state.
+            self.state = SyncState::load(&self.state_path).unwrap();
+            outcome
+        }
+    }
+
+    impl Drop for RebindFixture {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.root).unwrap();
+        }
+    }
+
+    #[test]
+    fn rebind_skipped_conflict_survives_two_runs() {
+        [5, 7].into_iter().for_each(|last_modified| {
+            let mut fixture = RebindFixture::new(last_modified);
+            fixture.fs.write("n.pdf", b"unresolved local edit").unwrap();
+            fixture.remote.docs[0].payload_hash = Some(hash_bytes(b"replacement"));
+            let before = fixture.state.serialize().unwrap();
+            let first = plan(
+                two_way(),
+                &fixture.locals(),
+                &fixture.remote,
+                &fixture.state,
+            );
+            assert!(matches!(first.actions[0], SyncAction::Rebind { .. }));
+            assert_eq!(conflicts(&first), ["n.pdf"]);
+            assert_eq!(first.actions.len(), 2);
+            assert_eq!(fixture.execute(&first).conflicts.len(), 1);
+
+            let rebound = &fixture.state.entries["n.pdf"];
+            let baseline = SyncState::parse(&before).unwrap();
+            let agreed = &baseline.entries["n.pdf"];
+            assert_eq!(rebound.uuid, "new-uuid");
+            assert!(rebound.remote_pending);
+            assert_eq!(rebound.remote_last_modified, agreed.remote_last_modified);
+            assert_eq!(rebound.payload_hash, agreed.payload_hash);
+            assert_eq!(rebound.local_hash, agreed.local_hash);
+            assert_eq!(rebound.local_size, agreed.local_size);
+            assert_eq!(rebound.local_mtime_ms, agreed.local_mtime_ms);
+            assert_eq!(
+                device_hash_candidates(&fixture.locals(), &fixture.remote, &fixture.state),
+                [("new-uuid".to_string(), "pdf")]
+            );
+
+            let second = plan(
+                two_way(),
+                &fixture.locals(),
+                &fixture.remote,
+                &fixture.state,
+            );
+            assert_eq!(conflicts(&second), ["n.pdf"]);
+            assert_eq!(second.actions.len(), 1);
+            assert_eq!(fixture.execute(&second).conflicts.len(), 1);
+            assert_eq!(fixture.fs.read("n.pdf").unwrap(), b"unresolved local edit");
+            assert!(fixture.state.entries["n.pdf"].remote_pending);
+        });
+    }
+
+    #[test]
+    fn rebind_interrupted_pull_keeps_successor_content_pending() {
+        [5, 7].into_iter().for_each(|last_modified| {
+            let mut fixture = RebindFixture::new(last_modified);
+            // No payload hash: even equal timestamps cannot prove that
+            // two different UUIDs have the same content.
+            let first = plan(pull(), &fixture.locals(), &fixture.remote, &fixture.state);
+            assert!(matches!(first.actions[0], SyncAction::Rebind { .. }));
+            assert!(matches!(&first.actions[1], SyncAction::Download { uuid, .. } if uuid == "new-uuid"));
+            // Simulate interruption at the durable action boundary,
+            // before the planned download executes.
+            fixture.execute(&Plan {
+                actions: first.actions[..1].to_vec(),
+            });
+            let resumed = plan(pull(), &fixture.locals(), &fixture.remote, &fixture.state);
+            assert!(matches!(&resumed.actions[..], [SyncAction::Download { uuid, .. }] if uuid == "new-uuid"));
+            assert!(fixture.state.entries["n.pdf"].remote_pending);
+            assert_eq!(fixture.fs.read("n.pdf").unwrap(), b"agreed");
+
+            // The successful transfer's archive writer must clear the
+            // pending flag; model the downloaded bytes locally.
+            fixture.fs.write("n.pdf", b"replacement").unwrap();
+            let hash = hash_bytes(b"replacement");
+            record_state_with(
+                &mut fixture.state,
+                &fixture.state_path,
+                &fixture.fs,
+                "n.pdf",
+                DocKind::Pdf,
+                "new-uuid",
+                last_modified,
+                Some(hash.clone()),
+                Some(hash),
+            )
+            .unwrap();
+            fixture.state = SyncState::load(&fixture.state_path).unwrap();
+            assert!(!fixture.state.entries["n.pdf"].remote_pending);
+            assert!(plan(pull(), &fixture.locals(), &fixture.remote, &fixture.state).actions.is_empty());
+        });
+    }
+
+    #[test]
+    fn rebind_pull_refresh_uses_successor_and_survives_interruption() {
+        let mut fixture = RebindFixture::new(5);
+        // Size differs from the local file, so the copy-size heuristic
+        // cannot accidentally supply the replacement hash for this test.
+        assert_eq!(
+            device_hash_candidates(&fixture.locals(), &fixture.remote, &fixture.state),
+            [("new-uuid".to_string(), "pdf")]
+        );
+        fixture.remote.docs[0].payload_hash = Some(hash_bytes(b"agreed"));
+        let first = plan(pull(), &fixture.locals(), &fixture.remote, &fixture.state);
+        assert!(
+            matches!(&first.actions[..], [SyncAction::Rebind { .. }, SyncAction::Refresh { uuid, .. }] if uuid == "new-uuid")
+        );
+        fixture.execute(&Plan {
+            actions: first.actions[..1].to_vec(),
+        });
+        let resumed = plan(pull(), &fixture.locals(), &fixture.remote, &fixture.state);
+        assert!(
+            matches!(&resumed.actions[..], [SyncAction::Refresh { uuid, .. }] if uuid == "new-uuid")
+        );
+        fixture.execute(&resumed);
+        let st = &fixture.state.entries["n.pdf"];
+        assert_eq!(st.uuid, "new-uuid");
+        assert!(!st.remote_pending);
+        assert_eq!(st.payload_hash, Some(hash_bytes(b"agreed")));
+        assert!(
+            plan(pull(), &fixture.locals(), &fixture.remote, &fixture.state)
+                .actions
+                .is_empty()
+        );
+        assert!(
+            device_hash_candidates(&fixture.locals(), &fixture.remote, &fixture.state).is_empty()
+        );
+    }
+
+    #[test]
+    fn rebind_push_resolution_targets_successor_not_missing_uuid() {
+        [false, true].into_iter().for_each(|remote_unchanged| {
+            let fixture = &mut RebindFixture::new(5);
+            fixture.fs.write("n.pdf", b"local edit").unwrap();
+            fixture.remote.docs[0].payload_hash = Some(hash_bytes(if remote_unchanged {
+                b"agreed"
+            } else {
+                b"replacement"
+            }));
+            let options = if remote_unchanged {
+                two_way()
+            } else {
+                with_policy(two_way(), ConflictPolicy::PreferLocal)
+            };
+            let result = plan(options, &fixture.locals(), &fixture.remote, &fixture.state);
+            assert!(matches!(&result.actions[..], [SyncAction::Rebind { .. }, SyncAction::UpdateRemote { uuid, .. }] if uuid == "new-uuid"));
+        });
+    }
+
+    #[test]
+    fn rebind_with_local_deletion_preserves_successor_on_both_runs() {
+        let mut fixture = RebindFixture::new(5);
+        fixture.fs.remove("n.pdf").unwrap();
+        let options = with_delete(two_way());
+        let first = plan(options, &fixture.locals(), &fixture.remote, &fixture.state);
+        assert!(matches!(
+            &first.actions[..],
+            [SyncAction::Rebind { .. }, SyncAction::Conflict { .. }]
+        ));
+        fixture.execute(&first);
+        let second = plan(options, &fixture.locals(), &fixture.remote, &fixture.state);
+        assert!(matches!(&second.actions[..], [SyncAction::Conflict { .. }]));
+    }
+
+    #[test]
+    fn rebind_pending_field_defaults_for_existing_archives() {
+        let fixture = RebindFixture::new(5);
+        let json = fixture.state.serialize().unwrap();
+        assert!(!json.contains("remote_pending"));
+        assert!(!SyncState::parse(&json).unwrap().entries["n.pdf"].remote_pending);
     }
 
     #[test]
@@ -5289,6 +5563,7 @@ mod tests {
             local_size: size,
             local_mtime_ms: a_mtime,
             remote_last_modified: b_mtime,
+            remote_pending: false,
             remote_size: Some(b_size),
             local_hash: None,
             payload_hash: None,
