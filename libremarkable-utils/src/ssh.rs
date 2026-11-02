@@ -14,12 +14,29 @@
 //! Connections are multiplexed via `ControlMaster` by default so one
 //! logical operation (which may issue several ssh commands) only
 //! authenticates once.
+//!
+//! Streaming diagnostics are drained concurrently. On Unix, once the direct
+//! child exits, readers collect only the bytes already queued, without waiting
+//! for helpers holding inherited output descriptors. Non-Unix readers still
+//! require EOF. This is not a command timeout: a live SSH process can still
+//! wait on the network, including during staged-upload error cleanup.
 
 use std::fmt;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+use std::thread::{self, JoinHandle};
+
+#[cfg(unix)]
+use std::{
+    os::fd::AsFd,
+    os::unix::net::UnixStream,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use crate::error::{Error, Result};
 use crate::progress::{NoProgress, Progress};
@@ -96,6 +113,8 @@ pub struct SshSession {
     opts: SshOptions,
     askpass_exe: Option<PathBuf>,
     control_dir: Option<PathBuf>,
+    #[cfg(test)]
+    ssh_exe: Option<PathBuf>,
 }
 
 impl SshSession {
@@ -113,6 +132,8 @@ impl SshSession {
             opts,
             askpass_exe,
             control_dir,
+            #[cfg(test)]
+            ssh_exe: None,
         })
     }
 
@@ -124,6 +145,10 @@ impl SshSession {
     /// ssh invocation with all options and env set, but no destination.
     fn base_command(&self) -> Command {
         let mut cmd = Command::new("ssh");
+        #[cfg(test)]
+        if let Some(exe) = &self.ssh_exe {
+            cmd = Command::new(exe);
+        }
         if let Some(port) = self.opts.port {
             cmd.arg("-p").arg(port.to_string());
         }
@@ -190,18 +215,13 @@ impl SshSession {
         total: Option<u64>,
         progress: &dyn Progress,
     ) -> Result<Vec<u8>> {
-        let mut child = self
-            .command(remote_cmd)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
+        let mut child = StreamingChild::spawn(&mut self.command(remote_cmd), false)?;
         let mut data = Vec::new();
-        {
-            let mut stdout = child.stdout.take().expect("stdout was piped");
-            copy_with_progress(&mut stdout, &mut data, total, progress)?;
-        }
-        checked(child.wait_with_output()?)?;
+        let transfer = {
+            let mut stdout = child.child.stdout.take().expect("stdout was piped");
+            copy_with_progress(&mut stdout, &mut data, total, progress)
+        };
+        child.finish(transfer)?;
         progress.bytes_done();
         Ok(data)
     }
@@ -214,18 +234,13 @@ impl SshSession {
         data: &[u8],
         progress: &dyn Progress,
     ) -> Result<()> {
-        let mut child = self
-            .command(remote_cmd)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        {
-            let mut stdin = child.stdin.take().expect("stdin was piped");
+        let mut child = StreamingChild::spawn(&mut self.command(remote_cmd), true)?;
+        let transfer = {
+            let mut stdin = child.child.stdin.take().expect("stdin was piped");
             let mut reader = data;
-            copy_with_progress(&mut reader, &mut stdin, Some(data.len() as u64), progress)?;
-        }
-        checked(child.wait_with_output()?)?;
+            copy_with_progress(&mut reader, &mut stdin, Some(data.len() as u64), progress)
+        };
+        child.finish(transfer)?;
         progress.bytes_done();
         Ok(())
     }
@@ -266,21 +281,17 @@ impl SshSession {
         total: u64,
         progress: &dyn Progress,
     ) -> Result<()> {
-        let mut child = self
-            .command(&staged_write_command(remote_path, total))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
+        let mut child = StreamingChild::spawn(
+            &mut self.command(&staged_write_command(remote_path, total)),
+            true,
+        )?;
         let copied = {
-            let mut stdin = child.stdin.take().expect("stdin was piped");
+            let mut stdin = child.child.stdin.take().expect("stdin was piped");
             copy_with_progress(reader, &mut stdin, Some(total), progress)
         };
         // Close stdin and reap even on a local read/write failure, allowing
         // the remote length check and cleanup trap to run on the partial input.
-        let output = child.wait_with_output()?;
-        copied?;
-        checked(output)?;
+        child.finish_upload(copied)?;
         progress.bytes_done();
         Ok(())
     }
@@ -338,16 +349,6 @@ impl Drop for DownloadTemp {
     }
 }
 
-/// Reap the download subprocess even if copying or reading diagnostics fails.
-struct DownloadChild(Child);
-
-impl Drop for DownloadChild {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
 fn download_to_local(
     command: &mut Command,
     local: &Path,
@@ -360,29 +361,12 @@ fn download_to_local(
         Err(error) => return Err(error.into()),
     };
     let mut temp = DownloadTemp::new(local)?;
-    let mut child = DownloadChild(
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?,
-    );
-    {
-        let mut stdout = child.0.stdout.take().expect("stdout was piped");
-        copy_with_progress(&mut stdout, &mut temp.file, total, progress)?;
-    }
-    let mut stderr = Vec::new();
-    child
-        .0
-        .stderr
-        .take()
-        .expect("stderr was piped")
-        .read_to_end(&mut stderr)?;
-    checked(Output {
-        status: child.0.wait()?,
-        stdout: Vec::new(),
-        stderr,
-    })?;
+    let mut child = StreamingChild::spawn(command, false)?;
+    let transfer = {
+        let mut stdout = child.child.stdout.take().expect("stdout was piped");
+        copy_with_progress(&mut stdout, &mut temp.file, total, progress)
+    };
+    child.finish(transfer)?;
     // Keep staging private until the transfer has succeeded. Sync before
     // rename so delayed local write errors cannot destroy the old backup.
     if let Some(permissions) = permissions {
@@ -451,6 +435,211 @@ pub fn shell_quote(s: &str) -> String {
         s.to_string()
     } else {
         format!("'{}'", s.replace('\'', r"'\''"))
+    }
+}
+
+/// Owns a streaming subprocess and its concurrent output readers. Transfer
+/// pipes must be closed before `finish`, so a successful upload sends EOF.
+/// On an early error (or unwind), cancel readers and kill/reap the direct child
+/// before joining. After child exit, Unix readers drain a finite snapshot of
+/// queued output. On non-Unix systems, readers still require pipe EOF.
+struct StreamingChild {
+    child: Child,
+    stderr: Option<JoinHandle<std::io::Result<Vec<u8>>>>,
+    stdout: Option<JoinHandle<std::io::Result<Vec<u8>>>>,
+    reaped: bool,
+    cancellation: DrainCancellation,
+}
+
+impl StreamingChild {
+    fn spawn(command: &mut Command, with_stdin: bool) -> std::io::Result<Self> {
+        let cancellation = DrainCancellation::new()?;
+        let child = command
+            .stdin(if with_stdin {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let mut stream = Self {
+            child,
+            stderr: None,
+            stdout: None,
+            reaped: false,
+            cancellation,
+        };
+        // Fallible thread creation leaves cleanup to the guard too.
+        stream.stderr = Some(drain_pipe(
+            stream.child.stderr.take().expect("stderr was piped"),
+            &stream.cancellation,
+        )?);
+        if with_stdin {
+            stream.stdout = Some(drain_pipe(
+                stream.child.stdout.take().expect("stdout was piped"),
+                &stream.cancellation,
+            )?);
+        }
+        Ok(stream)
+    }
+
+    fn finish(mut self, transfer: std::io::Result<u64>) -> Result<()> {
+        transfer?;
+        checked(self.wait_for_output()?)?;
+        Ok(())
+    }
+
+    fn finish_upload(mut self, transfer: std::io::Result<u64>) -> Result<()> {
+        // Staged writes must see EOF and run their length check/cleanup trap.
+        // Killing SSH here can strand the remote sibling. As before, this wait
+        // has no command timeout; a nonresponsive remote requires interruption.
+        let output = self.wait_for_output();
+        transfer?;
+        checked(output?)?;
+        Ok(())
+    }
+
+    fn wait_for_output(&mut self) -> std::io::Result<Output> {
+        let status = self.child.wait()?;
+        self.reaped = true;
+        self.cancellation.child_exited();
+        let stderr = join_pipe(self.stderr.take())?;
+        let stdout = join_pipe(self.stdout.take())?;
+        Ok(Output {
+            status,
+            stdout,
+            stderr,
+        })
+    }
+}
+
+impl Drop for StreamingChild {
+    fn drop(&mut self) {
+        // A ProxyCommand (or another local descendant) may keep output pipes
+        // open after SSH exits. Error cleanup must not depend on their EOF.
+        self.cancellation.cancel();
+        if !self.reaped {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+        let _ = join_pipe(self.stderr.take());
+        let _ = join_pipe(self.stdout.take());
+    }
+}
+
+/// Closing the sole writer wakes every reader, without changing SSH process
+/// groups or killing unrelated helpers. UnixStream descriptors are close-on-exec.
+struct DrainCancellation {
+    #[cfg(unix)]
+    reader: Arc<UnixStream>,
+    #[cfg(unix)]
+    writer: Option<UnixStream>,
+    #[cfg(unix)]
+    drain_queued: Arc<AtomicBool>,
+}
+
+impl DrainCancellation {
+    fn new() -> std::io::Result<Self> {
+        #[cfg(unix)]
+        {
+            let (reader, writer) = UnixStream::pair()?;
+            Ok(Self {
+                reader: Arc::new(reader),
+                writer: Some(writer),
+                drain_queued: Arc::new(AtomicBool::new(false)),
+            })
+        }
+        #[cfg(not(unix))]
+        Ok(Self {})
+    }
+
+    fn cancel(&mut self) {
+        #[cfg(unix)]
+        self.writer.take();
+    }
+
+    fn child_exited(&mut self) {
+        #[cfg(unix)]
+        self.drain_queued.store(true, Ordering::Release);
+        self.cancel();
+    }
+}
+
+#[cfg(unix)]
+fn drain_pipe(
+    mut pipe: impl Read + AsFd + Send + 'static,
+    cancellation: &DrainCancellation,
+) -> std::io::Result<JoinHandle<std::io::Result<Vec<u8>>>> {
+    use rustix::event::{PollFd, PollFlags, poll};
+
+    let cancelled = Arc::clone(&cancellation.reader);
+    let drain_queued = Arc::clone(&cancellation.drain_queued);
+    thread::Builder::new().spawn(move || {
+        let mut data = Vec::new();
+        let mut buffer = [0; 64 * 1024];
+        loop {
+            let mut fds = [
+                PollFd::new(&pipe, PollFlags::IN),
+                PollFd::new(&*cancelled, PollFlags::IN),
+            ];
+            match poll(&mut fds, None) {
+                Err(rustix::io::Errno::INTR) => continue,
+                Err(error) => return Err(error.into()),
+                Ok(_) => {}
+            }
+            // Cancellation takes precedence even if output is continuously ready.
+            if !fds[1].revents().is_empty() {
+                if drain_queued.load(Ordering::Acquire) {
+                    // The child has exited, so all its output is already in
+                    // this buffer or the pipe. Snapshot the queue, not EOF:
+                    // a helper may keep the writer open or produce forever.
+                    // With one reader these bytes cannot disappear, so this
+                    // finite read cannot wait for a future write from a helper.
+                    let queued = loop {
+                        match rustix::io::ioctl_fionread(&pipe) {
+                            Err(rustix::io::Errno::INTR) => continue,
+                            result => break result?,
+                        }
+                    };
+                    (&mut pipe).take(queued).read_to_end(&mut data)?;
+                }
+                return Ok(data);
+            }
+            if fds[0].revents().contains(PollFlags::NVAL) {
+                return Err(std::io::Error::other("invalid SSH output descriptor"));
+            }
+            // These are single-reader pipes: a ready read returns available
+            // bytes without waiting to fill the buffer. HUP can include unread
+            // data, so only a zero-byte read means the diagnostics are complete.
+            match pipe.read(&mut buffer) {
+                Ok(0) => return Ok(data),
+                Ok(n) => data.extend_from_slice(&buffer[..n]),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        }
+    })
+}
+
+#[cfg(not(unix))]
+fn drain_pipe(
+    mut pipe: impl Read + Send + 'static,
+    _cancellation: &DrainCancellation,
+) -> std::io::Result<JoinHandle<std::io::Result<Vec<u8>>>> {
+    thread::Builder::new().spawn(move || {
+        let mut data = Vec::new();
+        pipe.read_to_end(&mut data)?;
+        Ok(data)
+    })
+}
+
+fn join_pipe(reader: Option<JoinHandle<std::io::Result<Vec<u8>>>>) -> std::io::Result<Vec<u8>> {
+    match reader {
+        Some(reader) => reader
+            .join()
+            .map_err(|_| std::io::Error::other("SSH output reader panicked"))?,
+        None => Ok(Vec::new()),
     }
 }
 
@@ -536,6 +725,9 @@ fn make_control_dir() -> Option<PathBuf> {
     // ControlMaster is not supported by OpenSSH on Windows.
     None
 }
+
+#[cfg(all(test, unix))]
+mod streaming_tests;
 
 #[cfg(test)]
 mod tests {
