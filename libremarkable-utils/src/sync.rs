@@ -22,6 +22,9 @@ use crate::progress::Progress;
 use crate::ssh::{SshSession, shell_quote};
 use crate::xochitl::{self, Item};
 
+#[cfg(all(test, unix))]
+mod symlink_tests;
+
 /// Name of the **legacy** in-tree state file (pre-v2 sync). No longer
 /// read or written; used only to warn users that it can be deleted.
 pub const LEGACY_STATE_FILE_NAME: &str = ".rmu-sync.json";
@@ -290,6 +293,25 @@ pub struct RemoteSnapshot {
     pub folders: BTreeMap<String, String>,
     /// Items excluded up-front (duplicate names, unusable names, ...).
     pub skips: Vec<SyncAction>,
+    /// Present but unsafe to sync, including descendants of excluded folders.
+    pub excluded_uuids: std::collections::HashSet<String>,
+    /// Excluded logical names. Neither these paths nor paths below them are
+    /// safe targets, even when the previously mapped UUID is now absent.
+    pub excluded_paths: std::collections::BTreeSet<String>,
+}
+
+impl RemoteSnapshot {
+    fn excludes_path(&self, path: &str) -> bool {
+        self.excluded_paths
+            .iter()
+            .any(|excluded| path == excluded || path_under(excluded, path))
+    }
+
+    fn excludes_local(&self, path: &str, state: Option<&StateEntry>) -> bool {
+        let (dir, name) = split_target(path);
+        self.excludes_path(&join_rel(dir, &name))
+            || state.is_some_and(|st| self.excluded_uuids.contains(&st.uuid))
+    }
 }
 
 /// Build the device-side snapshot from a full listing, scoped to the
@@ -299,6 +321,29 @@ pub struct RemoteSnapshot {
 pub fn remote_snapshot(items: &[Item], root_uuid: &str) -> RemoteSnapshot {
     fn usable_name(name: &str) -> bool {
         !name.is_empty() && !name.contains('/') && !name.starts_with('.') && name != ".."
+    }
+
+    fn exclude(
+        children: &HashMap<&str, Vec<&Item>>,
+        item: &Item,
+        path: String,
+        reason: String,
+        snapshot: &mut RemoteSnapshot,
+    ) {
+        fn mark_subtree(
+            children: &HashMap<&str, Vec<&Item>>,
+            uuid: &str,
+            excluded: &mut std::collections::HashSet<String>,
+        ) {
+            if excluded.insert(uuid.to_string()) {
+                children.get(uuid).into_iter().flatten().for_each(|child| {
+                    mark_subtree(children, &child.uuid, excluded);
+                });
+            }
+        }
+        mark_subtree(children, &item.uuid, &mut snapshot.excluded_uuids);
+        snapshot.excluded_paths.insert(path.clone());
+        snapshot.skips.push(SyncAction::Skip { path, reason });
     }
 
     fn walk(
@@ -315,17 +360,23 @@ pub fn remote_snapshot(items: &[Item], root_uuid: &str) -> RemoteSnapshot {
         kids.iter().for_each(|item| {
             let path = join_rel(rel_dir, &item.visible_name);
             if name_counts[item.visible_name.as_str()] > 1 {
-                snapshot.skips.push(SyncAction::Skip {
+                exclude(
+                    children,
+                    item,
                     path,
-                    reason: "duplicate sibling name on device".to_string(),
-                });
+                    "duplicate sibling name on device".to_string(),
+                    snapshot,
+                );
                 return;
             }
             if !usable_name(&item.visible_name) {
-                snapshot.skips.push(SyncAction::Skip {
+                exclude(
+                    children,
+                    item,
                     path,
-                    reason: "name is not usable as a filename".to_string(),
-                });
+                    "name is not usable as a filename".to_string(),
+                    snapshot,
+                );
                 return;
             }
             if item.is_folder() {
@@ -338,10 +389,13 @@ pub fn remote_snapshot(items: &[Item], root_uuid: &str) -> RemoteSnapshot {
                 Some("epub") => RemoteType::Epub,
                 Some("notebook") | None => RemoteType::Notebook,
                 Some(other) => {
-                    snapshot.skips.push(SyncAction::Skip {
+                    exclude(
+                        children,
+                        item,
                         path,
-                        reason: format!("unsupported document type '{other}'"),
-                    });
+                        format!("unsupported document type '{other}'"),
+                        snapshot,
+                    );
                     return;
                 }
             };
@@ -518,8 +572,15 @@ pub trait FsEndpoint {
     /// SHA-256 of a file's content, if this endpoint can compute it
     /// cheaply enough to be worth it.
     fn content_hash(&self, rel_path: &str) -> Result<Option<String>>;
-    /// For local endpoints: the real path, enabling streamed transfers
-    /// instead of in-memory buffering.
+    /// Prepare a local output path for a streamed write, rejecting symlinks
+    /// below the endpoint root and creating missing parent directories.
+    /// Endpoints without this fast path use `write` instead.
+    fn prepare_local_write(&self, rel_path: &str) -> Result<Option<PathBuf>> {
+        let _ = rel_path;
+        Ok(None)
+    }
+    /// For local endpoints: the real path, enabling streamed reads.
+    /// This is not a validated output path; use `prepare_local_write` to write.
     fn as_local_path(&self, rel_path: &str) -> Option<PathBuf> {
         let _ = rel_path;
         None
@@ -535,6 +596,58 @@ impl LocalFs {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
     }
+}
+
+/// Require a nonempty, root-relative path before checking filesystem entries.
+/// In particular, `..` must not undo a checked component.
+fn sync_path_parts(rel_path: &str) -> Result<Vec<&str>> {
+    let parts: Vec<_> = rel_path.split('/').collect();
+    if parts.iter().any(|part| {
+        part.is_empty()
+            || *part == "."
+            || *part == ".."
+            || !matches!(
+                Path::new(part).components().next(),
+                Some(std::path::Component::Normal(_))
+            )
+            || part.contains('\0')
+    }) {
+        return Err(Error::InvalidName(format!("unsafe sync path: {rel_path}")));
+    }
+    Ok(parts)
+}
+
+/// Check every component beneath the selected root, including dangling links.
+/// The root itself may deliberately be a symlink (as may its own ancestors).
+/// These write-time checks reject collisions omitted by snapshots; they are
+/// not a sandbox against concurrent, hostile filesystem namespace changes.
+fn checked_local_path(root: &Path, rel_path: &str) -> Result<PathBuf> {
+    let parts = sync_path_parts(rel_path)?;
+    parts.iter().enumerate().try_fold(
+        root.to_path_buf(),
+        |path, (index, part)| -> Result<PathBuf> {
+            let path = path.join(part);
+            match fs::symlink_metadata(&path) {
+                Ok(meta) => {
+                    let valid_type = if index + 1 == parts.len() {
+                        meta.is_file()
+                    } else {
+                        meta.is_dir()
+                    };
+                    if meta.file_type().is_symlink() || !valid_type {
+                        return Err(std::io::Error::other(format!(
+                            "unsafe sync path (symlink or wrong file type): {}",
+                            path.display()
+                        ))
+                        .into());
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err.into()),
+            }
+            Ok(path)
+        },
+    )
 }
 
 impl FsEndpoint for LocalFs {
@@ -555,10 +668,7 @@ impl FsEndpoint for LocalFs {
     }
 
     fn write(&self, rel_path: &str, data: &[u8]) -> Result<()> {
-        let path = self.root.join(rel_path);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
+        let path = self.prepare_local_write(rel_path)?.expect("local endpoint");
         Ok(fs::write(path, data)?)
     }
 
@@ -571,11 +681,9 @@ impl FsEndpoint for LocalFs {
     }
 
     fn rename(&self, from: &str, to: &str) -> Result<()> {
-        let target = self.root.join(to);
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        Ok(fs::rename(self.root.join(from), target)?)
+        let source = checked_local_path(&self.root, from)?;
+        let target = self.prepare_local_write(to)?.expect("local endpoint");
+        Ok(fs::rename(source, target)?)
     }
 
     fn remove_dir(&self, rel_dir: &str) -> Result<bool> {
@@ -600,6 +708,15 @@ impl FsEndpoint for LocalFs {
 
     fn content_hash(&self, rel_path: &str) -> Result<Option<String>> {
         hash_file(&self.root.join(rel_path)).map(Some)
+    }
+
+    fn prepare_local_write(&self, rel_path: &str) -> Result<Option<PathBuf>> {
+        let path = checked_local_path(&self.root, rel_path)?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        // Check again after directory creation, immediately before the write.
+        checked_local_path(&self.root, rel_path).map(Some)
     }
 
     fn as_local_path(&self, rel_path: &str) -> Option<PathBuf> {
@@ -636,6 +753,35 @@ impl SshFs {
         }
     }
 
+    /// Enter the selected root, then reject links in every relative component
+    /// in the same shell invocation as the mutation (not just at snapshot time).
+    fn mutation_preamble(&self) -> String {
+        format!(
+            "mkdir -p {root} && cd {root} || exit 9\n",
+            root = shell_quote(&self.root_for_shell())
+        )
+    }
+
+    fn write_command(&self, rel_path: &str) -> Result<String> {
+        let guard = shell_path_guard(rel_path, true)?;
+        Ok(format!(
+            "{}{guard}cat > {}",
+            self.mutation_preamble(),
+            shell_quote(&format!("./{rel_path}"))
+        ))
+    }
+
+    fn rename_command(&self, from: &str, to: &str) -> Result<String> {
+        let source_guard = shell_path_guard(from, false)?;
+        let target_guard = shell_path_guard(to, true)?;
+        Ok(format!(
+            "{}{source_guard}{target_guard}mv -- {from} {to}",
+            self.mutation_preamble(),
+            from = shell_quote(&format!("./{from}")),
+            to = shell_quote(&format!("./{to}")),
+        ))
+    }
+
     fn root_for_shell(&self) -> String {
         if self.root.is_empty() {
             ".".to_string()
@@ -643,6 +789,35 @@ impl SshFs {
             self.root.clone()
         }
     }
+}
+
+/// POSIX shell counterpart of `checked_local_path`. Each parent is checked
+/// before mkdir can traverse it. `-L` also catches dangling symlinks; checking
+/// the leaf type prevents `mv` from treating a directory as a target container.
+fn shell_path_guard(rel_path: &str, create_parents: bool) -> Result<String> {
+    let parts = sync_path_parts(rel_path)?;
+    let (_, script) = parts.iter().enumerate().fold(
+        (String::from("."), String::new()),
+        |(mut path, mut script), (index, part)| {
+            path.push('/');
+            path.push_str(part);
+            let quoted = shell_quote(&path);
+            let is_parent = index + 1 < parts.len();
+            let kind = if is_parent { "d" } else { "f" };
+            script.push_str(&format!(
+                "if [ -L {quoted} ] || {{ [ -e {quoted} ] && [ ! -{kind} {quoted} ]; }}; then\n\
+                 printf '%s\\n' {message} >&2; exit 9\nfi\n",
+                message = shell_quote(&format!(
+                    "unsafe sync path (symlink or wrong file type): {path}"
+                )),
+            ));
+            if is_parent && create_parents {
+                script.push_str(&format!("mkdir -p {quoted} || exit 9\n"));
+            }
+            (path, script)
+        },
+    );
+    Ok(script)
 }
 
 impl FsEndpoint for SshFs {
@@ -680,17 +855,8 @@ impl FsEndpoint for SshFs {
     }
 
     fn write(&self, rel_path: &str, data: &[u8]) -> Result<()> {
-        let path = self.join(rel_path);
-        let parent = path.rsplit_once('/').map(|(dir, _)| dir).unwrap_or(".");
-        self.session.run_checked_with_stdin(
-            &format!(
-                "mkdir -p {parent} && cat > {path}",
-                parent = shell_quote(parent),
-                path = shell_quote(&path),
-            ),
-            data,
-            &*self.progress,
-        )
+        self.session
+            .run_checked_with_stdin(&self.write_command(rel_path)?, data, &*self.progress)
     }
 
     fn remove(&self, rel_path: &str) -> Result<()> {
@@ -700,14 +866,7 @@ impl FsEndpoint for SshFs {
     }
 
     fn rename(&self, from: &str, to: &str) -> Result<()> {
-        let to_path = self.join(to);
-        let parent = to_path.rsplit_once('/').map(|(dir, _)| dir).unwrap_or(".");
-        self.session.run_checked(&format!(
-            "mkdir -p {parent} && mv -- {from} {to}",
-            parent = shell_quote(parent),
-            from = shell_quote(&self.join(from)),
-            to = shell_quote(&to_path),
-        ))?;
+        self.session.run_checked(&self.rename_command(from, to)?)?;
         Ok(())
     }
 
@@ -1249,6 +1408,13 @@ fn detect_moves(
                 .filter(|(key, _)| path_under(&from_dir, key))
                 .collect();
             if mapped.is_empty()
+                || remote
+                    .excluded_paths
+                    .iter()
+                    .any(|path| path_under(&from_dir, path))
+                || mapped
+                    .iter()
+                    .any(|(key, st)| remote.excludes_local(key, Some(st)))
                 || mapped.iter().any(|(_, st)| st.local_hash.is_none())
                 || local.iter().any(|e| path_under(&from_dir, &e.rel_path))
             {
@@ -1264,6 +1430,7 @@ fn detect_moves(
             let hash0 = mapped[0].1.local_hash.clone().expect("filtered on Some");
             let verifies = |g: &str| -> bool {
                 !g.is_empty()
+                    && !remote.excludes_path(g)
                     && !out.remote.folders.contains_key(g)
                     && !state.entries.keys().any(|k| path_under(g, k) || k == g)
                     && mapped.iter().all(|(key, st)| {
@@ -1340,6 +1507,7 @@ fn detect_moves(
             .iter()
             .filter(|(key, st)| {
                 !local_by_path.contains_key(key.as_str())
+                    && !remote.excludes_local(key, Some(st))
                     && st.local_hash.is_some()
                     && docs_by_uuid
                         .get(st.uuid.as_str())
@@ -1355,7 +1523,10 @@ fn detect_moves(
             });
         local
             .iter()
-            .filter(|entry| !out.state.entries.contains_key(&entry.rel_path))
+            .filter(|entry| {
+                !out.state.entries.contains_key(&entry.rel_path)
+                    && !remote.excludes_local(&entry.rel_path, None)
+            })
             .filter_map(|entry| entry.hash.clone().map(|hash| (entry, hash)))
             .for_each(|(entry, hash)| {
                 if let Some(group) = groups.get_mut(&(hash, entry.kind)) {
@@ -1461,7 +1632,12 @@ fn detect_moves(
             };
             // Reconcile a rebound successor before following its moves.
             // MoveLocal records agreement, which is not yet established.
-            if st.remote_pending || *new_key == key || !local_by_path.contains_key(key.as_str()) {
+            if st.remote_pending
+                || *new_key == key
+                || !local_by_path.contains_key(key.as_str())
+                || remote.excludes_local(&key, Some(&st))
+                || remote.excludes_local(new_key, None)
+            {
                 return;
             }
             if local_by_path.contains_key(new_key.as_str())
@@ -1614,7 +1790,7 @@ pub fn plan(
         .iter()
         .map(|(key, st)| {
             let mut remote_doc = docs_by_uuid.get(st.uuid.as_str()).copied();
-            if remote_doc.is_none() {
+            if remote_doc.is_none() && !remote.excludes_local(key, Some(st)) {
                 // The mapped document vanished. If a same-name,
                 // same-kind unmapped document took its place (typical
                 // after an interrupted sync uploaded but never saved
@@ -1692,6 +1868,7 @@ pub fn plan(
     let mut without_copies = Buckets::default();
     views
         .iter()
+        .filter(|(key, view)| !remote.excludes_local(key, view.state))
         .for_each(|(key, view)| decide(options, key, view, &guards, &mut without_copies));
     let remote_writes: std::collections::HashSet<&str> = without_copies
         .transfers
@@ -1729,9 +1906,16 @@ pub fn plan(
         .filter_map(|entry| entry.hash.clone().map(|h| (h, entry.rel_path.clone())))
         .collect();
 
-    views
-        .iter()
-        .for_each(|(key, view)| decide(options, key, view, &guards, &mut buckets));
+    views.iter().for_each(|(key, view)| {
+        if remote.excludes_local(key, view.state) {
+            buckets.notes.push(skip(
+                key,
+                "device entry or target is excluded; preserving the sync mapping",
+            ));
+        } else {
+            decide(options, key, view, &guards, &mut buckets);
+        }
+    });
 
     if options.delete {
         append_dir_deletes(options, local, remote, &docs_by_uuid, &mut buckets);
@@ -2472,21 +2656,16 @@ pub fn execute(
                 size_bytes,
                 last_modified,
             } => {
-                match (doc_type, fs_side.as_local_path(local)) {
-                    (_, Some(dest)) => {
-                        if let Some(parent) = dest.parent() {
-                            fs::create_dir_all(parent)?;
+                match (doc_type, fs_side.prepare_local_write(local)?) {
+                    (_, Some(dest)) => match doc_type {
+                        RemoteType::Notebook => client.download_bundle_to(uuid, &dest)?,
+                        RemoteType::Pdf => {
+                            client.download_payload_to(uuid, "pdf", &dest, *size_bytes)?
                         }
-                        match doc_type {
-                            RemoteType::Notebook => client.download_bundle_to(uuid, &dest)?,
-                            RemoteType::Pdf => {
-                                client.download_payload_to(uuid, "pdf", &dest, *size_bytes)?
-                            }
-                            RemoteType::Epub => {
-                                client.download_payload_to(uuid, "epub", &dest, *size_bytes)?
-                            }
+                        RemoteType::Epub => {
+                            client.download_payload_to(uuid, "epub", &dest, *size_bytes)?
                         }
-                    }
+                    },
                     (RemoteType::Notebook, None) => {
                         fs_side.write(local, &client.download_bundle_bytes(uuid)?)?
                     }
@@ -2752,11 +2931,11 @@ pub fn execute(
                 last_modified,
                 hash,
             } => {
-                match (fs_side.as_local_path(from), fs_side.as_local_path(to)) {
+                match (
+                    fs_side.as_local_path(from),
+                    fs_side.prepare_local_write(to)?,
+                ) {
                     (Some(src), Some(dest)) => {
-                        if let Some(parent) = dest.parent() {
-                            fs::create_dir_all(parent)?;
-                        }
                         fs::copy(&src, &dest)?;
                     }
                     _ => {
@@ -3358,6 +3537,19 @@ pub fn plan_docs(
         let doc_a = a_by_key.get(key).copied();
         let doc_b = b_by_key.get(key).copied();
         let st = state.entries.get(key);
+        if a.excludes_path(key)
+            || b.excludes_path(key)
+            || st.is_some_and(|s| {
+                a.excluded_uuids.contains(&s.uuid_a) || b.excluded_uuids.contains(&s.uuid_b)
+            })
+        {
+            notes.push(DocAction::Conflict {
+                key: key.to_string(),
+                reason: "device entry or target is excluded; preserving the sync mapping"
+                    .to_string(),
+            });
+            return;
+        }
         // Changed = replaced (uuid drift) or modified (lastModified).
         let a_view = doc_a.map(|d| {
             let changed = st.is_none_or(|s| s.uuid_a != d.uuid || s.lm_a != d.last_modified);
@@ -3919,6 +4111,10 @@ mod tests {
         assert_eq!(snapshot.docs[0].local_rel_path(), "Note.rmdoc");
         assert_eq!(snapshot.skips.len(), 3); // two duplicates + one bad name
         assert_eq!(snapshot.folders[""], "b");
+        assert!(snapshot.excluded_uuids.contains("d1"));
+        assert!(snapshot.excluded_uuids.contains("d2"));
+        assert!(snapshot.excluded_uuids.contains("bad"));
+        assert!(!snapshot.excluded_uuids.contains("outside"));
     }
 
     #[test]
@@ -3931,6 +4127,305 @@ mod tests {
         let snapshot = remote_snapshot(&items, "");
         assert_eq!(snapshot.folders["A/B"], "bb");
         assert_eq!(snapshot.docs[0].local_rel_path(), "A/B/Deep.pdf");
+    }
+
+    // Each case retains the mapped UUID (u1), but excludes it from docs.
+    // Renamed cases also leave a usable successor at the archived path:
+    // UUID exclusion must prevent rebinding/replacing that successor.
+    fn excluded_cases() -> Vec<(&'static str, Vec<Item>)> {
+        vec![
+            (
+                "n",
+                vec![doc("u1", "n", "", "pdf", 5), doc("dup", "n", "", "pdf", 5)],
+            ),
+            (
+                "A/B/n",
+                vec![
+                    folder("a", "A", ""),
+                    folder("dup", "A", ""),
+                    folder("b", "B", "a"),
+                    doc("u1", "n", "b", "pdf", 5),
+                ],
+            ),
+            ("n", vec![doc("u1", "n", "", "unsupported", 5)]),
+            (
+                "n",
+                vec![
+                    doc("u1", ".hidden", "", "pdf", 5),
+                    doc("new", "n", "", "pdf", 9),
+                ],
+            ),
+            (
+                "A/n",
+                vec![folder("a", ".hidden", ""), doc("u1", "n", "a", "pdf", 5)],
+            ),
+            (
+                "n",
+                vec![
+                    doc("u1", "moved", "", "pdf", 5),
+                    doc("dup", "moved", "", "pdf", 5),
+                    doc("new", "n", "", "pdf", 9),
+                ],
+            ),
+        ]
+    }
+
+    #[test]
+    fn excluded_mappings_never_transfer_delete_move_or_rebind() {
+        excluded_cases().into_iter().for_each(|(key, items)| {
+            let path = format!("{key}.pdf");
+            let snapshot = remote_snapshot(&items, "");
+            assert!(snapshot.excluded_uuids.contains("u1"));
+            let mut state = SyncState::default();
+            state.entries.insert(
+                path.clone(),
+                entry_hashed("u1", DocKind::Pdf, 100, 1, 5, "h", "h"),
+            );
+            [push(), pull(), two_way()].into_iter().for_each(|mode| {
+                [false, true].into_iter().for_each(|delete| {
+                    [
+                        ConflictPolicy::Skip,
+                        ConflictPolicy::Newest,
+                        ConflictPolicy::PreferLocal,
+                        ConflictPolicy::PreferRemote,
+                    ]
+                    .into_iter()
+                    .for_each(|conflict| {
+                        // Unchanged, edited, and absent local copies must all
+                        // preserve the mapping rather than infer deletion.
+                        [
+                            vec![local(&path, DocKind::Pdf, 100, 1)],
+                            vec![local(&path, DocKind::Pdf, 200, 99)],
+                            vec![],
+                        ]
+                        .into_iter()
+                        .for_each(|locals| {
+                            let result = plan(
+                                SyncOptions {
+                                    delete,
+                                    conflict,
+                                    ..mode
+                                },
+                                &locals,
+                                &snapshot,
+                                &state,
+                            );
+                            assert!(
+                                result
+                                    .actions
+                                    .iter()
+                                    .all(|a| matches!(a, SyncAction::Skip { .. })),
+                                "{key}: {:?}",
+                                result.actions
+                            );
+                        });
+                    });
+                });
+            });
+        });
+    }
+
+    #[test]
+    fn duplicate_documents_and_subtrees_preserve_successful_sync_across_runs() {
+        [false, true].into_iter().for_each(|nested| {
+            let (key, mut items) = if nested {
+                (
+                    "A/B/n.pdf",
+                    vec![
+                        folder("a", "A", ""),
+                        folder("b", "B", "a"),
+                        doc("u1", "n", "b", "pdf", 5),
+                    ],
+                )
+            } else {
+                ("n.pdf", vec![doc("u1", "n", "", "pdf", 5)])
+            };
+            let clean = remote_snapshot(&items, "");
+            let initial = plan(pull(), &[], &clean, &SyncState::default());
+            assert!(
+                initial
+                    .actions
+                    .iter()
+                    .any(|a| matches!(a, SyncAction::Download { local, .. } if local == key))
+            );
+            // Archive and local copy produced by the successful initial download.
+            let mut state = SyncState::default();
+            state
+                .entries
+                .insert(key.to_string(), entry("u1", DocKind::Pdf, 100, 1, 5));
+            let locals = vec![local(key, DocKind::Pdf, 100, 1)];
+            assert!(plan(pull(), &locals, &clean, &state).actions.is_empty());
+            items.push(if nested {
+                folder("dup", "A", "")
+            } else {
+                doc("dup", "n", "", "pdf", 5)
+            });
+            let excluded = remote_snapshot(&items, "");
+            (0..2).for_each(|_| {
+                let result = plan(with_delete(pull()), &locals, &excluded, &state);
+                assert!(
+                    result
+                        .actions
+                        .iter()
+                        .all(|a| matches!(a, SyncAction::Skip { .. }))
+                );
+                // A skipped run writes no new entry; round-trip the retained archive.
+                state = serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+            });
+            assert!(
+                plan(with_delete(pull()), &locals, &clean, &state)
+                    .actions
+                    .is_empty()
+            );
+            let gone = remote_snapshot(&[], "");
+            assert!(
+                plan(with_delete(pull()), &locals, &gone, &state)
+                    .actions
+                    .iter()
+                    .any(|a| matches!(a, SyncAction::DeleteLocal { path } if path == key))
+            );
+        });
+    }
+
+    #[test]
+    fn excluded_paths_block_new_targets_and_absent_descendant_mappings() {
+        let snapshot = remote_snapshot(
+            &[
+                folder("a", "A", ""),
+                folder("dup", "A", ""),
+                doc("unsupported", "n", "", "unsupported", 5),
+            ],
+            "",
+        );
+        // No live UUID to match: the excluded subtree still makes absence unknown.
+        ["A/missing.pdf", "n.pdf"].into_iter().for_each(|key| {
+            let locals = vec![local(key, DocKind::Pdf, 100, 1)];
+            let mut state = SyncState::default();
+            state
+                .entries
+                .insert(key.to_string(), entry("gone", DocKind::Pdf, 100, 1, 5));
+            [push(), pull(), two_way()].into_iter().for_each(|options| {
+                [&state, &SyncState::default()]
+                    .into_iter()
+                    .for_each(|archive| {
+                        let result = plan(with_delete(options), &locals, &snapshot, archive);
+                        assert!(
+                            result
+                                .actions
+                                .iter()
+                                .all(|a| matches!(a, SyncAction::Skip { .. }))
+                        );
+                    });
+                let result = plan(with_delete(options), &[], &snapshot, &state);
+                assert!(
+                    result
+                        .actions
+                        .iter()
+                        .all(|a| matches!(a, SyncAction::Skip { .. }))
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn exclusions_do_not_block_unrelated_true_deletions() {
+        let snapshot = remote_snapshot(
+            &[doc("u1", "n", "", "pdf", 5), doc("dup", "n", "", "pdf", 5)],
+            "",
+        );
+        let locals = vec![
+            local("n.pdf", DocKind::Pdf, 100, 1),
+            local("gone.pdf", DocKind::Pdf, 100, 1),
+        ];
+        let mut state = SyncState::default();
+        state
+            .entries
+            .insert("n.pdf".to_string(), entry("u1", DocKind::Pdf, 100, 1, 5));
+        state.entries.insert(
+            "gone.pdf".to_string(),
+            entry("gone", DocKind::Pdf, 100, 1, 5),
+        );
+        let result = plan(with_delete(pull()), &locals, &snapshot, &state);
+        let changes: Vec<_> = result
+            .actions
+            .into_iter()
+            .filter(|a| !matches!(a, SyncAction::Skip { .. }))
+            .collect();
+        assert_eq!(
+            changes,
+            vec![SyncAction::DeleteLocal {
+                path: "gone.pdf".to_string()
+            }]
+        );
+
+        let peer = remote_snapshot(
+            &[
+                doc("peer", "n", "", "pdf", 5),
+                doc("gone-peer", "gone", "", "pdf", 5),
+            ],
+            "",
+        );
+        let mut state = PairState::default();
+        state
+            .entries
+            .insert("n".to_string(), pair_entry("u1", 5, "peer", 5));
+        state
+            .entries
+            .insert("gone".to_string(), pair_entry("gone", 5, "gone-peer", 5));
+        let changes: Vec<_> = plan_docs(with_delete(two_way()), &snapshot, &peer, &state)
+            .into_iter()
+            .filter(|a| !matches!(a, DocAction::Conflict { .. }))
+            .collect();
+        assert_eq!(
+            changes,
+            vec![DocAction::DeleteOnB {
+                key: "gone".to_string(),
+                uuid: "gone-peer".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn excluded_contents_and_targets_block_move_prepass() {
+        let mut state = SyncState::default();
+        state.entries.insert(
+            "A/n.pdf".to_string(),
+            entry_hashed("u1", DocKind::Pdf, 100, 1, 5, "h", "h"),
+        );
+        let locals = vec![with_hash(local("B/n.pdf", DocKind::Pdf, 100, 1), "h")];
+        let cases = [
+            // A folder move must not carry excluded, even untracked, content.
+            vec![
+                folder("a", "A", ""),
+                doc("u1", "n", "a", "pdf", 5),
+                doc("bad", "bad", "a", "unsupported", 5),
+            ],
+            // Neither folder nor file moves may target an excluded subtree.
+            vec![
+                folder("a", "A", ""),
+                doc("u1", "n", "a", "pdf", 5),
+                folder("b", "B", ""),
+                folder("dup", "B", ""),
+            ],
+        ];
+        cases.into_iter().enumerate().for_each(|(index, items)| {
+            let result = plan(push(), &locals, &remote_snapshot(&items, ""), &state);
+            assert!(
+                !result
+                    .actions
+                    .iter()
+                    .any(|a| matches!(a, SyncAction::MoveRemoteFolder { .. }))
+            );
+            if index == 1 {
+                assert!(!result.actions.iter().any(|a| matches!(
+                    a,
+                    SyncAction::MoveRemote { .. }
+                        | SyncAction::Upload { .. }
+                        | SyncAction::CopyRemote { .. }
+                        | SyncAction::CreateRemoteFolder { .. }
+                )));
+            }
+        });
     }
 
     // ---- push planning ----------------------------------------------------
@@ -4909,6 +5404,51 @@ mod tests {
         assert_eq!(actions.len(), 2);
         assert!(matches!(&actions[0], SyncAction::UpdateRemote { uuid, .. } if uuid == "u1"));
         assert!(matches!(&actions[1], SyncAction::Upload { local, .. } if local == "z.pdf"));
+    }
+
+    #[test]
+    fn excluded_views_do_not_invalidate_unchanged_local_copy_sources() {
+        let mut snapshot = remote_snapshot(
+            &[
+                folder("folder-a", "A", ""),
+                folder("duplicate-a", "A", ""),
+                doc("u1", "moved", "", "pdf", 9),
+                doc("u2", "b", "", "pdf", 9),
+                doc("u3", "z", "", "pdf", 5),
+            ],
+            "",
+        );
+        snapshot.docs.iter_mut().for_each(|doc| {
+            doc.payload_hash = Some(if doc.uuid == "u3" { "h1" } else { "h2" }.to_string());
+        });
+        let mut state = SyncState::default();
+        [("A/source.pdf", "u1"), ("b.pdf", "u2")]
+            .into_iter()
+            .for_each(|(path, uuid)| {
+                state.entries.insert(
+                    path.to_string(),
+                    entry_hashed(uuid, DocKind::Pdf, 10, 1, 5, "h1", "h1"),
+                );
+            });
+        let locals = vec![
+            with_hash(local("A/source.pdf", DocKind::Pdf, 10, 1), "h1"),
+            with_hash(local("b.pdf", DocKind::Pdf, 10, 1), "h1"),
+        ];
+        [pull(), two_way()].into_iter().for_each(|options| {
+            let result = plan(options, &locals, &snapshot, &state);
+            assert!(skips(&result).contains(&"A/source.pdf"));
+            let changes: Vec<_> = result
+                .actions
+                .iter()
+                .filter(|action| !matches!(action, SyncAction::Skip { .. }))
+                .collect();
+            assert_eq!(changes.len(), 2);
+            assert!(matches!(changes[0], SyncAction::Download { local, .. } if local == "b.pdf"));
+            // The excluded entry is not moved or downloaded in either
+            // pass. Its local bytes remain usable; b.pdf's do not.
+            assert!(matches!(changes[1], SyncAction::CopyLocal { from, to, .. }
+                if from == "A/source.pdf" && to == "z.pdf"));
+        });
     }
 
     #[test]
@@ -6674,6 +7214,131 @@ mod tests {
                 key: "n".to_string()
             }]
         );
+    }
+
+    #[test]
+    fn docs_excluded_mappings_block_both_sides_and_preserve_archives() {
+        excluded_cases().into_iter().for_each(|(key, items)| {
+            let excluded = remote_snapshot(&items, "");
+            let (dir, name) = key.rsplit_once('/').unwrap_or(("", key));
+            let peer = RemoteSnapshot {
+                docs: vec![RemoteDoc {
+                    rel_dir: dir.to_string(),
+                    name: name.to_string(),
+                    uuid: "peer".to_string(),
+                    doc_type: RemoteType::Pdf,
+                    last_modified: 5,
+                    size_bytes: Some(100),
+                    payload_hash: None,
+                }],
+                ..RemoteSnapshot::default()
+            };
+            [false, true].into_iter().for_each(|reverse| {
+                let (a, b, entry) = if reverse {
+                    (&peer, &excluded, pair_entry("peer", 5, "u1", 5))
+                } else {
+                    (&excluded, &peer, pair_entry("u1", 5, "peer", 5))
+                };
+                let mut state = PairState::default();
+                state.entries.insert(key.to_string(), entry);
+                [push(), pull(), two_way()].into_iter().for_each(|mode| {
+                    [false, true].into_iter().for_each(|delete| {
+                        [
+                            ConflictPolicy::Skip,
+                            ConflictPolicy::Newest,
+                            ConflictPolicy::PreferLocal,
+                            ConflictPolicy::PreferRemote,
+                        ]
+                        .into_iter()
+                        .for_each(|conflict| {
+                            let result = plan_docs(
+                                SyncOptions {
+                                    delete,
+                                    conflict,
+                                    ..mode
+                                },
+                                a,
+                                b,
+                                &state,
+                            );
+                            assert!(
+                                result
+                                    .iter()
+                                    .all(|a| matches!(a, DocAction::Conflict { .. })),
+                                "{key}: {result:?}"
+                            );
+                        });
+                    });
+                });
+            });
+        });
+    }
+
+    #[test]
+    fn docs_duplicate_subtrees_preserve_successful_sync_across_runs() {
+        [false, true].into_iter().for_each(|nested| {
+            let (key, mut items) = if nested {
+                (
+                    "A/n",
+                    vec![folder("a", "A", ""), doc("u1", "n", "a", "pdf", 5)],
+                )
+            } else {
+                ("n", vec![doc("u1", "n", "", "pdf", 5)])
+            };
+            let clean = remote_snapshot(&items, "");
+            let empty = remote_snapshot(&[], "");
+            assert!(
+                plan_docs(push(), &clean, &empty, &PairState::default())
+                    .iter()
+                    .any(|a| matches!(a, DocAction::CopyToB { key: k, .. } if k == key))
+            );
+            let mut peer = clean.clone();
+            peer.docs[0].uuid = "peer".to_string();
+            let mut state = PairState::default();
+            state
+                .entries
+                .insert(key.to_string(), pair_entry("u1", 5, "peer", 5));
+            assert!(plan_docs(two_way(), &clean, &peer, &state).is_empty());
+            items.push(if nested {
+                folder("dup", "A", "")
+            } else {
+                doc("dup", "n", "", "pdf", 5)
+            });
+            let excluded = remote_snapshot(&items, "");
+            (0..2).for_each(|_| {
+                let result = plan_docs(with_delete(two_way()), &excluded, &peer, &state);
+                assert!(
+                    result
+                        .iter()
+                        .all(|a| matches!(a, DocAction::Conflict { .. }))
+                );
+                state = serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+            });
+            assert!(plan_docs(with_delete(two_way()), &clean, &peer, &state).is_empty());
+            assert_eq!(
+                plan_docs(with_delete(two_way()), &empty, &peer, &state),
+                vec![DocAction::DeleteOnB {
+                    key: key.to_string(),
+                    uuid: "peer".to_string()
+                }]
+            );
+            // Neither a missing descendant UUID nor loss of the archive licenses
+            // copying into an ambiguous destination subtree.
+            items.retain(|item| item.uuid != "u1");
+            if !nested {
+                items.push(doc("dup2", "n", "", "pdf", 5));
+            }
+            let excluded = remote_snapshot(&items, "");
+            [&state, &PairState::default()]
+                .into_iter()
+                .for_each(|archive| {
+                    assert!(
+                        plan_docs(two_way(), &excluded, &peer, archive)
+                            .iter()
+                            .all(|a| matches!(a, DocAction::Conflict { .. }))
+                    );
+                });
+        });
     }
 
     #[test]
