@@ -2630,25 +2630,23 @@ pub fn execute(
             SyncAction::MoveLocal {
                 from,
                 to,
-                kind,
-                uuid,
                 last_modified,
-                local_hash,
-                payload_hash,
+                ..
             } => {
+                let mut entry = state
+                    .entries
+                    .get(from)
+                    .cloned()
+                    .ok_or_else(|| Error::PathNotFound(from.clone()))?;
                 fs_side.rename(from, to)?;
+                // Moving does not reconcile content. Keep the local stamp
+                // paired with its agreed hash so unresolved edits are still
+                // detected on the next run. The planner only advances the
+                // remote timestamp when the payload is verified unchanged.
+                entry.remote_last_modified = *last_modified;
                 state.entries.remove(from);
-                record_state_with(
-                    state,
-                    state_path,
-                    fs_side,
-                    to,
-                    *kind,
-                    uuid,
-                    *last_modified,
-                    local_hash.clone(),
-                    payload_hash.clone(),
-                )?;
+                state.entries.insert(to.clone(), entry);
+                state.save(state_path)?;
                 outcome.moved_local += 1;
             }
             SyncAction::CopyRemote {
@@ -4525,6 +4523,154 @@ mod tests {
             a,
             SyncAction::Download { local, .. } if local == "A/n.pdf"
         )));
+    }
+
+    // These plans only perform local operations. Disable SSH multiplexing
+    // (including its drop-time cleanup), and prohibit any network connection
+    // should a regression unexpectedly introduce a device operation.
+    fn with_local_executor(test: impl FnOnce(&LocalFs, &Path, &Client)) {
+        let root = std::env::temp_dir().join(format!("rmu-move-test-{}", uuid::Uuid::new_v4()));
+        let fs_side = LocalFs::new(root.join("files"));
+        fs_side.ensure_root().unwrap();
+        let session = SshSession::new(crate::ssh::SshOptions {
+            destination: "unused.invalid".to_string(),
+            multiplex: false,
+            extra_options: vec!["ProxyCommand=false".to_string()],
+            ..Default::default()
+        })
+        .unwrap();
+        let client = Client::new(session, "/unused");
+        test(&fs_side, &root.join("state.json"), &client);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn device_move_keeps_local_edit_conflicting_on_next_run() {
+        [pull(), two_way()].into_iter().for_each(|options| {
+            // A changed payload and an unavailable payload hash must both
+            // retain the unresolved device change across the local move.
+            [Some(hash_bytes(b"device edit")), None]
+                .into_iter()
+                .for_each(|remote_hash| {
+                    with_local_executor(|fs_side, state_path, client| {
+                        fs_side.write("n.pdf", b"agreed").unwrap();
+                        let (size, mtime) = fs_side.stat("n.pdf").unwrap();
+                        let hash = hash_bytes(b"agreed");
+                        let baseline =
+                            entry_hashed("u1", DocKind::Pdf, size, mtime, 5, &hash, &hash);
+                        let mut state = SyncState::default();
+                        state.entries.insert("n.pdf".to_string(), baseline.clone());
+                        state.save(state_path).unwrap();
+
+                        // Different size makes the edit detectable even on
+                        // filesystems with coarse timestamp resolution.
+                        let edited = b"unresolved local edit";
+                        fs_side.write("n.pdf", edited).unwrap();
+                        let mut remote = remote_snapshot(&[doc("u1", "renamed", "", "pdf", 9)], "");
+                        remote.docs[0].payload_hash = remote_hash.clone();
+                        let (mut locals, _) = fs_side.snapshot().unwrap();
+                        attach_hashes(fs_side, &mut locals, &state).unwrap();
+                        let first = plan(options, &locals, &remote, &state);
+                        assert!(matches!(first.actions.as_slice(), [
+                            SyncAction::MoveLocal { from, to, last_modified: 5, .. },
+                            SyncAction::Conflict { path, .. },
+                        ] if from == "n.pdf" && to == "renamed.pdf" && path == to));
+                        let outcome = execute(
+                            client,
+                            &crate::progress::NoProgress,
+                            fs_side,
+                            &first,
+                            &mut remote.folders,
+                            &mut state,
+                            state_path,
+                        )
+                        .unwrap();
+                        assert_eq!(outcome.moved_local, 1);
+                        assert_eq!(outcome.conflicts.len(), 1);
+                        assert!(!outcome.modified_remote);
+                        assert!(!fs_side.as_local_path("n.pdf").unwrap().exists());
+                        assert_eq!(fs_side.read("renamed.pdf").unwrap(), edited);
+
+                        // Reload the actual persisted archive, then run the
+                        // production hash-cache path rather than supplying a
+                        // hand-written local hash to the second planner pass.
+                        let mut state = SyncState::load(state_path).unwrap();
+                        assert_eq!(state.entries.len(), 1);
+                        let saved = &state.entries["renamed.pdf"];
+                        assert_eq!(saved.local_size, baseline.local_size);
+                        assert_eq!(saved.local_mtime_ms, baseline.local_mtime_ms);
+                        assert_eq!(saved.local_hash, baseline.local_hash);
+                        assert_eq!(saved.payload_hash, baseline.payload_hash);
+                        assert_eq!(saved.remote_last_modified, 5);
+                        let (mut locals, _) = fs_side.snapshot().unwrap();
+                        assert_eq!(cached_hash(&locals[0], &state), None);
+                        attach_hashes(fs_side, &mut locals, &state).unwrap();
+                        assert_eq!(locals[0].hash, Some(hash_bytes(edited)));
+                        let second = plan(options, &locals, &remote, &state);
+                        assert!(matches!(second.actions.as_slice(), [
+                            SyncAction::Conflict { path, .. },
+                        ] if path == "renamed.pdf"));
+                        let outcome = execute(
+                            client,
+                            &crate::progress::NoProgress,
+                            fs_side,
+                            &second,
+                            &mut remote.folders,
+                            &mut state,
+                            state_path,
+                        )
+                        .unwrap();
+                        assert_eq!(outcome.conflicts.len(), 1);
+                        assert_eq!(outcome.downloaded, 0);
+                        assert_eq!(fs_side.read("renamed.pdf").unwrap(), edited);
+                    });
+                });
+        });
+    }
+
+    #[test]
+    fn device_move_records_verified_rename_timestamp() {
+        with_local_executor(|fs_side, state_path, client| {
+            fs_side.write("n.pdf", b"agreed").unwrap();
+            let (size, mtime) = fs_side.stat("n.pdf").unwrap();
+            let hash = hash_bytes(b"agreed");
+            let mut state = SyncState::default();
+            state.entries.insert(
+                "n.pdf".to_string(),
+                entry_hashed("u1", DocKind::Pdf, size, mtime, 5, &hash, &hash),
+            );
+            let mut remote = remote_snapshot(&[doc("u1", "renamed", "", "pdf", 9)], "");
+            remote.docs[0].payload_hash = Some(hash.clone());
+            let (mut locals, _) = fs_side.snapshot().unwrap();
+            attach_hashes(fs_side, &mut locals, &state).unwrap();
+            let first = plan(two_way(), &locals, &remote, &state);
+            assert!(matches!(
+                first.actions.as_slice(),
+                [SyncAction::MoveLocal {
+                    last_modified: 9,
+                    ..
+                },]
+            ));
+            execute(
+                client,
+                &crate::progress::NoProgress,
+                fs_side,
+                &first,
+                &mut remote.folders,
+                &mut state,
+                state_path,
+            )
+            .unwrap();
+
+            let state = SyncState::load(state_path).unwrap();
+            assert_eq!(state.entries.len(), 1);
+            assert_eq!(state.entries["renamed.pdf"].remote_last_modified, 9);
+            let (mut locals, _) = fs_side.snapshot().unwrap();
+            assert_eq!(cached_hash(&locals[0], &state), Some(hash));
+            attach_hashes(fs_side, &mut locals, &state).unwrap();
+            assert!(plan(two_way(), &locals, &remote, &state).actions.is_empty());
+            assert_eq!(fs_side.read("renamed.pdf").unwrap(), b"agreed");
+        });
     }
 
     #[test]
