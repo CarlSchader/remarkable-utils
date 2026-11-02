@@ -559,15 +559,16 @@ impl Client {
         if !item.is_document() {
             return Err(Error::NotADocument(item_ref.to_string()));
         }
-        self.download_item(item, output, bundle)
+        let destination = resolve_destination(output, item, bundle)?;
+        self.download_item(item, destination, bundle)
     }
 
     /// Download one document — or every document matching a glob
     /// pattern. With multiple matches, `output` must be a directory
     /// (or absent = current directory), matched folders are skipped
     /// (`Books/*` downloads Books' documents; `Books/**` recurses),
-    /// and colliding output file names are rejected before anything
-    /// is transferred.
+    /// and unsafe or colliding output file names are rejected before
+    /// any document is transferred.
     pub fn download_matching(
         &self,
         item_ref: &str,
@@ -584,17 +585,24 @@ impl Client {
         if docs.is_empty() {
             return Err(Error::NotADocument(item_ref.to_string()));
         }
+        if docs.len() > 1
+            && let Some(path) = output
+            && !path.is_dir()
+        {
+            return Err(Error::OutputNotADirectory(path.to_path_buf()));
+        }
+        // Resolve every destination before transferring any document: a
+        // later unsafe name must not leave a partially downloaded glob.
+        let destinations = docs
+            .iter()
+            .map(|doc| resolve_destination(output, doc, bundle))
+            .collect::<Result<Vec<_>>>()?;
         if docs.len() > 1 {
-            if let Some(path) = output
-                && !path.is_dir()
-            {
-                return Err(Error::OutputNotADirectory(path.to_path_buf()));
-            }
             // Reject up-front if two matched documents would land on
             // the same local file name.
             let mut names = std::collections::HashSet::new();
-            for doc in &docs {
-                if !names.insert(download_filename(doc, bundle)) {
+            for (doc, destination) in docs.iter().zip(&destinations) {
+                if !names.insert(destination) {
                     return Err(Error::NameConflict {
                         name: doc.visible_name.clone(),
                         parent: "the output directory".to_string(),
@@ -603,14 +611,15 @@ impl Client {
             }
         }
         docs.iter()
-            .map(|doc| self.download_item(doc, output, bundle))
+            .zip(destinations)
+            .map(|(doc, destination)| self.download_item(doc, destination, bundle))
             .collect()
     }
 
-    fn download_item(&self, item: &Item, output: Option<&Path>, bundle: bool) -> Result<PathBuf> {
+    // The destination has already been validated, including all glob peers.
+    fn download_item(&self, item: &Item, destination: PathBuf, bundle: bool) -> Result<PathBuf> {
         let is_notebook = matches!(item.file_type.as_deref(), None | Some("notebook"));
         if bundle || is_notebook {
-            let destination = resolve_destination(output, &download_filename(item, bundle));
             self.progress
                 .step(&format!("Downloading '{}'", item.visible_name));
             let tar_bytes = self.fetch_item_tar(&item.uuid)?;
@@ -621,7 +630,6 @@ impl Client {
         }
 
         let extension = item.file_type.as_deref().expect("payload types are Some");
-        let destination = resolve_destination(output, &download_filename(item, bundle));
         self.progress
             .step(&format!("Downloading '{}'", item.visible_name));
         self.session.download_remote_file(
@@ -960,26 +968,51 @@ fn default_name(visible_name: Option<&str>, local: &Path) -> String {
 
 /// Local file name a download of `item` produces (notebooks and
 /// forced bundles land as `.rmdoc`, payloads keep their extension).
-fn download_filename(item: &Item, bundle: bool) -> String {
-    let is_notebook = matches!(item.file_type.as_deref(), None | Some("notebook"));
-    if bundle || is_notebook {
-        format!("{}.rmdoc", item.visible_name)
-    } else {
-        format!(
-            "{}.{}",
-            item.visible_name,
-            item.file_type.as_deref().expect("payload types are Some")
-        )
-    }
+fn download_filename(item: &Item, bundle: bool) -> Result<String> {
+    validate_download_component(&item.visible_name)?;
+    let extension = download_extension(item, bundle)?;
+    Ok(format!("{}.{extension}", item.visible_name))
 }
 
-/// Default to `filename` in the current directory; an existing local
-/// directory means "put it in there".
-fn resolve_destination(output: Option<&Path>, filename: &str) -> PathBuf {
+/// Metadata-derived parts must be single components, including when a
+/// backup is later used on a platform with different path separators.
+fn validate_download_component(value: &str) -> Result<()> {
+    let drive_prefix = value
+        .as_bytes()
+        .first()
+        .is_some_and(u8::is_ascii_alphabetic)
+        && value.as_bytes().get(1) == Some(&b':');
+    if value.is_empty()
+        || matches!(value, "." | "..")
+        || value.contains(['/', '\\', '\0'])
+        || drive_prefix
+    {
+        return Err(Error::InvalidName(value.to_string()));
+    }
+    Ok(())
+}
+
+fn download_extension(item: &Item, bundle: bool) -> Result<&str> {
+    let extension = match item.file_type.as_deref() {
+        _ if bundle => "rmdoc",
+        None | Some("notebook") => "rmdoc",
+        Some(extension) => extension,
+    };
+    validate_download_component(extension)?;
+    Ok(extension)
+}
+
+/// Default to the generated filename in the current directory; an
+/// existing local directory means "put it in there". An explicit file
+/// path is user-selected, so it need not use the remote visible name.
+fn resolve_destination(output: Option<&Path>, item: &Item, bundle: bool) -> Result<PathBuf> {
+    // Payload extensions also enter the remote path, even with an
+    // explicit local filename. Bundles do not use the remote file type.
+    download_extension(item, bundle)?;
     match output {
-        None => PathBuf::from(filename),
-        Some(path) if path.is_dir() => path.join(filename),
-        Some(path) => path.to_path_buf(),
+        None => Ok(PathBuf::from(download_filename(item, bundle)?)),
+        Some(path) if path.is_dir() => Ok(path.join(download_filename(item, bundle)?)),
+        Some(path) => Ok(path.to_path_buf()),
     }
 }
 
@@ -1245,6 +1278,97 @@ mod tests {
             item("ph", "Physics", "b", ItemKind::Document),
             item("n", "Notes", "", ItemKind::Document),
         ]
+    }
+
+    #[test]
+    fn generated_download_names_reject_unsafe_components() {
+        let unsafe_parts = [
+            "",
+            ".",
+            "..",
+            "../victim",
+            "/tmp/victim",
+            "dir/name",
+            "name/",
+            "./name",
+            "dir/../name",
+            "..\\victim",
+            "C:\\victim",
+            "C:victim",
+            "\\\\server\\share",
+            "nul\0name",
+        ];
+        for name in unsafe_parts {
+            for (file_type, bundle) in [
+                (Some("pdf"), false),
+                (Some("notebook"), false),
+                (None, false),
+                (Some("pdf"), true),
+            ] {
+                let mut doc = item("doc", name, "", ItemKind::Document);
+                doc.file_type = file_type.map(str::to_string);
+                assert!(
+                    matches!(download_filename(&doc, bundle), Err(Error::InvalidName(_))),
+                    "accepted {name:?}, {file_type:?}, bundle={bundle}"
+                );
+                assert!(matches!(
+                    resolve_destination(None, &doc, bundle),
+                    Err(Error::InvalidName(_))
+                ));
+            }
+        }
+        for extension in unsafe_parts {
+            let mut doc = item("doc", "Safe", "", ItemKind::Document);
+            doc.file_type = Some(extension.to_string());
+            assert!(matches!(
+                download_filename(&doc, false),
+                Err(Error::InvalidName(_))
+            ));
+            // An explicit destination cannot make a remote payload path safe.
+            assert!(matches!(
+                resolve_destination(Some(Path::new("chosen.pdf")), &doc, false),
+                Err(Error::InvalidName(_))
+            ));
+            // Bundles use a fixed extension and never build a payload path.
+            assert_eq!(download_filename(&doc, true).unwrap(), "Safe.rmdoc");
+        }
+    }
+
+    #[test]
+    fn download_names_preserve_normal_names_and_explicit_paths() {
+        for name in [
+            "Notes",
+            "Lecture 1",
+            "Résumé 日本語",
+            "draft.v2",
+            ".hidden",
+            "a..b",
+        ] {
+            for (file_type, bundle, extension) in [
+                (Some("pdf"), false, "pdf"),
+                (Some("epub"), false, "epub"),
+                (Some("notebook"), false, "rmdoc"),
+                (None, false, "rmdoc"),
+                (Some("pdf"), true, "rmdoc"),
+            ] {
+                let mut doc = item("doc", name, "", ItemKind::Document);
+                doc.file_type = file_type.map(str::to_string);
+                let expected = format!("{name}.{extension}");
+                assert_eq!(download_filename(&doc, bundle).unwrap(), expected);
+                assert_eq!(
+                    resolve_destination(None, &doc, bundle).unwrap(),
+                    PathBuf::from(expected)
+                );
+                doc.visible_name = "../unsafe".to_string();
+                for output in ["../chosen.pdf", "/chosen.rmdoc", "nested/chosen.pdf"] {
+                    let output = Path::new(output);
+                    assert_eq!(
+                        resolve_destination(Some(output), &doc, bundle).unwrap(),
+                        output
+                    );
+                }
+            }
+        }
     }
 
     #[test]
