@@ -106,7 +106,8 @@ printf 'call\n' >> "$RMU_CACHE_TEST_ROOT/calls"
 sh -c "$3"
 status=$?
 case "$3" in
-    'cat > '*)
+    *'cat > '*)
+        # Match staged uploads too: their cat follows setup/trap commands.
         # Force every metadata write to keep exactly the cached mtime.
         touch -r "$RMU_CACHE_TEST_ROOT/stamp" "$RMU_CACHE_TEST_ROOT"/data/*.metadata
         # Simulate a lost success response after the remote write completed.
