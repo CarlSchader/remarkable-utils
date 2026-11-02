@@ -1846,24 +1846,10 @@ pub fn plan(
             }
         });
 
-    let guards = Guards {
+    let mut guards = Guards {
         taken: device_taken(remote),
-        // Copy-by-fingerprint sources: mapped, still-present device
-        // docs whose payload is known-unchanged and hash-recorded.
-        copy_sources: state
-            .entries
-            .values()
-            .filter_map(|st| {
-                let doc = docs_by_uuid.get(st.uuid.as_str())?;
-                let hash = st.payload_hash.clone()?;
-                (payload_mirrored(doc.doc_type) && !remote_stamp_changed(st, doc))
-                    .then(|| (hash, (st.uuid.clone(), st.kind, doc.size_bytes)))
-            })
-            .collect(),
-        local_by_hash: local
-            .iter()
-            .filter_map(|entry| entry.hash.clone().map(|h| (h, entry.rel_path.clone())))
-            .collect(),
+        copy_sources: HashMap::new(),
+        local_by_hash: HashMap::new(),
         upload_counts: views
             .values()
             .filter(|v| v.local.is_some() && v.remote.is_none())
@@ -1874,6 +1860,51 @@ pub fn plan(
                 counts
             }),
     };
+
+    // First decide without copy optimizations so the indexes below
+    // exclude every payload/path this plan will overwrite. Checking
+    // only snapshot stamps is insufficient: an unchanged destination
+    // can be updated before a later copy reads its old fingerprint.
+    let mut without_copies = Buckets::default();
+    views
+        .iter()
+        .filter(|(key, view)| !remote.excludes_local(key, view.state))
+        .for_each(|(key, view)| decide(options, key, view, &guards, &mut without_copies));
+    let remote_writes: std::collections::HashSet<&str> = without_copies
+        .transfers
+        .iter()
+        .filter_map(|action| match action {
+            SyncAction::UpdateRemote { uuid, .. } => Some(uuid.as_str()),
+            _ => None,
+        })
+        .collect();
+    let local_writes: std::collections::HashSet<&str> = without_copies
+        .transfers
+        .iter()
+        .filter_map(|action| match action {
+            SyncAction::Download { local, .. } => Some(local.as_str()),
+            _ => None,
+        })
+        .collect();
+    // Moves already re-keyed these snapshots, and run before transfers:
+    // local sources use their new paths; device sources keep their UUIDs.
+    // Deletions run after all copies, so condemned sources remain usable.
+    guards.copy_sources = state
+        .entries
+        .values()
+        .filter(|st| !remote_writes.contains(st.uuid.as_str()))
+        .filter_map(|st| {
+            let doc = docs_by_uuid.get(st.uuid.as_str())?;
+            let hash = st.payload_hash.clone()?;
+            (payload_mirrored(doc.doc_type) && !remote_stamp_changed(st, doc))
+                .then(|| (hash, (st.uuid.clone(), st.kind, doc.size_bytes)))
+        })
+        .collect();
+    guards.local_by_hash = local
+        .iter()
+        .filter(|entry| !local_writes.contains(entry.rel_path.as_str()))
+        .filter_map(|entry| entry.hash.clone().map(|h| (h, entry.rel_path.clone())))
+        .collect();
 
     views.iter().for_each(|(key, view)| {
         if remote.excludes_local(key, view.state) {
@@ -5301,6 +5332,205 @@ mod tests {
                 hash: "h".to_string(),
             }]
         );
+    }
+
+    #[test]
+    fn fingerprint_copies_choose_an_unmodified_alternative() {
+        [push(), pull(), two_way()].into_iter().for_each(|options| {
+            let pushing = options.mode != Mode::Pull;
+            let mut snapshot = remote_snapshot(
+                &[
+                    doc("u1", "a", "", "pdf", if pushing { 5 } else { 9 }),
+                    doc("u2", "b", "", "pdf", 5),
+                ],
+                "",
+            );
+            let mut state = SyncState::default();
+            [ ("a.pdf", "u1"), ("b.pdf", "u2") ].into_iter().for_each(|(path, uuid)| {
+                state.entries.insert(
+                    path.to_string(),
+                    entry_hashed(uuid, DocKind::Pdf, 10, 1, 5, "h1", "h1"),
+                );
+            });
+            let mut locals = vec![
+                with_hash(local("a.pdf", DocKind::Pdf, 10, if pushing { 2 } else { 1 }), if pushing { "h2" } else { "h1" }),
+                with_hash(local("b.pdf", DocKind::Pdf, 10, 1), "h1"),
+            ];
+            if pushing {
+                locals.push(with_hash(local("z.pdf", DocKind::Pdf, 10, 1), "h1"));
+            } else {
+                let mut added = remote_snapshot(&[doc("u3", "z", "", "pdf", 5)], "");
+                added.docs[0].payload_hash = Some("h1".to_string());
+                snapshot.docs.extend(added.docs);
+            }
+            let actions = plan(options, &locals, &snapshot, &state).actions;
+            assert_eq!(actions.len(), 2);
+            if pushing {
+                assert!(matches!(&actions[0], SyncAction::UpdateRemote { uuid, .. } if uuid == "u1"));
+                assert!(matches!(&actions[1], SyncAction::CopyRemote { from_uuid, .. } if from_uuid == "u2"));
+            } else {
+                assert!(matches!(&actions[0], SyncAction::Download { local, .. } if local == "a.pdf"));
+                assert!(matches!(&actions[1], SyncAction::CopyLocal { from, .. } if from == "b.pdf"));
+            }
+        });
+    }
+
+    #[test]
+    fn pending_successor_and_overwritten_copy_sources_are_both_excluded() {
+        let snapshot = remote_snapshot(
+            &[doc("u1", "a", "", "pdf", 5), doc("u2", "b", "", "pdf", 5)],
+            "",
+        );
+        let mut state = SyncState::default();
+        state.entries.insert(
+            "a.pdf".to_string(),
+            entry_hashed("u1", DocKind::Pdf, 10, 1, 5, "h1", "h1"),
+        );
+        state.entries.insert(
+            "b.pdf".to_string(),
+            StateEntry {
+                // The successor retained its predecessor's timestamp,
+                // but its payload has not yet been reconciled.
+                remote_pending: true,
+                ..entry_hashed("u2", DocKind::Pdf, 10, 1, 5, "h1", "h1")
+            },
+        );
+        let locals = vec![
+            with_hash(local("a.pdf", DocKind::Pdf, 10, 2), "h2"),
+            with_hash(local("b.pdf", DocKind::Pdf, 10, 1), "h1"),
+            with_hash(local("z.pdf", DocKind::Pdf, 10, 1), "h1"),
+        ];
+        let actions = plan(push(), &locals, &snapshot, &state).actions;
+        assert_eq!(actions.len(), 2);
+        assert!(matches!(&actions[0], SyncAction::UpdateRemote { uuid, .. } if uuid == "u1"));
+        assert!(matches!(&actions[1], SyncAction::Upload { local, .. } if local == "z.pdf"));
+    }
+
+    #[test]
+    fn excluded_views_do_not_invalidate_unchanged_local_copy_sources() {
+        let mut snapshot = remote_snapshot(
+            &[
+                folder("folder-a", "A", ""),
+                folder("duplicate-a", "A", ""),
+                doc("u1", "moved", "", "pdf", 9),
+                doc("u2", "b", "", "pdf", 9),
+                doc("u3", "z", "", "pdf", 5),
+            ],
+            "",
+        );
+        snapshot.docs.iter_mut().for_each(|doc| {
+            doc.payload_hash = Some(if doc.uuid == "u3" { "h1" } else { "h2" }.to_string());
+        });
+        let mut state = SyncState::default();
+        [("A/source.pdf", "u1"), ("b.pdf", "u2")]
+            .into_iter()
+            .for_each(|(path, uuid)| {
+                state.entries.insert(
+                    path.to_string(),
+                    entry_hashed(uuid, DocKind::Pdf, 10, 1, 5, "h1", "h1"),
+                );
+            });
+        let locals = vec![
+            with_hash(local("A/source.pdf", DocKind::Pdf, 10, 1), "h1"),
+            with_hash(local("b.pdf", DocKind::Pdf, 10, 1), "h1"),
+        ];
+        [pull(), two_way()].into_iter().for_each(|options| {
+            let result = plan(options, &locals, &snapshot, &state);
+            assert!(skips(&result).contains(&"A/source.pdf"));
+            let changes: Vec<_> = result
+                .actions
+                .iter()
+                .filter(|action| !matches!(action, SyncAction::Skip { .. }))
+                .collect();
+            assert_eq!(changes.len(), 2);
+            assert!(matches!(changes[0], SyncAction::Download { local, .. } if local == "b.pdf"));
+            // The excluded entry is not moved or downloaded in either
+            // pass. Its local bytes remain usable; b.pdf's do not.
+            assert!(matches!(changes[1], SyncAction::CopyLocal { from, to, .. }
+                if from == "A/source.pdf" && to == "z.pdf"));
+        });
+    }
+
+    #[test]
+    fn moved_local_copy_source_is_usable_only_without_a_pending_download() {
+        ["h1", "h2"].into_iter().for_each(|payload| {
+            let mut snapshot = remote_snapshot(
+                &[doc("u1", "a", "", "pdf", 9), doc("u2", "z", "", "pdf", 5)],
+                "",
+            );
+            snapshot.docs.iter_mut().for_each(|doc| {
+                doc.payload_hash = Some(if doc.uuid == "u1" { payload } else { "h1" }.to_string());
+            });
+            let mut state = SyncState::default();
+            state.entries.insert(
+                "old.pdf".to_string(),
+                entry_hashed("u1", DocKind::Pdf, 10, 1, 5, "h1", "h1"),
+            );
+            let locals = vec![with_hash(local("old.pdf", DocKind::Pdf, 10, 1), "h1")];
+            let actions = plan(pull(), &locals, &snapshot, &state).actions;
+            assert!(matches!(&actions[0], SyncAction::MoveLocal { from, to, .. } if from == "old.pdf" && to == "a.pdf"));
+            if payload == "h1" {
+                assert_eq!(actions.len(), 2);
+                assert!(matches!(&actions[1], SyncAction::CopyLocal { from, to, .. } if from == "a.pdf" && to == "z.pdf"));
+            } else {
+                assert_eq!(actions.len(), 3);
+                assert!(matches!(&actions[1], SyncAction::Download { local, .. } if local == "a.pdf"));
+                assert!(matches!(&actions[2], SyncAction::Download { local, .. } if local == "z.pdf"));
+            }
+        });
+    }
+
+    #[test]
+    fn remote_copy_source_survives_a_metadata_only_move() {
+        let snapshot = remote_snapshot(&[doc("u1", "a", "", "pdf", 5)], "");
+        let mut state = SyncState::default();
+        state.entries.insert(
+            "a.pdf".to_string(),
+            entry_hashed("u1", DocKind::Pdf, 10, 1, 5, "h1", "h1"),
+        );
+        let locals = vec![
+            with_hash(local("moved/a.pdf", DocKind::Pdf, 10, 1), "h1"),
+            with_hash(local("z.pdf", DocKind::Pdf, 10, 1), "h1"),
+        ];
+        let actions = plan(push(), &locals, &snapshot, &state).actions;
+        assert_eq!(actions.len(), 3);
+        assert!(matches!(&actions[1], SyncAction::MoveRemote { uuid, .. } if uuid == "u1"));
+        assert!(
+            matches!(&actions[2], SyncAction::CopyRemote { from_uuid, local, .. } if from_uuid == "u1" && local == "z.pdf")
+        );
+    }
+
+    #[test]
+    fn copies_can_read_sources_deleted_after_transfers() {
+        let mut state = SyncState::default();
+        state.entries.insert(
+            "a.pdf".to_string(),
+            entry_hashed("u1", DocKind::Pdf, 10, 1, 5, "h1", "h1"),
+        );
+        let snapshot = remote_snapshot(&[doc("u1", "a", "", "pdf", 5)], "");
+        // Two targets make move pairing ambiguous: both copy before deletion.
+        let locals = vec![
+            with_hash(local("y.pdf", DocKind::Pdf, 10, 1), "h1"),
+            with_hash(local("z.pdf", DocKind::Pdf, 10, 1), "h1"),
+        ];
+        let actions = plan(with_delete(push()), &locals, &snapshot, &state).actions;
+        assert!(
+            matches!(&actions[0], SyncAction::CopyRemote { from_uuid, .. } if from_uuid == "u1")
+        );
+        assert!(
+            matches!(&actions[1], SyncAction::CopyRemote { from_uuid, .. } if from_uuid == "u1")
+        );
+        assert!(matches!(&actions[2], SyncAction::DeleteRemote { uuid, .. } if uuid == "u1"));
+
+        let mut snapshot = remote_snapshot(&[doc("u2", "z", "", "pdf", 5)], "");
+        snapshot.docs[0].payload_hash = Some("h1".to_string());
+        let locals = vec![with_hash(local("a.pdf", DocKind::Pdf, 10, 1), "h1")];
+        let actions = plan(with_delete(pull()), &locals, &snapshot, &state).actions;
+        assert_eq!(actions.len(), 2);
+        assert!(
+            matches!(&actions[0], SyncAction::CopyLocal { from, to, .. } if from == "a.pdf" && to == "z.pdf")
+        );
+        assert!(matches!(&actions[1], SyncAction::DeleteLocal { path } if path == "a.pdf"));
     }
 
     #[test]
