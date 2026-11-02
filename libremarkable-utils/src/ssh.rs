@@ -230,17 +230,24 @@ impl SshSession {
         Ok(())
     }
 
-    /// Write bytes to a remote file (via `cat > path`). Small control
-    /// writes; no progress reporting.
+    /// Atomically replace a remote file after verifying the received length.
+    /// Small control writes; no progress reporting.
     pub fn write_remote_file(&self, remote_path: &str, data: &[u8]) -> Result<()> {
-        self.run_checked_with_stdin(
-            &format!("cat > {}", shell_quote(remote_path)),
-            data,
-            &NoProgress,
-        )
+        self.write_remote_file_with_progress(remote_path, data, &NoProgress)
     }
 
-    /// Stream a local file to a remote path, reporting progress.
+    /// In-memory payload writes with the same staging as local-file uploads.
+    pub(crate) fn write_remote_file_with_progress(
+        &self,
+        remote_path: &str,
+        data: &[u8],
+        progress: &dyn Progress,
+    ) -> Result<()> {
+        self.upload_reader(&mut &data[..], remote_path, data.len() as u64, progress)
+    }
+
+    /// Stream a local file to a unique remote sibling, verify its length,
+    /// then atomically replace the destination, preserving existing permissions.
     pub fn upload_local_file(
         &self,
         local: &Path,
@@ -249,17 +256,31 @@ impl SshSession {
     ) -> Result<()> {
         let mut file = fs::File::open(local)?;
         let total = file.metadata()?.len();
+        self.upload_reader(&mut file, remote_path, total, progress)
+    }
+
+    fn upload_reader(
+        &self,
+        reader: &mut impl Read,
+        remote_path: &str,
+        total: u64,
+        progress: &dyn Progress,
+    ) -> Result<()> {
         let mut child = self
-            .command(&format!("cat > {}", shell_quote(remote_path)))
+            .command(&staged_write_command(remote_path, total))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
-        {
+        let copied = {
             let mut stdin = child.stdin.take().expect("stdin was piped");
-            copy_with_progress(&mut file, &mut stdin, Some(total), progress)?;
-        }
-        checked(child.wait_with_output()?)?;
+            copy_with_progress(reader, &mut stdin, Some(total), progress)
+        };
+        // Close stdin and reap even on a local read/write failure, allowing
+        // the remote length check and cleanup trap to run on the partial input.
+        let output = child.wait_with_output()?;
+        copied?;
+        checked(output)?;
         progress.bytes_done();
         Ok(())
     }
@@ -349,6 +370,40 @@ pub fn shell_quote(s: &str) -> String {
     } else {
         format!("'{}'", s.replace('\'', r"'\''"))
     }
+}
+
+/// One busybox-compatible transaction: EOF alone is not proof of a complete
+/// upload (e.g. a disconnected SSH channel can give `cat` a clean short EOF).
+/// The sibling is private until verified; rename stays on the same filesystem.
+/// Traps clean ordinary failures and catchable disconnect signals; uncatchable
+/// termination can leave an orphan sibling. This is not a crash-durability guarantee.
+fn staged_write_command(remote_path: &str, total: u64) -> String {
+    let parent = remote_path
+        .rsplit_once('/')
+        .map_or(".", |(dir, _)| if dir.is_empty() { "/" } else { dir });
+    format!(
+        r#"dest={dest}
+ tmp=$(mktemp -- {template}) || exit 1
+ trap 'rm -f -- "$tmp"' EXIT
+ trap 'exit 1' HUP INT TERM
+ cat > "$tmp" || exit 1
+ [ "$(wc -c < "$tmp")" -eq {total} ] || {{
+     echo 'incomplete remote upload: unexpected byte count' >&2
+     exit 1
+ }}
+ if [ -e "$dest" ]; then
+     attrs=$(stat -c '%a %u %g' -- "$dest") || exit 1
+     set -- $attrs
+     chown "$2:$3" "$tmp" || exit 1
+     chmod "$1" "$tmp" || exit 1
+ else
+     mask=$(umask)
+     chmod "$(printf '%o' "$((0666 & ~0$mask))")" "$tmp" || exit 1
+ fi
+ mv -fT -- "$tmp" "$dest""#,
+        dest = shell_quote(remote_path),
+        template = shell_quote(&format!("{parent}/.rmu-upload-XXXXXX")),
+    )
 }
 
 /// `io::copy` with per-chunk progress callbacks.
