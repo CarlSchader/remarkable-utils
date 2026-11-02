@@ -490,6 +490,15 @@ pub trait FsEndpoint {
     fn label(&self) -> String;
     /// Create the root directory if missing.
     fn ensure_root(&self) -> Result<()>;
+    /// Whether the root exists, without creating it. Missing writable
+    /// roots can be represented by an empty snapshot during planning.
+    fn root_exists(&self) -> Result<bool> {
+        match self.stat("") {
+            Ok(_) => Ok(true),
+            Err(Error::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(err) => Err(err),
+        }
+    }
     /// Walk the tree: (syncable files, unsupported-file count).
     fn snapshot(&self) -> Result<(Vec<LocalEntry>, usize)>;
     fn read(&self, rel_path: &str) -> Result<Vec<u8>>;
@@ -644,6 +653,27 @@ impl FsEndpoint for SshFs {
         self.session
             .run_checked(&format!("mkdir -p {}", shell_quote(&self.root_for_shell())))?;
         Ok(())
+    }
+
+    fn root_exists(&self) -> Result<bool> {
+        let root = shell_quote(&self.root_for_shell());
+        // A failed existence test can also mean ENOTDIR or EACCES.
+        // Before accepting absence, find the nearest existing ancestor
+        // and require it to be a searchable directory.
+        let output = self.session.run_checked(&format!(
+            "if test -e {root} || test -L {root}; then printf exists; exit 0; fi\n\
+             parent={root}\n\
+             while ! test -e \"$parent\" && ! test -L \"$parent\"; do\n\
+             case \"$parent\" in\n\
+             */*) parent=${{parent%/*}}; test -n \"$parent\" || parent=/ ;;\n\
+             *) parent=. ;;\n\
+             esac\n\
+             done\n\
+             test -d \"$parent\" && test -x \"$parent\" || {{\n\
+             printf 'not a searchable directory: %s\\n' \"$parent\" >&2; exit 9;\n\
+             }}"
+        ))?;
+        Ok(output == "exists")
     }
 
     fn snapshot(&self) -> Result<(Vec<LocalEntry>, usize)> {

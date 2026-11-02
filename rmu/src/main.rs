@@ -491,6 +491,54 @@ fn tablet_identity(destination: &str, path: &str) -> String {
     format!("{destination}:{}", path.trim_end_matches('/'))
 }
 
+/// Snapshot a filesystem root without creating it. Only writable sides
+/// may be absent; source errors and errors walking existing trees propagate.
+fn sync_fs_snapshot(
+    endpoint: &dyn FsEndpoint,
+    writable: bool,
+) -> Result<(Vec<sync::LocalEntry>, usize, bool)> {
+    if writable && !endpoint.root_exists()? {
+        return Ok((Vec::new(), 0, true));
+    }
+    let (entries, ignored) = endpoint
+        .snapshot()
+        .with_context(|| format!("reading {}", endpoint.label()))?;
+    Ok((entries, ignored, false))
+}
+
+/// A missing writable tablet root is an empty, virtual subtree. Its
+/// root mapping is replaced with the created UUID before execution.
+fn sync_tablet_snapshot(
+    client: &Client,
+    path: &str,
+    writable: bool,
+) -> Result<(sync::RemoteSnapshot, bool)> {
+    let items = client.list_items()?;
+    match xochitl::resolve_folder_ref(&items, path) {
+        Ok(uuid) => Ok((sync::remote_snapshot(&items, &uuid), false)),
+        Err(libremarkable_utils::Error::PathNotFound(_)) if writable => {
+            // Check the existing prefix just as mkdir_path does: a document
+            // or ambiguous folder must not be treated as a missing directory.
+            path.split('/')
+                .map(str::trim)
+                .filter(|part| !part.is_empty())
+                .try_fold(Some(String::new()), |parent, part| {
+                    let Some(parent) = parent else {
+                        return Ok::<_, libremarkable_utils::Error>(None);
+                    };
+                    if let Some(folder) = xochitl::find_child(&items, &parent, part, true)? {
+                        Ok(Some(folder.uuid.clone()))
+                    } else {
+                        xochitl::ensure_no_conflict(&items, &parent, part, None)?;
+                        Ok(None)
+                    }
+                })?;
+            Ok((sync::remote_snapshot(&[], ""), true))
+        }
+        Err(err) => Err(err.into()),
+    }
+}
+
 /// Sync between two tablets via `.rmdoc` bundle streaming.
 #[allow(clippy::too_many_arguments)]
 fn run_docs_sync(
@@ -529,35 +577,23 @@ fn run_docs_sync(
         conflict: map_conflict(conflict, a_is_src),
     };
 
-    // Resolve each root folder; create it when that side is writable.
-    let resolve_root =
-        |client: &Client, path: &str, writable: bool| -> Result<(Vec<Item>, String)> {
-            let mut items = client.list_items()?;
-            let uuid = match xochitl::resolve_folder_ref(&items, path) {
-                Ok(uuid) => uuid,
-                Err(libremarkable_utils::Error::PathNotFound(_)) if writable => {
-                    let created = client.mkdir_path(path, "")?;
-                    items = client.list_items()?;
-                    created.uuid
-                }
-                Err(err) => return Err(err.into()),
-            };
-            Ok((items, uuid))
-        };
-    let (items_a, root_a) = resolve_root(&client_a, &path_a, mode != Mode::Push)?;
-    let (items_b, root_b) = resolve_root(&client_b, &path_b, mode != Mode::Pull)?;
-
-    let snapshot_a = sync::remote_snapshot(&items_a, &root_a);
-    let snapshot_b = sync::remote_snapshot(&items_b, &root_b);
+    let (snapshot_a, missing_a) = sync_tablet_snapshot(&client_a, &path_a, mode != Mode::Push)?;
+    let (snapshot_b, missing_b) = sync_tablet_snapshot(&client_b, &path_b, mode != Mode::Pull)?;
     let state_path = sync::pair_state_path(&id_a, &id_b);
     let mut state = sync::PairState::load(&state_path)?;
     let plan = sync::plan_docs(options, &snapshot_a, &snapshot_b, &state);
 
     info(cli, format!("A = {id_a}, B = {id_b}"));
     if dry_run {
+        if missing_a {
+            println!("mkdir root A   {path_a}");
+        }
+        if missing_b {
+            println!("mkdir root B   {path_b}");
+        }
         plan.iter()
             .for_each(|action| println!("{}", sync::describe_doc(action)));
-        if plan.is_empty() {
+        if plan.is_empty() && !missing_a && !missing_b {
             info(cli, "Already in sync; nothing to do.");
         }
         return Ok(());
@@ -565,7 +601,13 @@ fn run_docs_sync(
 
     let mut folders_a = snapshot_a.folders.clone();
     let mut folders_b = snapshot_b.folders.clone();
-    let outcome = sync::execute_docs(
+    if missing_a {
+        folders_a.insert(String::new(), client_a.mkdir_path(&path_a, "")?.uuid);
+    }
+    if missing_b {
+        folders_b.insert(String::new(), client_b.mkdir_path(&path_b, "")?.uuid);
+    }
+    let mut outcome = sync::execute_docs(
         &client_a,
         &client_b,
         &**progress,
@@ -576,6 +618,8 @@ fn run_docs_sync(
         &state_path,
     )?;
 
+    outcome.modified_a |= missing_a;
+    outcome.modified_b |= missing_b;
     outcome
         .conflicts
         .iter()
@@ -640,30 +684,9 @@ fn run_device_sync(
         conflict: map_conflict(conflict, fs_is_src),
     };
 
-    // The fs side holds the state file and receives pulls: make sure
-    // its root exists (except pure push, where a missing source is an
-    // error surfaced by the snapshot).
-    if mode != Mode::Push {
-        fs_side.ensure_root()?;
-    }
-
-    // Resolve the device folder; when this side can be written to,
-    // create it if missing.
-    let mut items = client.list_items()?;
-    let root_uuid = match xochitl::resolve_folder_ref(&items, remote_path) {
-        Ok(uuid) => uuid,
-        Err(libremarkable_utils::Error::PathNotFound(_)) if mode != Mode::Pull => {
-            let created = client.mkdir_path(remote_path, "")?;
-            items = client.list_items()?;
-            created.uuid
-        }
-        Err(err) => return Err(err.into()),
-    };
-
-    let (mut fs_entries, ignored) = fs_side
-        .snapshot()
-        .with_context(|| format!("reading {}", fs_side.label()))?;
-    let mut snapshot = sync::remote_snapshot(&items, &root_uuid);
+    let (mut fs_entries, ignored, missing_fs) = sync_fs_snapshot(fs_side, mode != Mode::Push)?;
+    let (mut snapshot, missing_remote) =
+        sync_tablet_snapshot(client, remote_path, mode != Mode::Pull)?;
     let mut state = sync::SyncState::load(state_path)?;
     warn_legacy_state(cli, fs_side);
 
@@ -680,17 +703,29 @@ fn run_device_sync(
 
     if dry_run {
         // The plan *is* the output in dry-run mode.
+        if missing_fs {
+            println!("mkdir root fs   {}", fs_side.label());
+        }
+        if missing_remote {
+            println!("mkdir root tablet   {remote_path}");
+        }
         plan.actions
             .iter()
             .for_each(|action| println!("{}", sync::describe(action)));
-        if plan.actions.is_empty() {
+        if plan.actions.is_empty() && !missing_fs && !missing_remote {
             info(cli, "Already in sync; nothing to do.");
         }
         return Ok(());
     }
 
+    if missing_fs {
+        fs_side.ensure_root()?;
+    }
     let mut folders = snapshot.folders.clone();
-    let outcome = sync::execute(
+    if missing_remote {
+        folders.insert(String::new(), client.mkdir_path(remote_path, "")?.uuid);
+    }
+    let mut outcome = sync::execute(
         client,
         &**progress,
         fs_side,
@@ -700,6 +735,7 @@ fn run_device_sync(
         state_path,
     )?;
 
+    outcome.modified_remote |= missing_remote;
     outcome
         .skipped
         .iter()
@@ -789,36 +825,34 @@ fn run_files_sync(
         conflict: map_conflict(conflict, a_is_src),
     };
 
-    // Create write-target roots; a missing pure source stays an error.
-    match mode {
-        Mode::Push => b.ensure_root()?,
-        Mode::Pull => a.ensure_root()?,
-        Mode::TwoWay => {
-            a.ensure_root()?;
-            b.ensure_root()?;
-        }
-    }
-
-    let (a_entries, a_ignored) = a
-        .snapshot()
-        .with_context(|| format!("reading {}", a.label()))?;
-    let (b_entries, b_ignored) = b
-        .snapshot()
-        .with_context(|| format!("reading {}", b.label()))?;
+    let (a_entries, a_ignored, missing_a) = sync_fs_snapshot(&*a, mode != Mode::Push)?;
+    let (b_entries, b_ignored, missing_b) = sync_fs_snapshot(&*b, mode != Mode::Pull)?;
     let mut state = sync::SyncState::load(&state_path)?;
     warn_legacy_state(cli, &*a);
     let plan = sync::plan_files(options, &a_entries, &b_entries, &state);
 
     info(cli, format!("A = {}, B = {}", a.label(), b.label()));
     if dry_run {
+        if missing_a {
+            println!("mkdir root A   {}", a.label());
+        }
+        if missing_b {
+            println!("mkdir root B   {}", b.label());
+        }
         plan.iter()
             .for_each(|action| println!("{}", sync::describe_file(action)));
-        if plan.is_empty() {
+        if plan.is_empty() && !missing_a && !missing_b {
             info(cli, "Already in sync; nothing to do.");
         }
         return Ok(());
     }
 
+    if missing_a {
+        a.ensure_root()?;
+    }
+    if missing_b {
+        b.ensure_root()?;
+    }
     let outcome = sync::execute_files(&*a, &*b, &**progress, &plan, &mut state, &state_path)?;
     outcome
         .conflicts
