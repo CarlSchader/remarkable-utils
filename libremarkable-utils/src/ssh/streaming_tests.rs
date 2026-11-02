@@ -140,10 +140,19 @@ fn check_transfers(status: i32) {
 
     let progress = Recorder::default();
     let local = scratch.0.join("download");
+    fs::write(&local, b"existing backup").unwrap();
     let total = Some(PIPE_FILL as u64);
     let result = session.download_remote_file("mock remote", &local, total, &progress);
     assert_result(result, status, &progress, total);
-    assert_eq!(fs::read(local).unwrap(), vec![0; PIPE_FILL]);
+    assert_eq!(
+        fs::read(local).unwrap(),
+        if status == 0 {
+            vec![0; PIPE_FILL]
+        } else {
+            b"existing backup".to_vec()
+        }
+    );
+    assert_no_download_temps(&scratch.0);
     assert_pid_file_reaped(&pid_file);
 
     // Fill both output pipes before consuming stdin. The input also exceeds
@@ -167,6 +176,16 @@ fn check_transfers(status: i32) {
     assert_result(result, status, &progress, total);
     assert_eq!(fs::read(&captured).unwrap(), data);
     assert_pid_file_reaped(&pid_file);
+}
+
+fn assert_no_download_temps(directory: &Path) {
+    assert!(fs::read_dir(directory).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".rmu-download-")
+    }));
 }
 
 fn assert_pid_file_reaped(path: &Path) {
@@ -284,15 +303,19 @@ fn check_early_errors() {
     assert!(matches!(child.finish(transfer), Err(Error::Io(_))));
     assert_reaped(pid);
 
-    // Exercise cleanup before finish (e.g. File::create fails in download).
+    // Exercise cleanup before finish (e.g. a transfer setup error).
     let child = StreamingChild::spawn(&mut command, false).unwrap();
     let pid = child.child.id();
     drop(child);
     assert_reaped(pid);
 
     let scratch = Scratch::new();
-    let session = scratch.session("exec sleep 60");
-    let result = session.download_remote_file("mock remote", &scratch.0, None, &progress);
+    let session = scratch.session("printf payload");
+    let directory = scratch.0.join("destination-directory");
+    fs::create_dir(&directory).unwrap();
+    let result = session.download_remote_file("mock remote", &directory, None, &progress);
     assert!(matches!(result, Err(Error::Io(_))));
+    assert!(directory.is_dir());
+    assert_no_download_temps(&scratch.0);
     assert_eq!(progress.done.get(), 0);
 }

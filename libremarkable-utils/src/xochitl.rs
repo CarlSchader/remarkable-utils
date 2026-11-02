@@ -408,22 +408,21 @@ pub fn resolve_glob<'a>(items: &'a [Item], pattern: &str) -> Result<Vec<&'a Item
 /// Expand a mixed list of exact references and glob patterns into
 /// UUIDs against one listing. Exact resolution is tried first, so an
 /// item whose name literally contains glob metacharacters stays
-/// addressable; only when that fails and the reference contains
-/// metacharacters is it treated as a pattern.
+/// addressable; only when the exact path is not found and the reference
+/// contains metacharacters is it treated as a pattern. Ambiguity and
+/// other exact-resolution errors are preserved.
 pub fn expand_refs(items: &[Item], item_refs: &[&str]) -> Result<Vec<String>> {
     item_refs.iter().try_fold(Vec::new(), |mut out, reference| {
         match resolve_item_ref(items, reference) {
             Ok(item) => out.push(item.uuid.clone()),
-            Err(exact_err) => {
-                if !is_glob(reference) {
-                    return Err(exact_err);
-                }
+            Err(Error::PathNotFound(_)) if is_glob(reference) => {
                 out.extend(
                     resolve_glob(items, reference)?
                         .iter()
                         .map(|item| item.uuid.clone()),
                 );
             }
+            Err(exact_err) => return Err(exact_err),
         }
         Ok(out)
     })
@@ -993,6 +992,79 @@ mod tests {
             expand_refs(&items, &["Books/Nope"]),
             Err(Error::PathNotFound(_))
         ));
+    }
+
+    #[test]
+    fn expand_refs_rejects_ambiguous_literal_globs() {
+        let mut items = sample();
+        items.extend([
+            doc("star1", "vol-*", "b", "pdf"),
+            doc("star2", "vol-*", "b", "pdf"),
+            doc("important", "vol-important", "b", "pdf"),
+        ]);
+
+        // A preceding valid reference must not turn failure into a partial selection.
+        assert!(matches!(
+            expand_refs(&items, &["ph", "Books/vol-*"]),
+            Err(Error::AmbiguousPath { segment, path })
+                if segment == "vol-*" && path == "Books/vol-*"
+        ));
+        // UUIDs still disambiguate literal names containing metacharacters.
+        assert_eq!(expand_refs(&items, &["star1"]).unwrap(), ["star1"]);
+    }
+
+    #[test]
+    fn expand_refs_rejects_ambiguous_intermediate_segments() {
+        let mut items = sample();
+        items.extend([
+            folder("b2", "Books", ""),
+            doc("v1", "vol-1", "b", "pdf"),
+            doc("v2", "vol-2", "b2", "pdf"),
+        ]);
+        assert!(matches!(
+            expand_refs(&items, &["Books/vol-*"]),
+            Err(Error::AmbiguousPath { segment, path })
+                if segment == "Books" && path == "Books/vol-*"
+        ));
+
+        let items = vec![
+            folder("star1", "vol-*", ""),
+            folder("star2", "vol-*", ""),
+            folder("important", "vol-important", ""),
+            doc("d1", "Doc", "star1", "pdf"),
+            doc("d2", "Doc", "star2", "pdf"),
+            doc("d3", "Doc", "important", "pdf"),
+        ];
+        assert!(matches!(
+            expand_refs(&items, &["vol-*/Doc"]),
+            Err(Error::AmbiguousPath { segment, path })
+                if segment == "vol-*" && path == "vol-*/Doc"
+        ));
+    }
+
+    #[test]
+    fn expand_refs_allows_globs_over_duplicate_matching_names() {
+        let mut items = sample();
+        items.push(doc("ph2", "Physics", "b", "pdf"));
+        assert_eq!(
+            expand_refs(&items, &["Books/Phys*"]).unwrap(),
+            ["ph", "ph2"]
+        );
+        assert!(matches!(
+            expand_refs(&items, &["Books/z*"]),
+            Err(Error::PathNotFound(path)) if path == "Books/z*"
+        ));
+    }
+
+    #[test]
+    fn expand_refs_preserves_root_errors() {
+        let items = sample();
+        ["", "/", "(root)", "///"].iter().for_each(|reference| {
+            assert!(matches!(
+                expand_refs(&items, &[reference]),
+                Err(Error::RootTarget)
+            ));
+        });
     }
 
     #[test]

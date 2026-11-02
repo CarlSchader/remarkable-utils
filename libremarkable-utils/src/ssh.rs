@@ -265,6 +265,9 @@ impl SshSession {
     }
 
     /// Stream a remote file to a local path, reporting progress.
+    /// The destination is atomically replaced only after a successful transfer.
+    /// Existing regular-file permissions are preserved; a destination symlink
+    /// is replaced rather than followed. New files are private on Unix.
     /// `total` is a size hint for the progress bar (e.g. from a prior
     /// listing); the transfer itself does not depend on it.
     pub fn download_remote_file(
@@ -274,19 +277,73 @@ impl SshSession {
         total: Option<u64>,
         progress: &dyn Progress,
     ) -> Result<()> {
-        let mut child = StreamingChild::spawn(
+        download_to_local(
             &mut self.command(&format!("cat {}", shell_quote(remote_path))),
-            false,
-        )?;
-        let transfer = {
-            let mut stdout = child.child.stdout.take().expect("stdout was piped");
-            let mut file = fs::File::create(local)?;
-            copy_with_progress(&mut stdout, &mut file, total, progress)
-        };
-        child.finish(transfer)?;
-        progress.bytes_done();
-        Ok(())
+            local,
+            total,
+            progress,
+        )
     }
+}
+
+/// An exclusively created sibling, removed on every unsuccessful exit path.
+struct DownloadTemp {
+    file: fs::File,
+    path: PathBuf,
+}
+
+impl DownloadTemp {
+    fn new(local: &Path) -> std::io::Result<Self> {
+        let parent = local.parent().filter(|p| !p.as_os_str().is_empty());
+        let path = parent.unwrap_or(Path::new(".")).join(format!(
+            ".rmu-download-{}.tmp",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(&path)?;
+        Ok(Self { file, path })
+    }
+}
+
+impl Drop for DownloadTemp {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn download_to_local(
+    command: &mut Command,
+    local: &Path,
+    total: Option<u64>,
+    progress: &dyn Progress,
+) -> Result<()> {
+    let permissions = match fs::symlink_metadata(local) {
+        Ok(metadata) => metadata.is_file().then(|| metadata.permissions()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    let mut temp = DownloadTemp::new(local)?;
+    let mut child = StreamingChild::spawn(command, false)?;
+    let transfer = {
+        let mut stdout = child.child.stdout.take().expect("stdout was piped");
+        copy_with_progress(&mut stdout, &mut temp.file, total, progress)
+    };
+    child.finish(transfer)?;
+    // Keep staging private until the transfer has succeeded. Sync before
+    // rename so delayed local write errors cannot destroy the old backup.
+    if let Some(permissions) = permissions {
+        temp.file.set_permissions(permissions)?;
+    }
+    temp.file.sync_all()?;
+    fs::rename(&temp.path, local)?;
+    progress.bytes_done();
+    Ok(())
 }
 
 impl Drop for SshSession {
@@ -569,6 +626,241 @@ mod streaming_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    mod downloads {
+        use super::*;
+        use std::cell::Cell;
+        use std::os::unix::fs::PermissionsExt;
+
+        struct Fixture(PathBuf);
+
+        impl Fixture {
+            fn new() -> Self {
+                let path = std::env::temp_dir()
+                    .join(format!("rmu-download-test-{}", uuid::Uuid::new_v4()));
+                fs::create_dir(&path).unwrap();
+                Self(path)
+            }
+
+            fn destination(&self) -> PathBuf {
+                self.0.join("backup.pdf")
+            }
+
+            fn assert_no_temps(&self) {
+                assert!(fs::read_dir(&self.0).unwrap().all(|entry| {
+                    !entry
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".rmu-download-")
+                }));
+            }
+        }
+
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                fs::remove_dir_all(&self.0).unwrap();
+            }
+        }
+
+        // Inject only the subprocess command, exercising the same download
+        // path as SSH without modifying PATH or contacting a real device.
+        fn mock_ssh(script: &str) -> Command {
+            let mut command = Command::new("sh");
+            command.args(["-c", script, "mock-ssh"]);
+            command
+        }
+
+        struct Observer<'a> {
+            destination: &'a Path,
+            before: &'a [u8],
+            after: &'a [u8],
+            chunks: Cell<usize>,
+            done: Cell<bool>,
+        }
+
+        impl Progress for Observer<'_> {
+            fn step(&self, _: &str) {}
+            fn bytes(&self, _: u64, _: Option<u64>) {
+                assert_eq!(fs::read(self.destination).unwrap(), self.before);
+                self.chunks.set(self.chunks.get() + 1);
+            }
+            fn bytes_done(&self) {
+                assert_eq!(fs::read(self.destination).unwrap(), self.after);
+                self.done.set(true);
+            }
+            fn finished(&self) {}
+        }
+
+        #[test]
+        fn missing_remote_source_preserves_backup_on_repeated_attempts() {
+            let fixture = Fixture::new();
+            let destination = fixture.destination();
+            fs::write(&destination, b"existing backup").unwrap();
+            let missing = fixture.0.join("missing-remote.pdf");
+            (0..3).for_each(|_| {
+                let result = download_to_local(
+                    mock_ssh("cat \"$1\"").arg(&missing),
+                    &destination,
+                    None,
+                    &NoProgress,
+                );
+                assert!(matches!(result, Err(Error::Remote { .. })));
+                assert_eq!(fs::read(&destination).unwrap(), b"existing backup");
+                fixture.assert_no_temps();
+            });
+        }
+
+        #[test]
+        fn mid_stream_ssh_failure_preserves_backup_and_permissions() {
+            let fixture = Fixture::new();
+            let destination = fixture.destination();
+            fs::write(&destination, b"existing backup").unwrap();
+            fs::set_permissions(&destination, fs::Permissions::from_mode(0o640)).unwrap();
+            let source = fixture.0.join("partial-remote.pdf");
+            fs::write(&source, vec![7; 100 * 1024]).unwrap();
+            let observer = Observer {
+                destination: &destination,
+                before: b"existing backup",
+                after: b"must not be published",
+                chunks: Cell::new(0),
+                done: Cell::new(false),
+            };
+            (0..3).for_each(|_| {
+                let result = download_to_local(
+                    mock_ssh("cat \"$1\"; printf 'connection lost' >&2; exit 23").arg(&source),
+                    &destination,
+                    Some(200 * 1024),
+                    &observer,
+                );
+                assert!(matches!(result, Err(Error::Remote { status: 23, stderr }) if stderr == "connection lost"));
+                assert_eq!(fs::read(&destination).unwrap(), b"existing backup");
+                assert_eq!(fs::metadata(&destination).unwrap().permissions().mode() & 0o777, 0o640);
+                assert!(!observer.done.get());
+                fixture.assert_no_temps();
+            });
+            assert!(observer.chunks.get() >= 6);
+        }
+
+        #[test]
+        fn successful_download_replaces_only_after_completion() {
+            let fixture = Fixture::new();
+            let destination = fixture.destination();
+            let source = fixture.0.join("remote.pdf");
+            let payload = vec![9; 100 * 1024];
+            fs::write(&source, &payload).unwrap();
+            fs::write(&destination, b"existing backup").unwrap();
+            fs::set_permissions(&destination, fs::Permissions::from_mode(0o640)).unwrap();
+            let observer = Observer {
+                destination: &destination,
+                before: b"existing backup",
+                after: &payload,
+                chunks: Cell::new(0),
+                done: Cell::new(false),
+            };
+            // A stale size hint must not reject an otherwise successful copy.
+            download_to_local(
+                mock_ssh("cat \"$1\"").arg(&source),
+                &destination,
+                Some(1),
+                &observer,
+            )
+            .unwrap();
+            assert!(observer.chunks.get() >= 2);
+            assert!(observer.done.get());
+            assert_eq!(
+                fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
+                0o640
+            );
+            fixture.assert_no_temps();
+            // Empty files are valid successful replacements too.
+            download_to_local(&mut mock_ssh("exit 0"), &destination, None, &NoProgress).unwrap();
+            assert!(fs::read(&destination).unwrap().is_empty());
+            fixture.assert_no_temps();
+        }
+
+        #[test]
+        fn spawn_failure_preserves_backup_and_removes_temp() {
+            let fixture = Fixture::new();
+            let destination = fixture.destination();
+            fs::write(&destination, b"existing backup").unwrap();
+            let result = download_to_local(
+                &mut Command::new(fixture.0.join("missing-ssh")),
+                &destination,
+                None,
+                &NoProgress,
+            );
+            assert!(matches!(result, Err(Error::Io(_))));
+            assert_eq!(fs::read(&destination).unwrap(), b"existing backup");
+            fixture.assert_no_temps();
+        }
+
+        #[test]
+        fn failed_download_does_not_create_destination() {
+            let fixture = Fixture::new();
+            let destination = fixture.destination();
+            let result = download_to_local(
+                &mut mock_ssh("printf partial; exit 1"),
+                &destination,
+                None,
+                &NoProgress,
+            );
+            assert!(matches!(result, Err(Error::Remote { .. })));
+            assert!(!destination.exists());
+            fixture.assert_no_temps();
+            download_to_local(
+                &mut mock_ssh("printf complete"),
+                &destination,
+                None,
+                &NoProgress,
+            )
+            .unwrap();
+            assert_eq!(fs::read(&destination).unwrap(), b"complete");
+            assert_eq!(
+                fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            fixture.assert_no_temps();
+        }
+
+        #[test]
+        fn failed_rename_removes_temp_and_preserves_destination() {
+            let fixture = Fixture::new();
+            let destination = fixture.destination();
+            fs::create_dir(&destination).unwrap();
+            fs::write(destination.join("keep"), b"untouched").unwrap();
+            let result = download_to_local(
+                &mut mock_ssh("printf complete"),
+                &destination,
+                None,
+                &NoProgress,
+            );
+            assert!(matches!(result, Err(Error::Io(_))));
+            assert_eq!(fs::read(destination.join("keep")).unwrap(), b"untouched");
+            fixture.assert_no_temps();
+        }
+
+        #[test]
+        fn successful_download_replaces_symlink_not_its_target() {
+            let fixture = Fixture::new();
+            let destination = fixture.destination();
+            let target = fixture.0.join("symlink-target.pdf");
+            fs::write(&target, b"untouched").unwrap();
+            std::os::unix::fs::symlink(&target, &destination).unwrap();
+            download_to_local(
+                &mut mock_ssh("printf complete"),
+                &destination,
+                None,
+                &NoProgress,
+            )
+            .unwrap();
+            assert!(fs::symlink_metadata(&destination).unwrap().is_file());
+            assert_eq!(fs::read(&destination).unwrap(), b"complete");
+            assert_eq!(fs::read(&target).unwrap(), b"untouched");
+            fixture.assert_no_temps();
+        }
+    }
 
     #[test]
     fn quote_passthrough_for_safe_strings() {
