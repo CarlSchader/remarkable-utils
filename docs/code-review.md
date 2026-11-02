@@ -10,8 +10,8 @@ in the table below.
 
 ## Resolution status
 
-**15 fixes are merged. Finding 16 remains a draft pending human macOS
-validation.** Each fix received regression coverage and code review. Merged
+**All 16 fixes are merged.** Each fix received regression coverage and code
+review. Merged
 combinations were tested against the then-current `main`, not just in isolated
 branches; conflicts and failing integration tests were returned for repair.
 
@@ -32,33 +32,34 @@ branches; conflicts and failing integration tests were returned for repair.
 | 13. Side-effect-free dry-run roots | [#14](https://github.com/CarlSchader/remarkable-utils/pull/14) | Merged |
 | 14. Stable filesystem archive roles | [#10](https://github.com/CarlSchader/remarkable-utils/pull/10) | Merged |
 | 15. Incomplete incremental listings | [#6](https://github.com/CarlSchader/remarkable-utils/pull/6) | Merged |
-| 16. Concurrent diagnostic draining | [#16](https://github.com/CarlSchader/remarkable-utils/pull/16) | Draft: native macOS validation required |
+| 16. Concurrent diagnostic draining | [#16](https://github.com/CarlSchader/remarkable-utils/pull/16) | Merged |
 
-The merged fix set at `d117b70` passed 199 automated tests, strict Clippy,
-and formatting checks on Linux. The combined tree of that revision and
-PR #16 head `c82617f` passed 200 tests and the same checks on Linux, but
-**PR #16 is not merged**. No real-tablet tests were performed. These results
-are not claims of macOS runtime validation or race-free device snapshots.
+The complete fix set merged at `95c1014` passed 200 automated tests on Linux
+and 198 on native Apple Silicon macOS, plus strict Clippy and formatting on
+both platforms. Two Linux-only atomic-remote tests are not enabled on macOS;
+the Unix streaming regressions did run there. No real-tablet tests were
+performed. These results are not claims of race-free device snapshots.
 
-### Human validation required for finding 16
+### Native macOS validation for finding 16
 
 Review found that the original streaming-test helper used a pipe API excluded
-on Apple targets. The draft replaces it with portable APIs without disabling
-macOS coverage. Linux validation and portability review pass, but this
-environment lacks the Apple target standard library and a native macOS runtime.
+on Apple targets. The fix replaces it with portable APIs without disabling
+macOS coverage. Native validation passed on Apple Silicon macOS 26.0.1 with
+the repository Nix toolchain (Rust/Cargo 1.98.0), clearing the final merge gate.
 
-On a native macOS checkout, run the following against the current PR head and
-record the results in [PR #16](https://github.com/CarlSchader/remarkable-utils/pull/16):
+The following commands passed on exact PR #16 head `c82617f` and its
+combination with then-current `main` at `c9d11fe`. The integrated streaming
+regression also passed five additional consecutive runs. The merged Git tree
+matches the tree validated on both platforms. Results are recorded in
+[PR #16](https://github.com/CarlSchader/remarkable-utils/pull/16#issuecomment-6579453092).
 
 ```sh
-gh pr checkout 16
 CARGO_BUILD_JOBS=2 nix develop --command cargo test -p libremarkable-utils --all-features ssh::streaming_tests::transfers_drain_and_reap -- --exact --nocapture
 CARGO_BUILD_JOBS=2 nix develop --command cargo test --workspace --all-features
 CARGO_BUILD_JOBS=2 nix develop --command cargo clippy --workspace --all-features --all-targets -- -D warnings
 nix fmt -- --fail-on-change
 ```
 
-Keep the PR draft until those checks pass and the final revision is reviewed.
 No physical tablet is needed for these tests. The PR documents the remaining
 non-Unix EOF dependency and the distinction between bounded post-exit draining
 and timeouts for a still-running remote process.
