@@ -2908,7 +2908,9 @@ fn decide_pair(
                 },
             }
         }
-        // B deleted it.
+        // B deleted it. Deletions, like copies, may only write to a
+        // destination allowed by the mode; a missing destination must
+        // never cause a one-way source to be deleted.
         (true, Some((a_changed, a_ms)), None) => {
             if can_b && !options.delete {
                 return Some(CopyToB); // recopy
@@ -2917,13 +2919,13 @@ fn decide_pair(
                 return None; // one-way toward A without --delete: stale state kept
             }
             if !a_changed {
-                return Some(DeleteA);
+                return can_a.then_some(DeleteA);
             }
             match winner(options.conflict, a_ms, i64::MIN) {
                 None => Some(Conflict("deleted on one side but changed on the other")),
                 Some(Winner::Local) if can_b => Some(CopyToB),
                 Some(Winner::Local) => Some(Forget),
-                Some(Winner::Remote) => Some(DeleteA),
+                Some(Winner::Remote) => can_a.then_some(DeleteA),
             }
         }
         // A deleted it (mirror).
@@ -2935,13 +2937,13 @@ fn decide_pair(
                 return None;
             }
             if !b_changed {
-                return Some(DeleteB);
+                return can_b.then_some(DeleteB);
             }
             match winner(options.conflict, i64::MIN, b_ms) {
                 None => Some(Conflict("deleted on one side but changed on the other")),
                 Some(Winner::Remote) if can_a => Some(CopyToA),
                 Some(Winner::Remote) => Some(Forget),
-                Some(Winner::Local) => Some(DeleteB),
+                Some(Winner::Local) => can_b.then_some(DeleteB),
             }
         }
         (true, None, None) => Some(Forget),
@@ -5263,6 +5265,272 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn pair_deletions_respect_direction_and_policy() {
+        use ConflictPolicy::{Newest, PreferLocal, PreferRemote, Skip};
+        use Disposition::{CopyToA, CopyToB, DeleteA, DeleteB, Forget};
+        use Mode::{Pull, Push, TwoWay};
+
+        let conflict = Some(Disposition::Conflict(
+            "deleted on one side but changed on the other",
+        ));
+        // Each row specifies: mode, surviving side, unchanged outcome,
+        // changed outcomes (skip/newest/prefer A/prefer B), and recopy
+        // without --delete. Blocked deletions retain the mapping.
+        let cases = [
+            (
+                Push,
+                true,
+                None,
+                [conflict, Some(CopyToB), Some(CopyToB), None],
+                Some(CopyToB),
+            ),
+            (
+                Pull,
+                true,
+                Some(DeleteA),
+                [conflict, Some(Forget), Some(Forget), Some(DeleteA)],
+                None,
+            ),
+            (
+                TwoWay,
+                true,
+                Some(DeleteA),
+                [conflict, Some(CopyToB), Some(CopyToB), Some(DeleteA)],
+                Some(CopyToB),
+            ),
+            (
+                Push,
+                false,
+                Some(DeleteB),
+                [conflict, Some(Forget), Some(DeleteB), Some(Forget)],
+                None,
+            ),
+            (
+                Pull,
+                false,
+                None,
+                [conflict, Some(CopyToA), None, Some(CopyToA)],
+                Some(CopyToA),
+            ),
+            (
+                TwoWay,
+                false,
+                Some(DeleteB),
+                [conflict, Some(CopyToA), Some(DeleteB), Some(CopyToA)],
+                Some(CopyToA),
+            ),
+        ];
+        cases
+            .into_iter()
+            .for_each(|(mode, survives_a, unchanged, changed_outcomes, recopy)| {
+                [false, true].into_iter().for_each(|changed| {
+                    [false, true].into_iter().for_each(|delete| {
+                        [Skip, Newest, PreferLocal, PreferRemote]
+                            .into_iter()
+                            .zip(changed_outcomes)
+                            .for_each(|(policy, changed_outcome)| {
+                                let options = SyncOptions {
+                                    mode,
+                                    delete,
+                                    conflict: policy,
+                                };
+                                let expected = if !delete {
+                                    recopy
+                                } else if changed {
+                                    changed_outcome
+                                } else {
+                                    unchanged
+                                };
+                                let lm = if changed { 200 } else { 100 };
+                                let file = local("n.pdf", DocKind::Pdf, 10, lm);
+                                let (a, b) = if survives_a {
+                                    (vec![file], vec![])
+                                } else {
+                                    (vec![], vec![file])
+                                };
+                                let mut state = SyncState::default();
+                                state
+                                    .entries
+                                    .insert("n.pdf".to_string(), file_entry(10, 100, 100, 10));
+                                let path = "n.pdf".to_string();
+                                let expected_files: Vec<_> = expected
+                                    .into_iter()
+                                    .map(|d| match d {
+                                        CopyToA => FileAction::CopyToA { path: path.clone() },
+                                        CopyToB => FileAction::CopyToB { path: path.clone() },
+                                        DeleteA => FileAction::DeleteA { path: path.clone() },
+                                        DeleteB => FileAction::DeleteB { path: path.clone() },
+                                        Forget => FileAction::Forget { path: path.clone() },
+                                        Disposition::Conflict(reason) => FileAction::Conflict {
+                                            path: path.clone(),
+                                            reason: reason.to_string(),
+                                        },
+                                    })
+                                    .collect();
+                                assert_eq!(
+                                    plan_files(options, &a, &b, &state),
+                                    expected_files,
+                                    "files: {options:?}, survives_a={survives_a}, changed={changed}"
+                                );
+
+                                let present = remote_snapshot(
+                                    &[doc(
+                                        if survives_a { "a1" } else { "b1" },
+                                        "n",
+                                        "",
+                                        "notebook",
+                                        lm,
+                                    )],
+                                    "",
+                                );
+                                let empty = remote_snapshot(&[], "");
+                                let (a, b) = if survives_a {
+                                    (&present, &empty)
+                                } else {
+                                    (&empty, &present)
+                                };
+                                let mut state = PairState::default();
+                                state
+                                    .entries
+                                    .insert("n".to_string(), pair_entry("a1", 100, "b1", 100));
+                                let key = "n".to_string();
+                                let expected_docs: Vec<_> = expected
+                                    .into_iter()
+                                    .map(|d| match d {
+                                        CopyToA => DocAction::CopyToA {
+                                            key: key.clone(),
+                                            rel_dir: String::new(),
+                                            name: key.clone(),
+                                            from_uuid: "b1".to_string(),
+                                            from_lm: lm,
+                                            replace_uuid: None,
+                                        },
+                                        CopyToB => DocAction::CopyToB {
+                                            key: key.clone(),
+                                            rel_dir: String::new(),
+                                            name: key.clone(),
+                                            from_uuid: "a1".to_string(),
+                                            from_lm: lm,
+                                            replace_uuid: None,
+                                        },
+                                        DeleteA => DocAction::DeleteOnA {
+                                            key: key.clone(),
+                                            uuid: "a1".to_string(),
+                                        },
+                                        DeleteB => DocAction::DeleteOnB {
+                                            key: key.clone(),
+                                            uuid: "b1".to_string(),
+                                        },
+                                        Forget => DocAction::Forget { key: key.clone() },
+                                        Disposition::Conflict(reason) => DocAction::Conflict {
+                                            key: key.clone(),
+                                            reason: reason.to_string(),
+                                        },
+                                    })
+                                    .collect();
+                                assert_eq!(
+                                    plan_docs(options, a, b, &state),
+                                    expected_docs,
+                                    "docs: {options:?}, survives_a={survives_a}, changed={changed}"
+                                );
+                            });
+                    });
+                });
+            });
+    }
+
+    #[test]
+    fn files_destination_deletion_keeps_source_across_runs() {
+        [Mode::Push, Mode::Pull].into_iter().for_each(|mode| {
+            [
+                ConflictPolicy::Skip,
+                ConflictPolicy::Newest,
+                ConflictPolicy::PreferLocal,
+                ConflictPolicy::PreferRemote,
+            ]
+            .into_iter()
+            .for_each(|conflict| {
+                [false, true].into_iter().for_each(|changed| {
+                    let root = std::env::temp_dir()
+                        .join(format!("rmu-delete-direction-{}", uuid::Uuid::new_v4()));
+                    let a = LocalFs::new(root.join("a"));
+                    let b = LocalFs::new(root.join("b"));
+                    a.ensure_root().unwrap();
+                    b.ensure_root().unwrap();
+                    let (source, destination) = if mode == Mode::Push {
+                        (&a, &b)
+                    } else {
+                        (&b, &a)
+                    };
+                    source
+                        .write("n.pdf", b"original synthetic document")
+                        .unwrap();
+                    let state_path = root.join("state.json");
+                    let mut state = SyncState::default();
+                    let options = SyncOptions {
+                        mode,
+                        delete: true,
+                        conflict,
+                    };
+                    let actions = plan_files(
+                        options,
+                        &a.snapshot().unwrap().0,
+                        &b.snapshot().unwrap().0,
+                        &state,
+                    );
+                    execute_files(
+                        &a,
+                        &b,
+                        &crate::progress::NoProgress,
+                        &actions,
+                        &mut state,
+                        &state_path,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        source.read("n.pdf").unwrap(),
+                        destination.read("n.pdf").unwrap()
+                    );
+                    destination.remove("n.pdf").unwrap();
+                    if changed {
+                        // A size change avoids relying on filesystem timestamp precision.
+                        source
+                            .write("n.pdf", b"edited synthetic document with a different size")
+                            .unwrap();
+                    }
+                    let expected = source.read("n.pdf").unwrap();
+                    (0..2).for_each(|_| {
+                        let mut state = SyncState::load(&state_path).unwrap();
+                        let actions = plan_files(
+                            options,
+                            &a.snapshot().unwrap().0,
+                            &b.snapshot().unwrap().0,
+                            &state,
+                        );
+                        let outcome = execute_files(
+                            &a,
+                            &b,
+                            &crate::progress::NoProgress,
+                            &actions,
+                            &mut state,
+                            &state_path,
+                        )
+                        .unwrap();
+                        assert_eq!(
+                            outcome.deleted_a + outcome.deleted_b,
+                            0,
+                            "{options:?}, changed={changed}"
+                        );
+                        assert_eq!(source.read("n.pdf").unwrap(), expected);
+                        assert!(state.entries.contains_key("n.pdf"));
+                    });
+                    fs::remove_dir_all(root).unwrap();
+                });
+            });
+        });
     }
 
     #[test]
