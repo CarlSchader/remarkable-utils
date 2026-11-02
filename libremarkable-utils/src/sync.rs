@@ -22,6 +22,9 @@ use crate::progress::Progress;
 use crate::ssh::{SshSession, shell_quote};
 use crate::xochitl::{self, Item};
 
+#[cfg(all(test, unix))]
+mod symlink_tests;
+
 /// Name of the **legacy** in-tree state file (pre-v2 sync). No longer
 /// read or written; used only to warn users that it can be deleted.
 pub const LEGACY_STATE_FILE_NAME: &str = ".rmu-sync.json";
@@ -290,6 +293,25 @@ pub struct RemoteSnapshot {
     pub folders: BTreeMap<String, String>,
     /// Items excluded up-front (duplicate names, unusable names, ...).
     pub skips: Vec<SyncAction>,
+    /// Present but unsafe to sync, including descendants of excluded folders.
+    pub excluded_uuids: std::collections::HashSet<String>,
+    /// Excluded logical names. Neither these paths nor paths below them are
+    /// safe targets, even when the previously mapped UUID is now absent.
+    pub excluded_paths: std::collections::BTreeSet<String>,
+}
+
+impl RemoteSnapshot {
+    fn excludes_path(&self, path: &str) -> bool {
+        self.excluded_paths
+            .iter()
+            .any(|excluded| path == excluded || path_under(excluded, path))
+    }
+
+    fn excludes_local(&self, path: &str, state: Option<&StateEntry>) -> bool {
+        let (dir, name) = split_target(path);
+        self.excludes_path(&join_rel(dir, &name))
+            || state.is_some_and(|st| self.excluded_uuids.contains(&st.uuid))
+    }
 }
 
 /// Build the device-side snapshot from a full listing, scoped to the
@@ -299,6 +321,29 @@ pub struct RemoteSnapshot {
 pub fn remote_snapshot(items: &[Item], root_uuid: &str) -> RemoteSnapshot {
     fn usable_name(name: &str) -> bool {
         !name.is_empty() && !name.contains('/') && !name.starts_with('.') && name != ".."
+    }
+
+    fn exclude(
+        children: &HashMap<&str, Vec<&Item>>,
+        item: &Item,
+        path: String,
+        reason: String,
+        snapshot: &mut RemoteSnapshot,
+    ) {
+        fn mark_subtree(
+            children: &HashMap<&str, Vec<&Item>>,
+            uuid: &str,
+            excluded: &mut std::collections::HashSet<String>,
+        ) {
+            if excluded.insert(uuid.to_string()) {
+                children.get(uuid).into_iter().flatten().for_each(|child| {
+                    mark_subtree(children, &child.uuid, excluded);
+                });
+            }
+        }
+        mark_subtree(children, &item.uuid, &mut snapshot.excluded_uuids);
+        snapshot.excluded_paths.insert(path.clone());
+        snapshot.skips.push(SyncAction::Skip { path, reason });
     }
 
     fn walk(
@@ -315,17 +360,23 @@ pub fn remote_snapshot(items: &[Item], root_uuid: &str) -> RemoteSnapshot {
         kids.iter().for_each(|item| {
             let path = join_rel(rel_dir, &item.visible_name);
             if name_counts[item.visible_name.as_str()] > 1 {
-                snapshot.skips.push(SyncAction::Skip {
+                exclude(
+                    children,
+                    item,
                     path,
-                    reason: "duplicate sibling name on device".to_string(),
-                });
+                    "duplicate sibling name on device".to_string(),
+                    snapshot,
+                );
                 return;
             }
             if !usable_name(&item.visible_name) {
-                snapshot.skips.push(SyncAction::Skip {
+                exclude(
+                    children,
+                    item,
                     path,
-                    reason: "name is not usable as a filename".to_string(),
-                });
+                    "name is not usable as a filename".to_string(),
+                    snapshot,
+                );
                 return;
             }
             if item.is_folder() {
@@ -338,10 +389,13 @@ pub fn remote_snapshot(items: &[Item], root_uuid: &str) -> RemoteSnapshot {
                 Some("epub") => RemoteType::Epub,
                 Some("notebook") | None => RemoteType::Notebook,
                 Some(other) => {
-                    snapshot.skips.push(SyncAction::Skip {
+                    exclude(
+                        children,
+                        item,
                         path,
-                        reason: format!("unsupported document type '{other}'"),
-                    });
+                        format!("unsupported document type '{other}'"),
+                        snapshot,
+                    );
                     return;
                 }
             };
@@ -403,6 +457,10 @@ pub struct StateEntry {
     pub local_mtime_ms: i64,
     /// Device `lastModified`, or the B side's mtime for fs↔fs pairs.
     pub remote_last_modified: i64,
+    /// The UUID was rebound, but the successor's content has not yet
+    /// been reconciled. Its timestamp may equal the old document's.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub remote_pending: bool,
     /// B-side size for fs↔fs pairs (absent for device pairs).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_size: Option<u64>,
@@ -415,6 +473,12 @@ pub struct StateEntry {
     /// sync. Absent for notebooks/bundles.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload_hash: Option<String>,
+}
+
+/// A new UUID is a change signal even when its timestamp is unchanged.
+/// After rebinding, persist that signal until content is reconciled.
+fn remote_stamp_changed(st: &StateEntry, doc: &RemoteDoc) -> bool {
+    st.remote_pending || st.uuid != doc.uuid || doc.last_modified != st.remote_last_modified
 }
 
 /// The sync archive: `local rel path ↔ device UUID` plus what both
@@ -517,8 +581,15 @@ pub trait FsEndpoint {
     /// SHA-256 of a file's content, if this endpoint can compute it
     /// cheaply enough to be worth it.
     fn content_hash(&self, rel_path: &str) -> Result<Option<String>>;
-    /// For local endpoints: the real path, enabling streamed transfers
-    /// instead of in-memory buffering.
+    /// Prepare a local output path for a streamed write, rejecting symlinks
+    /// below the endpoint root and creating missing parent directories.
+    /// Endpoints without this fast path use `write` instead.
+    fn prepare_local_write(&self, rel_path: &str) -> Result<Option<PathBuf>> {
+        let _ = rel_path;
+        Ok(None)
+    }
+    /// For local endpoints: the real path, enabling streamed reads.
+    /// This is not a validated output path; use `prepare_local_write` to write.
     fn as_local_path(&self, rel_path: &str) -> Option<PathBuf> {
         let _ = rel_path;
         None
@@ -534,6 +605,58 @@ impl LocalFs {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
     }
+}
+
+/// Require a nonempty, root-relative path before checking filesystem entries.
+/// In particular, `..` must not undo a checked component.
+fn sync_path_parts(rel_path: &str) -> Result<Vec<&str>> {
+    let parts: Vec<_> = rel_path.split('/').collect();
+    if parts.iter().any(|part| {
+        part.is_empty()
+            || *part == "."
+            || *part == ".."
+            || !matches!(
+                Path::new(part).components().next(),
+                Some(std::path::Component::Normal(_))
+            )
+            || part.contains('\0')
+    }) {
+        return Err(Error::InvalidName(format!("unsafe sync path: {rel_path}")));
+    }
+    Ok(parts)
+}
+
+/// Check every component beneath the selected root, including dangling links.
+/// The root itself may deliberately be a symlink (as may its own ancestors).
+/// These write-time checks reject collisions omitted by snapshots; they are
+/// not a sandbox against concurrent, hostile filesystem namespace changes.
+fn checked_local_path(root: &Path, rel_path: &str) -> Result<PathBuf> {
+    let parts = sync_path_parts(rel_path)?;
+    parts.iter().enumerate().try_fold(
+        root.to_path_buf(),
+        |path, (index, part)| -> Result<PathBuf> {
+            let path = path.join(part);
+            match fs::symlink_metadata(&path) {
+                Ok(meta) => {
+                    let valid_type = if index + 1 == parts.len() {
+                        meta.is_file()
+                    } else {
+                        meta.is_dir()
+                    };
+                    if meta.file_type().is_symlink() || !valid_type {
+                        return Err(std::io::Error::other(format!(
+                            "unsafe sync path (symlink or wrong file type): {}",
+                            path.display()
+                        ))
+                        .into());
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err.into()),
+            }
+            Ok(path)
+        },
+    )
 }
 
 impl FsEndpoint for LocalFs {
@@ -554,10 +677,7 @@ impl FsEndpoint for LocalFs {
     }
 
     fn write(&self, rel_path: &str, data: &[u8]) -> Result<()> {
-        let path = self.root.join(rel_path);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
+        let path = self.prepare_local_write(rel_path)?.expect("local endpoint");
         Ok(fs::write(path, data)?)
     }
 
@@ -570,11 +690,9 @@ impl FsEndpoint for LocalFs {
     }
 
     fn rename(&self, from: &str, to: &str) -> Result<()> {
-        let target = self.root.join(to);
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        Ok(fs::rename(self.root.join(from), target)?)
+        let source = checked_local_path(&self.root, from)?;
+        let target = self.prepare_local_write(to)?.expect("local endpoint");
+        Ok(fs::rename(source, target)?)
     }
 
     fn remove_dir(&self, rel_dir: &str) -> Result<bool> {
@@ -599,6 +717,15 @@ impl FsEndpoint for LocalFs {
 
     fn content_hash(&self, rel_path: &str) -> Result<Option<String>> {
         hash_file(&self.root.join(rel_path)).map(Some)
+    }
+
+    fn prepare_local_write(&self, rel_path: &str) -> Result<Option<PathBuf>> {
+        let path = checked_local_path(&self.root, rel_path)?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        // Check again after directory creation, immediately before the write.
+        checked_local_path(&self.root, rel_path).map(Some)
     }
 
     fn as_local_path(&self, rel_path: &str) -> Option<PathBuf> {
@@ -635,6 +762,35 @@ impl SshFs {
         }
     }
 
+    /// Enter the selected root, then reject links in every relative component
+    /// in the same shell invocation as the mutation (not just at snapshot time).
+    fn mutation_preamble(&self) -> String {
+        format!(
+            "mkdir -p {root} && cd {root} || exit 9\n",
+            root = shell_quote(&self.root_for_shell())
+        )
+    }
+
+    fn write_command(&self, rel_path: &str) -> Result<String> {
+        let guard = shell_path_guard(rel_path, true)?;
+        Ok(format!(
+            "{}{guard}cat > {}",
+            self.mutation_preamble(),
+            shell_quote(&format!("./{rel_path}"))
+        ))
+    }
+
+    fn rename_command(&self, from: &str, to: &str) -> Result<String> {
+        let source_guard = shell_path_guard(from, false)?;
+        let target_guard = shell_path_guard(to, true)?;
+        Ok(format!(
+            "{}{source_guard}{target_guard}mv -- {from} {to}",
+            self.mutation_preamble(),
+            from = shell_quote(&format!("./{from}")),
+            to = shell_quote(&format!("./{to}")),
+        ))
+    }
+
     fn root_for_shell(&self) -> String {
         if self.root.is_empty() {
             ".".to_string()
@@ -642,6 +798,35 @@ impl SshFs {
             self.root.clone()
         }
     }
+}
+
+/// POSIX shell counterpart of `checked_local_path`. Each parent is checked
+/// before mkdir can traverse it. `-L` also catches dangling symlinks; checking
+/// the leaf type prevents `mv` from treating a directory as a target container.
+fn shell_path_guard(rel_path: &str, create_parents: bool) -> Result<String> {
+    let parts = sync_path_parts(rel_path)?;
+    let (_, script) = parts.iter().enumerate().fold(
+        (String::from("."), String::new()),
+        |(mut path, mut script), (index, part)| {
+            path.push('/');
+            path.push_str(part);
+            let quoted = shell_quote(&path);
+            let is_parent = index + 1 < parts.len();
+            let kind = if is_parent { "d" } else { "f" };
+            script.push_str(&format!(
+                "if [ -L {quoted} ] || {{ [ -e {quoted} ] && [ ! -{kind} {quoted} ]; }}; then\n\
+                 printf '%s\\n' {message} >&2; exit 9\nfi\n",
+                message = shell_quote(&format!(
+                    "unsafe sync path (symlink or wrong file type): {path}"
+                )),
+            ));
+            if is_parent && create_parents {
+                script.push_str(&format!("mkdir -p {quoted} || exit 9\n"));
+            }
+            (path, script)
+        },
+    );
+    Ok(script)
 }
 
 impl FsEndpoint for SshFs {
@@ -700,17 +885,8 @@ impl FsEndpoint for SshFs {
     }
 
     fn write(&self, rel_path: &str, data: &[u8]) -> Result<()> {
-        let path = self.join(rel_path);
-        let parent = path.rsplit_once('/').map(|(dir, _)| dir).unwrap_or(".");
-        self.session.run_checked_with_stdin(
-            &format!(
-                "mkdir -p {parent} && cat > {path}",
-                parent = shell_quote(parent),
-                path = shell_quote(&path),
-            ),
-            data,
-            &*self.progress,
-        )
+        self.session
+            .run_checked_with_stdin(&self.write_command(rel_path)?, data, &*self.progress)
     }
 
     fn remove(&self, rel_path: &str) -> Result<()> {
@@ -720,14 +896,7 @@ impl FsEndpoint for SshFs {
     }
 
     fn rename(&self, from: &str, to: &str) -> Result<()> {
-        let to_path = self.join(to);
-        let parent = to_path.rsplit_once('/').map(|(dir, _)| dir).unwrap_or(".");
-        self.session.run_checked(&format!(
-            "mkdir -p {parent} && mv -- {from} {to}",
-            parent = shell_quote(parent),
-            from = shell_quote(&self.join(from)),
-            to = shell_quote(&to_path),
-        ))?;
+        self.session.run_checked(&self.rename_command(from, to)?)?;
         Ok(())
     }
 
@@ -916,9 +1085,11 @@ pub enum SyncAction {
     /// Re-link a mapping whose document was replaced on the device by
     /// a same-name, same-kind document (e.g. an interrupted sync that
     /// uploaded but never recorded state). State-only; no transfer.
+    /// Changes identity only, preserving the last agreed content baseline.
     Rebind {
         path: String,
         uuid: String,
+        /// Observed successor stamp, not a new content-agreement baseline.
         last_modified: i64,
     },
     /// Pair an unmapped local file with an unmapped device document
@@ -1118,9 +1289,9 @@ fn payload_mirrored(doc_type: RemoteType) -> bool {
 
 /// Which device payloads are worth hashing before planning (lazy,
 /// batched by the caller into one round trip). Pure. Candidates:
-/// - mapped docs whose `lastModified` moved while a recorded payload
-///   hash exists (annotation-only changes and pure device-side moves
-///   can then skip the transfer);
+/// - mapped docs whose remote stamp changed (including pending UUID
+///   replacements) while a recorded payload hash exists (annotation-only
+///   changes and identical successors can then skip the transfer);
 /// - unmapped docs whose pull path collides with an unmapped local
 ///   file of the same payload kind (hash-verified adoption);
 /// - unmapped docs whose size matches some local file (hash-verified
@@ -1139,12 +1310,22 @@ pub fn device_hash_candidates(
     let by_uuid: HashMap<&str, &RemoteDoc> =
         remote.docs.iter().map(|d| (d.uuid.as_str(), d)).collect();
 
-    let mapped = state.entries.values().filter_map(|st| {
-        let doc = by_uuid.get(st.uuid.as_str())?;
+    let by_target: HashMap<(&str, &str), &RemoteDoc> = remote
+        .docs
+        .iter()
+        .map(|d| ((d.rel_dir.as_str(), d.name.as_str()), d))
+        .collect();
+    let mapped = state.entries.iter().filter_map(|(key, st)| {
+        let (dir, stem) = split_target(key);
+        let doc = by_uuid.get(st.uuid.as_str()).or_else(|| {
+            by_target.get(&(dir, stem.as_str())).filter(|doc| {
+                !mapped_uuids.contains(doc.uuid.as_str()) && kind_matches(st.kind, doc.doc_type)
+            })
+        })?;
         (payload_mirrored(doc.doc_type)
             && st.payload_hash.is_some()
-            && doc.last_modified != st.remote_last_modified)
-            .then_some(*doc)
+            && remote_stamp_changed(st, doc))
+        .then_some(*doc)
     });
     let adoption = remote
         .docs
@@ -1257,6 +1438,13 @@ fn detect_moves(
                 .filter(|(key, _)| path_under(&from_dir, key))
                 .collect();
             if mapped.is_empty()
+                || remote
+                    .excluded_paths
+                    .iter()
+                    .any(|path| path_under(&from_dir, path))
+                || mapped
+                    .iter()
+                    .any(|(key, st)| remote.excludes_local(key, Some(st)))
                 || mapped.iter().any(|(_, st)| st.local_hash.is_none())
                 || local.iter().any(|e| path_under(&from_dir, &e.rel_path))
             {
@@ -1272,6 +1460,7 @@ fn detect_moves(
             let hash0 = mapped[0].1.local_hash.clone().expect("filtered on Some");
             let verifies = |g: &str| -> bool {
                 !g.is_empty()
+                    && !remote.excludes_path(g)
                     && !out.remote.folders.contains_key(g)
                     && !state.entries.keys().any(|k| path_under(g, k) || k == g)
                     && mapped.iter().all(|(key, st)| {
@@ -1348,10 +1537,11 @@ fn detect_moves(
             .iter()
             .filter(|(key, st)| {
                 !local_by_path.contains_key(key.as_str())
+                    && !remote.excludes_local(key, Some(st))
                     && st.local_hash.is_some()
                     && docs_by_uuid
                         .get(st.uuid.as_str())
-                        .is_some_and(|doc| doc.last_modified == st.remote_last_modified)
+                        .is_some_and(|doc| !remote_stamp_changed(st, doc))
             })
             .for_each(|(key, st)| {
                 let hash = st.local_hash.clone().expect("filtered on Some");
@@ -1363,7 +1553,10 @@ fn detect_moves(
             });
         local
             .iter()
-            .filter(|entry| !out.state.entries.contains_key(&entry.rel_path))
+            .filter(|entry| {
+                !out.state.entries.contains_key(&entry.rel_path)
+                    && !remote.excludes_local(&entry.rel_path, None)
+            })
             .filter_map(|entry| entry.hash.clone().map(|hash| (entry, hash)))
             .for_each(|(entry, hash)| {
                 if let Some(group) = groups.get_mut(&(hash, entry.kind)) {
@@ -1467,7 +1660,14 @@ fn detect_moves(
             let Some((new_key, last_modified, payload_hash)) = adjusted_docs.get(&st.uuid) else {
                 return;
             };
-            if *new_key == key || !local_by_path.contains_key(key.as_str()) {
+            // Reconcile a rebound successor before following its moves.
+            // MoveLocal records agreement, which is not yet established.
+            if st.remote_pending
+                || *new_key == key
+                || !local_by_path.contains_key(key.as_str())
+                || remote.excludes_local(&key, Some(&st))
+                || remote.excludes_local(new_key, None)
+            {
                 return;
             }
             if local_by_path.contains_key(new_key.as_str())
@@ -1620,7 +1820,7 @@ pub fn plan(
         .iter()
         .map(|(key, st)| {
             let mut remote_doc = docs_by_uuid.get(st.uuid.as_str()).copied();
-            if remote_doc.is_none() {
+            if remote_doc.is_none() && !remote.excludes_local(key, Some(st)) {
                 // The mapped document vanished. If a same-name,
                 // same-kind unmapped document took its place (typical
                 // after an interrupted sync uploaded but never saved
@@ -1686,7 +1886,7 @@ pub fn plan(
             .filter_map(|st| {
                 let doc = docs_by_uuid.get(st.uuid.as_str())?;
                 let hash = st.payload_hash.clone()?;
-                (payload_mirrored(doc.doc_type) && doc.last_modified == st.remote_last_modified)
+                (payload_mirrored(doc.doc_type) && !remote_stamp_changed(st, doc))
                     .then(|| (hash, (st.uuid.clone(), st.kind, doc.size_bytes)))
             })
             .collect(),
@@ -1705,9 +1905,16 @@ pub fn plan(
             }),
     };
 
-    views
-        .iter()
-        .for_each(|(key, view)| decide(options, key, view, &guards, &mut buckets));
+    views.iter().for_each(|(key, view)| {
+        if remote.excludes_local(key, view.state) {
+            buckets.notes.push(skip(
+                key,
+                "device entry or target is excluded; preserving the sync mapping",
+            ));
+        } else {
+            decide(options, key, view, &guards, &mut buckets);
+        }
+    });
 
     if options.delete {
         append_dir_deletes(options, local, remote, &docs_by_uuid, &mut buckets);
@@ -1941,7 +2148,7 @@ fn mapped_both(
     out: &mut Buckets,
 ) {
     let stamp_local = entry.size != st.local_size || entry.mtime_ms != st.local_mtime_ms;
-    let stamp_remote = doc.last_modified != st.remote_last_modified;
+    let stamp_remote = remote_stamp_changed(st, doc);
     // Content verdicts override stamp verdicts when hashes are known:
     // a touched-but-identical file, or a device `lastModified` bumped
     // by annotations, is not a change worth transferring.
@@ -1962,7 +2169,7 @@ fn mapped_both(
         out.rebinds.push(SyncAction::Refresh {
             path: key.to_string(),
             kind: st.kind,
-            uuid: st.uuid.clone(),
+            uuid: doc.uuid.clone(),
             last_modified: doc.last_modified,
             local_hash: entry.hash.clone().or_else(|| st.local_hash.clone()),
             payload_hash: doc.payload_hash.clone().or_else(|| st.payload_hash.clone()),
@@ -1974,7 +2181,7 @@ fn mapped_both(
         (false, false) => {}
         (true, false) => {
             if push_ok {
-                out.transfers.push(update_remote(key, entry, &st.uuid));
+                out.transfers.push(update_remote(key, entry, &doc.uuid));
             } else if can_write_remote(options.mode) {
                 out.notes.push(skip(
                     key,
@@ -2004,7 +2211,7 @@ fn mapped_both(
                 .push(conflict(key, "both sides changed since last sync")),
             Some(Winner::Local) => {
                 if push_ok {
-                    out.transfers.push(update_remote(key, entry, &st.uuid));
+                    out.transfers.push(update_remote(key, entry, &doc.uuid));
                 } else if can_write_remote(options.mode) {
                     out.notes.push(skip(
                         key,
@@ -2098,7 +2305,7 @@ fn mapped_local_gone(
     doc: &RemoteDoc,
     out: &mut Buckets,
 ) {
-    let remote_changed = doc.last_modified != st.remote_last_modified;
+    let remote_changed = remote_stamp_changed(st, doc);
     match options.mode {
         // Source still has it: recopy.
         Mode::Pull => out.transfers.push(download(key, doc)),
@@ -2448,21 +2655,16 @@ pub fn execute(
                 size_bytes,
                 last_modified,
             } => {
-                match (doc_type, fs_side.as_local_path(local)) {
-                    (_, Some(dest)) => {
-                        if let Some(parent) = dest.parent() {
-                            fs::create_dir_all(parent)?;
+                match (doc_type, fs_side.prepare_local_write(local)?) {
+                    (_, Some(dest)) => match doc_type {
+                        RemoteType::Notebook => client.download_bundle_to(uuid, &dest)?,
+                        RemoteType::Pdf => {
+                            client.download_payload_to(uuid, "pdf", &dest, *size_bytes)?
                         }
-                        match doc_type {
-                            RemoteType::Notebook => client.download_bundle_to(uuid, &dest)?,
-                            RemoteType::Pdf => {
-                                client.download_payload_to(uuid, "pdf", &dest, *size_bytes)?
-                            }
-                            RemoteType::Epub => {
-                                client.download_payload_to(uuid, "epub", &dest, *size_bytes)?
-                            }
+                        RemoteType::Epub => {
+                            client.download_payload_to(uuid, "epub", &dest, *size_bytes)?
                         }
-                    }
+                    },
                     (RemoteType::Notebook, None) => {
                         fs_side.write(local, &client.download_bundle_bytes(uuid)?)?
                     }
@@ -2542,6 +2744,7 @@ pub fn execute(
                         local_size: size,
                         local_mtime_ms: mtime,
                         remote_last_modified: *last_modified,
+                        remote_pending: false,
                         remote_size: None,
                         local_hash: Some(hash.clone()),
                         // Verified equal to the local hash by the planner.
@@ -2567,6 +2770,7 @@ pub fn execute(
                         local_size: size,
                         local_mtime_ms: mtime,
                         remote_last_modified: *last_modified,
+                        remote_pending: false,
                         remote_size: None,
                         local_hash: local_hash.clone(),
                         payload_hash: payload_hash.clone(),
@@ -2660,25 +2864,23 @@ pub fn execute(
             SyncAction::MoveLocal {
                 from,
                 to,
-                kind,
-                uuid,
                 last_modified,
-                local_hash,
-                payload_hash,
+                ..
             } => {
+                let mut entry = state
+                    .entries
+                    .get(from)
+                    .cloned()
+                    .ok_or_else(|| Error::PathNotFound(from.clone()))?;
                 fs_side.rename(from, to)?;
+                // Moving does not reconcile content. Keep the local stamp
+                // paired with its agreed hash so unresolved edits are still
+                // detected on the next run. The planner only advances the
+                // remote timestamp when the payload is verified unchanged.
+                entry.remote_last_modified = *last_modified;
                 state.entries.remove(from);
-                record_state_with(
-                    state,
-                    state_path,
-                    fs_side,
-                    to,
-                    *kind,
-                    uuid,
-                    *last_modified,
-                    local_hash.clone(),
-                    payload_hash.clone(),
-                )?;
+                state.entries.insert(to.clone(), entry);
+                state.save(state_path)?;
                 outcome.moved_local += 1;
             }
             SyncAction::CopyRemote {
@@ -2728,11 +2930,11 @@ pub fn execute(
                 last_modified,
                 hash,
             } => {
-                match (fs_side.as_local_path(from), fs_side.as_local_path(to)) {
+                match (
+                    fs_side.as_local_path(from),
+                    fs_side.prepare_local_write(to)?,
+                ) {
                     (Some(src), Some(dest)) => {
-                        if let Some(parent) = dest.parent() {
-                            fs::create_dir_all(parent)?;
-                        }
                         fs::copy(&src, &dest)?;
                     }
                     _ => {
@@ -2753,16 +2955,12 @@ pub fn execute(
                 )?;
                 outcome.copied_local += 1;
             }
-            SyncAction::Rebind {
-                path,
-                uuid,
-                last_modified,
-            } => {
+            SyncAction::Rebind { path, uuid, .. } => {
                 if let Some(entry) = state.entries.get_mut(path) {
                     entry.uuid = uuid.clone();
-                    entry.remote_last_modified = *last_modified;
-                    // The replacement's payload was never hashed.
-                    entry.payload_hash = None;
+                    // Identity is known, content agreement is not. Keep
+                    // both baselines until a refresh or transfer succeeds.
+                    entry.remote_pending = true;
                 }
                 state.save(state_path)?;
                 // A rebind means a previous interrupted run wrote this
@@ -2813,6 +3011,7 @@ fn record_state_with(
             local_size: size,
             local_mtime_ms: mtime,
             remote_last_modified,
+            remote_pending: false,
             remote_size: None,
             local_hash,
             payload_hash,
@@ -2938,7 +3137,9 @@ fn decide_pair(
                 },
             }
         }
-        // B deleted it.
+        // B deleted it. Deletions, like copies, may only write to a
+        // destination allowed by the mode; a missing destination must
+        // never cause a one-way source to be deleted.
         (true, Some((a_changed, a_ms)), None) => {
             if can_b && !options.delete {
                 return Some(CopyToB); // recopy
@@ -2947,13 +3148,13 @@ fn decide_pair(
                 return None; // one-way toward A without --delete: stale state kept
             }
             if !a_changed {
-                return Some(DeleteA);
+                return can_a.then_some(DeleteA);
             }
             match winner(options.conflict, a_ms, i64::MIN) {
                 None => Some(Conflict("deleted on one side but changed on the other")),
                 Some(Winner::Local) if can_b => Some(CopyToB),
                 Some(Winner::Local) => Some(Forget),
-                Some(Winner::Remote) => Some(DeleteA),
+                Some(Winner::Remote) => can_a.then_some(DeleteA),
             }
         }
         // A deleted it (mirror).
@@ -2965,13 +3166,13 @@ fn decide_pair(
                 return None;
             }
             if !b_changed {
-                return Some(DeleteB);
+                return can_b.then_some(DeleteB);
             }
             match winner(options.conflict, i64::MIN, b_ms) {
                 None => Some(Conflict("deleted on one side but changed on the other")),
                 Some(Winner::Remote) if can_a => Some(CopyToA),
                 Some(Winner::Remote) => Some(Forget),
-                Some(Winner::Local) => Some(DeleteB),
+                Some(Winner::Local) => can_b.then_some(DeleteB),
             }
         }
         (true, None, None) => Some(Forget),
@@ -3050,9 +3251,32 @@ pub fn execute_files(
     let mut outcome = FileOutcome::default();
     let mut done = 0usize;
 
-    let record = |state: &mut SyncState, path: &str| -> Result<()> {
-        let (a_size, a_mtime) = a.stat(path)?;
-        let (b_size, b_mtime) = b.stat(path)?;
+    let copy = |state: &mut SyncState, path: &str, to_b: bool| -> Result<()> {
+        let (source, destination) = if to_b { (a, b) } else { (b, a) };
+        let source_stamp = source.stat(path)?;
+        let data = source.read(path)?;
+        let verify_source = || -> Result<()> {
+            if source.stat(path)? != source_stamp || data.len() as u64 != source_stamp.0 {
+                return Err(std::io::Error::other(format!(
+                    "source changed during sync transfer: {path}; archive entry not updated"
+                ))
+                .into());
+            }
+            Ok(())
+        };
+        // Reject a changing read before touching the destination. Recheck after
+        // the write too: a source edit during that write must remain pending.
+        verify_source()?;
+        destination.write(path, &data)?;
+        let destination_stamp = destination.stat(path)?;
+        verify_source()?;
+        // Record the captured version, never a later source stamp. Even an edit
+        // after verification will then differ from the archived source version.
+        let ((a_size, a_mtime), (b_size, b_mtime)) = if to_b {
+            (source_stamp, destination_stamp)
+        } else {
+            (destination_stamp, source_stamp)
+        };
         let kind = Path::new(path)
             .extension()
             .and_then(|e| e.to_str())
@@ -3067,6 +3291,7 @@ pub fn execute_files(
                 local_size: a_size,
                 local_mtime_ms: a_mtime,
                 remote_last_modified: b_mtime,
+                remote_pending: false,
                 remote_size: Some(b_size),
                 local_hash: None,
                 payload_hash: None,
@@ -3082,13 +3307,11 @@ pub fn execute_files(
         }
         match action {
             FileAction::CopyToB { path } => {
-                b.write(path, &a.read(path)?)?;
-                record(state, path)?;
+                copy(state, path, true)?;
                 outcome.copied_to_b += 1;
             }
             FileAction::CopyToA { path } => {
-                a.write(path, &b.read(path)?)?;
-                record(state, path)?;
+                copy(state, path, false)?;
                 outcome.copied_to_a += 1;
             }
             FileAction::DeleteA { path } => {
@@ -3313,6 +3536,19 @@ pub fn plan_docs(
         let doc_a = a_by_key.get(key).copied();
         let doc_b = b_by_key.get(key).copied();
         let st = state.entries.get(key);
+        if a.excludes_path(key)
+            || b.excludes_path(key)
+            || st.is_some_and(|s| {
+                a.excluded_uuids.contains(&s.uuid_a) || b.excluded_uuids.contains(&s.uuid_b)
+            })
+        {
+            notes.push(DocAction::Conflict {
+                key: key.to_string(),
+                reason: "device entry or target is excluded; preserving the sync mapping"
+                    .to_string(),
+            });
+            return;
+        }
         // Changed = replaced (uuid drift) or modified (lastModified).
         let a_view = doc_a.map(|d| {
             let changed = st.is_none_or(|s| s.uuid_a != d.uuid || s.lm_a != d.last_modified);
@@ -3733,6 +3969,7 @@ mod tests {
             local_size: size,
             local_mtime_ms: mtime,
             remote_last_modified: remote,
+            remote_pending: false,
             remote_size: None,
             local_hash: None,
             payload_hash: None,
@@ -3873,6 +4110,10 @@ mod tests {
         assert_eq!(snapshot.docs[0].local_rel_path(), "Note.rmdoc");
         assert_eq!(snapshot.skips.len(), 3); // two duplicates + one bad name
         assert_eq!(snapshot.folders[""], "b");
+        assert!(snapshot.excluded_uuids.contains("d1"));
+        assert!(snapshot.excluded_uuids.contains("d2"));
+        assert!(snapshot.excluded_uuids.contains("bad"));
+        assert!(!snapshot.excluded_uuids.contains("outside"));
     }
 
     #[test]
@@ -3885,6 +4126,305 @@ mod tests {
         let snapshot = remote_snapshot(&items, "");
         assert_eq!(snapshot.folders["A/B"], "bb");
         assert_eq!(snapshot.docs[0].local_rel_path(), "A/B/Deep.pdf");
+    }
+
+    // Each case retains the mapped UUID (u1), but excludes it from docs.
+    // Renamed cases also leave a usable successor at the archived path:
+    // UUID exclusion must prevent rebinding/replacing that successor.
+    fn excluded_cases() -> Vec<(&'static str, Vec<Item>)> {
+        vec![
+            (
+                "n",
+                vec![doc("u1", "n", "", "pdf", 5), doc("dup", "n", "", "pdf", 5)],
+            ),
+            (
+                "A/B/n",
+                vec![
+                    folder("a", "A", ""),
+                    folder("dup", "A", ""),
+                    folder("b", "B", "a"),
+                    doc("u1", "n", "b", "pdf", 5),
+                ],
+            ),
+            ("n", vec![doc("u1", "n", "", "unsupported", 5)]),
+            (
+                "n",
+                vec![
+                    doc("u1", ".hidden", "", "pdf", 5),
+                    doc("new", "n", "", "pdf", 9),
+                ],
+            ),
+            (
+                "A/n",
+                vec![folder("a", ".hidden", ""), doc("u1", "n", "a", "pdf", 5)],
+            ),
+            (
+                "n",
+                vec![
+                    doc("u1", "moved", "", "pdf", 5),
+                    doc("dup", "moved", "", "pdf", 5),
+                    doc("new", "n", "", "pdf", 9),
+                ],
+            ),
+        ]
+    }
+
+    #[test]
+    fn excluded_mappings_never_transfer_delete_move_or_rebind() {
+        excluded_cases().into_iter().for_each(|(key, items)| {
+            let path = format!("{key}.pdf");
+            let snapshot = remote_snapshot(&items, "");
+            assert!(snapshot.excluded_uuids.contains("u1"));
+            let mut state = SyncState::default();
+            state.entries.insert(
+                path.clone(),
+                entry_hashed("u1", DocKind::Pdf, 100, 1, 5, "h", "h"),
+            );
+            [push(), pull(), two_way()].into_iter().for_each(|mode| {
+                [false, true].into_iter().for_each(|delete| {
+                    [
+                        ConflictPolicy::Skip,
+                        ConflictPolicy::Newest,
+                        ConflictPolicy::PreferLocal,
+                        ConflictPolicy::PreferRemote,
+                    ]
+                    .into_iter()
+                    .for_each(|conflict| {
+                        // Unchanged, edited, and absent local copies must all
+                        // preserve the mapping rather than infer deletion.
+                        [
+                            vec![local(&path, DocKind::Pdf, 100, 1)],
+                            vec![local(&path, DocKind::Pdf, 200, 99)],
+                            vec![],
+                        ]
+                        .into_iter()
+                        .for_each(|locals| {
+                            let result = plan(
+                                SyncOptions {
+                                    delete,
+                                    conflict,
+                                    ..mode
+                                },
+                                &locals,
+                                &snapshot,
+                                &state,
+                            );
+                            assert!(
+                                result
+                                    .actions
+                                    .iter()
+                                    .all(|a| matches!(a, SyncAction::Skip { .. })),
+                                "{key}: {:?}",
+                                result.actions
+                            );
+                        });
+                    });
+                });
+            });
+        });
+    }
+
+    #[test]
+    fn duplicate_documents_and_subtrees_preserve_successful_sync_across_runs() {
+        [false, true].into_iter().for_each(|nested| {
+            let (key, mut items) = if nested {
+                (
+                    "A/B/n.pdf",
+                    vec![
+                        folder("a", "A", ""),
+                        folder("b", "B", "a"),
+                        doc("u1", "n", "b", "pdf", 5),
+                    ],
+                )
+            } else {
+                ("n.pdf", vec![doc("u1", "n", "", "pdf", 5)])
+            };
+            let clean = remote_snapshot(&items, "");
+            let initial = plan(pull(), &[], &clean, &SyncState::default());
+            assert!(
+                initial
+                    .actions
+                    .iter()
+                    .any(|a| matches!(a, SyncAction::Download { local, .. } if local == key))
+            );
+            // Archive and local copy produced by the successful initial download.
+            let mut state = SyncState::default();
+            state
+                .entries
+                .insert(key.to_string(), entry("u1", DocKind::Pdf, 100, 1, 5));
+            let locals = vec![local(key, DocKind::Pdf, 100, 1)];
+            assert!(plan(pull(), &locals, &clean, &state).actions.is_empty());
+            items.push(if nested {
+                folder("dup", "A", "")
+            } else {
+                doc("dup", "n", "", "pdf", 5)
+            });
+            let excluded = remote_snapshot(&items, "");
+            (0..2).for_each(|_| {
+                let result = plan(with_delete(pull()), &locals, &excluded, &state);
+                assert!(
+                    result
+                        .actions
+                        .iter()
+                        .all(|a| matches!(a, SyncAction::Skip { .. }))
+                );
+                // A skipped run writes no new entry; round-trip the retained archive.
+                state = serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+            });
+            assert!(
+                plan(with_delete(pull()), &locals, &clean, &state)
+                    .actions
+                    .is_empty()
+            );
+            let gone = remote_snapshot(&[], "");
+            assert!(
+                plan(with_delete(pull()), &locals, &gone, &state)
+                    .actions
+                    .iter()
+                    .any(|a| matches!(a, SyncAction::DeleteLocal { path } if path == key))
+            );
+        });
+    }
+
+    #[test]
+    fn excluded_paths_block_new_targets_and_absent_descendant_mappings() {
+        let snapshot = remote_snapshot(
+            &[
+                folder("a", "A", ""),
+                folder("dup", "A", ""),
+                doc("unsupported", "n", "", "unsupported", 5),
+            ],
+            "",
+        );
+        // No live UUID to match: the excluded subtree still makes absence unknown.
+        ["A/missing.pdf", "n.pdf"].into_iter().for_each(|key| {
+            let locals = vec![local(key, DocKind::Pdf, 100, 1)];
+            let mut state = SyncState::default();
+            state
+                .entries
+                .insert(key.to_string(), entry("gone", DocKind::Pdf, 100, 1, 5));
+            [push(), pull(), two_way()].into_iter().for_each(|options| {
+                [&state, &SyncState::default()]
+                    .into_iter()
+                    .for_each(|archive| {
+                        let result = plan(with_delete(options), &locals, &snapshot, archive);
+                        assert!(
+                            result
+                                .actions
+                                .iter()
+                                .all(|a| matches!(a, SyncAction::Skip { .. }))
+                        );
+                    });
+                let result = plan(with_delete(options), &[], &snapshot, &state);
+                assert!(
+                    result
+                        .actions
+                        .iter()
+                        .all(|a| matches!(a, SyncAction::Skip { .. }))
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn exclusions_do_not_block_unrelated_true_deletions() {
+        let snapshot = remote_snapshot(
+            &[doc("u1", "n", "", "pdf", 5), doc("dup", "n", "", "pdf", 5)],
+            "",
+        );
+        let locals = vec![
+            local("n.pdf", DocKind::Pdf, 100, 1),
+            local("gone.pdf", DocKind::Pdf, 100, 1),
+        ];
+        let mut state = SyncState::default();
+        state
+            .entries
+            .insert("n.pdf".to_string(), entry("u1", DocKind::Pdf, 100, 1, 5));
+        state.entries.insert(
+            "gone.pdf".to_string(),
+            entry("gone", DocKind::Pdf, 100, 1, 5),
+        );
+        let result = plan(with_delete(pull()), &locals, &snapshot, &state);
+        let changes: Vec<_> = result
+            .actions
+            .into_iter()
+            .filter(|a| !matches!(a, SyncAction::Skip { .. }))
+            .collect();
+        assert_eq!(
+            changes,
+            vec![SyncAction::DeleteLocal {
+                path: "gone.pdf".to_string()
+            }]
+        );
+
+        let peer = remote_snapshot(
+            &[
+                doc("peer", "n", "", "pdf", 5),
+                doc("gone-peer", "gone", "", "pdf", 5),
+            ],
+            "",
+        );
+        let mut state = PairState::default();
+        state
+            .entries
+            .insert("n".to_string(), pair_entry("u1", 5, "peer", 5));
+        state
+            .entries
+            .insert("gone".to_string(), pair_entry("gone", 5, "gone-peer", 5));
+        let changes: Vec<_> = plan_docs(with_delete(two_way()), &snapshot, &peer, &state)
+            .into_iter()
+            .filter(|a| !matches!(a, DocAction::Conflict { .. }))
+            .collect();
+        assert_eq!(
+            changes,
+            vec![DocAction::DeleteOnB {
+                key: "gone".to_string(),
+                uuid: "gone-peer".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn excluded_contents_and_targets_block_move_prepass() {
+        let mut state = SyncState::default();
+        state.entries.insert(
+            "A/n.pdf".to_string(),
+            entry_hashed("u1", DocKind::Pdf, 100, 1, 5, "h", "h"),
+        );
+        let locals = vec![with_hash(local("B/n.pdf", DocKind::Pdf, 100, 1), "h")];
+        let cases = [
+            // A folder move must not carry excluded, even untracked, content.
+            vec![
+                folder("a", "A", ""),
+                doc("u1", "n", "a", "pdf", 5),
+                doc("bad", "bad", "a", "unsupported", 5),
+            ],
+            // Neither folder nor file moves may target an excluded subtree.
+            vec![
+                folder("a", "A", ""),
+                doc("u1", "n", "a", "pdf", 5),
+                folder("b", "B", ""),
+                folder("dup", "B", ""),
+            ],
+        ];
+        cases.into_iter().enumerate().for_each(|(index, items)| {
+            let result = plan(push(), &locals, &remote_snapshot(&items, ""), &state);
+            assert!(
+                !result
+                    .actions
+                    .iter()
+                    .any(|a| matches!(a, SyncAction::MoveRemoteFolder { .. }))
+            );
+            if index == 1 {
+                assert!(!result.actions.iter().any(|a| matches!(
+                    a,
+                    SyncAction::MoveRemote { .. }
+                        | SyncAction::Upload { .. }
+                        | SyncAction::CopyRemote { .. }
+                        | SyncAction::CreateRemoteFolder { .. }
+                )));
+            }
+        });
     }
 
     // ---- push planning ----------------------------------------------------
@@ -4555,6 +5095,154 @@ mod tests {
             a,
             SyncAction::Download { local, .. } if local == "A/n.pdf"
         )));
+    }
+
+    // These plans only perform local operations. Disable SSH multiplexing
+    // (including its drop-time cleanup), and prohibit any network connection
+    // should a regression unexpectedly introduce a device operation.
+    fn with_local_executor(test: impl FnOnce(&LocalFs, &Path, &Client)) {
+        let root = std::env::temp_dir().join(format!("rmu-move-test-{}", uuid::Uuid::new_v4()));
+        let fs_side = LocalFs::new(root.join("files"));
+        fs_side.ensure_root().unwrap();
+        let session = SshSession::new(crate::ssh::SshOptions {
+            destination: "unused.invalid".to_string(),
+            multiplex: false,
+            extra_options: vec!["ProxyCommand=false".to_string()],
+            ..Default::default()
+        })
+        .unwrap();
+        let client = Client::new(session, "/unused");
+        test(&fs_side, &root.join("state.json"), &client);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn device_move_keeps_local_edit_conflicting_on_next_run() {
+        [pull(), two_way()].into_iter().for_each(|options| {
+            // A changed payload and an unavailable payload hash must both
+            // retain the unresolved device change across the local move.
+            [Some(hash_bytes(b"device edit")), None]
+                .into_iter()
+                .for_each(|remote_hash| {
+                    with_local_executor(|fs_side, state_path, client| {
+                        fs_side.write("n.pdf", b"agreed").unwrap();
+                        let (size, mtime) = fs_side.stat("n.pdf").unwrap();
+                        let hash = hash_bytes(b"agreed");
+                        let baseline =
+                            entry_hashed("u1", DocKind::Pdf, size, mtime, 5, &hash, &hash);
+                        let mut state = SyncState::default();
+                        state.entries.insert("n.pdf".to_string(), baseline.clone());
+                        state.save(state_path).unwrap();
+
+                        // Different size makes the edit detectable even on
+                        // filesystems with coarse timestamp resolution.
+                        let edited = b"unresolved local edit";
+                        fs_side.write("n.pdf", edited).unwrap();
+                        let mut remote = remote_snapshot(&[doc("u1", "renamed", "", "pdf", 9)], "");
+                        remote.docs[0].payload_hash = remote_hash.clone();
+                        let (mut locals, _) = fs_side.snapshot().unwrap();
+                        attach_hashes(fs_side, &mut locals, &state).unwrap();
+                        let first = plan(options, &locals, &remote, &state);
+                        assert!(matches!(first.actions.as_slice(), [
+                            SyncAction::MoveLocal { from, to, last_modified: 5, .. },
+                            SyncAction::Conflict { path, .. },
+                        ] if from == "n.pdf" && to == "renamed.pdf" && path == to));
+                        let outcome = execute(
+                            client,
+                            &crate::progress::NoProgress,
+                            fs_side,
+                            &first,
+                            &mut remote.folders,
+                            &mut state,
+                            state_path,
+                        )
+                        .unwrap();
+                        assert_eq!(outcome.moved_local, 1);
+                        assert_eq!(outcome.conflicts.len(), 1);
+                        assert!(!outcome.modified_remote);
+                        assert!(!fs_side.as_local_path("n.pdf").unwrap().exists());
+                        assert_eq!(fs_side.read("renamed.pdf").unwrap(), edited);
+
+                        // Reload the actual persisted archive, then run the
+                        // production hash-cache path rather than supplying a
+                        // hand-written local hash to the second planner pass.
+                        let mut state = SyncState::load(state_path).unwrap();
+                        assert_eq!(state.entries.len(), 1);
+                        let saved = &state.entries["renamed.pdf"];
+                        assert_eq!(saved.local_size, baseline.local_size);
+                        assert_eq!(saved.local_mtime_ms, baseline.local_mtime_ms);
+                        assert_eq!(saved.local_hash, baseline.local_hash);
+                        assert_eq!(saved.payload_hash, baseline.payload_hash);
+                        assert_eq!(saved.remote_last_modified, 5);
+                        let (mut locals, _) = fs_side.snapshot().unwrap();
+                        assert_eq!(cached_hash(&locals[0], &state), None);
+                        attach_hashes(fs_side, &mut locals, &state).unwrap();
+                        assert_eq!(locals[0].hash, Some(hash_bytes(edited)));
+                        let second = plan(options, &locals, &remote, &state);
+                        assert!(matches!(second.actions.as_slice(), [
+                            SyncAction::Conflict { path, .. },
+                        ] if path == "renamed.pdf"));
+                        let outcome = execute(
+                            client,
+                            &crate::progress::NoProgress,
+                            fs_side,
+                            &second,
+                            &mut remote.folders,
+                            &mut state,
+                            state_path,
+                        )
+                        .unwrap();
+                        assert_eq!(outcome.conflicts.len(), 1);
+                        assert_eq!(outcome.downloaded, 0);
+                        assert_eq!(fs_side.read("renamed.pdf").unwrap(), edited);
+                    });
+                });
+        });
+    }
+
+    #[test]
+    fn device_move_records_verified_rename_timestamp() {
+        with_local_executor(|fs_side, state_path, client| {
+            fs_side.write("n.pdf", b"agreed").unwrap();
+            let (size, mtime) = fs_side.stat("n.pdf").unwrap();
+            let hash = hash_bytes(b"agreed");
+            let mut state = SyncState::default();
+            state.entries.insert(
+                "n.pdf".to_string(),
+                entry_hashed("u1", DocKind::Pdf, size, mtime, 5, &hash, &hash),
+            );
+            let mut remote = remote_snapshot(&[doc("u1", "renamed", "", "pdf", 9)], "");
+            remote.docs[0].payload_hash = Some(hash.clone());
+            let (mut locals, _) = fs_side.snapshot().unwrap();
+            attach_hashes(fs_side, &mut locals, &state).unwrap();
+            let first = plan(two_way(), &locals, &remote, &state);
+            assert!(matches!(
+                first.actions.as_slice(),
+                [SyncAction::MoveLocal {
+                    last_modified: 9,
+                    ..
+                },]
+            ));
+            execute(
+                client,
+                &crate::progress::NoProgress,
+                fs_side,
+                &first,
+                &mut remote.folders,
+                &mut state,
+                state_path,
+            )
+            .unwrap();
+
+            let state = SyncState::load(state_path).unwrap();
+            assert_eq!(state.entries.len(), 1);
+            assert_eq!(state.entries["renamed.pdf"].remote_last_modified, 9);
+            let (mut locals, _) = fs_side.snapshot().unwrap();
+            assert_eq!(cached_hash(&locals[0], &state), Some(hash));
+            attach_hashes(fs_side, &mut locals, &state).unwrap();
+            assert!(plan(two_way(), &locals, &remote, &state).actions.is_empty());
+            assert_eq!(fs_side.read("renamed.pdf").unwrap(), b"agreed");
+        });
     }
 
     #[test]
@@ -5232,7 +5920,7 @@ mod tests {
     #[test]
     fn rebind_then_pull_refreshes_content() {
         // Same recovery in pull mode: rebind, then re-download since
-        // the successor's lastModified differs from the recorded one.
+        // the successor's content has not been verified.
         let snapshot = remote_snapshot(&[doc("new-uuid", "n", "", "pdf", 7)], "");
         let mut state = SyncState::default();
         state.entries.insert(
@@ -5243,6 +5931,255 @@ mod tests {
         let plan = plan(pull(), &locals, &snapshot, &state);
         assert!(matches!(plan.actions[0], SyncAction::Rebind { .. }));
         assert!(matches!(plan.actions[1], SyncAction::Download { .. }));
+    }
+
+    /// Real local files and archives; the client is deliberately unable
+    /// to connect. These tests execute only state actions and conflicts.
+    struct RebindFixture {
+        root: PathBuf,
+        fs: LocalFs,
+        client: Client,
+        state_path: PathBuf,
+        state: SyncState,
+        remote: RemoteSnapshot,
+    }
+
+    impl RebindFixture {
+        fn new(last_modified: i64) -> Self {
+            let root = std::env::temp_dir().join(format!("rmu-rebind-{}", uuid::Uuid::new_v4()));
+            let fs = LocalFs::new(root.join("files"));
+            fs.ensure_root().unwrap();
+            fs.write("n.pdf", b"agreed").unwrap();
+            let state_path = root.join("state.json");
+            let mut state = SyncState::default();
+            let hash = hash_bytes(b"agreed");
+            record_state_with(
+                &mut state,
+                &state_path,
+                &fs,
+                "n.pdf",
+                DocKind::Pdf,
+                "old-uuid",
+                5,
+                Some(hash.clone()),
+                Some(hash),
+            )
+            .unwrap();
+            let session = crate::ssh::SshSession::new(crate::ssh::SshOptions {
+                destination: "rebind-test.invalid".to_string(),
+                multiplex: false,
+                extra_options: vec![
+                    "ProxyCommand=false".to_string(),
+                    "BatchMode=yes".to_string(),
+                ],
+                ..Default::default()
+            })
+            .unwrap();
+            Self {
+                root,
+                fs,
+                client: Client::new(session, "/synthetic-xochitl"),
+                state_path,
+                state,
+                remote: remote_snapshot(&[doc("new-uuid", "n", "", "pdf", last_modified)], ""),
+            }
+        }
+
+        fn locals(&self) -> Vec<LocalEntry> {
+            let (mut locals, _) = self.fs.snapshot().unwrap();
+            attach_hashes(&self.fs, &mut locals, &self.state).unwrap();
+            locals
+        }
+
+        fn execute(&mut self, plan: &Plan) -> Outcome {
+            let outcome = execute(
+                &self.client,
+                &crate::progress::NoProgress,
+                &self.fs,
+                plan,
+                &mut BTreeMap::new(),
+                &mut self.state,
+                &self.state_path,
+            )
+            .unwrap();
+            // Every next planner pass uses the persisted archive, as a
+            // new invocation would, rather than only the in-memory state.
+            self.state = SyncState::load(&self.state_path).unwrap();
+            outcome
+        }
+    }
+
+    impl Drop for RebindFixture {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.root).unwrap();
+        }
+    }
+
+    #[test]
+    fn rebind_skipped_conflict_survives_two_runs() {
+        [5, 7].into_iter().for_each(|last_modified| {
+            let mut fixture = RebindFixture::new(last_modified);
+            fixture.fs.write("n.pdf", b"unresolved local edit").unwrap();
+            fixture.remote.docs[0].payload_hash = Some(hash_bytes(b"replacement"));
+            let before = fixture.state.serialize().unwrap();
+            let first = plan(
+                two_way(),
+                &fixture.locals(),
+                &fixture.remote,
+                &fixture.state,
+            );
+            assert!(matches!(first.actions[0], SyncAction::Rebind { .. }));
+            assert_eq!(conflicts(&first), ["n.pdf"]);
+            assert_eq!(first.actions.len(), 2);
+            assert_eq!(fixture.execute(&first).conflicts.len(), 1);
+
+            let rebound = &fixture.state.entries["n.pdf"];
+            let baseline = SyncState::parse(&before).unwrap();
+            let agreed = &baseline.entries["n.pdf"];
+            assert_eq!(rebound.uuid, "new-uuid");
+            assert!(rebound.remote_pending);
+            assert_eq!(rebound.remote_last_modified, agreed.remote_last_modified);
+            assert_eq!(rebound.payload_hash, agreed.payload_hash);
+            assert_eq!(rebound.local_hash, agreed.local_hash);
+            assert_eq!(rebound.local_size, agreed.local_size);
+            assert_eq!(rebound.local_mtime_ms, agreed.local_mtime_ms);
+            assert_eq!(
+                device_hash_candidates(&fixture.locals(), &fixture.remote, &fixture.state),
+                [("new-uuid".to_string(), "pdf")]
+            );
+
+            let second = plan(
+                two_way(),
+                &fixture.locals(),
+                &fixture.remote,
+                &fixture.state,
+            );
+            assert_eq!(conflicts(&second), ["n.pdf"]);
+            assert_eq!(second.actions.len(), 1);
+            assert_eq!(fixture.execute(&second).conflicts.len(), 1);
+            assert_eq!(fixture.fs.read("n.pdf").unwrap(), b"unresolved local edit");
+            assert!(fixture.state.entries["n.pdf"].remote_pending);
+        });
+    }
+
+    #[test]
+    fn rebind_interrupted_pull_keeps_successor_content_pending() {
+        [5, 7].into_iter().for_each(|last_modified| {
+            let mut fixture = RebindFixture::new(last_modified);
+            // No payload hash: even equal timestamps cannot prove that
+            // two different UUIDs have the same content.
+            let first = plan(pull(), &fixture.locals(), &fixture.remote, &fixture.state);
+            assert!(matches!(first.actions[0], SyncAction::Rebind { .. }));
+            assert!(matches!(&first.actions[1], SyncAction::Download { uuid, .. } if uuid == "new-uuid"));
+            // Simulate interruption at the durable action boundary,
+            // before the planned download executes.
+            fixture.execute(&Plan {
+                actions: first.actions[..1].to_vec(),
+            });
+            let resumed = plan(pull(), &fixture.locals(), &fixture.remote, &fixture.state);
+            assert!(matches!(&resumed.actions[..], [SyncAction::Download { uuid, .. }] if uuid == "new-uuid"));
+            assert!(fixture.state.entries["n.pdf"].remote_pending);
+            assert_eq!(fixture.fs.read("n.pdf").unwrap(), b"agreed");
+
+            // The successful transfer's archive writer must clear the
+            // pending flag; model the downloaded bytes locally.
+            fixture.fs.write("n.pdf", b"replacement").unwrap();
+            let hash = hash_bytes(b"replacement");
+            record_state_with(
+                &mut fixture.state,
+                &fixture.state_path,
+                &fixture.fs,
+                "n.pdf",
+                DocKind::Pdf,
+                "new-uuid",
+                last_modified,
+                Some(hash.clone()),
+                Some(hash),
+            )
+            .unwrap();
+            fixture.state = SyncState::load(&fixture.state_path).unwrap();
+            assert!(!fixture.state.entries["n.pdf"].remote_pending);
+            assert!(plan(pull(), &fixture.locals(), &fixture.remote, &fixture.state).actions.is_empty());
+        });
+    }
+
+    #[test]
+    fn rebind_pull_refresh_uses_successor_and_survives_interruption() {
+        let mut fixture = RebindFixture::new(5);
+        // Size differs from the local file, so the copy-size heuristic
+        // cannot accidentally supply the replacement hash for this test.
+        assert_eq!(
+            device_hash_candidates(&fixture.locals(), &fixture.remote, &fixture.state),
+            [("new-uuid".to_string(), "pdf")]
+        );
+        fixture.remote.docs[0].payload_hash = Some(hash_bytes(b"agreed"));
+        let first = plan(pull(), &fixture.locals(), &fixture.remote, &fixture.state);
+        assert!(
+            matches!(&first.actions[..], [SyncAction::Rebind { .. }, SyncAction::Refresh { uuid, .. }] if uuid == "new-uuid")
+        );
+        fixture.execute(&Plan {
+            actions: first.actions[..1].to_vec(),
+        });
+        let resumed = plan(pull(), &fixture.locals(), &fixture.remote, &fixture.state);
+        assert!(
+            matches!(&resumed.actions[..], [SyncAction::Refresh { uuid, .. }] if uuid == "new-uuid")
+        );
+        fixture.execute(&resumed);
+        let st = &fixture.state.entries["n.pdf"];
+        assert_eq!(st.uuid, "new-uuid");
+        assert!(!st.remote_pending);
+        assert_eq!(st.payload_hash, Some(hash_bytes(b"agreed")));
+        assert!(
+            plan(pull(), &fixture.locals(), &fixture.remote, &fixture.state)
+                .actions
+                .is_empty()
+        );
+        assert!(
+            device_hash_candidates(&fixture.locals(), &fixture.remote, &fixture.state).is_empty()
+        );
+    }
+
+    #[test]
+    fn rebind_push_resolution_targets_successor_not_missing_uuid() {
+        [false, true].into_iter().for_each(|remote_unchanged| {
+            let fixture = &mut RebindFixture::new(5);
+            fixture.fs.write("n.pdf", b"local edit").unwrap();
+            fixture.remote.docs[0].payload_hash = Some(hash_bytes(if remote_unchanged {
+                b"agreed"
+            } else {
+                b"replacement"
+            }));
+            let options = if remote_unchanged {
+                two_way()
+            } else {
+                with_policy(two_way(), ConflictPolicy::PreferLocal)
+            };
+            let result = plan(options, &fixture.locals(), &fixture.remote, &fixture.state);
+            assert!(matches!(&result.actions[..], [SyncAction::Rebind { .. }, SyncAction::UpdateRemote { uuid, .. }] if uuid == "new-uuid"));
+        });
+    }
+
+    #[test]
+    fn rebind_with_local_deletion_preserves_successor_on_both_runs() {
+        let mut fixture = RebindFixture::new(5);
+        fixture.fs.remove("n.pdf").unwrap();
+        let options = with_delete(two_way());
+        let first = plan(options, &fixture.locals(), &fixture.remote, &fixture.state);
+        assert!(matches!(
+            &first.actions[..],
+            [SyncAction::Rebind { .. }, SyncAction::Conflict { .. }]
+        ));
+        fixture.execute(&first);
+        let second = plan(options, &fixture.locals(), &fixture.remote, &fixture.state);
+        assert!(matches!(&second.actions[..], [SyncAction::Conflict { .. }]));
+    }
+
+    #[test]
+    fn rebind_pending_field_defaults_for_existing_archives() {
+        let fixture = RebindFixture::new(5);
+        let json = fixture.state.serialize().unwrap();
+        assert!(!json.contains("remote_pending"));
+        assert!(!SyncState::parse(&json).unwrap().entries["n.pdf"].remote_pending);
     }
 
     #[test]
@@ -5296,6 +6233,272 @@ mod tests {
     }
 
     #[test]
+    fn pair_deletions_respect_direction_and_policy() {
+        use ConflictPolicy::{Newest, PreferLocal, PreferRemote, Skip};
+        use Disposition::{CopyToA, CopyToB, DeleteA, DeleteB, Forget};
+        use Mode::{Pull, Push, TwoWay};
+
+        let conflict = Some(Disposition::Conflict(
+            "deleted on one side but changed on the other",
+        ));
+        // Each row specifies: mode, surviving side, unchanged outcome,
+        // changed outcomes (skip/newest/prefer A/prefer B), and recopy
+        // without --delete. Blocked deletions retain the mapping.
+        let cases = [
+            (
+                Push,
+                true,
+                None,
+                [conflict, Some(CopyToB), Some(CopyToB), None],
+                Some(CopyToB),
+            ),
+            (
+                Pull,
+                true,
+                Some(DeleteA),
+                [conflict, Some(Forget), Some(Forget), Some(DeleteA)],
+                None,
+            ),
+            (
+                TwoWay,
+                true,
+                Some(DeleteA),
+                [conflict, Some(CopyToB), Some(CopyToB), Some(DeleteA)],
+                Some(CopyToB),
+            ),
+            (
+                Push,
+                false,
+                Some(DeleteB),
+                [conflict, Some(Forget), Some(DeleteB), Some(Forget)],
+                None,
+            ),
+            (
+                Pull,
+                false,
+                None,
+                [conflict, Some(CopyToA), None, Some(CopyToA)],
+                Some(CopyToA),
+            ),
+            (
+                TwoWay,
+                false,
+                Some(DeleteB),
+                [conflict, Some(CopyToA), Some(DeleteB), Some(CopyToA)],
+                Some(CopyToA),
+            ),
+        ];
+        cases
+            .into_iter()
+            .for_each(|(mode, survives_a, unchanged, changed_outcomes, recopy)| {
+                [false, true].into_iter().for_each(|changed| {
+                    [false, true].into_iter().for_each(|delete| {
+                        [Skip, Newest, PreferLocal, PreferRemote]
+                            .into_iter()
+                            .zip(changed_outcomes)
+                            .for_each(|(policy, changed_outcome)| {
+                                let options = SyncOptions {
+                                    mode,
+                                    delete,
+                                    conflict: policy,
+                                };
+                                let expected = if !delete {
+                                    recopy
+                                } else if changed {
+                                    changed_outcome
+                                } else {
+                                    unchanged
+                                };
+                                let lm = if changed { 200 } else { 100 };
+                                let file = local("n.pdf", DocKind::Pdf, 10, lm);
+                                let (a, b) = if survives_a {
+                                    (vec![file], vec![])
+                                } else {
+                                    (vec![], vec![file])
+                                };
+                                let mut state = SyncState::default();
+                                state
+                                    .entries
+                                    .insert("n.pdf".to_string(), file_entry(10, 100, 100, 10));
+                                let path = "n.pdf".to_string();
+                                let expected_files: Vec<_> = expected
+                                    .into_iter()
+                                    .map(|d| match d {
+                                        CopyToA => FileAction::CopyToA { path: path.clone() },
+                                        CopyToB => FileAction::CopyToB { path: path.clone() },
+                                        DeleteA => FileAction::DeleteA { path: path.clone() },
+                                        DeleteB => FileAction::DeleteB { path: path.clone() },
+                                        Forget => FileAction::Forget { path: path.clone() },
+                                        Disposition::Conflict(reason) => FileAction::Conflict {
+                                            path: path.clone(),
+                                            reason: reason.to_string(),
+                                        },
+                                    })
+                                    .collect();
+                                assert_eq!(
+                                    plan_files(options, &a, &b, &state),
+                                    expected_files,
+                                    "files: {options:?}, survives_a={survives_a}, changed={changed}"
+                                );
+
+                                let present = remote_snapshot(
+                                    &[doc(
+                                        if survives_a { "a1" } else { "b1" },
+                                        "n",
+                                        "",
+                                        "notebook",
+                                        lm,
+                                    )],
+                                    "",
+                                );
+                                let empty = remote_snapshot(&[], "");
+                                let (a, b) = if survives_a {
+                                    (&present, &empty)
+                                } else {
+                                    (&empty, &present)
+                                };
+                                let mut state = PairState::default();
+                                state
+                                    .entries
+                                    .insert("n".to_string(), pair_entry("a1", 100, "b1", 100));
+                                let key = "n".to_string();
+                                let expected_docs: Vec<_> = expected
+                                    .into_iter()
+                                    .map(|d| match d {
+                                        CopyToA => DocAction::CopyToA {
+                                            key: key.clone(),
+                                            rel_dir: String::new(),
+                                            name: key.clone(),
+                                            from_uuid: "b1".to_string(),
+                                            from_lm: lm,
+                                            replace_uuid: None,
+                                        },
+                                        CopyToB => DocAction::CopyToB {
+                                            key: key.clone(),
+                                            rel_dir: String::new(),
+                                            name: key.clone(),
+                                            from_uuid: "a1".to_string(),
+                                            from_lm: lm,
+                                            replace_uuid: None,
+                                        },
+                                        DeleteA => DocAction::DeleteOnA {
+                                            key: key.clone(),
+                                            uuid: "a1".to_string(),
+                                        },
+                                        DeleteB => DocAction::DeleteOnB {
+                                            key: key.clone(),
+                                            uuid: "b1".to_string(),
+                                        },
+                                        Forget => DocAction::Forget { key: key.clone() },
+                                        Disposition::Conflict(reason) => DocAction::Conflict {
+                                            key: key.clone(),
+                                            reason: reason.to_string(),
+                                        },
+                                    })
+                                    .collect();
+                                assert_eq!(
+                                    plan_docs(options, a, b, &state),
+                                    expected_docs,
+                                    "docs: {options:?}, survives_a={survives_a}, changed={changed}"
+                                );
+                            });
+                    });
+                });
+            });
+    }
+
+    #[test]
+    fn files_destination_deletion_keeps_source_across_runs() {
+        [Mode::Push, Mode::Pull].into_iter().for_each(|mode| {
+            [
+                ConflictPolicy::Skip,
+                ConflictPolicy::Newest,
+                ConflictPolicy::PreferLocal,
+                ConflictPolicy::PreferRemote,
+            ]
+            .into_iter()
+            .for_each(|conflict| {
+                [false, true].into_iter().for_each(|changed| {
+                    let root = std::env::temp_dir()
+                        .join(format!("rmu-delete-direction-{}", uuid::Uuid::new_v4()));
+                    let a = LocalFs::new(root.join("a"));
+                    let b = LocalFs::new(root.join("b"));
+                    a.ensure_root().unwrap();
+                    b.ensure_root().unwrap();
+                    let (source, destination) = if mode == Mode::Push {
+                        (&a, &b)
+                    } else {
+                        (&b, &a)
+                    };
+                    source
+                        .write("n.pdf", b"original synthetic document")
+                        .unwrap();
+                    let state_path = root.join("state.json");
+                    let mut state = SyncState::default();
+                    let options = SyncOptions {
+                        mode,
+                        delete: true,
+                        conflict,
+                    };
+                    let actions = plan_files(
+                        options,
+                        &a.snapshot().unwrap().0,
+                        &b.snapshot().unwrap().0,
+                        &state,
+                    );
+                    execute_files(
+                        &a,
+                        &b,
+                        &crate::progress::NoProgress,
+                        &actions,
+                        &mut state,
+                        &state_path,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        source.read("n.pdf").unwrap(),
+                        destination.read("n.pdf").unwrap()
+                    );
+                    destination.remove("n.pdf").unwrap();
+                    if changed {
+                        // A size change avoids relying on filesystem timestamp precision.
+                        source
+                            .write("n.pdf", b"edited synthetic document with a different size")
+                            .unwrap();
+                    }
+                    let expected = source.read("n.pdf").unwrap();
+                    (0..2).for_each(|_| {
+                        let mut state = SyncState::load(&state_path).unwrap();
+                        let actions = plan_files(
+                            options,
+                            &a.snapshot().unwrap().0,
+                            &b.snapshot().unwrap().0,
+                            &state,
+                        );
+                        let outcome = execute_files(
+                            &a,
+                            &b,
+                            &crate::progress::NoProgress,
+                            &actions,
+                            &mut state,
+                            &state_path,
+                        )
+                        .unwrap();
+                        assert_eq!(
+                            outcome.deleted_a + outcome.deleted_b,
+                            0,
+                            "{options:?}, changed={changed}"
+                        );
+                        assert_eq!(source.read("n.pdf").unwrap(), expected);
+                        assert!(state.entries.contains_key("n.pdf"));
+                    });
+                    fs::remove_dir_all(root).unwrap();
+                });
+            });
+        });
+    }
+
+    #[test]
     fn files_delete_propagates_a_side_deletion() {
         let mut state = SyncState::default();
         state
@@ -5319,6 +6522,7 @@ mod tests {
             local_size: size,
             local_mtime_ms: a_mtime,
             remote_last_modified: b_mtime,
+            remote_pending: false,
             remote_size: Some(b_size),
             local_hash: None,
             payload_hash: None,
@@ -5420,6 +6624,260 @@ mod tests {
                 path: "a.pdf".to_string()
             }]
         );
+    }
+
+    // ---- fs ↔ fs execution --------------------------------------------------
+
+    #[derive(Default)]
+    struct TransferFs<'a> {
+        files: std::cell::RefCell<BTreeMap<String, (Vec<u8>, i64)>>,
+        edit_after_read: std::cell::RefCell<Option<Vec<u8>>>,
+        after_write: std::cell::RefCell<Option<Box<dyn FnOnce() + 'a>>>,
+    }
+
+    impl TransferFs<'_> {
+        fn put(&self, path: &str, data: &[u8]) {
+            let mut files = self.files.borrow_mut();
+            let stamp = files.get(path).map_or(1, |(_, stamp)| stamp + 1);
+            files.insert(path.to_string(), (data.to_vec(), stamp));
+        }
+    }
+
+    impl FsEndpoint for TransferFs<'_> {
+        fn label(&self) -> String {
+            "synthetic transfer endpoint".to_string()
+        }
+        fn ensure_root(&self) -> Result<()> {
+            Ok(())
+        }
+        fn snapshot(&self) -> Result<(Vec<LocalEntry>, usize)> {
+            Ok((
+                self.files
+                    .borrow()
+                    .iter()
+                    .map(|(path, (data, stamp))| {
+                        local(path, DocKind::Pdf, data.len() as u64, *stamp)
+                    })
+                    .collect(),
+                0,
+            ))
+        }
+        fn read(&self, path: &str) -> Result<Vec<u8>> {
+            let data = self.files.borrow()[path].0.clone();
+            if let Some(edit) = self.edit_after_read.borrow_mut().take() {
+                self.put(path, &edit);
+            }
+            Ok(data)
+        }
+        fn write(&self, path: &str, data: &[u8]) -> Result<()> {
+            self.put(path, data);
+            if let Some(hook) = self.after_write.borrow_mut().take() {
+                hook();
+            }
+            Ok(())
+        }
+        fn stat(&self, path: &str) -> Result<(u64, i64)> {
+            let files = self.files.borrow();
+            let (data, stamp) = &files[path];
+            Ok((data.len() as u64, *stamp))
+        }
+        fn content_hash(&self, _: &str) -> Result<Option<String>> {
+            Ok(None)
+        }
+        fn remove(&self, _: &str) -> Result<()> {
+            panic!("unexpected removal")
+        }
+        fn rename(&self, _: &str, _: &str) -> Result<()> {
+            panic!("unexpected rename")
+        }
+        fn remove_dir(&self, _: &str) -> Result<bool> {
+            panic!("unexpected directory removal")
+        }
+    }
+
+    struct TransferArchive(PathBuf);
+
+    impl TransferArchive {
+        fn new() -> Self {
+            Self(
+                std::env::temp_dir()
+                    .join(format!("rmu-transfer-test-{}.json", uuid::Uuid::new_v4())),
+            )
+        }
+    }
+
+    impl Drop for TransferArchive {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+
+    fn transfer_plan(a: &dyn FsEndpoint, b: &dyn FsEndpoint, state: &SyncState) -> Vec<FileAction> {
+        plan_files(
+            two_way(),
+            &a.snapshot().unwrap().0,
+            &b.snapshot().unwrap().0,
+            state,
+        )
+    }
+
+    #[test]
+    fn files_source_edits_during_transfer_are_not_archived() {
+        // Both directions, first/existing agreements, edits during read/write,
+        // and both size-changing and same-size edits with a changed stamp.
+        [false, true].into_iter().for_each(|to_b| {
+            [false, true].into_iter().for_each(|mapped| {
+                [false, true].into_iter().for_each(|during_write| {
+                    [b"new".as_slice(), b"longer edit".as_slice()]
+                        .into_iter()
+                        .for_each(|edit| {
+                            let source = TransferFs::default();
+                            let destination = TransferFs::default();
+                            let (a, b): (&dyn FsEndpoint, &dyn FsEndpoint) = if to_b {
+                                (&source, &destination)
+                            } else {
+                                (&destination, &source)
+                            };
+                            let archive = TransferArchive::new();
+                            let mut state = SyncState::default();
+                            source.put("doc.pdf", b"old");
+                            if mapped {
+                                let plan = transfer_plan(a, b, &state);
+                                execute_files(
+                                    a,
+                                    b,
+                                    &crate::progress::NoProgress,
+                                    &plan,
+                                    &mut state,
+                                    &archive.0,
+                                )
+                                .unwrap();
+                                state = SyncState::load(&archive.0).unwrap();
+                                assert!(transfer_plan(a, b, &state).is_empty());
+                            }
+                            source.put("doc.pdf", b"src");
+                            let plan = transfer_plan(a, b, &state);
+                            assert_eq!(plan.len(), 1);
+                            let before = state.serialize().unwrap();
+                            if during_write {
+                                *destination.after_write.borrow_mut() =
+                                    Some(Box::new(|| source.put("doc.pdf", edit)));
+                            } else {
+                                *source.edit_after_read.borrow_mut() = Some(edit.to_vec());
+                            }
+                            let err = execute_files(
+                                a,
+                                b,
+                                &crate::progress::NoProgress,
+                                &plan,
+                                &mut state,
+                                &archive.0,
+                            )
+                            .unwrap_err();
+                            assert!(
+                                err.to_string()
+                                    .contains("source changed during sync transfer")
+                            );
+                            assert_eq!(state.serialize().unwrap(), before);
+                            if mapped {
+                                assert_eq!(
+                                    SyncState::load(&archive.0).unwrap().serialize().unwrap(),
+                                    before
+                                );
+                            } else {
+                                assert!(!archive.0.exists());
+                            }
+                            if during_write {
+                                assert_eq!(destination.read("doc.pdf").unwrap(), b"src");
+                            } else if mapped {
+                                assert_eq!(destination.read("doc.pdf").unwrap(), b"old");
+                            } else {
+                                assert!(destination.files.borrow().is_empty());
+                            }
+                            // Reload as a new invocation would: the source edit
+                            // must still be pending, never a no-op.
+                            state = SyncState::load(&archive.0).unwrap();
+                            assert!(!transfer_plan(a, b, &state).is_empty());
+                            // An opposite-side edit must conflict, not overwrite
+                            // the untransferred source version on the next run.
+                            destination.put("doc.pdf", b"dst");
+                            let next = transfer_plan(a, b, &state);
+                            assert!(matches!(next.as_slice(), [FileAction::Conflict { .. }]));
+                            let outcome = execute_files(
+                                a,
+                                b,
+                                &crate::progress::NoProgress,
+                                &next,
+                                &mut state,
+                                &archive.0,
+                            )
+                            .unwrap();
+                            assert_eq!(outcome.conflicts.len(), 1);
+                            assert_eq!(source.read("doc.pdf").unwrap(), edit);
+                            assert_eq!(destination.read("doc.pdf").unwrap(), b"dst");
+                        });
+                });
+            });
+        });
+    }
+
+    #[test]
+    fn files_source_race_preserves_prior_incremental_saves() {
+        let source = TransferFs::default();
+        let destination = TransferFs::default();
+        let archive = TransferArchive::new();
+        let mut state = SyncState::default();
+        source.put("a.pdf", b"first");
+        source.put("b.pdf", b"second");
+        source.put("c.pdf", b"third");
+        // Arm the second transfer's read race after the first write succeeds.
+        *destination.after_write.borrow_mut() = Some(Box::new(|| {
+            *source.edit_after_read.borrow_mut() = Some(b"edited".to_vec());
+        }));
+        let plan = transfer_plan(&source, &destination, &state);
+        assert!(
+            execute_files(
+                &source,
+                &destination,
+                &crate::progress::NoProgress,
+                &plan,
+                &mut state,
+                &archive.0
+            )
+            .is_err()
+        );
+        let mut saved = SyncState::load(&archive.0).unwrap();
+        assert_eq!(
+            saved.entries.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["a.pdf"]
+        );
+        assert_eq!(saved.serialize().unwrap(), state.serialize().unwrap());
+        assert_eq!(destination.read("a.pdf").unwrap(), b"first");
+        assert_eq!(destination.files.borrow().len(), 1);
+        let retry = transfer_plan(&source, &destination, &saved);
+        assert_eq!(
+            retry,
+            vec![
+                FileAction::CopyToB {
+                    path: "b.pdf".to_string()
+                },
+                FileAction::CopyToB {
+                    path: "c.pdf".to_string()
+                }
+            ]
+        );
+        execute_files(
+            &source,
+            &destination,
+            &crate::progress::NoProgress,
+            &retry,
+            &mut saved,
+            &archive.0,
+        )
+        .unwrap();
+        let saved = SyncState::load(&archive.0).unwrap();
+        assert!(transfer_plan(&source, &destination, &saved).is_empty());
+        assert_eq!(destination.read("b.pdf").unwrap(), b"edited");
     }
 
     // ---- tablet ↔ tablet planning ---------------------------------------------
@@ -5556,6 +7014,131 @@ mod tests {
                 key: "n".to_string()
             }]
         );
+    }
+
+    #[test]
+    fn docs_excluded_mappings_block_both_sides_and_preserve_archives() {
+        excluded_cases().into_iter().for_each(|(key, items)| {
+            let excluded = remote_snapshot(&items, "");
+            let (dir, name) = key.rsplit_once('/').unwrap_or(("", key));
+            let peer = RemoteSnapshot {
+                docs: vec![RemoteDoc {
+                    rel_dir: dir.to_string(),
+                    name: name.to_string(),
+                    uuid: "peer".to_string(),
+                    doc_type: RemoteType::Pdf,
+                    last_modified: 5,
+                    size_bytes: Some(100),
+                    payload_hash: None,
+                }],
+                ..RemoteSnapshot::default()
+            };
+            [false, true].into_iter().for_each(|reverse| {
+                let (a, b, entry) = if reverse {
+                    (&peer, &excluded, pair_entry("peer", 5, "u1", 5))
+                } else {
+                    (&excluded, &peer, pair_entry("u1", 5, "peer", 5))
+                };
+                let mut state = PairState::default();
+                state.entries.insert(key.to_string(), entry);
+                [push(), pull(), two_way()].into_iter().for_each(|mode| {
+                    [false, true].into_iter().for_each(|delete| {
+                        [
+                            ConflictPolicy::Skip,
+                            ConflictPolicy::Newest,
+                            ConflictPolicy::PreferLocal,
+                            ConflictPolicy::PreferRemote,
+                        ]
+                        .into_iter()
+                        .for_each(|conflict| {
+                            let result = plan_docs(
+                                SyncOptions {
+                                    delete,
+                                    conflict,
+                                    ..mode
+                                },
+                                a,
+                                b,
+                                &state,
+                            );
+                            assert!(
+                                result
+                                    .iter()
+                                    .all(|a| matches!(a, DocAction::Conflict { .. })),
+                                "{key}: {result:?}"
+                            );
+                        });
+                    });
+                });
+            });
+        });
+    }
+
+    #[test]
+    fn docs_duplicate_subtrees_preserve_successful_sync_across_runs() {
+        [false, true].into_iter().for_each(|nested| {
+            let (key, mut items) = if nested {
+                (
+                    "A/n",
+                    vec![folder("a", "A", ""), doc("u1", "n", "a", "pdf", 5)],
+                )
+            } else {
+                ("n", vec![doc("u1", "n", "", "pdf", 5)])
+            };
+            let clean = remote_snapshot(&items, "");
+            let empty = remote_snapshot(&[], "");
+            assert!(
+                plan_docs(push(), &clean, &empty, &PairState::default())
+                    .iter()
+                    .any(|a| matches!(a, DocAction::CopyToB { key: k, .. } if k == key))
+            );
+            let mut peer = clean.clone();
+            peer.docs[0].uuid = "peer".to_string();
+            let mut state = PairState::default();
+            state
+                .entries
+                .insert(key.to_string(), pair_entry("u1", 5, "peer", 5));
+            assert!(plan_docs(two_way(), &clean, &peer, &state).is_empty());
+            items.push(if nested {
+                folder("dup", "A", "")
+            } else {
+                doc("dup", "n", "", "pdf", 5)
+            });
+            let excluded = remote_snapshot(&items, "");
+            (0..2).for_each(|_| {
+                let result = plan_docs(with_delete(two_way()), &excluded, &peer, &state);
+                assert!(
+                    result
+                        .iter()
+                        .all(|a| matches!(a, DocAction::Conflict { .. }))
+                );
+                state = serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+            });
+            assert!(plan_docs(with_delete(two_way()), &clean, &peer, &state).is_empty());
+            assert_eq!(
+                plan_docs(with_delete(two_way()), &empty, &peer, &state),
+                vec![DocAction::DeleteOnB {
+                    key: key.to_string(),
+                    uuid: "peer".to_string()
+                }]
+            );
+            // Neither a missing descendant UUID nor loss of the archive licenses
+            // copying into an ambiguous destination subtree.
+            items.retain(|item| item.uuid != "u1");
+            if !nested {
+                items.push(doc("dup2", "n", "", "pdf", 5));
+            }
+            let excluded = remote_snapshot(&items, "");
+            [&state, &PairState::default()]
+                .into_iter()
+                .for_each(|archive| {
+                    assert!(
+                        plan_docs(two_way(), &excluded, &peer, archive)
+                            .iter()
+                            .all(|a| matches!(a, DocAction::Conflict { .. }))
+                    );
+                });
+        });
     }
 
     #[test]
