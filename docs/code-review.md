@@ -2,10 +2,66 @@
 
 Reviewed revision: `f990c6b` (`feat: phase 3 (2 and 3 needs testing)`).
 
-All findings below are **open**. References identify source lines at the
-reviewed revision; they may move as fixes land. P1 denotes high-priority
-correctness or data-safety issues; P2 denotes other actionable correctness
-or reliability issues. Suggested fixes have not been implemented.
+The original findings below are preserved as historical context. References
+identify source lines at the reviewed revision, not the current implementation.
+P1 denotes high-priority correctness or data-safety issues; P2 denotes other
+actionable correctness or reliability issues. Current disposition is recorded
+in the table below.
+
+## Resolution status
+
+**15 fixes are merged. Finding 16 remains a draft pending human macOS
+validation.** Each fix received regression coverage and code review. Merged
+combinations were tested against the then-current `main`, not just in isolated
+branches; conflicts and failing integration tests were returned for repair.
+
+| Finding | Fix PR | Status |
+|---|---|---|
+| 1. One-way deletion direction | [#4](https://github.com/CarlSchader/remarkable-utils/pull/4) | Merged |
+| 2. Local-move conflict baseline | [#5](https://github.com/CarlSchader/remarkable-utils/pull/5) | Merged |
+| 3. Rebind conflict baseline | [#11](https://github.com/CarlSchader/remarkable-utils/pull/11) | Merged |
+| 4. Fingerprint copy sources | [#13](https://github.com/CarlSchader/remarkable-utils/pull/13) | Merged |
+| 5. Excluded documents versus deletions | [#7](https://github.com/CarlSchader/remarkable-utils/pull/7) | Merged |
+| 6. Symlink write destinations | [#12](https://github.com/CarlSchader/remarkable-utils/pull/12) | Merged |
+| 7. Generated download filenames | [#9](https://github.com/CarlSchader/remarkable-utils/pull/9) | Merged |
+| 8. Atomic remote replacements | [#15](https://github.com/CarlSchader/remarkable-utils/pull/15) | Merged |
+| 9. Atomic local downloads | [#1](https://github.com/CarlSchader/remarkable-utils/pull/1) | Merged |
+| 10. Source stability during transfers | [#2](https://github.com/CarlSchader/remarkable-utils/pull/2) | Merged |
+| 11. Authoritative mutation/sync listings | [#8](https://github.com/CarlSchader/remarkable-utils/pull/8) | Merged |
+| 12. Ambiguous literal glob references | [#3](https://github.com/CarlSchader/remarkable-utils/pull/3) | Merged |
+| 13. Side-effect-free dry-run roots | [#14](https://github.com/CarlSchader/remarkable-utils/pull/14) | Merged |
+| 14. Stable filesystem archive roles | [#10](https://github.com/CarlSchader/remarkable-utils/pull/10) | Merged |
+| 15. Incomplete incremental listings | [#6](https://github.com/CarlSchader/remarkable-utils/pull/6) | Merged |
+| 16. Concurrent diagnostic draining | [#16](https://github.com/CarlSchader/remarkable-utils/pull/16) | Draft: native macOS validation required |
+
+The merged fix set at `d117b70` passed 199 automated tests, strict Clippy,
+and formatting checks on Linux. The combined tree of that revision and
+PR #16 head `c82617f` passed 200 tests and the same checks on Linux, but
+**PR #16 is not merged**. No real-tablet tests were performed. These results
+are not claims of macOS runtime validation or race-free device snapshots.
+
+### Human validation required for finding 16
+
+Review found that the original streaming-test helper used a pipe API excluded
+on Apple targets. The draft replaces it with portable APIs without disabling
+macOS coverage. Linux validation and portability review pass, but this
+environment lacks the Apple target standard library and a native macOS runtime.
+
+On a native macOS checkout, run the following against the current PR head and
+record the results in [PR #16](https://github.com/CarlSchader/remarkable-utils/pull/16):
+
+```sh
+gh pr checkout 16
+CARGO_BUILD_JOBS=2 nix develop --command cargo test -p libremarkable-utils --all-features ssh::streaming_tests::transfers_drain_and_reap -- --exact --nocapture
+CARGO_BUILD_JOBS=2 nix develop --command cargo test --workspace --all-features
+CARGO_BUILD_JOBS=2 nix develop --command cargo clippy --workspace --all-features --all-targets -- -D warnings
+nix fmt -- --fail-on-change
+```
+
+Keep the PR draft until those checks pass and the final revision is reviewed.
+No physical tablet is needed for these tests. The PR documents the remaining
+non-Unix EOF dependency and the distinction between bounded post-exit draining
+and timeouts for a still-running remote process.
 
 ## Scope and validation
 
