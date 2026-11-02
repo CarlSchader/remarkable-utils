@@ -65,7 +65,7 @@ impl Client {
     /// With a cache (see [`Self::with_listing_cache`]): an
     /// **incremental** listing — round trip 1 stats every relevant
     /// file (tiny output), round trip 2 fetches only files whose
-    /// mtime+size moved since the cached copy. A no-op sync of a large
+    /// mtime+size moved since the cached copy. A no-op listing of a large
     /// library stops re-reading thousands of JSONs. Any cache problem
     /// falls back to the full fetch.
     pub fn list_items(&self) -> Result<Vec<Item>> {
@@ -77,9 +77,14 @@ impl Client {
         self.list_items_full()
     }
 
-    // Mutation reference/tree checks must read current bodies, not trust the
-    // cache's lossy second-resolution mtime+size signature. Keep this a single
-    // batched read, including ancestors and siblings needed for tree checks.
+    /// Load current metadata/content bodies in one batched read, bypassing
+    /// the listing cache's lossy mtime+size signatures. Use this for mutation
+    /// planning, including sync roots and snapshots consumed by UUID-based
+    /// executors. This is not an atomic snapshot against concurrent edits.
+    pub fn list_items_authoritative(&self) -> Result<Vec<Item>> {
+        self.list_items_full()
+    }
+
     fn list_items_full(&self) -> Result<Vec<Item>> {
         self.progress.step("Reading document index");
         let marker = format!("===RMU:{}===", uuid::Uuid::new_v4().simple());
@@ -196,7 +201,9 @@ impl Client {
             return Err(Error::EmptyPath);
         }
 
-        let items = self.list_items()?;
+        // Root creation can be part of destructive sync planning. Do not
+        // reuse an externally renamed folder through a stale cached path.
+        let items = self.list_items_authoritative()?;
         let parent = xochitl::resolve_folder_ref(&items, parent_ref)?;
 
         // Fold each path segment into (known items, current parent),

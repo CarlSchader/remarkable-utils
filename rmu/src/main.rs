@@ -529,15 +529,18 @@ fn run_docs_sync(
         conflict: map_conflict(conflict, a_is_src),
     };
 
-    // Resolve each root folder; create it when that side is writable.
+    // Root resolution and both planning snapshots must bypass stat-fastcheck:
+    // executors mutate by UUID and cannot re-check the user's logical paths.
+    // Read the source authoritatively too: its snapshot can drive deletions.
+    // Create a missing root when that side is writable.
     let resolve_root =
         |client: &Client, path: &str, writable: bool| -> Result<(Vec<Item>, String)> {
-            let mut items = client.list_items()?;
+            let mut items = client.list_items_authoritative()?;
             let uuid = match xochitl::resolve_folder_ref(&items, path) {
                 Ok(uuid) => uuid,
                 Err(libremarkable_utils::Error::PathNotFound(_)) if writable => {
                     let created = client.mkdir_path(path, "")?;
-                    items = client.list_items()?;
+                    items = client.list_items_authoritative()?;
                     created.uuid
                 }
                 Err(err) => return Err(err.into()),
@@ -647,14 +650,15 @@ fn run_device_sync(
         fs_side.ensure_root()?;
     }
 
-    // Resolve the device folder; when this side can be written to,
-    // create it if missing.
-    let mut items = client.list_items()?;
+    // Use current bodies for root resolution and the entire planning tree,
+    // even for pulls: either side's snapshot may drive destructive actions.
+    // UUID-based executors rely on this scope being authoritative.
+    let mut items = client.list_items_authoritative()?;
     let root_uuid = match xochitl::resolve_folder_ref(&items, remote_path) {
         Ok(uuid) => uuid,
         Err(libremarkable_utils::Error::PathNotFound(_)) if mode != Mode::Pull => {
             let created = client.mkdir_path(remote_path, "")?;
-            items = client.list_items()?;
+            items = client.list_items_authoritative()?;
             created.uuid
         }
         Err(err) => return Err(err.into()),
