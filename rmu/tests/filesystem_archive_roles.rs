@@ -62,7 +62,14 @@ case "$3" in
     'mkdir -p .'|'mkdir -p /') exit 0 ;;
     'cat book.pdf') exec cat "$MOCK_HOME/book.pdf" ;;
     'cat /book.pdf') exec cat "$MOCK_ROOT/book.pdf" ;;
-    'mkdir -p . && cat > book.pdf') cat > "$MOCK_HOME/book.pdf"; exit $? ;;
+    'mkdir -p . && cd . || exit 9'*)
+        # Emulate the guarded write inside the synthetic login directory;
+        # never evaluate the incoming script or its paths on the real host.
+        cd "$MOCK_HOME" || exit 9
+        if [ -L ./book.pdf ] || { [ -e ./book.pdf ] && [ ! -f ./book.pdf ]; }; then
+            printf '%s\n' 'unsafe mock write target: ./book.pdf' >&2; exit 9
+        fi
+        cat > ./book.pdf; exit $? ;;
     "stat -c '%s %Y' -- book.pdf "*)
         stamp '%s %Y' '%z %m' "$MOCK_HOME/book.pdf"; exit $? ;;
     "stat -c '%s %Y' -- /book.pdf "*)
