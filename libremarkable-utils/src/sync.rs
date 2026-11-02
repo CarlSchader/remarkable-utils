@@ -3020,9 +3020,32 @@ pub fn execute_files(
     let mut outcome = FileOutcome::default();
     let mut done = 0usize;
 
-    let record = |state: &mut SyncState, path: &str| -> Result<()> {
-        let (a_size, a_mtime) = a.stat(path)?;
-        let (b_size, b_mtime) = b.stat(path)?;
+    let copy = |state: &mut SyncState, path: &str, to_b: bool| -> Result<()> {
+        let (source, destination) = if to_b { (a, b) } else { (b, a) };
+        let source_stamp = source.stat(path)?;
+        let data = source.read(path)?;
+        let verify_source = || -> Result<()> {
+            if source.stat(path)? != source_stamp || data.len() as u64 != source_stamp.0 {
+                return Err(std::io::Error::other(format!(
+                    "source changed during sync transfer: {path}; archive entry not updated"
+                ))
+                .into());
+            }
+            Ok(())
+        };
+        // Reject a changing read before touching the destination. Recheck after
+        // the write too: a source edit during that write must remain pending.
+        verify_source()?;
+        destination.write(path, &data)?;
+        let destination_stamp = destination.stat(path)?;
+        verify_source()?;
+        // Record the captured version, never a later source stamp. Even an edit
+        // after verification will then differ from the archived source version.
+        let ((a_size, a_mtime), (b_size, b_mtime)) = if to_b {
+            (source_stamp, destination_stamp)
+        } else {
+            (destination_stamp, source_stamp)
+        };
         let kind = Path::new(path)
             .extension()
             .and_then(|e| e.to_str())
@@ -3052,13 +3075,11 @@ pub fn execute_files(
         }
         match action {
             FileAction::CopyToB { path } => {
-                b.write(path, &a.read(path)?)?;
-                record(state, path)?;
+                copy(state, path, true)?;
                 outcome.copied_to_b += 1;
             }
             FileAction::CopyToA { path } => {
-                a.write(path, &b.read(path)?)?;
-                record(state, path)?;
+                copy(state, path, false)?;
                 outcome.copied_to_a += 1;
             }
             FileAction::DeleteA { path } => {
@@ -5390,6 +5411,260 @@ mod tests {
                 path: "a.pdf".to_string()
             }]
         );
+    }
+
+    // ---- fs ↔ fs execution --------------------------------------------------
+
+    #[derive(Default)]
+    struct TransferFs<'a> {
+        files: std::cell::RefCell<BTreeMap<String, (Vec<u8>, i64)>>,
+        edit_after_read: std::cell::RefCell<Option<Vec<u8>>>,
+        after_write: std::cell::RefCell<Option<Box<dyn FnOnce() + 'a>>>,
+    }
+
+    impl TransferFs<'_> {
+        fn put(&self, path: &str, data: &[u8]) {
+            let mut files = self.files.borrow_mut();
+            let stamp = files.get(path).map_or(1, |(_, stamp)| stamp + 1);
+            files.insert(path.to_string(), (data.to_vec(), stamp));
+        }
+    }
+
+    impl FsEndpoint for TransferFs<'_> {
+        fn label(&self) -> String {
+            "synthetic transfer endpoint".to_string()
+        }
+        fn ensure_root(&self) -> Result<()> {
+            Ok(())
+        }
+        fn snapshot(&self) -> Result<(Vec<LocalEntry>, usize)> {
+            Ok((
+                self.files
+                    .borrow()
+                    .iter()
+                    .map(|(path, (data, stamp))| {
+                        local(path, DocKind::Pdf, data.len() as u64, *stamp)
+                    })
+                    .collect(),
+                0,
+            ))
+        }
+        fn read(&self, path: &str) -> Result<Vec<u8>> {
+            let data = self.files.borrow()[path].0.clone();
+            if let Some(edit) = self.edit_after_read.borrow_mut().take() {
+                self.put(path, &edit);
+            }
+            Ok(data)
+        }
+        fn write(&self, path: &str, data: &[u8]) -> Result<()> {
+            self.put(path, data);
+            if let Some(hook) = self.after_write.borrow_mut().take() {
+                hook();
+            }
+            Ok(())
+        }
+        fn stat(&self, path: &str) -> Result<(u64, i64)> {
+            let files = self.files.borrow();
+            let (data, stamp) = &files[path];
+            Ok((data.len() as u64, *stamp))
+        }
+        fn content_hash(&self, _: &str) -> Result<Option<String>> {
+            Ok(None)
+        }
+        fn remove(&self, _: &str) -> Result<()> {
+            panic!("unexpected removal")
+        }
+        fn rename(&self, _: &str, _: &str) -> Result<()> {
+            panic!("unexpected rename")
+        }
+        fn remove_dir(&self, _: &str) -> Result<bool> {
+            panic!("unexpected directory removal")
+        }
+    }
+
+    struct TransferArchive(PathBuf);
+
+    impl TransferArchive {
+        fn new() -> Self {
+            Self(
+                std::env::temp_dir()
+                    .join(format!("rmu-transfer-test-{}.json", uuid::Uuid::new_v4())),
+            )
+        }
+    }
+
+    impl Drop for TransferArchive {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+
+    fn transfer_plan(a: &dyn FsEndpoint, b: &dyn FsEndpoint, state: &SyncState) -> Vec<FileAction> {
+        plan_files(
+            two_way(),
+            &a.snapshot().unwrap().0,
+            &b.snapshot().unwrap().0,
+            state,
+        )
+    }
+
+    #[test]
+    fn files_source_edits_during_transfer_are_not_archived() {
+        // Both directions, first/existing agreements, edits during read/write,
+        // and both size-changing and same-size edits with a changed stamp.
+        [false, true].into_iter().for_each(|to_b| {
+            [false, true].into_iter().for_each(|mapped| {
+                [false, true].into_iter().for_each(|during_write| {
+                    [b"new".as_slice(), b"longer edit".as_slice()]
+                        .into_iter()
+                        .for_each(|edit| {
+                            let source = TransferFs::default();
+                            let destination = TransferFs::default();
+                            let (a, b): (&dyn FsEndpoint, &dyn FsEndpoint) = if to_b {
+                                (&source, &destination)
+                            } else {
+                                (&destination, &source)
+                            };
+                            let archive = TransferArchive::new();
+                            let mut state = SyncState::default();
+                            source.put("doc.pdf", b"old");
+                            if mapped {
+                                let plan = transfer_plan(a, b, &state);
+                                execute_files(
+                                    a,
+                                    b,
+                                    &crate::progress::NoProgress,
+                                    &plan,
+                                    &mut state,
+                                    &archive.0,
+                                )
+                                .unwrap();
+                                state = SyncState::load(&archive.0).unwrap();
+                                assert!(transfer_plan(a, b, &state).is_empty());
+                            }
+                            source.put("doc.pdf", b"src");
+                            let plan = transfer_plan(a, b, &state);
+                            assert_eq!(plan.len(), 1);
+                            let before = state.serialize().unwrap();
+                            if during_write {
+                                *destination.after_write.borrow_mut() =
+                                    Some(Box::new(|| source.put("doc.pdf", edit)));
+                            } else {
+                                *source.edit_after_read.borrow_mut() = Some(edit.to_vec());
+                            }
+                            let err = execute_files(
+                                a,
+                                b,
+                                &crate::progress::NoProgress,
+                                &plan,
+                                &mut state,
+                                &archive.0,
+                            )
+                            .unwrap_err();
+                            assert!(
+                                err.to_string()
+                                    .contains("source changed during sync transfer")
+                            );
+                            assert_eq!(state.serialize().unwrap(), before);
+                            if mapped {
+                                assert_eq!(
+                                    SyncState::load(&archive.0).unwrap().serialize().unwrap(),
+                                    before
+                                );
+                            } else {
+                                assert!(!archive.0.exists());
+                            }
+                            if during_write {
+                                assert_eq!(destination.read("doc.pdf").unwrap(), b"src");
+                            } else if mapped {
+                                assert_eq!(destination.read("doc.pdf").unwrap(), b"old");
+                            } else {
+                                assert!(destination.files.borrow().is_empty());
+                            }
+                            // Reload as a new invocation would: the source edit
+                            // must still be pending, never a no-op.
+                            state = SyncState::load(&archive.0).unwrap();
+                            assert!(!transfer_plan(a, b, &state).is_empty());
+                            // An opposite-side edit must conflict, not overwrite
+                            // the untransferred source version on the next run.
+                            destination.put("doc.pdf", b"dst");
+                            let next = transfer_plan(a, b, &state);
+                            assert!(matches!(next.as_slice(), [FileAction::Conflict { .. }]));
+                            let outcome = execute_files(
+                                a,
+                                b,
+                                &crate::progress::NoProgress,
+                                &next,
+                                &mut state,
+                                &archive.0,
+                            )
+                            .unwrap();
+                            assert_eq!(outcome.conflicts.len(), 1);
+                            assert_eq!(source.read("doc.pdf").unwrap(), edit);
+                            assert_eq!(destination.read("doc.pdf").unwrap(), b"dst");
+                        });
+                });
+            });
+        });
+    }
+
+    #[test]
+    fn files_source_race_preserves_prior_incremental_saves() {
+        let source = TransferFs::default();
+        let destination = TransferFs::default();
+        let archive = TransferArchive::new();
+        let mut state = SyncState::default();
+        source.put("a.pdf", b"first");
+        source.put("b.pdf", b"second");
+        source.put("c.pdf", b"third");
+        // Arm the second transfer's read race after the first write succeeds.
+        *destination.after_write.borrow_mut() = Some(Box::new(|| {
+            *source.edit_after_read.borrow_mut() = Some(b"edited".to_vec());
+        }));
+        let plan = transfer_plan(&source, &destination, &state);
+        assert!(
+            execute_files(
+                &source,
+                &destination,
+                &crate::progress::NoProgress,
+                &plan,
+                &mut state,
+                &archive.0
+            )
+            .is_err()
+        );
+        let mut saved = SyncState::load(&archive.0).unwrap();
+        assert_eq!(
+            saved.entries.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["a.pdf"]
+        );
+        assert_eq!(saved.serialize().unwrap(), state.serialize().unwrap());
+        assert_eq!(destination.read("a.pdf").unwrap(), b"first");
+        assert_eq!(destination.files.borrow().len(), 1);
+        let retry = transfer_plan(&source, &destination, &saved);
+        assert_eq!(
+            retry,
+            vec![
+                FileAction::CopyToB {
+                    path: "b.pdf".to_string()
+                },
+                FileAction::CopyToB {
+                    path: "c.pdf".to_string()
+                }
+            ]
+        );
+        execute_files(
+            &source,
+            &destination,
+            &crate::progress::NoProgress,
+            &retry,
+            &mut saved,
+            &archive.0,
+        )
+        .unwrap();
+        let saved = SyncState::load(&archive.0).unwrap();
+        assert!(transfer_plan(&source, &destination, &saved).is_empty());
+        assert_eq!(destination.read("b.pdf").unwrap(), b"edited");
     }
 
     // ---- tablet ↔ tablet planning ---------------------------------------------
