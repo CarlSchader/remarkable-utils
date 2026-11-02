@@ -83,14 +83,17 @@ impl Client {
         let script = format!(
             "cd {dir} || exit 9\n\
              for f in *.metadata *.content; do\n\
-             [ -f \"$f\" ] || continue\n\
+             case \"$f\" in '*.metadata'|'*.content')\n\
+             [ -e \"$f\" ] || [ -L \"$f\" ] || continue;; esac\n\
              printf '\\n%s %s\\n' {marker} \"$f\"\n\
-             cat \"$f\"\n\
+             cat \"$f\" || exit 1\n\
              done\n\
              printf '\\n%s __sizes__\\n' {marker}\n\
              for f in *.pdf *.epub; do\n\
-             [ -f \"$f\" ] || continue\n\
-             printf '%s %s\\n' \"$(wc -c < \"$f\")\" \"$f\"\n\
+             case \"$f\" in '*.pdf'|'*.epub')\n\
+             [ -e \"$f\" ] || [ -L \"$f\" ] || continue;; esac\n\
+             size=$(wc -c < \"$f\") || exit 1\n\
+             printf '%s %s\\n' \"$size\" \"$f\"\n\
              done\n",
             dir = shell_quote(&self.dir),
             marker = shell_quote(&marker),
@@ -104,12 +107,18 @@ impl Client {
 
     fn list_items_incremental(&self, cache_path: &Path) -> Result<Vec<Item>> {
         self.progress.step("Reading document index (incremental)");
-        // Round trip 1: stat everything relevant. Unmatched globs
-        // arrive as literal names and fail inside stat; harmless.
+        // Round trip 1: stat everything relevant in one invocation.
+        // Skip only unmatched glob literals, not files whose stat fails:
+        // a partial stat listing must never replace the cached index.
         let script = format!(
             "cd {dir} || exit 9\n\
-             stat -c '%Y %s %n' -- *.metadata *.content *.pdf *.epub 2>/dev/null\n\
-             exit 0\n",
+             set --\n\
+             for f in *.metadata *.content *.pdf *.epub; do\n\
+             case \"$f\" in '*.metadata'|'*.content'|'*.pdf'|'*.epub')\n\
+             [ -e \"$f\" ] || [ -L \"$f\" ] || continue;; esac\n\
+             set -- \"$@\" \"$f\"\n\
+             done\n\
+             [ \"$#\" -eq 0 ] || stat -c '%Y %s %n' -- \"$@\"\n",
             dir = shell_quote(&self.dir),
         );
         let output = self.session.run_checked(&script)?;
@@ -133,9 +142,8 @@ impl Client {
             let script = format!(
                 "cd {dir} || exit 9\n\
                  for f in {names}; do\n\
-                 [ -f \"$f\" ] || continue\n\
                  printf '\\n%s %s\\n' {marker} \"$f\"\n\
-                 cat \"$f\"\n\
+                 cat \"$f\" || exit 1\n\
                  done\n",
                 dir = shell_quote(&self.dir),
                 marker = shell_quote(&marker),
