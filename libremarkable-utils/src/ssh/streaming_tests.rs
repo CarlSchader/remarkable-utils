@@ -29,6 +29,17 @@ fn transfers_drain_and_reap() {
             [0, 23].into_iter().for_each(check_transfers);
             check_early_errors();
             check_inherited_outputs();
+            [false, true].into_iter().for_each(|with_stdin| {
+                [0, 23].into_iter().for_each(|status| {
+                    check_completed_inherited_outputs(status, with_stdin, false);
+                });
+            });
+            [0, 23].into_iter().for_each(|status| {
+                check_completed_inherited_outputs(status, true, true);
+            });
+            check_queued_diagnostics();
+            #[cfg(target_os = "linux")]
+            check_staged_upload_errors();
         });
         return;
     }
@@ -216,11 +227,16 @@ impl Drop for PipeHolder {
     }
 }
 
+fn output_pipe() -> (fs::File, fs::File) {
+    let (reader, writer) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).unwrap();
+    (reader.into(), writer.into())
+}
+
 fn check_inherited_outputs() {
     use std::os::fd::OwnedFd;
 
-    let (stdout_reader, stdout_writer) = UnixStream::pair().unwrap();
-    let (stderr_reader, stderr_writer) = UnixStream::pair().unwrap();
+    let (stdout_reader, stdout_writer) = output_pipe();
+    let (stderr_reader, stderr_writer) = output_pipe();
     let mut holder = PipeHolder(
         Command::new("cat")
             .stdin(Stdio::piped())
@@ -259,6 +275,174 @@ fn check_inherited_outputs() {
     let holder_pid = holder.0.id();
     drop(holder);
     assert_reaped(holder_pid);
+}
+
+fn check_completed_inherited_outputs(status: i32, with_stdin: bool, noisy_holder: bool) {
+    use std::os::fd::OwnedFd;
+
+    let (stdout_reader, stdout_writer) = output_pipe();
+    let (stderr_reader, stderr_writer) = output_pipe();
+    let mut holder_command = Command::new("sh");
+    holder_command.args([
+        "-c",
+        if noisy_holder {
+            "while :; do printf helper-output; printf helper-error >&2; done"
+        } else {
+            "exec cat"
+        },
+    ]);
+    let mut holder = PipeHolder(
+        holder_command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::from(OwnedFd::from(
+                stdout_writer.try_clone().unwrap(),
+            )))
+            .stderr(Stdio::from(OwnedFd::from(
+                stderr_writer.try_clone().unwrap(),
+            )))
+            .spawn()
+            .unwrap(),
+    );
+    let cancellation = DrainCancellation::new().unwrap();
+    let mut command = Command::new("sh");
+    command.args(["-c", &format!(
+        "cat >/dev/null; head -c {PIPE_FILL} /dev/zero >&2; printf diagnostic-tail >&2; {} exit {status}",
+        if with_stdin { "head -c 1048576 /dev/zero;" } else { "" }
+    )]);
+    let mut child = StreamingChild {
+        child: command
+            .stdin(if with_stdin {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(if with_stdin {
+                Stdio::from(OwnedFd::from(stdout_writer))
+            } else {
+                Stdio::null()
+            })
+            .stderr(Stdio::from(OwnedFd::from(stderr_writer)))
+            .spawn()
+            .unwrap(),
+        stderr: None,
+        stdout: None,
+        reaped: false,
+        cancellation,
+    };
+    let pid = child.child.id();
+    child.stderr = Some(drain_pipe(stderr_reader, &child.cancellation).unwrap());
+    if with_stdin {
+        child.stdout = Some(drain_pipe(stdout_reader, &child.cancellation).unwrap());
+        child
+            .child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"complete input")
+            .unwrap();
+    }
+    assert!(holder.0.try_wait().unwrap().is_none());
+    // Direct child completes, but the independent helper keeps stderr and
+    // (for uploads) stdout open. Both exit statuses must finalize without EOF.
+    let result = child.finish(Ok(if with_stdin { 14 } else { 0 }));
+    if status == 0 {
+        result.unwrap();
+    } else {
+        assert!(matches!(result, Err(Error::Remote { status: 23, stderr })
+        if if noisy_holder { stderr.contains("diagnostic-tail") } else {
+            stderr == format!("{}diagnostic-tail", "\0".repeat(PIPE_FILL))
+        }));
+    }
+    assert_reaped(pid);
+    if !noisy_holder {
+        assert!(holder.0.try_wait().unwrap().is_none());
+    }
+    let holder_pid = holder.0.id();
+    drop(holder);
+    assert_reaped(holder_pid);
+}
+
+fn check_queued_diagnostics() {
+    // Start readers only after notification: queued tails must not be discarded
+    // when the child-exit signal and readable data arrive together. Keep the
+    // writers open so this cannot accidentally pass by waiting for EOF.
+    let (reader_a, mut writer_a) = output_pipe();
+    let (reader_b, mut writer_b) = output_pipe();
+    let (empty_reader, empty_writer) = output_pipe();
+    writer_a.write_all(b"queued stderr").unwrap();
+    writer_b.write_all(b"queued stdout").unwrap();
+    let mut cancellation = DrainCancellation::new().unwrap();
+    cancellation.child_exited();
+    let a = drain_pipe(reader_a, &cancellation).unwrap();
+    let b = drain_pipe(reader_b, &cancellation).unwrap();
+    assert_eq!(join_pipe(Some(a)).unwrap(), b"queued stderr");
+    assert_eq!(join_pipe(Some(b)).unwrap(), b"queued stdout");
+    let empty = drain_pipe(empty_reader, &cancellation).unwrap();
+    assert!(join_pipe(Some(empty)).unwrap().is_empty());
+    drop((writer_a, writer_b, empty_writer));
+}
+
+#[cfg(target_os = "linux")]
+fn check_staged_upload_errors() {
+    // Execute the unchanged BusyBox/GNU-compatible staging transaction locally.
+    // Closing stdin must let its length check and EXIT cleanup run, not kill
+    // the shell while it still owns a temporary sibling.
+    let scratch = Scratch::new();
+    let remote = scratch.0.join("remote.pdf");
+    let pid_file = scratch.0.join("upload-pid");
+    fs::write(&remote, b"existing remote").unwrap();
+    let session = scratch.session(&format!(
+        "echo $$ > {}\nfor cmd do :; done\nexec sh -c 'exec 3>&1; cat() {{ head -c {PIPE_FILL} /dev/zero >&2; head -c {PIPE_FILL} /dev/zero >&3; command cat \"$@\"; }}; '\"$cmd\"",
+        shell_quote(pid_file.to_str().unwrap())
+    ));
+    let mut reader = std::io::Cursor::new(vec![7; PIPE_FILL]).chain(FailingIo);
+    let progress = Recorder::default();
+    let result = session.upload_reader(
+        &mut reader,
+        remote.to_str().unwrap(),
+        (2 * PIPE_FILL) as u64,
+        &progress,
+    );
+    assert!(
+        matches!(result, Err(Error::Io(error)) if error.to_string() == "injected read failure")
+    );
+    assert_eq!(progress.transferred.get(), PIPE_FILL as u64);
+    assert_eq!(progress.done.get(), 0);
+    assert_eq!(fs::read(&remote).unwrap(), b"existing remote");
+    assert_pid_file_reaped(&pid_file);
+    assert_no_upload_temps(&scratch.0);
+
+    // Deliberately delay the shell after it closes stdin: immediate kill on
+    // BrokenPipe would bypass the EXIT trap and leave the staged sibling.
+    let session = scratch.session(&format!(
+        "echo $$ > {}\nfor cmd do :; done\nexec sh -c 'cat() {{ exec 0<&-; sleep 0.05; return 1; }}; '\"$cmd\"",
+        shell_quote(pid_file.to_str().unwrap())
+    ));
+    let progress = Recorder::default();
+    let result = session.upload_reader(
+        &mut &vec![7; PIPE_FILL][..],
+        remote.to_str().unwrap(),
+        PIPE_FILL as u64,
+        &progress,
+    );
+    assert!(
+        matches!(result, Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::BrokenPipe)
+    );
+    assert_eq!(progress.done.get(), 0);
+    assert_eq!(fs::read(remote).unwrap(), b"existing remote");
+    assert_pid_file_reaped(&pid_file);
+    assert_no_upload_temps(&scratch.0);
+}
+
+#[cfg(target_os = "linux")]
+fn assert_no_upload_temps(directory: &Path) {
+    assert!(fs::read_dir(directory).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".rmu-upload-")
+    }));
 }
 
 struct FailingIo;

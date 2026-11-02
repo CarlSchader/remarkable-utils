@@ -14,6 +14,12 @@
 //! Connections are multiplexed via `ControlMaster` by default so one
 //! logical operation (which may issue several ssh commands) only
 //! authenticates once.
+//!
+//! Streaming diagnostics are drained concurrently. On Unix, once the direct
+//! child exits, readers collect only the bytes already queued, without waiting
+//! for helpers holding inherited output descriptors. Non-Unix readers still
+//! require EOF. This is not a command timeout: a live SSH process can still
+//! wait on the network, including during staged-upload error cleanup.
 
 use std::fmt;
 use std::fs;
@@ -23,7 +29,14 @@ use std::process::{Child, Command, Output, Stdio};
 use std::thread::{self, JoinHandle};
 
 #[cfg(unix)]
-use std::{os::fd::AsFd, os::unix::net::UnixStream, sync::Arc};
+use std::{
+    os::fd::AsFd,
+    os::unix::net::UnixStream,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use crate::error::{Error, Result};
 use crate::progress::{NoProgress, Progress};
@@ -232,17 +245,24 @@ impl SshSession {
         Ok(())
     }
 
-    /// Write bytes to a remote file (via `cat > path`). Small control
-    /// writes; no progress reporting.
+    /// Atomically replace a remote file after verifying the received length.
+    /// Small control writes; no progress reporting.
     pub fn write_remote_file(&self, remote_path: &str, data: &[u8]) -> Result<()> {
-        self.run_checked_with_stdin(
-            &format!("cat > {}", shell_quote(remote_path)),
-            data,
-            &NoProgress,
-        )
+        self.write_remote_file_with_progress(remote_path, data, &NoProgress)
     }
 
-    /// Stream a local file to a remote path, reporting progress.
+    /// In-memory payload writes with the same staging as local-file uploads.
+    pub(crate) fn write_remote_file_with_progress(
+        &self,
+        remote_path: &str,
+        data: &[u8],
+        progress: &dyn Progress,
+    ) -> Result<()> {
+        self.upload_reader(&mut &data[..], remote_path, data.len() as u64, progress)
+    }
+
+    /// Stream a local file to a unique remote sibling, verify its length,
+    /// then atomically replace the destination, preserving existing permissions.
     pub fn upload_local_file(
         &self,
         local: &Path,
@@ -251,15 +271,27 @@ impl SshSession {
     ) -> Result<()> {
         let mut file = fs::File::open(local)?;
         let total = file.metadata()?.len();
+        self.upload_reader(&mut file, remote_path, total, progress)
+    }
+
+    fn upload_reader(
+        &self,
+        reader: &mut impl Read,
+        remote_path: &str,
+        total: u64,
+        progress: &dyn Progress,
+    ) -> Result<()> {
         let mut child = StreamingChild::spawn(
-            &mut self.command(&format!("cat > {}", shell_quote(remote_path))),
+            &mut self.command(&staged_write_command(remote_path, total)),
             true,
         )?;
-        let transfer = {
+        let copied = {
             let mut stdin = child.child.stdin.take().expect("stdin was piped");
-            copy_with_progress(&mut file, &mut stdin, Some(total), progress)
+            copy_with_progress(reader, &mut stdin, Some(total), progress)
         };
-        child.finish(transfer)?;
+        // Close stdin and reap even on a local read/write failure, allowing
+        // the remote length check and cleanup trap to run on the partial input.
+        child.finish_upload(copied)?;
         progress.bytes_done();
         Ok(())
     }
@@ -409,7 +441,8 @@ pub fn shell_quote(s: &str) -> String {
 /// Owns a streaming subprocess and its concurrent output readers. Transfer
 /// pipes must be closed before `finish`, so a successful upload sends EOF.
 /// On an early error (or unwind), cancel readers and kill/reap the direct child
-/// before joining. On non-Unix systems, readers still require pipe EOF.
+/// before joining. After child exit, Unix readers drain a finite snapshot of
+/// queued output. On non-Unix systems, readers still require pipe EOF.
 struct StreamingChild {
     child: Child,
     stderr: Option<JoinHandle<std::io::Result<Vec<u8>>>>,
@@ -453,16 +486,31 @@ impl StreamingChild {
 
     fn finish(mut self, transfer: std::io::Result<u64>) -> Result<()> {
         transfer?;
+        checked(self.wait_for_output()?)?;
+        Ok(())
+    }
+
+    fn finish_upload(mut self, transfer: std::io::Result<u64>) -> Result<()> {
+        // Staged writes must see EOF and run their length check/cleanup trap.
+        // Killing SSH here can strand the remote sibling. As before, this wait
+        // has no command timeout; a nonresponsive remote requires interruption.
+        let output = self.wait_for_output();
+        transfer?;
+        checked(output?)?;
+        Ok(())
+    }
+
+    fn wait_for_output(&mut self) -> std::io::Result<Output> {
         let status = self.child.wait()?;
         self.reaped = true;
+        self.cancellation.child_exited();
         let stderr = join_pipe(self.stderr.take())?;
         let stdout = join_pipe(self.stdout.take())?;
-        checked(Output {
+        Ok(Output {
             status,
             stdout,
             stderr,
-        })?;
-        Ok(())
+        })
     }
 }
 
@@ -487,6 +535,8 @@ struct DrainCancellation {
     reader: Arc<UnixStream>,
     #[cfg(unix)]
     writer: Option<UnixStream>,
+    #[cfg(unix)]
+    drain_queued: Arc<AtomicBool>,
 }
 
 impl DrainCancellation {
@@ -497,6 +547,7 @@ impl DrainCancellation {
             Ok(Self {
                 reader: Arc::new(reader),
                 writer: Some(writer),
+                drain_queued: Arc::new(AtomicBool::new(false)),
             })
         }
         #[cfg(not(unix))]
@@ -506,6 +557,12 @@ impl DrainCancellation {
     fn cancel(&mut self) {
         #[cfg(unix)]
         self.writer.take();
+    }
+
+    fn child_exited(&mut self) {
+        #[cfg(unix)]
+        self.drain_queued.store(true, Ordering::Release);
+        self.cancel();
     }
 }
 
@@ -517,6 +574,7 @@ fn drain_pipe(
     use rustix::event::{PollFd, PollFlags, poll};
 
     let cancelled = Arc::clone(&cancellation.reader);
+    let drain_queued = Arc::clone(&cancellation.drain_queued);
     thread::Builder::new().spawn(move || {
         let mut data = Vec::new();
         let mut buffer = [0; 64 * 1024];
@@ -532,6 +590,20 @@ fn drain_pipe(
             }
             // Cancellation takes precedence even if output is continuously ready.
             if !fds[1].revents().is_empty() {
+                if drain_queued.load(Ordering::Acquire) {
+                    // The child has exited, so all its output is already in
+                    // this buffer or the pipe. Snapshot the queue, not EOF:
+                    // a helper may keep the writer open or produce forever.
+                    // With one reader these bytes cannot disappear, so this
+                    // finite read cannot wait for a future write from a helper.
+                    let queued = loop {
+                        match rustix::io::ioctl_fionread(&pipe) {
+                            Err(rustix::io::Errno::INTR) => continue,
+                            result => break result?,
+                        }
+                    };
+                    (&mut pipe).take(queued).read_to_end(&mut data)?;
+                }
                 return Ok(data);
             }
             if fds[0].revents().contains(PollFlags::NVAL) {
@@ -569,6 +641,40 @@ fn join_pipe(reader: Option<JoinHandle<std::io::Result<Vec<u8>>>>) -> std::io::R
             .map_err(|_| std::io::Error::other("SSH output reader panicked"))?,
         None => Ok(Vec::new()),
     }
+}
+
+/// One busybox-compatible transaction: EOF alone is not proof of a complete
+/// upload (e.g. a disconnected SSH channel can give `cat` a clean short EOF).
+/// The sibling is private until verified; rename stays on the same filesystem.
+/// Traps clean ordinary failures and catchable disconnect signals; uncatchable
+/// termination can leave an orphan sibling. This is not a crash-durability guarantee.
+fn staged_write_command(remote_path: &str, total: u64) -> String {
+    let parent = remote_path
+        .rsplit_once('/')
+        .map_or(".", |(dir, _)| if dir.is_empty() { "/" } else { dir });
+    format!(
+        r#"dest={dest}
+ tmp=$(mktemp -- {template}) || exit 1
+ trap 'rm -f -- "$tmp"' EXIT
+ trap 'exit 1' HUP INT TERM
+ cat > "$tmp" || exit 1
+ [ "$(wc -c < "$tmp")" -eq {total} ] || {{
+     echo 'incomplete remote upload: unexpected byte count' >&2
+     exit 1
+ }}
+ if [ -e "$dest" ]; then
+     attrs=$(stat -c '%a %u %g' -- "$dest") || exit 1
+     set -- $attrs
+     chown "$2:$3" "$tmp" || exit 1
+     chmod "$1" "$tmp" || exit 1
+ else
+     mask=$(umask)
+     chmod "$(printf '%o' "$((0666 & ~0$mask))")" "$tmp" || exit 1
+ fi
+ mv -fT -- "$tmp" "$dest""#,
+        dest = shell_quote(remote_path),
+        template = shell_quote(&format!("{parent}/.rmu-upload-XXXXXX")),
+    )
 }
 
 /// `io::copy` with per-chunk progress callbacks.

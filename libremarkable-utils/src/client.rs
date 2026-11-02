@@ -298,11 +298,8 @@ impl Client {
     ) -> Result<Item> {
         let doc_uuid = uuid::Uuid::new_v4().to_string();
         self.progress.step(&format!("Uploading '{name}'"));
-        self.session.run_checked_with_stdin(
-            &format!(
-                "cat > {}",
-                shell_quote(&self.remote_path(&format!("{doc_uuid}.{file_type}")))
-            ),
+        self.session.write_remote_file_with_progress(
+            &self.remote_path(&format!("{doc_uuid}.{file_type}")),
             data,
             &*self.progress,
         )?;
@@ -439,11 +436,8 @@ impl Client {
     /// (e.g. a regenerated EPUB) and bump `lastModified`.
     pub fn update_payload_bytes(&self, uuid: &str, file_type: &str, data: &[u8]) -> Result<i64> {
         self.progress.step("Updating document");
-        self.session.run_checked_with_stdin(
-            &format!(
-                "cat > {}",
-                shell_quote(&self.remote_path(&format!("{uuid}.{file_type}")))
-            ),
+        self.session.write_remote_file_with_progress(
+            &self.remote_path(&format!("{uuid}.{file_type}")),
             data,
             &*self.progress,
         )?;
