@@ -262,7 +262,7 @@ notes.
 
 `Client::list_items` with a listing cache
 (`$XDG_STATE_HOME/rmu/listing-<hash>.json`, keyed by ssh destination +
-xochitl dir) becomes change-scaled, Unison-archive style:
+xochitl dir) provides change-scaled read-only listings, Unison-archive style:
 
 1. Round trip 1: `stat -c '%Y %s %n'` over every
    `.metadata`/`.content`/payload file — tiny output, one exec.
@@ -276,8 +276,23 @@ JSONs. The cache is best-effort: any load problem falls back to the
 full fetch, any save problem only costs speed next run. Staleness
 caveat (same trade as the git index / Unison fastcheck): a rewrite
 within the same second that keeps the file size is invisible until
-the next change. `rmu sync` and the regular commands both use the
-cache; every run re-stats, so rmu's own writes are always seen.
+the next change. Mutations discard the listing cache before changing
+metadata/content or deleting artifacts, including when the remote operation
+later fails; an unremovable cache blocks that mutation. The next listing
+re-fetches the bodies, so rmu's own metadata writes are visible even with
+identical stat signatures. Delete, move, rename, empty-trash, and folder
+creation reference/tree checks bypass the cache with a single batched full
+read, protecting against external same-stamp changes too.
+
+Sync uses `Client::list_items_authoritative` for root resolution and the
+entire tablet snapshot on both sides, including after creating a missing
+writable root. This also applies without `--delete` and in dry runs: snapshot
+contents drive overwrite/move decisions and UUID-based executor actions, not
+just deletions. A cached `/AAAA` renamed externally to `/BBBB` cannot select
+the renamed folder through either root lookup or the folder-creation fallback.
+This trades incremental metadata reads for mutation safety; ordinary listings
+retain stat fastcheck. Neither listing mode provides an atomic snapshot or a
+lock against concurrent device edits.
 
 ## Executor
 
