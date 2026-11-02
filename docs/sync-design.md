@@ -86,7 +86,8 @@ file). Notebooks/bundles are never hashed; their rules are unchanged.
 
 ### What the lazy device hashing covers (`device_hash_candidates`)
 
-1. **Mapped docs whose `lastModified` moved** while the archive has a
+1. **Mapped docs whose `lastModified` moved, or whose UUID was
+   replaced and still awaits reconciliation**, while the archive has a
    payload hash: annotating a PDF bumps `lastModified` without touching
    the payload. If the fresh hash matches the recorded one, the plan
    emits `refresh` (state-only) instead of a re-download. This fixes
@@ -108,7 +109,8 @@ A versioned JSON file per endpoint pair recording, per synced entry:
 ```
 relative path <-> device UUID,
 last-synced local mtime+size and SHA-256,
-last-synced device lastModified and payload SHA-256
+last-synced device lastModified and payload SHA-256,
+pending successor reconciliation (only when a UUID was rebound)
 ```
 
 Placement: `$XDG_STATE_HOME/rmu/sync-<pairhash>.json` (or
@@ -183,7 +185,12 @@ Unchanged v1 rules that remain data-safety invariants:
 - `--delete` only propagates deletions of **mapped** files.
 - Uploads write `.metadata` last, so interruption leaves invisible
   orphans, not half-documents; dangling mappings **rebind** to
-  same-name same-kind successors.
+  same-name same-kind successors. Rebinding changes only the UUID:
+  the last agreed stamps and hashes remain intact, and a persisted
+  pending flag keeps the successor a remote change even if its timestamp
+  equals the predecessor's. Only a successful transfer or hash-verified
+  refresh clears that flag. Pending successors are not copy sources and
+  their device-side moves are followed only after content reconciliation.
 
 ## Moves and copies (phase 2)
 
