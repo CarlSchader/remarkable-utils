@@ -554,6 +554,15 @@ pub trait FsEndpoint {
     fn label(&self) -> String;
     /// Create the root directory if missing.
     fn ensure_root(&self) -> Result<()>;
+    /// Whether the root exists, without creating it. Missing writable
+    /// roots can be represented by an empty snapshot during planning.
+    fn root_exists(&self) -> Result<bool> {
+        match self.stat("") {
+            Ok(_) => Ok(true),
+            Err(Error::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(err) => Err(err),
+        }
+    }
     /// Walk the tree: (syncable files, unsupported-file count).
     fn snapshot(&self) -> Result<(Vec<LocalEntry>, usize)>;
     fn read(&self, rel_path: &str) -> Result<Vec<u8>>;
@@ -657,6 +666,43 @@ impl FsEndpoint for LocalFs {
 
     fn ensure_root(&self) -> Result<()> {
         Ok(fs::create_dir_all(&self.root)?)
+    }
+
+    fn root_exists(&self) -> Result<bool> {
+        // Strip trailing separators/dots so lstat sees a dangling root link
+        // itself, rather than following it. Keep `..` components intact.
+        let root: PathBuf = self.root.components().collect();
+        root.ancestors()
+            .enumerate()
+            .find_map(|(depth, path)| {
+                let path = if path.as_os_str().is_empty() {
+                    Path::new(".")
+                } else {
+                    path
+                };
+                match fs::symlink_metadata(path) {
+                    // Follow an existing link only after identifying it. A
+                    // dangling link is an error, not a creatable missing root.
+                    // Valid directory links at/above the root remain supported.
+                    Ok(_) => Some(
+                        fs::metadata(path)
+                            .and_then(|metadata| {
+                                if metadata.is_dir() {
+                                    Ok(depth == 0)
+                                } else {
+                                    Err(std::io::Error::new(
+                                        std::io::ErrorKind::NotADirectory,
+                                        format!("not a sync root directory: {}", path.display()),
+                                    ))
+                                }
+                            })
+                            .map_err(Error::from),
+                    ),
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(err) => Some(Err(err.into())),
+                }
+            })
+            .unwrap_or(Ok(false))
     }
 
     fn snapshot(&self) -> Result<(Vec<LocalEntry>, usize)> {
@@ -829,6 +875,27 @@ impl FsEndpoint for SshFs {
         self.session
             .run_checked(&format!("mkdir -p {}", shell_quote(&self.root_for_shell())))?;
         Ok(())
+    }
+
+    fn root_exists(&self) -> Result<bool> {
+        let root = shell_quote(&self.root_for_shell());
+        // A failed existence test can also mean ENOTDIR or EACCES.
+        // Before accepting absence, find the nearest existing ancestor
+        // and require it to be a searchable directory.
+        let output = self.session.run_checked(&format!(
+            "if test -e {root} || test -L {root}; then printf exists; exit 0; fi\n\
+             parent={root}\n\
+             while ! test -e \"$parent\" && ! test -L \"$parent\"; do\n\
+             case \"$parent\" in\n\
+             */*) parent=${{parent%/*}}; test -n \"$parent\" || parent=/ ;;\n\
+             *) parent=. ;;\n\
+             esac\n\
+             done\n\
+             test -d \"$parent\" && test -x \"$parent\" || {{\n\
+             printf 'not a searchable directory: %s\\n' \"$parent\" >&2; exit 9;\n\
+             }}"
+        ))?;
+        Ok(output == "exists")
     }
 
     fn snapshot(&self) -> Result<(Vec<LocalEntry>, usize)> {

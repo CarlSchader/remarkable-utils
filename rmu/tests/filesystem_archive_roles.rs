@@ -60,6 +60,12 @@ stamp() {
 }
 case "$3" in
     'mkdir -p .'|'mkdir -p /') exit 0 ;;
+    'if test -e . || test -L .; then printf exists; exit 0; fi'*)
+        [ -d "$MOCK_HOME" ] || exit 9
+        printf exists; exit 0 ;;
+    'if test -e / || test -L /; then printf exists; exit 0; fi'*)
+        [ -d "$MOCK_ROOT" ] || exit 9
+        printf exists; exit 0 ;;
     'cat book.pdf') exec cat "$MOCK_HOME/book.pdf" ;;
     'cat /book.pdf') exec cat "$MOCK_ROOT/book.pdf" ;;
     'mkdir -p . && cd . || exit 9'*)

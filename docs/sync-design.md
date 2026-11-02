@@ -285,10 +285,11 @@ creation reference/tree checks bypass the cache with a single batched full
 read, protecting against external same-stamp changes too.
 
 Sync uses `Client::list_items_authoritative` for root resolution and the
-entire tablet snapshot on both sides, including after creating a missing
-writable root. This also applies without `--delete` and in dry runs: snapshot
-contents drive overwrite/move decisions and UUID-based executor actions, not
-just deletions. A cached `/AAAA` renamed externally to `/BBBB` cannot select
+entire tablet snapshot on both sides. Missing writable roots stay virtual
+until execution; creation checks the tree authoritatively again and installs
+the returned UUID directly, without a cached post-create lookup. Authoritative
+snapshots also apply without `--delete` and in dry runs: snapshot contents drive
+overwrite/move decisions and UUID-based executor actions, not just deletions. A cached `/AAAA` renamed externally to `/BBBB` cannot select
 the renamed folder through either root lookup or the folder-creation fallback.
 This trades incremental metadata reads for mutation safety; ordinary listings
 retain stat fastcheck. Neither listing mode provides an atomic snapshot or a

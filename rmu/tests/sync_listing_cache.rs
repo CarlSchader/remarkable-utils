@@ -343,6 +343,61 @@ fn renamed_read_only_sources_abort_before_propagating_deletions() {
 }
 
 #[test]
+fn dry_run_uses_authoritative_roots_without_creating_renamed_targets() {
+    fn tree(path: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+        fs::read_dir(path)
+            .unwrap()
+            .fold(std::collections::BTreeMap::new(), |mut files, entry| {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    files.extend(tree(&path));
+                    files.insert(path, Vec::new());
+                } else {
+                    files.insert(path.clone(), fs::read(path).unwrap());
+                }
+                files
+            })
+    }
+
+    for tablet_source in [false, true] {
+        let fixture = Fixture::new();
+        fixture.folder("a", ROOT, "Source");
+        fixture.document("a");
+        fixture.folder("b", ROOT, "AAAA");
+        fs::write(fixture.0.join("local/keep.pdf"), ORIGINAL).unwrap();
+        let src = if tablet_source {
+            "root@a.invalid:/Source".to_string()
+        } else {
+            local_path(&fixture)
+        };
+        let dst = "root@b.invalid:/AAAA";
+        assert_success(fixture.sync(&src, dst, false, ""));
+        fixture.prime_cache("b");
+        fixture.same_stamp_change("b", ROOT, "visibleName", "BBBB");
+        let files = || tree(&fixture.0.join("b/device"));
+        let before = files();
+        for _ in 0..2 {
+            let output = fixture
+                .command()
+                .args([
+                    "sync",
+                    "--remote-kind",
+                    "remarkable",
+                    "--dry-run",
+                    "--delete",
+                    &src,
+                    dst,
+                ])
+                .output()
+                .unwrap();
+            assert!(String::from_utf8_lossy(&output.stdout).contains("mkdir root"));
+            assert_success(output);
+            assert_eq!(files(), before);
+        }
+    }
+}
+
+#[test]
 fn failed_authoritative_sync_listing_never_uses_warm_cache() {
     for tablet_source in [false, true] {
         let fixture = Fixture::new();
