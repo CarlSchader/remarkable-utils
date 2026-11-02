@@ -228,7 +228,17 @@ impl Drop for PipeHolder {
 }
 
 fn output_pipe() -> (fs::File, fs::File) {
-    let (reader, writer) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).unwrap();
+    // Apple has pipe(), not pipe2(). Only this scenario thread spawns children
+    // in the isolated test process, so setting CLOEXEC before spawning is safe.
+    let (reader, writer) = rustix::pipe::pipe().unwrap();
+    [&reader, &writer].into_iter().for_each(|fd| {
+        rustix::io::fcntl_setfd(fd, rustix::io::FdFlags::CLOEXEC).unwrap();
+        assert!(
+            rustix::io::fcntl_getfd(fd)
+                .unwrap()
+                .contains(rustix::io::FdFlags::CLOEXEC)
+        );
+    });
     (reader.into(), writer.into())
 }
 
