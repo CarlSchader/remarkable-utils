@@ -6,10 +6,10 @@ use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicUsize, Ordering};
+
+use test_support::Scratch;
 
 const PAYLOAD: &[u8] = b"synthetic PDF payload\n";
-static NEXT: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Copy, Debug)]
 enum Kind {
@@ -19,19 +19,12 @@ enum Kind {
 }
 const KINDS: [Kind; 3] = [Kind::Local, Kind::Ssh, Kind::Tablet];
 
-struct Fixture(PathBuf);
+struct Fixture(Scratch);
 
 impl Fixture {
     fn new() -> Self {
-        let root = std::env::temp_dir().join(format!(
-            "rmu-sync-roots-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir(&root).unwrap();
-        let fixture = Self(root);
-        fs::create_dir(fixture.0.join("bin")).unwrap();
-        fixture.script(
+        let fixture = Self(Scratch::new("sync-roots"));
+        fixture.0.mock_command(
             "ssh",
             r#"while [ "$1" != -- ]; do
     [ "$#" -gt 0 ] || exit 90
@@ -61,15 +54,11 @@ esac
 exec sh -c "$command"
 "#,
         );
-        fixture.script(
+        fixture.0.mock_command(
             "systemctl",
             "printf '%s: %s\\n' \"$PWD\" \"$*\" >> \"$MOCK_ROOT/restarts\"\n",
         );
         fixture
-    }
-
-    fn script(&self, name: &str, body: &str) {
-        test_support::write_script(&self.0.join("bin").join(name), body);
     }
 
     fn endpoint(&self, kind: Kind, side: &str, exists: bool, populated: bool) -> String {
@@ -133,18 +122,13 @@ exec sh -c "$command"
     }
 
     fn run(&self, src: &str, dst: &str, flags: &[&str], fail_writes: bool) -> Output {
-        let path = std::env::join_paths(
-            std::iter::once(self.0.join("bin"))
-                .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
-        )
-        .unwrap();
         Command::new(env!("CARGO_BIN_EXE_rmu"))
             .args(["--no-multiplex", "--xochitl-dir", "xochitl", "sync"])
             .args(flags)
             .args([src, dst])
-            .env("PATH", path)
+            .env("PATH", self.0.mock_path())
             .env("XDG_STATE_HOME", self.0.join("state"))
-            .env("MOCK_ROOT", &self.0)
+            .env("MOCK_ROOT", self.0.path())
             .env(
                 "MOCK_READ_ONLY",
                 if flags.contains(&"--dry-run") {
@@ -181,7 +165,7 @@ exec sh -c "$command"
             });
         }
         let mut result = BTreeMap::new();
-        walk(&self.0, &self.0.join("trees"), &mut result);
+        walk(self.0.path(), &self.0.join("trees"), &mut result);
         result
     }
 
@@ -231,18 +215,8 @@ exec sh -c "$command"
     }
 }
 
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        fs::remove_dir_all(&self.0).unwrap();
-    }
-}
-
 fn success(output: &Output) -> String {
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    test_support::assert_success(output);
     String::from_utf8(output.stdout.clone()).unwrap()
 }
 

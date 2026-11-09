@@ -3,34 +3,27 @@
 #![cfg(unix)]
 
 use std::fs;
-use std::path::PathBuf;
 use std::process::Command;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use libremarkable_utils::sync::{SyncState, hash_bytes};
 use serde_json::json;
+use test_support::Scratch;
 
 const ORIGINAL: &[u8] = b"synthetic original PDF payload";
 const CHANGED: &[u8] = b"synthetic changed PDF payload, with a different size";
-static NEXT: AtomicUsize = AtomicUsize::new(0);
 
 struct Fixture {
-    root: PathBuf,
+    root: Scratch,
 }
 
 impl Fixture {
     fn new() -> Self {
-        let root = std::env::temp_dir().join(format!(
-            "rmu-copy-sources-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir(&root).unwrap();
-        ["bin", "local", "device", "state"].iter().for_each(|dir| {
+        let root = Scratch::new("copy-sources");
+        ["local", "device", "state"].iter().for_each(|dir| {
             fs::create_dir(root.join(dir)).unwrap();
         });
-        test_support::write_script(
-            &root.join("bin/ssh"),
+        root.mock_command(
+            "ssh",
             "while [ \"$#\" -gt 0 ] && [ \"$1\" != -- ]; do shift; done\n\
              [ \"$#\" -eq 3 ] || exit 97\n\
              shift\n\
@@ -61,13 +54,10 @@ impl Fixture {
     }
 
     fn sync(&self, push: bool, dry_run: bool) -> String {
-        let paths = std::iter::once(self.root.join("bin"))
-            .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap()))
-            .collect::<Vec<_>>();
         let mut command = Command::new(env!("CARGO_BIN_EXE_rmu"));
         command
-            .env("PATH", std::env::join_paths(paths).unwrap())
-            .env("HOME", &self.root)
+            .env("PATH", self.root.mock_path())
+            .env("HOME", self.root.path())
             .env("XDG_STATE_HOME", self.root.join("state"))
             .env_remove("RMU_SSH_PASSWORD")
             .args(["--no-multiplex", "--no-restart", "--quiet", "--xochitl-dir"])
@@ -83,11 +73,7 @@ impl Fixture {
             command.arg("--dry-run");
         }
         let output = command.output().unwrap();
-        assert!(
-            output.status.success(),
-            "rmu failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        test_support::assert_success(&output);
         String::from_utf8(output.stdout).unwrap()
     }
 
@@ -122,12 +108,6 @@ impl Fixture {
                     Some(hash_bytes(&device).as_str())
                 );
             });
-    }
-}
-
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.root);
     }
 }
 

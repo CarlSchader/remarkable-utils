@@ -596,6 +596,9 @@ dependencies = [
 [[package]]
 name = "test-support"
 version = "0.1.0"
+dependencies = [
+ "uuid",
+]
 
 [[package]]
 name = "thiserror"
