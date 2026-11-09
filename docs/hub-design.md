@@ -130,7 +130,8 @@ Read-only inspection of a reMarkable Paper Pro on firmware 3.28:
   "base_overrides": { "<doc-uuid>": "<commit>" },  // or null = empty base
   "device_ref": "<commit>",    // written right after each device-ref push
   "manifest": { "<path>": [size, mtime, ctime, inode, "<blob-id>"] },
-                               // xochitl-relative path; times in ns
+                               // xochitl-relative path; times in ns;
+                               // racy entries left out (see below)
   "quarantine": ["<doc-uuid>"],  // malformed documents, reported every run
   "journal": null              // { merge, snapshot } from before the push
                                // attempt until the apply is reconciled
@@ -145,10 +146,18 @@ cleared as soon as the document is reconciled.
 A base of `null` is the **empty base**: no common version, so the
 document merges by the "new on both" rules. `clone` into a non-empty
 origin uses it for documents whose version matched nothing in origin
-(see "Clone"). Repo and device ids are random lowercase UUIDs; commit
-and blob ids are 40 or 64 lowercase hex digits. Fields an rmu does not
-know are preserved when it rewrites the file, so optional fields can be
-added without a format bump; a newer `format` is refused.
+(see "Clone"). `base`, `device_ref` and `journal` are required keys
+that may be `null`: a silently missing `base` would read as the empty
+base and bring back every deletion, and a missing `journal` would skip
+reconciliation. Repo and device ids are random lowercase UUIDs; commit
+and blob ids are 40 or 64 lowercase hex digits; the device name is 1 to
+64 characters without control characters (it ends up in git
+identities, fork names and trailers); manifest keys must be safe
+relative paths. A newer `format` is refused. Fields an rmu does not
+know are preserved when it rewrites the file, but a field may be added
+without a format bump only if it stays valid when an older rmu rewrites
+the rest of the file; anything describing `manifest`, `journal` or the
+bases needs a format bump.
 
 ## Repository layout
 
@@ -176,14 +185,22 @@ tablet, are reported, and are never copied or deleted by a merge.
 Repository paths outside `docs/<uuid>/` and `.rmu/` (a hand-committed
 README, say), and paths inside a document subtree that the active
 rules do not cover, are never applied to a tablet; they are carried
-forward unchanged.
+forward unchanged. Only regular (and executable) entries count as
+mirrored files; a symlink or gitlink at a mirrored name is treated the
+same way. Paths must be UTF-8: a non-UTF-8 path in a tree stops the run
+with an error naming it, because converting it lossily would rename,
+and so in effect delete, a carried-forward path.
 
 **Carry-forward.** A snapshot is built from the base tree, replacing
 only the paths the allowlist covers; every other path in the
 repository is carried forward unchanged. An older rmu, or one with a
 narrower allowlist, therefore cannot delete what it does not understand.
 Deleting a document removes its whole `docs/<uuid>/` subtree,
-carried-forward paths included.
+carried-forward paths included; a subtree that is not a document (no
+`metadata`, e.g. written by another tool) is carried forward. A
+carried-forward path that collides with a mirrored path (equal, or one
+a directory prefix of the other) is dropped, since the tree could not
+hold both.
 
 **Rules version.** rmu always mirrors with the **repository's**
 mirror-rules version, never its own newest: otherwise a newer binary
@@ -265,10 +282,12 @@ as `Client::restart_xochitl` does today.
 
 - **I/O failures abort the run** — nothing committed, nothing pushed:
   stat or read errors, and byte counts that differ from the stat pass.
-  The error names the path.
+  The error names the path. So does a snapshot whose blob list for a
+  valid document differs from the files validation saw: a lost entry
+  must never read as that file being deleted on the tablet.
 - **A malformed document is quarantined**, not fatal: unparsable
   `.metadata` or `.content` (or a `.metadata` that is not a JSON
-  object), a zero-length `.rm`, or files that contradict each other: a
+  object or has no string `type`), a zero-length `.rm`, or files that contradict each other: a
   folder with payload, page or highlight files; a `DocumentType`
   without a `.content` object; `fileType` `pdf`/`epub` without that
   payload. Its base version is carried forward (neither
@@ -283,10 +302,19 @@ as `Client::restart_xochitl` does today.
 
 Stat signatures are size, mtime, ctime and inode. Busybox `stat`'s `%Y`
 and `%Z` are whole seconds, but `%y`/`%z` print nanoseconds on the
-Paper Pro's ext4, and the signature uses those. A file whose mtime is
-within the same second as the previous snapshot is still re-read
-regardless (git's racy-entry rule), in case a filesystem or firmware
-reports coarse timestamps.
+Paper Pro's ext4, and the signature uses those.
+
+Racy entries are handled as git does, by leaving them out when the
+manifest is recorded (step 15); a missing entry already means "dirty,
+read again next run", so no extra field is needed. An entry is racy
+when its mtime is coarse (sub-second part zero, as on a filesystem or
+firmware with whole-second timestamps) and falls in the same second as
+its reference time, or later: xochitl could change the file again
+within that second without moving the signature. The reference is the
+xochitl start that follows the stat: step 6 for stats from step 5, and
+the record time itself (conservative) for files apply wrote, which are
+stat'ed after the write. Nanosecond mtimes are always kept, so applied
+files are not downloaded again on every sync.
 
 ### Ancestry and identity checks (step 8)
 
@@ -846,10 +874,10 @@ To be handled in the implementation PRs named:
   question 1 and refuses on `true`.
 - Device layer: skip the `tar` call when there is nothing to download
   (BusyBox `tar` fails on an empty file list); stat signatures use
-  `%y`/`%z` for nanosecond times. The racy-entry rule ("Snapshot
-  validation") needs the time the manifest was recorded, which the
-  tablet state does not hold yet: add it as an optional field (no
-  format bump needed, unknown fields are preserved).
+  `%y`/`%z` for nanosecond times. When recording the manifest, leave out
+  racy entries (`StatSignature::keep_in_manifest`, "Snapshot
+  validation") using the device time of the step-6 start for step-5
+  stats and the record time for post-write stats.
 
 ## Implementation plan
 

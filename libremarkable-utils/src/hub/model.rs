@@ -46,6 +46,9 @@ pub const RMU_TEMP_PREFIX: &str = ".rmu-";
 /// Longest accepted page id. Real page ids are 36-character UUIDs.
 const MAX_PAGE_ID_LEN: usize = 128;
 
+/// Longest accepted device name, in characters.
+const MAX_DEVICE_NAME_CHARS: usize = 64;
+
 /// Errors from the hub data model.
 #[derive(Debug, Error)]
 pub enum ModelError {
@@ -68,6 +71,15 @@ pub enum ModelError {
     /// A repo or device id that is not a canonical lowercase UUID.
     #[error("invalid id '{0}': expected a lowercase UUID")]
     InvalidId(String),
+
+    /// A device name that is empty, too long, or has control characters.
+    #[error("invalid device name {0:?}: must be 1 to 64 characters without control characters")]
+    InvalidDeviceName(String),
+
+    /// A repository path that is not UTF-8. Never converted lossily: that
+    /// would rename a carried-forward path, in effect deleting it.
+    #[error("repository path '{}' is not UTF-8", .0.escape_ascii())]
+    NonUtf8Path(Vec<u8>),
 
     /// A repository path outside `docs/<uuid>/` and `.rmu/`.
     #[error("repository path '{0}' is outside docs/<uuid>/ and .rmu/")]
@@ -95,6 +107,22 @@ pub enum ModelError {
     )]
     UnsupportedRules { found: u32, supported: u32 },
 
+    /// A mirror-rules version that never existed (0).
+    #[error("invalid mirror-rules version {0}")]
+    InvalidRules(u32),
+
+    /// The snapshot's files for a validated document differ from the
+    /// files validation saw: the snapshot is not reliable and must not
+    /// be committed.
+    #[error(
+        "snapshot of document {doc} does not match its validation (missing: {missing:?}, unexpected: {unexpected:?})"
+    )]
+    SnapshotMismatch {
+        doc: DocId,
+        missing: Vec<String>,
+        unexpected: Vec<String>,
+    },
+
     /// A state file that is not valid JSON of the expected shape.
     #[error("invalid {what}: {source}")]
     Json {
@@ -119,6 +147,14 @@ fn is_page_id(s: &str) -> bool {
 
 fn is_object_id(s: &str) -> bool {
     matches!(s.len(), 40 | 64) && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+fn is_device_name(s: &str) -> bool {
+    (1..=MAX_DEVICE_NAME_CHARS).contains(&s.chars().count()) && !s.chars().any(char::is_control)
+}
+
+fn is_safe_relative_path(s: &str) -> bool {
+    checked_components(s).is_ok()
 }
 
 /// A string newtype validated on construction and on deserialisation.
@@ -208,6 +244,24 @@ validated_id!(
     InvalidId
 );
 
+validated_id!(
+    /// A tablet's user-chosen name: 1 to 64 characters, no control
+    /// characters. It ends up in git identities, fork names and commit
+    /// trailers, so a newline must never get through.
+    DeviceName,
+    is_device_name,
+    InvalidDeviceName
+);
+
+validated_id!(
+    /// A safe path relative to the xochitl data dir (no absolute path,
+    /// no empty, `.` or `..` components): manifest keys can never point
+    /// the device layer outside the data dir.
+    XochitlPath,
+    is_safe_relative_path,
+    UnsafePath
+);
+
 impl RepoId {
     /// A fresh random repo id.
     pub fn random() -> Self {
@@ -237,6 +291,22 @@ pub enum FileKind {
     Page,
     PageMetadata,
     Highlights,
+}
+
+impl fmt::Display for FileKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            FileKind::Metadata => ".metadata",
+            FileKind::Content => ".content",
+            FileKind::Pagedata => ".pagedata",
+            FileKind::Template => ".template",
+            FileKind::PayloadPdf => ".pdf payload",
+            FileKind::PayloadEpub => ".epub payload",
+            FileKind::Page => ".rm page",
+            FileKind::PageMetadata => "page -metadata.json",
+            FileKind::Highlights => "highlights",
+        })
+    }
 }
 
 /// One mirrored file of a document.
@@ -406,7 +476,7 @@ impl fmt::Display for Exclusion {
             Exclusion::CloudCache => f.write_str("cloud-sync cache"),
             Exclusion::RmuTemp => f.write_str("rmu temporary file"),
             Exclusion::NotInRules(kind) => {
-                write!(f, "{kind:?} files are not mirrored by these rules")
+                write!(f, "{kind} files are not mirrored by these rules")
             }
             Exclusion::Unknown => f.write_str("unrecognised file"),
         }
@@ -632,6 +702,7 @@ impl MirrorRules {
     /// versions newer than this rmu supports (or invalid ones).
     pub fn for_version(version: u32) -> Result<&'static MirrorRules> {
         match version {
+            0 => Err(ModelError::InvalidRules(0)),
             1 => Ok(&RULES_V1),
             found => Err(ModelError::UnsupportedRules {
                 found,
@@ -901,6 +972,8 @@ impl RepoConfig {
     }
 }
 
+const NANOS_PER_SEC: i64 = 1_000_000_000;
+
 /// A file's stat signature. Times are nanoseconds since the epoch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StatSignature {
@@ -908,6 +981,24 @@ pub struct StatSignature {
     pub mtime_ns: i64,
     pub ctime_ns: i64,
     pub inode: u64,
+}
+
+impl StatSignature {
+    /// Whether this stat may be recorded in the manifest (git's remedy
+    /// for racy entries). `reference_ns` is the device time of the
+    /// xochitl start that follows the stat (for step-5 stats), or the
+    /// record time (for stats taken after apply wrote the file).
+    ///
+    /// A coarse mtime (zero sub-second part) in the same second as the
+    /// reference, or later, could hide a change xochitl makes within
+    /// that second, so such an entry is left out; a missing entry means
+    /// "dirty, read again next run". Nanosecond mtimes, as on the Paper
+    /// Pro's ext4, are always kept, so applied files are not downloaded
+    /// again on every sync.
+    pub fn keep_in_manifest(&self, reference_ns: i64) -> bool {
+        let coarse = self.mtime_ns.rem_euclid(NANOS_PER_SEC) == 0;
+        !coarse || self.mtime_ns.div_euclid(NANOS_PER_SEC) < reference_ns.div_euclid(NANOS_PER_SEC)
+    }
 }
 
 /// A manifest entry: the stat signature a file had when its blob was
@@ -964,22 +1055,30 @@ pub struct TabletState {
     /// Default origin URL; overridable per computer.
     pub origin: String,
     pub device_id: DeviceId,
-    pub device_name: String,
+    pub device_name: DeviceName,
     /// Default base commit for every document. `None` is the empty base
-    /// (a clone where no document matched a version in origin).
+    /// (a clone where no document matched a version in origin). The key
+    /// is required: a silently missing base would bring back every
+    /// deletion.
+    #[serde(deserialize_with = "Option::deserialize")]
     pub base: Option<ObjectId>,
     /// Documents whose base differs from `base`; `None` is the empty
     /// base.
     #[serde(default)]
     pub base_overrides: BTreeMap<DocId, Option<ObjectId>>,
     /// Device-ref head, written right after each device-ref push.
+    #[serde(deserialize_with = "Option::deserialize")]
     pub device_ref: Option<ObjectId>,
     /// Xochitl-relative path → stat signature and blob at last record.
+    /// Racy entries are left out (see [`StatSignature::keep_in_manifest`]).
     #[serde(default)]
-    pub manifest: BTreeMap<String, ManifestEntry>,
+    pub manifest: BTreeMap<XochitlPath, ManifestEntry>,
     /// Malformed documents, reported every run.
     #[serde(default)]
     pub quarantine: BTreeSet<DocId>,
+    /// Required key: a silently missing journal would skip
+    /// reconciliation.
+    #[serde(deserialize_with = "Option::deserialize")]
     pub journal: Option<Journal>,
     /// Fields this rmu does not know, preserved verbatim.
     #[serde(flatten)]
@@ -990,7 +1089,12 @@ impl TabletState {
     pub const FORMAT: u32 = 1;
 
     /// State for a freshly attached tablet (empty base, no history).
-    pub fn new(repo_id: RepoId, origin: String, device_id: DeviceId, device_name: String) -> Self {
+    pub fn new(
+        repo_id: RepoId,
+        origin: String,
+        device_id: DeviceId,
+        device_name: DeviceName,
+    ) -> Self {
         Self {
             format: Self::FORMAT,
             repo_id,
@@ -1045,6 +1149,11 @@ impl EntryMode {
             "160000" => Some(EntryMode::Gitlink),
             _ => None,
         }
+    }
+
+    /// Regular or executable: content that can be written to a file.
+    pub fn is_file(self) -> bool {
+        matches!(self, EntryMode::Regular | EntryMode::Executable)
     }
 
     pub fn as_octal(self) -> &'static str {
@@ -1125,30 +1234,46 @@ pub struct RepoTree {
 }
 
 impl MirrorRules {
-    /// Group a flat tree listing into per-document versions. Fails only
+    /// Group a flat tree listing into per-document versions.
+    ///
+    /// Paths may come as strings or as git's raw bytes: a non-UTF-8 path
+    /// is refused ([`ModelError::NonUtf8Path`]), never converted lossily,
+    /// since a renamed carried-forward path would in effect be deleted.
+    /// Only regular and executable entries count as mirrored files;
+    /// anything else at a mirrored name (a symlink, a gitlink) goes to
+    /// [`DocVersion::other`]: carried forward, never applied. Also fails
     /// on unsafe paths, which git trees cannot normally contain.
-    pub fn group_tree(&self, listing: &TreeListing) -> Result<RepoTree> {
+    pub fn group_tree<P: AsRef<[u8]>>(
+        &self,
+        listing: impl IntoIterator<Item = (P, TreeEntry)>,
+    ) -> Result<RepoTree> {
         listing
-            .iter()
+            .into_iter()
             .try_fold(RepoTree::default(), |mut tree, (path, entry)| {
+                let bytes = path.as_ref();
+                let path = std::str::from_utf8(bytes)
+                    .map_err(|_| ModelError::NonUtf8Path(bytes.to_vec()))?;
                 match self.parse_repo_path(path) {
-                    Ok(RepoPath::Mirrored(file)) => {
+                    Ok(RepoPath::Mirrored(file)) if entry.mode.is_file() => {
                         tree.docs
                             .entry(file.doc)
                             .or_default()
                             .files
-                            .insert(file.file, entry.clone());
+                            .insert(file.file, entry);
                     }
-                    Ok(RepoPath::DocOther { doc, name }) => {
+                    Ok(RepoPath::Mirrored(file)) => {
                         tree.docs
-                            .entry(doc)
+                            .entry(file.doc)
                             .or_default()
                             .other
-                            .insert(name, entry.clone());
+                            .insert(file.file.repo_name(), entry);
+                    }
+                    Ok(RepoPath::DocOther { doc, name }) => {
+                        tree.docs.entry(doc).or_default().other.insert(name, entry);
                     }
                     Ok(RepoPath::Rmu(_))
                     | Err(ModelError::OutsideLayout(_) | ModelError::InvalidDocId(_)) => {
-                        tree.extra.insert(path.clone(), entry.clone());
+                        tree.extra.insert(path.to_string(), entry);
                     }
                     Err(err) => return Err(err),
                 }
@@ -1191,6 +1316,9 @@ pub type ParseResult = std::result::Result<Value, String>;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QuarantineReason {
     UnparsableMetadata(String),
+    /// `.metadata` parsed but is not an object, or has no string `type`
+    /// (every firmware writes one).
+    InvalidMetadata(String),
     UnparsableContent(String),
     /// A zero-length `.rm` page.
     EmptyPage(PageId),
@@ -1205,6 +1333,7 @@ impl fmt::Display for QuarantineReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             QuarantineReason::UnparsableMetadata(err) => write!(f, "unparsable .metadata: {err}"),
+            QuarantineReason::InvalidMetadata(why) => write!(f, "invalid .metadata: {why}"),
             QuarantineReason::UnparsableContent(err) => write!(f, "unparsable .content: {err}"),
             QuarantineReason::EmptyPage(page) => write!(f, "empty page file {page}.rm"),
             QuarantineReason::Inconsistent(why) => write!(f, "inconsistent files: {why}"),
@@ -1230,6 +1359,10 @@ pub enum DocOutcome {
 pub struct SnapshotValidation {
     /// Every document with at least one mirrored file on the tablet.
     pub docs: BTreeMap<DocId, DocOutcome>,
+    /// The mirrored files validation saw, per document (same keys as
+    /// `docs`). [`carry_forward`] requires the snapshot's files for every
+    /// [`DocOutcome::Ok`] document to be exactly these.
+    pub files: BTreeMap<DocId, BTreeSet<DocFile>>,
     /// Tablet files that are not mirrored, for reporting.
     pub excluded: BTreeMap<String, Exclusion>,
 }
@@ -1269,7 +1402,7 @@ impl MirrorRules {
                 Ok::<_, ModelError>((mirrored, excluded))
             },
         )?;
-        let docs = mirrored
+        let (docs, files) = mirrored
             .into_iter()
             .map(|(doc, doc_files)| {
                 let parsed = |file: &DocFile| {
@@ -1292,10 +1425,15 @@ impl MirrorRules {
                     )
                     .map_or_else(DocOutcome::Quarantined, |()| DocOutcome::Ok),
                 };
-                (doc, outcome)
+                let seen = doc_files.keys().cloned().collect();
+                ((doc.clone(), outcome), (doc, seen))
             })
-            .collect();
-        Ok(SnapshotValidation { docs, excluded })
+            .unzip();
+        Ok(SnapshotValidation {
+            docs,
+            files,
+            excluded,
+        })
     }
 }
 
@@ -1308,8 +1446,16 @@ fn check_document<'a>(
 ) -> std::result::Result<(), QuarantineReason> {
     let metadata = metadata.map_err(QuarantineReason::UnparsableMetadata)?;
     if !metadata.is_object() {
-        return Err(QuarantineReason::UnparsableMetadata(
+        return Err(QuarantineReason::InvalidMetadata(
             "not a JSON object".to_string(),
+        ));
+    }
+    // Committing a typeless `.metadata` would let the per-field metadata
+    // merge strip `visibleName` and `parent` from origin. Unknown string
+    // types stay valid.
+    if !metadata.get("type").is_some_and(Value::is_string) {
+        return Err(QuarantineReason::InvalidMetadata(
+            "\"type\" is missing or not a string".to_string(),
         ));
     }
     let content = content
@@ -1370,15 +1516,24 @@ pub type SnapshotFiles = BTreeMap<MirroredFile, ObjectId>;
 ///
 /// For a document validated [`DocOutcome::Ok`], exactly the mirrored
 /// paths are replaced by the snapshot's files; its other paths are
-/// carried forward. Quarantined and orphan documents keep their base
+/// carried forward, except ones that collide with a mirrored path (equal
+/// to it, or one a directory prefix of the other), which would make an
+/// impossible tree. Quarantined and orphan documents keep their base
 /// version. A document with no mirrored files on the tablet is deleted:
-/// its whole subtree goes, carried-forward paths included. Paths outside
-/// document subtrees are carried forward unchanged.
+/// its whole subtree goes, carried-forward paths included. A base
+/// subtree that is not a document (no `metadata`) is carried forward,
+/// as are paths outside document subtrees.
+///
+/// The snapshot's files for every `Ok` document must be exactly the
+/// files validation saw, and there must be none for documents validation
+/// never saw; otherwise the inputs diverged and the snapshot is refused
+/// ([`ModelError::SnapshotMismatch`]) rather than reading a missing file
+/// as a deletion.
 pub fn carry_forward(
     base: &RepoTree,
     snapshot: &SnapshotFiles,
     validation: &SnapshotValidation,
-) -> RepoTree {
+) -> Result<RepoTree> {
     let snapshot_docs = snapshot.iter().fold(
         BTreeMap::<&DocId, BTreeMap<DocFile, TreeEntry>>::new(),
         |mut docs, (file, blob)| {
@@ -1388,6 +1543,20 @@ pub fn carry_forward(
             docs
         },
     );
+    validation
+        .docs
+        .iter()
+        .filter(|(_, outcome)| **outcome == DocOutcome::Ok)
+        .map(|(doc, _)| doc)
+        .chain(
+            snapshot_docs
+                .keys()
+                .copied()
+                .filter(|doc| !validation.docs.contains_key(*doc)),
+        )
+        .try_for_each(|doc| {
+            check_snapshot_files(doc, validation.files.get(doc), snapshot_docs.get(doc))
+        })?;
     let doc_ids: BTreeSet<&DocId> = base
         .docs
         .keys()
@@ -1400,26 +1569,63 @@ pub fn carry_forward(
             let base_version = base.docs.get(doc);
             let version = match (validation.docs.get(doc), snapshot_docs.get(doc)) {
                 (Some(DocOutcome::Ok), Some(files)) if files.contains_key(&DocFile::Metadata) => {
+                    let names: Vec<String> = files.keys().map(DocFile::repo_name).collect();
                     Some(DocVersion {
                         files: files.clone(),
                         other: base_version
-                            .map(|version| version.other.clone())
-                            .unwrap_or_default(),
+                            .into_iter()
+                            .flat_map(|version| &version.other)
+                            .filter(|(name, _)| !names.iter().any(|m| paths_collide(name, m)))
+                            .map(|(name, entry)| (name.clone(), entry.clone()))
+                            .collect(),
                     })
                 }
-                // No mirrored file on the tablet: deleted.
-                (None, None) => None,
-                // Quarantined, orphan, or (defensively) files that were
-                // never validated: never guess, keep base.
+                // No mirrored file on the tablet: a document is deleted;
+                // a subtree that is not one is carried forward.
+                (None, None) => base_version
+                    .filter(|version| !version.is_present())
+                    .cloned(),
+                // Quarantined or orphan: never guess, keep base.
                 _ => base_version.cloned(),
             };
             version.map(|version| (doc.clone(), version))
         })
         .collect();
-    RepoTree {
+    Ok(RepoTree {
         docs,
         extra: base.extra.clone(),
+    })
+}
+
+/// The snapshot's files for one document must be exactly the validated
+/// ones (none, for a document validation did not see).
+fn check_snapshot_files(
+    doc: &DocId,
+    validated: Option<&BTreeSet<DocFile>>,
+    snapshot: Option<&BTreeMap<DocFile, TreeEntry>>,
+) -> Result<()> {
+    let validated: BTreeSet<&DocFile> = validated.into_iter().flatten().collect();
+    let snapshot: BTreeSet<&DocFile> = snapshot.into_iter().flat_map(BTreeMap::keys).collect();
+    if validated == snapshot {
+        return Ok(());
     }
+    let names = |files: BTreeSet<&&DocFile>| files.into_iter().map(|f| f.repo_name()).collect();
+    Err(ModelError::SnapshotMismatch {
+        doc: doc.clone(),
+        missing: names(validated.difference(&snapshot).collect()),
+        unexpected: names(snapshot.difference(&validated).collect()),
+    })
+}
+
+/// Whether two paths in one subtree cannot coexist: equal, or one is a
+/// directory prefix of the other.
+fn paths_collide(a: &str, b: &str) -> bool {
+    let inside = |inner: &str, outer: &str| {
+        inner
+            .strip_prefix(outer)
+            .is_some_and(|rest| rest.starts_with('/'))
+    };
+    a == b || inside(a, b) || inside(b, a)
 }
 
 #[cfg(test)]
@@ -1790,7 +1996,11 @@ mod tests {
     fn rules_versions() {
         assert_eq!(rules().version(), 1);
         assert_eq!(MirrorRules::latest().version(), SUPPORTED_MIRROR_RULES);
-        [0, 2, u32::MAX].iter().for_each(|version| {
+        assert!(matches!(
+            MirrorRules::for_version(0),
+            Err(ModelError::InvalidRules(0))
+        ));
+        [2, u32::MAX].iter().for_each(|version| {
             assert!(matches!(
                 MirrorRules::for_version(*version),
                 Err(ModelError::UnsupportedRules { found, supported: 1 }) if found == *version
@@ -1977,9 +2187,9 @@ mod tests {
     fn tablet_state_round_trip() {
         let input = full_state_json();
         let state = TabletState::parse(input.to_string().as_bytes()).unwrap();
-        assert_eq!(state.device_name, "Paper Pro c001");
+        assert_eq!(state.device_name.as_str(), "Paper Pro c001");
         assert_eq!(
-            state.manifest[&format!("{DOC}.metadata")],
+            state.manifest[&XochitlPath::new(format!("{DOC}.metadata")).unwrap()],
             ManifestEntry {
                 stat: StatSignature {
                     size: 312,
@@ -1991,7 +2201,9 @@ mod tests {
             }
         );
         assert_eq!(
-            state.manifest[&format!("{DOC}/{PAGE}.rm")].stat.inode,
+            state.manifest[&XochitlPath::new(format!("{DOC}/{PAGE}.rm")).unwrap()]
+                .stat
+                .inode,
             u64::MAX
         );
         assert_eq!(
@@ -2012,7 +2224,7 @@ mod tests {
             RepoId::new(REPO).unwrap(),
             "ssh://library.example/srv/library.git".to_string(),
             DeviceId::new(DEVICE).unwrap(),
-            "tablet".to_string(),
+            DeviceName::new("tablet").unwrap(),
         );
         let json = state.to_json();
         let value: Value = serde_json::from_str(&json).unwrap();
@@ -2020,14 +2232,34 @@ mod tests {
         assert_eq!(value["journal"], Value::Null);
         assert_eq!(value["manifest"], json!({}));
         assert_eq!(TabletState::parse(json.as_bytes()).unwrap(), state);
-        // Empty collections and null options may be omitted.
+        // Empty collections may be omitted.
         let sparse = json!({
             "format": 1, "repo_id": REPO, "origin": "o", "device_id": DEVICE,
-            "device_name": "tablet",
+            "device_name": "tablet", "base": null, "device_ref": null, "journal": null,
         });
         let parsed = TabletState::parse(sparse.to_string().as_bytes()).unwrap();
         assert_eq!(parsed.base, None);
         assert!(parsed.manifest.is_empty() && parsed.quarantine.is_empty());
+        assert!(parsed.base_overrides.is_empty());
+    }
+
+    #[test]
+    fn tablet_state_requires_nullable_keys() {
+        // A missing base would read as "empty base" and bring back every
+        // deletion; a missing journal would skip reconciliation.
+        ["base", "device_ref", "journal"].iter().for_each(|key| {
+            let mut input = full_state_json();
+            input.as_object_mut().unwrap().remove(*key);
+            assert!(
+                matches!(
+                    TabletState::parse(input.to_string().as_bytes()),
+                    Err(ModelError::Json { .. })
+                ),
+                "{key}"
+            );
+            input[*key] = Value::Null;
+            assert!(TabletState::parse(input.to_string().as_bytes()).is_ok());
+        });
     }
 
     #[test]
@@ -2061,6 +2293,14 @@ mod tests {
             ("journal", json!({ "merge": oid(1).as_str() })),
             ("manifest", json!({ "x": [1, 2, 3, oid(1).as_str()] })),
             ("manifest", json!({ "x": [-1, 2, 3, 4, oid(1).as_str()] })),
+            (
+                "manifest",
+                json!({ "../../etc/shadow": [1, 2, 3, 4, oid(1).as_str()] }),
+            ),
+            ("manifest", json!({ "/abs": [1, 2, 3, 4, oid(1).as_str()] })),
+            ("device_name", json!("evil\nRmu-Consent: yes")),
+            ("device_name", json!("")),
+            ("device_name", json!("x".repeat(65))),
         ];
         bad_values.iter().for_each(|(field, value)| {
             let mut input = full_state_json();
@@ -2078,7 +2318,7 @@ mod tests {
     #[test]
     fn tablet_state_preserves_unknown_fields() {
         let mut input = full_state_json();
-        input["snapshot_time_ns"] = json!(1767225600000000000_i64);
+        input["future_note"] = json!({ "kept": [1, 2] });
         let state = TabletState::parse(input.to_string().as_bytes()).unwrap();
         let back: Value = serde_json::from_str(&state.to_json()).unwrap();
         assert_eq!(back, input);
@@ -2409,7 +2649,7 @@ mod tests {
                 id: oid(12),
             },
         );
-        let tree = rules().group_tree(&flat).unwrap();
+        let tree = rules().group_tree(flat.clone()).unwrap();
         assert_eq!(tree.docs.len(), 2);
         let version = &tree.docs[&doc(DOC)];
         assert!(version.is_present());
@@ -2438,7 +2678,7 @@ mod tests {
     #[test]
     fn group_tree_depends_on_rules() {
         let flat = listing(&[("docs/{d}/metadata", 1), ("docs/{d}/payload.pdf", 2)]);
-        let tree = rules_without_pdf().group_tree(&flat).unwrap();
+        let tree = rules_without_pdf().group_tree(flat.clone()).unwrap();
         let version = &tree.docs[&doc(DOC)];
         assert!(!version.files.contains_key(&DocFile::PayloadPdf));
         assert_eq!(version.other["payload.pdf"].id, oid(2));
@@ -2449,14 +2689,14 @@ mod tests {
     fn group_tree_rejects_unsafe_paths() {
         let flat = listing(&[("docs/{d}/../{d2}/metadata", 1)]);
         assert!(matches!(
-            rules().group_tree(&flat),
+            rules().group_tree(flat.clone()),
             Err(ModelError::UnsafePath(_))
         ));
     }
 
     #[test]
     fn empty_trees() {
-        let tree = rules().group_tree(&TreeListing::new()).unwrap();
+        let tree = rules().group_tree(TreeListing::new()).unwrap();
         assert_eq!(tree, RepoTree::default());
         assert!(tree.to_listing().is_empty());
     }
@@ -2477,7 +2717,7 @@ mod tests {
     #[test]
     fn item_kinds() {
         let tree = rules()
-            .group_tree(&listing(&[
+            .group_tree(listing(&[
                 ("docs/{d}/metadata", 1),
                 ("docs/{d}/pages/{p}.rm", 2),
                 ("docs/{f}/metadata", 3),
@@ -2661,10 +2901,24 @@ mod tests {
             .json(format!("{DOC}.content"), json!([]));
         assert_eq!(
             array_metadata.outcome(DOC, &[]),
-            quarantined(QuarantineReason::UnparsableMetadata(
+            quarantined(QuarantineReason::InvalidMetadata(
                 "not a JSON object".to_string()
             ))
         );
+        // Every firmware writes a string `type`; unknown strings are fine.
+        [json!({}), json!({ "type": 1, "visibleName": "X" })]
+            .into_iter()
+            .for_each(|metadata| {
+                let typeless = Snapshot::new()
+                    .json(format!("{DOC}.metadata"), metadata)
+                    .json(format!("{DOC}.content"), json!([]));
+                assert_eq!(
+                    typeless.outcome(DOC, &[]),
+                    quarantined(QuarantineReason::InvalidMetadata(
+                        "\"type\" is missing or not a string".to_string()
+                    ))
+                );
+            });
         let broken_content = Snapshot::new()
             .json(format!("{DOC}.metadata"), sample_metadata())
             .broken(format!("{DOC}.content"))
@@ -2709,6 +2963,13 @@ mod tests {
             .folder(DOC)
             .file(format!("{DOC}/{PAGE}.rm"), 10);
         assert_eq!(inconsistent(folder_with_pages), "folder has document files");
+        let folder_with_page_metadata = Snapshot::new()
+            .folder(DOC)
+            .file(format!("{DOC}/{PAGE}-metadata.json"), 10);
+        assert_eq!(
+            inconsistent(folder_with_page_metadata),
+            "folder has document files"
+        );
         let no_content = Snapshot::new()
             .json(format!("{DOC}.metadata"), sample_metadata())
             .file(format!("{DOC}.pdf"), 10);
@@ -2795,6 +3056,192 @@ mod tests {
         );
     }
 
+    // ---- review follow-ups ------------------------------------------------
+
+    #[test]
+    fn device_names() {
+        [
+            "Paper Pro c001",
+            "Ünïcödé tablet",
+            &"x".repeat(64),
+            &"é".repeat(64),
+        ]
+        .iter()
+        .for_each(|name| assert!(DeviceName::new(*name).is_ok(), "{name}"));
+        [
+            "",
+            "a\nb",
+            "a\rb",
+            "tab\there",
+            "nul\0",
+            "esc\u{1b}[0m",
+            &"x".repeat(65),
+        ]
+        .iter()
+        .for_each(|name| {
+            assert!(
+                matches!(
+                    DeviceName::new(*name),
+                    Err(ModelError::InvalidDeviceName(_))
+                ),
+                "{name:?}"
+            )
+        });
+    }
+
+    #[test]
+    fn xochitl_paths_must_be_safe() {
+        [
+            format!("{DOC}.metadata"),
+            format!("{DOC}/{PAGE}.rm"),
+            ".tree".to_string(),
+        ]
+        .iter()
+        .for_each(|path| assert!(XochitlPath::new(path.as_str()).is_ok(), "{path}"));
+        ["", "/abs", "../x", "a/../b", "a//b", "a/", "./a"]
+            .iter()
+            .for_each(|path| {
+                assert!(
+                    matches!(XochitlPath::new(*path), Err(ModelError::UnsafePath(_))),
+                    "{path}"
+                )
+            });
+    }
+
+    fn mtime(secs: i64, nanos: i64) -> StatSignature {
+        StatSignature {
+            mtime_ns: secs * 1_000_000_000 + nanos,
+            ..stat(10)
+        }
+    }
+
+    #[test]
+    fn racy_coarse_mtimes_are_left_out_of_the_manifest() {
+        let reference = 1_767_225_600 * 1_000_000_000 + 250_000_000;
+        // Coarse mtime in an earlier second: kept.
+        assert!(mtime(1_767_225_599, 0).keep_in_manifest(reference));
+        // Coarse mtime in the reference's second, or later: left out.
+        assert!(!mtime(1_767_225_600, 0).keep_in_manifest(reference));
+        assert!(!mtime(1_767_225_601, 0).keep_in_manifest(reference));
+        // Reference exactly on a second boundary.
+        assert!(!mtime(1_767_225_600, 0).keep_in_manifest(1_767_225_600 * 1_000_000_000));
+        // Fine-grained mtimes are always kept, even after the reference.
+        assert!(mtime(1_767_225_600, 1).keep_in_manifest(reference));
+        assert!(mtime(1_767_225_700, 999_999_999).keep_in_manifest(reference));
+        // Pre-epoch times use floor division.
+        assert!(!mtime(-1, 0).keep_in_manifest(-1));
+        assert!(!mtime(-1, 0).keep_in_manifest(-999_999_999));
+        assert!(mtime(-2, 0).keep_in_manifest(-1));
+    }
+
+    #[test]
+    fn only_file_entries_count_as_mirrored_files() {
+        let mut flat = listing(&[("docs/{d}/content", 1)]);
+        flat.insert(
+            format!("docs/{DOC}/metadata"),
+            TreeEntry {
+                mode: EntryMode::Gitlink,
+                id: oid(2),
+            },
+        );
+        flat.insert(
+            format!("docs/{DOC}/pages/{PAGE}.rm"),
+            TreeEntry {
+                mode: EntryMode::Symlink,
+                id: oid(3),
+            },
+        );
+        flat.insert(
+            format!("docs/{DOC}/payload.pdf"),
+            TreeEntry {
+                mode: EntryMode::Executable,
+                id: oid(4),
+            },
+        );
+        let tree = rules().group_tree(flat.clone()).unwrap();
+        let version = &tree.docs[&doc(DOC)];
+        assert!(!version.is_present());
+        assert_eq!(
+            version.files.keys().cloned().collect::<Vec<_>>(),
+            [DocFile::Content, DocFile::PayloadPdf]
+        );
+        assert_eq!(
+            version.other.keys().cloned().collect::<Vec<_>>(),
+            ["metadata".to_string(), format!("pages/{PAGE}.rm")]
+        );
+        assert_eq!(tree.to_listing(), flat);
+        assert!(EntryMode::Regular.is_file() && EntryMode::Executable.is_file());
+        assert!(!EntryMode::Symlink.is_file() && !EntryMode::Gitlink.is_file());
+    }
+
+    #[test]
+    fn group_tree_takes_byte_paths_and_refuses_non_utf8() {
+        let flat = listing(&[("docs/{d}/metadata", 1), ("README.md", 2)]);
+        let bytes: Vec<(Vec<u8>, TreeEntry)> = flat
+            .iter()
+            .map(|(path, entry)| (path.clone().into_bytes(), entry.clone()))
+            .collect();
+        assert_eq!(rules().group_tree(bytes).unwrap().to_listing(), flat);
+        let bad = vec![(b"docs/caf\xe9".to_vec(), TreeEntry::regular(oid(1)))];
+        let err = rules().group_tree(bad).unwrap_err();
+        assert!(matches!(&err, ModelError::NonUtf8Path(path) if path == b"docs/caf\xe9"));
+        assert_eq!(
+            err.to_string(),
+            "repository path 'docs/caf\\xe9' is not UTF-8"
+        );
+    }
+
+    #[test]
+    fn validation_records_each_documents_file_set() {
+        let snapshot = Snapshot::new()
+            .pdf(DOC)
+            .json(format!("{DOC2}.content"), json!({ "fileType": "notebook" }));
+        let validation = snapshot.validate(&[]);
+        assert_eq!(
+            validation.files,
+            BTreeMap::from([
+                (
+                    doc(DOC),
+                    BTreeSet::from([
+                        DocFile::Metadata,
+                        DocFile::Content,
+                        DocFile::PayloadPdf,
+                        DocFile::Page(page(PAGE)),
+                    ])
+                ),
+                (doc(DOC2), BTreeSet::from([DocFile::Content])),
+            ])
+        );
+        assert_eq!(
+            validation.files.keys().collect::<Vec<_>>(),
+            validation.docs.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn messages() {
+        assert_eq!(
+            Exclusion::NotInRules(FileKind::PayloadPdf).to_string(),
+            ".pdf payload files are not mirrored by these rules"
+        );
+        assert_eq!(
+            ModelError::InvalidRules(0).to_string(),
+            "invalid mirror-rules version 0"
+        );
+        assert!(
+            ModelError::UnsupportedRules {
+                found: 2,
+                supported: 1
+            }
+            .to_string()
+            .contains("upgrade rmu")
+        );
+        assert_eq!(
+            QuarantineReason::InvalidMetadata("not a JSON object".to_string()).to_string(),
+            "invalid .metadata: not a JSON object"
+        );
+    }
+
     // ---- carry-forward -----------------------------------------------------
 
     fn snapshot_files(entries: &[(&str, DocFile, u32)]) -> SnapshotFiles {
@@ -2804,19 +3251,33 @@ mod tests {
             .collect()
     }
 
-    fn outcomes(entries: &[(&str, DocOutcome)]) -> SnapshotValidation {
+    /// A validation whose file sets are exactly the snapshot's files.
+    fn validated(snapshot: &SnapshotFiles, entries: &[(&str, DocOutcome)]) -> SnapshotValidation {
+        let docs: BTreeMap<DocId, DocOutcome> = entries
+            .iter()
+            .map(|(uuid, outcome)| (doc(uuid), outcome.clone()))
+            .collect();
+        let files = docs
+            .keys()
+            .map(|id| {
+                let seen = snapshot
+                    .keys()
+                    .filter(|file| &file.doc == id)
+                    .map(|file| file.file.clone())
+                    .collect();
+                (id.clone(), seen)
+            })
+            .collect();
         SnapshotValidation {
-            docs: entries
-                .iter()
-                .map(|(uuid, outcome)| (doc(uuid), outcome.clone()))
-                .collect(),
+            docs,
+            files,
             excluded: BTreeMap::new(),
         }
     }
 
     fn base_tree() -> RepoTree {
         rules()
-            .group_tree(&listing(&[
+            .group_tree(listing(&[
                 (".rmu/hub.json", 1),
                 ("README.md", 2),
                 ("docs/{d}/metadata", 10),
@@ -2844,12 +3305,17 @@ mod tests {
             (FOLDER, DocFile::Metadata, 40),
             (FOLDER, DocFile::Content, 41),
         ]);
-        let validation = outcomes(&[
-            (DOC, DocOutcome::Ok),
-            (DOC2, DocOutcome::Ok),
-            (FOLDER, DocOutcome::Ok),
-        ]);
-        let result = carry_forward(&base_tree(), &snapshot, &validation).to_listing();
+        let validation = validated(
+            &snapshot,
+            &[
+                (DOC, DocOutcome::Ok),
+                (DOC2, DocOutcome::Ok),
+                (FOLDER, DocOutcome::Ok),
+            ],
+        );
+        let result = carry_forward(&base_tree(), &snapshot, &validation)
+            .unwrap()
+            .to_listing();
         assert_eq!(
             result,
             listing(&[
@@ -2877,8 +3343,8 @@ mod tests {
             (DOC, DocFile::PayloadPdf, 12),
             (DOC, DocFile::Page(page(PAGE)), 13),
         ]);
-        let validation = outcomes(&[(DOC, DocOutcome::Ok)]);
-        let result = carry_forward(&base_tree(), &snapshot, &validation);
+        let validation = validated(&snapshot, &[(DOC, DocOutcome::Ok)]);
+        let result = carry_forward(&base_tree(), &snapshot, &validation).unwrap();
         assert!(!result.docs.contains_key(&doc(DOC2)));
         assert!(!result.to_listing().keys().any(|path| path.contains(DOC2)));
         assert_eq!(result.docs[&doc(DOC)], base_tree().docs[&doc(DOC)]);
@@ -2887,9 +3353,29 @@ mod tests {
             &base_tree(),
             &SnapshotFiles::new(),
             &SnapshotValidation::default(),
-        );
+        )
+        .unwrap();
         assert!(empty.docs.is_empty());
         assert_eq!(empty.extra, base_tree().extra);
+    }
+
+    #[test]
+    fn carry_forward_keeps_base_subtrees_that_are_not_documents() {
+        // Hand-committed or written by another tool: no metadata, so not
+        // a document, and nothing for that UUID on the tablet.
+        let base = rules()
+            .group_tree(listing(&[
+                ("docs/{f}/content", 1),
+                ("docs/{f}/notes.txt", 2),
+                ("docs/{d}/metadata", 3),
+            ]))
+            .unwrap();
+        let result =
+            carry_forward(&base, &SnapshotFiles::new(), &SnapshotValidation::default()).unwrap();
+        assert_eq!(
+            result.to_listing(),
+            listing(&[("docs/{f}/content", 1), ("docs/{f}/notes.txt", 2)])
+        );
     }
 
     #[test]
@@ -2903,44 +3389,154 @@ mod tests {
             // FOLDER: an orphan, not in base.
             (FOLDER, DocFile::Content, 97),
         ]);
-        let validation = outcomes(&[
-            (
-                DOC,
-                quarantined(QuarantineReason::UnparsableContent("x".to_string())),
-            ),
-            (DOC2, quarantined(QuarantineReason::MissingMetadata)),
-            (FOLDER, DocOutcome::Orphan),
-        ]);
-        let result = carry_forward(&base_tree(), &snapshot, &validation);
+        let mut validation = validated(
+            &snapshot,
+            &[
+                (
+                    DOC,
+                    quarantined(QuarantineReason::UnparsableContent("x".to_string())),
+                ),
+                (DOC2, quarantined(QuarantineReason::MissingMetadata)),
+                (FOLDER, DocOutcome::Orphan),
+            ],
+        );
+        // File sets of documents that keep their base are not checked.
+        validation
+            .files
+            .get_mut(&doc(DOC))
+            .unwrap()
+            .insert(DocFile::Pagedata);
+        let result = carry_forward(&base_tree(), &snapshot, &validation).unwrap();
         assert_eq!(result, base_tree());
     }
 
     #[test]
     fn carry_forward_never_adds_quarantined_new_documents() {
         let snapshot = snapshot_files(&[(FOLDER, DocFile::Metadata, 50)]);
-        let validation = outcomes(&[(
-            FOLDER,
-            quarantined(QuarantineReason::UnparsableMetadata("x".to_string())),
-        )]);
+        let validation = validated(
+            &snapshot,
+            &[(
+                FOLDER,
+                quarantined(QuarantineReason::UnparsableMetadata("x".to_string())),
+            )],
+        );
         let base = RepoTree::default();
-        assert_eq!(carry_forward(&base, &snapshot, &validation), base);
+        assert_eq!(carry_forward(&base, &snapshot, &validation).unwrap(), base);
+    }
+
+    fn mismatch(result: Result<RepoTree>) -> (DocId, Vec<String>, Vec<String>) {
+        match result {
+            Err(ModelError::SnapshotMismatch {
+                doc,
+                missing,
+                unexpected,
+            }) => (doc, missing, unexpected),
+            other => panic!("expected a snapshot mismatch, got {other:?}"),
+        }
     }
 
     #[test]
-    fn carry_forward_keeps_base_for_unvalidated_files() {
-        // Defensive: snapshot files without an outcome, or an Ok outcome
-        // without metadata, never read as a change or a deletion.
-        let snapshot = snapshot_files(&[(DOC, DocFile::Content, 77), (DOC2, DocFile::Content, 78)]);
-        let validation = outcomes(&[(DOC2, DocOutcome::Ok)]);
-        let result = carry_forward(&base_tree(), &snapshot, &validation);
-        assert_eq!(result, base_tree());
+    fn carry_forward_refuses_a_snapshot_missing_a_validated_page() {
+        // Validation saw the page; the snapshot's blob list lost it. That
+        // must not read as the page being deleted on the tablet.
+        let tablet = Snapshot::new().pdf(DOC);
+        let validation = tablet.validate(&[DOC]);
+        assert_eq!(validation.docs[&doc(DOC)], DocOutcome::Ok);
+        let snapshot = snapshot_files(&[
+            (DOC, DocFile::Metadata, 30),
+            (DOC, DocFile::Content, 31),
+            (DOC, DocFile::PayloadPdf, 32),
+        ]);
+        assert_eq!(
+            mismatch(carry_forward(&base_tree(), &snapshot, &validation)),
+            (doc(DOC), vec![format!("pages/{PAGE}.rm")], vec![])
+        );
+    }
+
+    #[test]
+    fn carry_forward_refuses_diverged_inputs() {
+        let base = base_tree();
+        // A file validation never saw.
+        let snapshot = snapshot_files(&[(DOC, DocFile::Metadata, 30), (DOC, DocFile::Content, 31)]);
+        let mut validation = validated(&snapshot, &[(DOC, DocOutcome::Ok)]);
+        validation
+            .files
+            .get_mut(&doc(DOC))
+            .unwrap()
+            .remove(&DocFile::Content);
+        assert_eq!(
+            mismatch(carry_forward(&base, &snapshot, &validation)),
+            (doc(DOC), vec![], vec!["content".to_string()])
+        );
+        // An Ok document with no snapshot files at all.
+        let validation = validated(&snapshot, &[(DOC, DocOutcome::Ok)]);
+        assert_eq!(
+            mismatch(carry_forward(&base, &SnapshotFiles::new(), &validation)),
+            (
+                doc(DOC),
+                vec!["metadata".to_string(), "content".to_string()],
+                vec![]
+            )
+        );
+        // Snapshot files for a document validation did not see.
+        let stray = snapshot_files(&[(DOC2, DocFile::Content, 78)]);
+        assert_eq!(
+            mismatch(carry_forward(&base, &stray, &SnapshotValidation::default())),
+            (doc(DOC2), vec![], vec!["content".to_string()])
+        );
+    }
+
+    #[test]
+    fn carry_forward_drops_other_paths_that_collide_with_mirrored_ones() {
+        let mut flat = listing(&[
+            ("docs/{d}/pages", 1),
+            ("docs/{d}/content/old", 3),
+            ("docs/{d}/pagesx", 4),
+            ("docs/{d}/notes.txt", 5),
+        ]);
+        flat.insert(
+            format!("docs/{DOC}/metadata"),
+            TreeEntry {
+                mode: EntryMode::Symlink,
+                id: oid(2),
+            },
+        );
+        let base = rules().group_tree(flat).unwrap();
+        assert_eq!(base.docs[&doc(DOC)].other.len(), 5);
+        let snapshot = snapshot_files(&[
+            (DOC, DocFile::Metadata, 30),
+            (DOC, DocFile::Content, 31),
+            (DOC, DocFile::Page(page(PAGE)), 32),
+        ]);
+        let validation = validated(&snapshot, &[(DOC, DocOutcome::Ok)]);
+        let result = carry_forward(&base, &snapshot, &validation).unwrap();
+        assert_eq!(
+            result.to_listing(),
+            listing(&[
+                ("docs/{d}/metadata", 30),
+                ("docs/{d}/content", 31),
+                ("docs/{d}/pages/{p}.rm", 32),
+                ("docs/{d}/pagesx", 4),
+                ("docs/{d}/notes.txt", 5),
+            ])
+        );
+    }
+
+    #[test]
+    fn path_collisions() {
+        assert!(paths_collide("pages", "pages"));
+        assert!(paths_collide("pages", "pages/x.rm"));
+        assert!(paths_collide("content/old", "content"));
+        assert!(!paths_collide("pagesx", "pages/x.rm"));
+        assert!(!paths_collide("pages/x.rm", "pages/y.rm"));
+        assert!(!paths_collide("content", "contents"));
     }
 
     #[test]
     fn narrower_rules_carry_forward_what_they_do_not_mirror() {
         let narrow = rules_without_pdf();
         let base = narrow
-            .group_tree(&listing(&[
+            .group_tree(listing(&[
                 ("docs/{d}/metadata", 10),
                 ("docs/{d}/content", 11),
                 ("docs/{d}/payload.pdf", 12),
@@ -2948,8 +3544,10 @@ mod tests {
             .unwrap();
         // The tablet still has its PDF, but these rules do not see it.
         let snapshot = snapshot_files(&[(DOC, DocFile::Metadata, 30), (DOC, DocFile::Content, 11)]);
-        let validation = outcomes(&[(DOC, DocOutcome::Ok)]);
-        let result = carry_forward(&base, &snapshot, &validation).to_listing();
+        let validation = validated(&snapshot, &[(DOC, DocOutcome::Ok)]);
+        let result = carry_forward(&base, &snapshot, &validation)
+            .unwrap()
+            .to_listing();
         assert_eq!(
             result,
             listing(&[
@@ -2986,7 +3584,7 @@ mod tests {
                 Classification::Excluded(_) => None,
             })
             .collect();
-        let result = carry_forward(&base, &snapshot, &validation);
+        let result = carry_forward(&base, &snapshot, &validation).unwrap();
         assert_eq!(result.docs[&doc(DOC2)], base.docs[&doc(DOC2)]);
         let version = &result.docs[&doc(DOC)];
         assert_eq!(
