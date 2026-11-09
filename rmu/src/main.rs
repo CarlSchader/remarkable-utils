@@ -7,9 +7,12 @@
 //! `ls` tree/JSON, downloaded paths, created UUIDs). Everything else —
 //! progress bars, human status lines — goes to stderr.
 
+mod hub;
+
 use std::fs;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -195,6 +198,10 @@ enum Command {
         #[arg(long, value_enum)]
         remote_kind: Option<RemoteKindArg>,
     },
+    /// Git-backed library shared by several tablets: clone, sync,
+    /// backup, status (see the README)
+    #[command(after_help = hub::AFTER_HELP)]
+    Hub(hub::HubArgs),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -217,7 +224,7 @@ enum RemoteKindArg {
     Fs,
 }
 
-fn main() -> Result<()> {
+fn main() -> ExitCode {
     // Must run before argument parsing: ssh re-executes this binary as
     // an askpass helper when password auth is in use.
     maybe_run_askpass();
@@ -232,11 +239,30 @@ fn main() -> Result<()> {
 
     let result = match &cli.command {
         Command::Sync { .. } => run_sync(&cli, progress.clone()),
+        Command::Hub(args) => hub::run(
+            args,
+            &hub::Env {
+                quiet: cli.quiet,
+                xochitl_dir: &cli.xochitl_dir,
+                progress: progress.clone(),
+            },
+            || make_session(&cli, &format!("{}@{}", cli.user, cli.host)),
+        ),
         _ => run_regular(&cli, progress.clone()),
     };
     // Clear any progress UI before errors are printed.
     progress.finished();
-    result
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            // As `main` returning the error would print it.
+            eprintln!("Error: {error:?}");
+            ExitCode::from(match cli.command {
+                Command::Hub(_) => hub::exit_code(&error),
+                _ => 1,
+            })
+        }
+    }
 }
 
 /// Build a session for a destination string (`host` or `user@host`).
@@ -1096,8 +1122,10 @@ fn run_command(client: &Client, cli: &Cli) -> Result<bool> {
             info(cli, "xochitl restarted");
             Ok(false)
         }
-        // Handled by run_sync, never reaches run_command.
-        Command::Sync { .. } => unreachable!("sync is dispatched in main"),
+        // Dispatched in main, never reach run_command.
+        Command::Sync { .. } | Command::Hub(_) => {
+            unreachable!("sync and hub are dispatched in main")
+        }
     }
 }
 
