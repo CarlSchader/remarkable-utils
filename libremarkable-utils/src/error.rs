@@ -5,7 +5,8 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
-/// Errors produced by SSH transport and logical-tree operations.
+/// Errors produced by SSH transport, git plumbing, and logical-tree
+/// operations.
 #[derive(Debug, Error)]
 pub enum Error {
     /// The remote command ran but exited non-zero.
@@ -91,6 +92,54 @@ pub enum Error {
     /// xochitl did not come back after a restart attempt.
     #[error("failed to restart xochitl: {0}")]
     XochitlRestart(String),
+
+    /// The `git` binary could not be started.
+    #[error("failed to run git {command}: {source} (is git installed and on PATH?)")]
+    GitSpawn { command: String, source: io::Error },
+
+    /// A git command ran but exited non-zero.
+    #[error("git {command} exited with status {status}: {stderr}")]
+    Git {
+        command: String,
+        status: i32,
+        stderr: String,
+    },
+
+    /// A git command produced output rmu could not interpret.
+    #[error("unexpected output from git {command}: {detail}")]
+    GitOutput { command: String, detail: String },
+
+    /// An argument that git cannot represent (object id, tree path,
+    /// identity) or that rmu refuses to pass on.
+    #[error("invalid git input: {0}")]
+    InvalidGitInput(String),
+
+    /// A path expected to hold a bare git repository does not.
+    #[error("not a bare git repository: {}", .0.display())]
+    NotABareRepository(PathBuf),
+
+    /// The remote ref moved: not a fast-forward, or the lease is stale.
+    /// Fetch, recompute, and retry.
+    #[error("push to {reference} rejected: {reason}")]
+    PushRejected { reference: String, reason: String },
+
+    /// The remote refused the push for another reason (hook, size
+    /// limit, ...); `stderr` carries the remote's message.
+    #[error("push to {reference} failed: {reason}: {stderr}")]
+    PushFailed {
+        reference: String,
+        reason: String,
+        stderr: String,
+    },
+
+    /// A blob reader yielded a different number of bytes than declared
+    /// (e.g. a file changed between stat and read).
+    #[error("blob for {path}: expected {expected} bytes, got {actual}")]
+    BlobSizeMismatch {
+        path: String,
+        expected: u64,
+        actual: u64,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

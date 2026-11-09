@@ -55,6 +55,16 @@ This repository is **open source** (dual-licensed MIT OR Apache-2.0):
   auth re-executes the current binary as an `SSH_ASKPASS` helper
   (`maybe_run_askpass` must be called first thing in `main`); the
   password travels via environment, never argv.
+- `git.rs` — plumbing over the system `git` binary for `rmu hub`
+  (`docs/hub-design.md`): bare repositories only, explicit `--git-dir`,
+  argv (never shell strings), and an explicit environment (`gc.auto=0`,
+  hooks disabled, `GIT_TERMINAL_PROMPT=0` when non-interactive; the
+  user's own config and credential helpers otherwise apply). Commits
+  go through `fast-import` with identity always passed explicitly and
+  blobs streamed; push rejection (non-fast-forward, stale lease) is the
+  typed `PushRejected`. Output parsers are pure and unit-tested; tests
+  against temp repos must stay hermetic (`GIT_CONFIG_GLOBAL=/dev/null`,
+  `GIT_CONFIG_NOSYSTEM=1`, temp `HOME`).
 - `xochitl.rs` — on-device file formats and **pure** tree logic (path/UUID
   resolution, glob matching/expansion, ambiguity rejection,
   conflict/cycle checks, rendering). Keep this module I/O-free so it
