@@ -100,8 +100,16 @@ This repository is **open source** (dual-licensed MIT OR Apache-2.0):
   format versions are refused, unknown fields preserved), view-state
   normalisation and overlay, per-document grouping of tree listings,
   snapshot validation (quarantine/orphan) and carry-forward. Keep it
-  I/O-free. `hub/merge.rs` (pure merge engine) and `hub/device.rs`
-  (tablet I/O) are declared but not implemented yet.
+  I/O-free. `hub/merge.rs` is the **pure** merge engine, phase 1:
+  per-document three-way merge (blob contents through a `BlobSource`,
+  history through `History`), forks with deterministic UUIDv5 ids, tree
+  rules, `tree_violations` (reused by apply on the live tablet) and the
+  deletion guard. Its tests (`hub/merge/tests.rs`) include a seeded
+  property test that new ink is never discarded; keep it passing and
+  add a case for every new rule. Hub code returns its own errors
+  (`ModelError`, `MergeError`), which are variants of `crate::Error`;
+  code that calls caller-supplied readers returns `crate::Result`.
+  `hub/device.rs` (tablet I/O) is in progress.
 - `status.rs` — device system state (`rmu status`): one
   marker-sectioned SSH round trip, pure best-effort parsing (every
   field `Option`al — firmware/models differ), pure rendering.

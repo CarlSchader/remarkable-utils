@@ -12,6 +12,12 @@
 //! - [`merge`] — pure three-way merge, deletion guard, forks.
 //! - [`device`] — tablet I/O behind a trait (lock, watchdog, stat
 //!   pass, staged apply).
+//!
+//! Errors: pure functions that fail only on their own terms return
+//! their module's error ([`model::ModelError`], [`merge::MergeError`]);
+//! functions that call caller-supplied readers return [`crate::Result`],
+//! and their own failures are variants of [`crate::Error`]
+//! (`HubModel`, `HubMerge`). Hub errors never wrap [`crate::Error`].
 
 pub mod device;
 pub mod merge;

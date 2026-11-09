@@ -1741,7 +1741,7 @@ mod tests {
             assert!(
                 matches!(
                     bad.parse::<Oid>(),
-                    Err(crate::error::Error::InvalidGitInput(_))
+                    Err(crate::error::Error::InvalidObjectId(_))
                 ),
                 "{bad}"
             )

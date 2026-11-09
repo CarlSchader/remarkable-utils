@@ -128,7 +128,7 @@ impl FromStr for Oid {
             matches!(s.len(), 40 | 64) && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
         valid
             .then(|| Oid(s.to_string()))
-            .ok_or_else(|| Error::InvalidGitInput(format!("not an object id: {s:?}")))
+            .ok_or_else(|| Error::InvalidObjectId(s.to_string()))
     }
 }
 
@@ -1421,7 +1421,7 @@ mod tests {
         // Uppercase is refused, not normalised (see `Oid`).
         assert!(matches!(
             A.to_uppercase().parse::<Oid>(),
-            Err(Error::InvalidGitInput(_))
+            Err(Error::InvalidObjectId(_))
         ));
         assert!(format!("{A}{}", &B[..24]).parse::<Oid>().is_ok());
         assert!(A[..39].parse::<Oid>().is_err());

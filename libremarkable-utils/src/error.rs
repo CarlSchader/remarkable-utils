@@ -147,6 +147,14 @@ pub enum Error {
     /// `rmu hub` data-model error (layout, formats, mirror rules).
     #[error(transparent)]
     HubModel(#[from] crate::hub::model::ModelError),
+
+    /// `rmu hub` merge-engine error.
+    #[error(transparent)]
+    HubMerge(#[from] crate::hub::merge::MergeError),
+
+    /// A string that is not a git object id ([`crate::git::Oid`]).
+    #[error("invalid object id {0:?}: expected 40 or 64 lowercase hex digits")]
+    InvalidObjectId(String),
 }
 
 fn describe_actual(expected: u64, actual: Option<u64>) -> String {
