@@ -147,6 +147,10 @@ pub enum Error {
     /// `rmu hub` data-model error (layout, formats, mirror rules).
     #[error(transparent)]
     HubModel(#[from] crate::hub::model::ModelError),
+
+    /// `rmu hub` device-layer error (lock, watchdog, transfers, apply).
+    #[error(transparent)]
+    HubDevice(#[from] crate::hub::device::DeviceError),
 }
 
 fn describe_actual(expected: u64, actual: Option<u64>) -> String {

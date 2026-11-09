@@ -303,7 +303,13 @@ as `Client::restart_xochitl` does today.
 
 Stat signatures are size, mtime, ctime and inode. Busybox `stat`'s `%Y`
 and `%Z` are whole seconds, but `%y`/`%z` print nanoseconds on the
-Paper Pro's ext4, and the signature uses those.
+Paper Pro's ext4, and the signature uses those. The stat pass is one
+`find . ! -type d -exec stat -c '%f %s %Y %y %Z %z %i %n' {} +` over the
+data dir: nanoseconds combine `%Y` with the fraction of `%y` (no
+time-zone arithmetic; the seconds fields must agree), and `%f` (raw
+mode) tells regular files from symlinks. Names containing a newline
+cannot be listed line by line and are never mirrored names; they are
+pruned and counted. Any diagnostic from `find` or `stat` fails the pass.
 
 Racy entries are handled as git does, by leaving them out when the
 manifest is recorded (step 15); a missing entry already means "dirty,
@@ -314,7 +320,9 @@ its reference time, or later: xochitl could change the file again
 within that second without moving the signature. The reference is the
 xochitl start that follows the stat: step 6 for stats from step 5, and
 the record time itself (conservative) for files apply wrote, which are
-stat'ed after the write. Nanosecond mtimes are always kept, so applied
+stat'ed after the write. The device layer reads the step-6 reference as
+the device clock just before `systemctl start` (earlier only drops more
+entries), and the record time after apply's `sync`. Nanosecond mtimes are always kept, so applied
 files are not downloaded again on every sync.
 
 ### Ancestry and identity checks (step 8)
@@ -349,7 +357,11 @@ clean-up does not require `--allow-deletions` on every tablet.
 
 - New and changed files are uploaded into a staging directory under
   `/home/root/.local/share/rmu/` (same filesystem) **before** xochitl is
-  stopped, so the outage covers only verification and moves.
+  stopped, so the outage covers only verification and moves. Each run
+  stages into `staging/<run-id>/`, keeping xochitl-relative paths, as one
+  streamed tar; staged files are `touch`ed after extraction, so applied
+  files carry device-clock nanosecond mtimes (never kept out of the
+  manifest as racy).
 - While stopped, rmu re-reads every `.metadata` and `.content` whose
   stat moved since the snapshot.
 - **Verify**: a document is applied only if its tablet files still match
@@ -365,10 +377,19 @@ clean-up does not require `--allow-deletions` on every tablet.
   that has gained children, no orphans. Documents that would violate them
   are skipped with a base override.
 - Staged files are moved into place in one batch script. Within a
-  document: pages and payload, then `.content`, then `.metadata`.
+  document: pages and payload, then `.content`, then `.metadata`. Each
+  move is a `rename` (`mv -T`). Mirrored files the merge dropped from a
+  document that stays (a deleted page) are removed in the same phase as
+  their kind.
 - A document deletion removes the whole `<uuid>`/`<uuid>.*` set,
-  including thumbnails and `.local`. Otherwise apply never deletes files
-  outside the mirror.
+  including thumbnails and `.local`, `.metadata` first (an interrupted
+  deletion leaves invisible orphans, never a half document). Otherwise
+  apply never deletes files outside the mirror.
+- The script first checks that every staged file is there (nothing
+  changes otherwise) and runs `sync`, so no rename can outlive its
+  file's data in a power cut. It prints each finished document, then,
+  after a final `sync`, the device time and a stat of every written file
+  (for the manifest), all in the same invocation.
 - View-state fields of existing documents are overlaid with the values
   re-read in the stopped window (see "View state").
 - `sync` runs on the device before step 15. `write_remote_file` is
@@ -395,6 +416,45 @@ clean-up does not require `--allow-deletions` on every tablet.
   rmu checks the marker before every device mutation and inside the
   apply's move script itself, and aborts if it is present, so a slow but
   live run can never overlap a second run that considered the lock stale.
+- **Guard.** That check (the *guard*) also requires the lock to still
+  name this run: the owner record holds a random run id, and every
+  mutating device command first tests, in the same invocation, that the
+  marker is absent and the run id is still there. Taking the lock (fresh
+  or over a stale one) therefore clears the marker: the old run is still
+  stopped, because the lock is no longer its own. Lock operations and
+  guarded commands hold an exclusive `flock` (BusyBox) on a file in
+  `/home/root/.local/share/rmu/` from the guard check to their last
+  change, so a takeover can never fall between a run's guard and its
+  mutation; the kernel drops it when the command exits, however it ends.
+  Only bounded local work runs under it: staging (a network transfer
+  into the run's own directory) checks the guard without it, and the
+  watchdog never takes it. The apply script repeats the guard before
+  every document. Starting xochitl checks only that the lock is still
+  ours: bringing the UI back stays allowed after the watchdog fired.
+- **Device-layer details.** The owner record is `key=value` lines
+  (`run`, `host`, `pid`, `started`, `boot_id`; unknown keys ignored).
+  The run id belongs to the process, so a retry after a lost
+  acknowledgement of the acquisition adopts its own lock. Taking over a
+  stale lock is a compare-and-swap on a device-side checksum of the
+  record as inspected, so two runs taking over at once cannot both win
+  and even a corrupt record can be broken with `--break-lock`. A lock
+  directory left without a record (power cut while acquiring) needs
+  `--break-lock`. The marker is written before xochitl is started. The
+  systemd watchdog is `systemd-run --quiet --collect
+  --unit=rmu-hub-watchdog-<token> --on-active=<n>s /bin/sh -c '<marker;
+  reset-failed; start>'`, with a fresh unit per arming: re-arming arms
+  the new timer first and only then stops the old one, so a failed
+  re-arm leaves the old watchdog in place. Taking over a lock does not
+  disarm the previous owner's watchdog, which may be what brings
+  xochitl back. The `sleep` fallback runs in its own session (`setsid`)
+  and fires only if a token file still holds the token written when it
+  was armed; disarming removes the token before killing the process
+  group, which is recorded with the boot id so that a number from before
+  a reboot is never signalled. The pairing check fails rather than
+  reading an unreadable configuration as unpaired. Device scripts are piped to `sh -s` and file lists to
+  `tar -T -`, never put on the remote command line (one argv string,
+  128 KiB on Linux); script bodies are wrapped in a shell function, so
+  a truncated transfer runs nothing.
 - Other mutating rmu commands (`upload`, `mv`, `rm`, `rename`, `sync`,
   `restart`) refuse while the hub lock is held, and `rmu sync` warns
   when its target tablet is attached to a hub (fresh-UUID copies would
@@ -592,9 +652,10 @@ When fork-class content changed on both sides:
   --auto` runs at the end.
 - **Bulk objects**: snapshots are written with `git fast-import` (blobs,
   trees and the commit in one stream) fed by a **streaming** tar reader.
-  The existing tar download (`run_checked_bytes`) buffers in memory, which
-  does not scale to a multi-GB first clone, so a streaming path is new
-  work.
+  The older tar download (`run_checked_bytes`) buffers in memory, which
+  does not scale to a multi-GB first clone; the device layer reads the
+  tar as it arrives (`SshSession::stream_stdout`) and hands each entry to
+  the caller as a reader with its size.
 - **Remote errors** (size limits, server hooks) become typed errors that
   name the offending path.
 - **Growth**: payloads never change after import, so each is stored once.
@@ -873,9 +934,9 @@ To be handled in the implementation PRs named:
   pages by `redir` when both sides materialised from an empty base.
 - Sync cycle, step 2: the pairing guard runs the one-liner from survey
   question 1 and refuses on `true`.
-- Device layer: skip the `tar` call when there is nothing to download
-  (BusyBox `tar` fails on an empty file list); stat signatures use
-  `%y`/`%z` for nanosecond times. When recording the manifest, leave out
+- Device layer (done): skip the `tar` call when there is nothing to
+  download (BusyBox `tar` fails on an empty file list); stat signatures
+  use `%y`/`%z` for nanosecond times. When recording the manifest, leave out
   racy entries (`StatSignature::keep_in_manifest`, "Snapshot
   validation") using the device time of the step-6 start for step-5
   stats and the record time for post-write stats.
