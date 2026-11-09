@@ -118,13 +118,15 @@ pub enum Error {
     #[error("not a bare git repository: {}", .0.display())]
     NotABareRepository(PathBuf),
 
-    /// The remote ref moved: not a fast-forward, or the lease is stale.
-    /// Fetch, recompute, and retry.
+    /// The push lost to a concurrent writer: not a fast-forward, a stale
+    /// lease, or the remote's own compare-and-swap failing because the
+    /// ref moved mid-push. Fetch, recompute, and retry. It does not carry
+    /// the remote's current value; fetch to learn it.
     #[error("push to {reference} rejected: {reason}")]
     PushRejected { reference: String, reason: String },
 
-    /// The remote refused the push for another reason (hook, size
-    /// limit, ...); `stderr` carries the remote's message.
+    /// The remote refused the push for a reason a retry will not fix
+    /// (hook, size limit, ...); `stderr` carries the remote's message.
     #[error("push to {reference} failed: {reason}: {stderr}")]
     PushFailed {
         reference: String,
@@ -133,13 +135,18 @@ pub enum Error {
     },
 
     /// A blob reader yielded a different number of bytes than declared
-    /// (e.g. a file changed between stat and read).
-    #[error("blob for {path}: expected {expected} bytes, got {actual}")]
+    /// (e.g. a file changed between stat and read). `actual` is `None`
+    /// when it yielded more: the rest is never read.
+    #[error("blob for {path}: expected {expected} bytes, got {}", describe_actual(*.expected, *.actual))]
     BlobSizeMismatch {
         path: String,
         expected: u64,
-        actual: u64,
+        actual: Option<u64>,
     },
+}
+
+fn describe_actual(expected: u64, actual: Option<u64>) -> String {
+    actual.map_or_else(|| format!("more than {expected}"), |n| n.to_string())
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

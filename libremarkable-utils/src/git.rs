@@ -11,12 +11,14 @@
 //! - Variables that would redirect git to another repository (`GIT_DIR`,
 //!   `GIT_INDEX_FILE`, ... as set inside git hooks) are removed.
 //! - `gc.auto=0` and `maintenance.auto=false`: no background repacking
-//!   while a tablet is stopped; `core.hooksPath=/dev/null`: hooks from a
-//!   user's template directory never run on rmu's own fetches, ref
-//!   updates and pushes; `core.logAllRefUpdates=false`: reflog entries
-//!   would need an auto-detected identity (a hostname). These are applied
-//!   to every command — read-only commands ignore them.
-//! - `GIT_TERMINAL_PROMPT=0` unless the caller says it is interactive.
+//!   while a tablet is stopped (only [`Repo::maintenance_auto`] runs
+//!   without them); `core.hooksPath=/dev/null`: hooks from a user's
+//!   template directory never run on rmu's own fetches, ref updates and
+//!   pushes; `core.logAllRefUpdates=false`: reflog entries would need an
+//!   auto-detected identity (a hostname); `push.gpgSign=false`: nothing
+//!   rmu writes is signed. These are applied to every command —
+//!   read-only commands ignore them.
+//! - `GIT_TERMINAL_PROMPT=0` unless the caller opts in to interactivity.
 //!
 //! Commits are written with `git fast-import` ([`CommitWriter`]), whose
 //! stream carries author and committer explicitly; identity is never
@@ -26,10 +28,13 @@
 //!
 //! Output parsers are pure functions with unit tests; paths are raw
 //! bytes throughout, since git allows any byte except NUL.
+//!
+//! Requires git 2.30 or newer (`rev-parse --end-of-options`).
 
 use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
+use std::fs;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Output, Stdio};
@@ -41,11 +46,16 @@ use crate::progress::Progress;
 
 /// `-c` settings for every invocation (see the module docs).
 const CONFIG: &[&str] = &[
-    "gc.auto=0",
-    "maintenance.auto=false",
     "core.hooksPath=/dev/null",
     "core.logAllRefUpdates=false",
+    "push.gpgSign=false",
 ];
+
+/// `-c` settings for every invocation but [`Repo::maintenance_auto`].
+const NO_AUTO_MAINTENANCE: &[&str] = &["gc.auto=0", "maintenance.auto=false"];
+
+/// Keeps [`Repo::maintenance_auto`] in the foreground.
+const NO_DETACH: &[&str] = &["gc.autoDetach=false", "maintenance.autoDetach=false"];
 
 /// Inherited variables that would point git at a different repository
 /// or object store than the one rmu names (e.g. when run from a hook).
@@ -74,6 +84,31 @@ pub struct Oid(String);
 impl Oid {
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// The hash function that produced this id, from its length.
+    pub fn object_format(&self) -> ObjectFormat {
+        if self.0.len() == 64 {
+            ObjectFormat::Sha256
+        } else {
+            ObjectFormat::Sha1
+        }
+    }
+}
+
+/// A repository's hash function. Fetching requires both sides to agree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ObjectFormat {
+    Sha1,
+    Sha256,
+}
+
+impl ObjectFormat {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Sha1 => "sha1",
+            Self::Sha256 => "sha256",
+        }
     }
 }
 
@@ -205,6 +240,8 @@ pub struct Signature {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitMeta {
     /// Parent commits, first parent first; empty for a root commit.
+    /// Repeats are dropped (first occurrence kept), so a snapshot whose
+    /// base equals the previous device ref gets one parent.
     pub parents: Vec<Oid>,
     pub author: Signature,
     pub committer: Signature,
@@ -213,19 +250,13 @@ pub struct CommitMeta {
 }
 
 /// How to run `git`: interactivity and extra environment. Cheap to clone.
-#[derive(Debug, Clone)]
+///
+/// Non-interactive by default, so a forgotten setting fails instead of
+/// hanging on a prompt.
+#[derive(Debug, Clone, Default)]
 pub struct Git {
     interactive: bool,
     env: Vec<(OsString, OsString)>,
-}
-
-impl Default for Git {
-    fn default() -> Self {
-        Self {
-            interactive: true,
-            env: Vec::new(),
-        }
-    }
 }
 
 impl Git {
@@ -234,8 +265,8 @@ impl Git {
     }
 
     /// Whether git may prompt on the terminal for credentials (default
-    /// `true`). Set `false` without a tty: prompts then fail instead of
-    /// hanging (`GIT_TERMINAL_PROMPT=0`).
+    /// `false`: prompts fail instead of hanging, `GIT_TERMINAL_PROMPT=0`).
+    /// Opt in only when there is a tty to prompt on.
     pub fn interactive(mut self, interactive: bool) -> Self {
         self.interactive = interactive;
         self
@@ -249,11 +280,21 @@ impl Git {
         self
     }
 
-    /// Create a bare repository at `path` (re-initialising an existing
-    /// one is harmless) with `HEAD` on `main` and no template files.
-    pub fn init_bare(&self, path: &Path) -> Result<Repo> {
+    /// Create a bare repository at `path` with `HEAD` on `main`, no
+    /// template files, and the given object format (never the user's
+    /// `init.defaultObjectFormat` or `GIT_DEFAULT_HASH`). Re-initialising
+    /// an existing repository of the same format is harmless.
+    ///
+    /// A cache must have its origin's format to fetch from it.
+    /// `ls_remote` works across formats, so compare
+    /// [`Oid::object_format`] of origin's refs with
+    /// [`Repo::object_format`] and re-create the cache on a mismatch. An
+    /// empty origin advertises nothing; create new origins as
+    /// [`ObjectFormat::Sha1`], which every forge accepts.
+    pub fn init_bare(&self, path: &Path, format: ObjectFormat) -> Result<Repo> {
         let mut cmd = self.command(None, "init");
         cmd.args(["--bare", "--quiet", "--template=", "--initial-branch=main"])
+            .arg(format!("--object-format={}", format.name()))
             .arg("--end-of-options")
             .arg(path);
         run("init", &mut cmd)?;
@@ -279,6 +320,15 @@ impl Git {
     }
 
     fn command(&self, git_dir: Option<&Path>, subcommand: &str) -> Command {
+        self.command_with(git_dir, subcommand, &[NO_AUTO_MAINTENANCE, CONFIG])
+    }
+
+    fn command_with(
+        &self,
+        git_dir: Option<&Path>,
+        subcommand: &str,
+        config: &[&[&str]],
+    ) -> Command {
         let mut cmd = Command::new("git");
         SCRUBBED_ENV.iter().for_each(|key| {
             cmd.env_remove(key);
@@ -292,7 +342,7 @@ impl Git {
         if let Some(dir) = git_dir {
             cmd.arg("--git-dir").arg(dir);
         }
-        CONFIG.iter().for_each(|setting| {
+        config.iter().flat_map(|c| c.iter()).for_each(|setting| {
             cmd.arg("-c").arg(setting);
         });
         cmd.arg(subcommand);
@@ -324,30 +374,34 @@ impl Repo {
     }
 
     /// Fetch `refspecs` (e.g. `+refs/heads/main:refs/remotes/origin/main`)
-    /// from `url`, without tags.
-    pub fn fetch(&self, url: &str, refspecs: &[&str]) -> Result<()> {
+    /// from `url`, without tags. Local refs under a refspec's destination
+    /// that the remote no longer has are deleted only with `prune`
+    /// (a user's `fetch.prune` never applies).
+    pub fn fetch(&self, url: &str, refspecs: &[&str], prune: bool) -> Result<()> {
         let mut cmd = self.command("fetch");
-        cmd.args(["--quiet", "--no-tags", "--end-of-options"])
+        cmd.args(["--quiet", "--no-tags"])
+            .arg(if prune { "--prune" } else { "--no-prune" })
+            .arg("--end-of-options")
             .arg(url)
             .args(refspecs);
         run("fetch", &mut cmd).map(drop)
     }
 
-    /// Push local `src` (an oid or ref) to the full remote ref `dst`.
+    /// Push commit `src` to the full remote ref `dst`.
     ///
     /// Without a lease, the remote accepts only a fast-forward (or a new
     /// ref). With one, the update is a compare-and-swap: it may rewind,
-    /// but only if `dst` currently matches. Either refusal is
-    /// [`Error::PushRejected`] — fetch, recompute, retry. Anything the
-    /// remote itself refuses (hooks, size limits, a lost ref-lock race)
-    /// is [`Error::PushFailed`] with the remote's message; failures
-    /// before any ref status (auth, network) are [`Error::Git`].
-    pub fn push(&self, url: &str, src: &str, dst: &str, lease: Option<&Expected>) -> Result<()> {
-        if !dst.starts_with("refs/") {
-            return Err(Error::InvalidGitInput(format!(
-                "push destination must be a full ref name: {dst:?}"
-            )));
-        }
+    /// but only if `dst` currently matches. Every way of losing to a
+    /// concurrent writer is [`Error::PushRejected`] — fetch, recompute,
+    /// retry: the client-side check (non-fast-forward, stale lease) and
+    /// the remote's own compare-and-swap (its ref moved between the
+    /// advertisement and the update). Anything else the remote refuses
+    /// (hooks, size limits) is [`Error::PushFailed`] with the remote's
+    /// message; failures before any ref status (auth, network) are
+    /// [`Error::Git`]. A status the request cannot have asked for (a
+    /// deletion, or a forced update without a lease) is an error too.
+    pub fn push(&self, url: &str, src: &Oid, dst: &str, lease: Option<&Expected>) -> Result<()> {
+        validate_ref_name(dst)?;
         let mut cmd = self.command("push");
         cmd.args(["--porcelain", "--no-verify"]);
         if let Some(expected) = lease {
@@ -357,16 +411,27 @@ impl Repo {
             .arg(url)
             .arg(format!("{src}:{dst}"));
         let output = output("push", &mut cmd)?;
-        push_outcome(
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        match push_outcome(
             dst,
+            lease.is_some(),
             output.status.success(),
             &String::from_utf8_lossy(&output.stdout),
-            &String::from_utf8_lossy(&output.stderr),
-        )
-        .map_err(|error| match error {
-            Error::Git { .. } => failure("push", &output),
-            other => other,
-        })
+            &stderr,
+        ) {
+            PushOutcome::Updated => Ok(()),
+            PushOutcome::Rejected(reason) => Err(Error::PushRejected {
+                reference: dst.to_string(),
+                reason,
+            }),
+            PushOutcome::Refused(reason) => Err(Error::PushFailed {
+                reference: dst.to_string(),
+                reason,
+                stderr: stderr.trim().to_string(),
+            }),
+            PushOutcome::Unexpected(detail) => Err(output_error("push", detail)),
+            PushOutcome::Failed => Err(failure("push", &output)),
+        }
     }
 
     /// Resolve `rev` like `git rev-parse --verify`; `None` if it does not
@@ -384,7 +449,14 @@ impl Repo {
     }
 
     /// Whether `ancestor` is reachable from `descendant` (a commit is
-    /// its own ancestor). Missing objects are an error, not `false`.
+    /// its own ancestor).
+    ///
+    /// A missing object — including a missing `ancestor` — is an error,
+    /// not `false`. A commit that may never have reached this repository
+    /// (e.g. a journaled merge whose push was lost, checked from another
+    /// computer or a fresh cache) must be checked with
+    /// `rev_parse("<oid>^{commit}")` first; `None` there means it is not
+    /// in the fetched history.
     pub fn is_ancestor(&self, ancestor: &Oid, descendant: &Oid) -> Result<bool> {
         let mut cmd = self.command("merge-base");
         cmd.args([
@@ -401,15 +473,43 @@ impl Repo {
         }
     }
 
-    /// Point local ref `name` at `new`; with `old`, only if the ref
-    /// currently has that value (atomic compare-and-swap).
+    /// Point local ref `name` (a full `refs/...` name) at `new`; with
+    /// `old`, only if the ref currently has that value (atomic
+    /// compare-and-swap).
     pub fn update_ref(&self, name: &str, new: &Oid, old: Option<&Expected>) -> Result<()> {
+        validate_ref_name(name)?;
         let mut cmd = self.command("update-ref");
         cmd.args(["--end-of-options", name, new.as_str()]);
         if let Some(old) = old {
             cmd.arg(old.arg());
         }
         run("update-ref", &mut cmd).map(drop)
+    }
+
+    /// The repository's object format.
+    pub fn object_format(&self) -> Result<ObjectFormat> {
+        let mut cmd = self.command("rev-parse");
+        cmd.arg("--show-object-format");
+        match run("rev-parse", &mut cmd)?.as_slice() {
+            b"sha1\n" => Ok(ObjectFormat::Sha1),
+            b"sha256\n" => Ok(ObjectFormat::Sha256),
+            other => Err(output_error(
+                "rev-parse",
+                format!("unknown object format {:?}", String::from_utf8_lossy(other)),
+            )),
+        }
+    }
+
+    /// `git maintenance run --auto` in the foreground: the one command
+    /// that runs without the `gc.auto=0`/`maintenance.auto=false`
+    /// overrides, so the user's thresholds decide whether anything
+    /// happens. Run it once the tablet is back up.
+    pub fn maintenance_auto(&self) -> Result<()> {
+        let mut cmd =
+            self.git
+                .command_with(Some(&self.git_dir), "maintenance", &[CONFIG, NO_DETACH]);
+        cmd.args(["run", "--auto", "--quiet"]);
+        run("maintenance", &mut cmd).map(drop)
     }
 
     /// Every entry below `treeish` (a commit or tree), trees included,
@@ -448,6 +548,9 @@ impl Repo {
         let stdin = process.child.stdin.take().expect("stdin was piped");
         let stdout = process.child.stdout.take().expect("stdout was piped");
         Ok(CommitWriter {
+            crash_report: self
+                .git_dir
+                .join(format!("fast_import_crash_{}", process.child.id())),
             process,
             stdin: Some(BufWriter::with_capacity(64 * 1024, stdin)),
             stdout: BufReader::new(stdout),
@@ -578,14 +681,18 @@ impl Read for ObjectReader<'_> {
 /// full tree, then [`CommitWriter::commit`].
 ///
 /// New blobs are streamed to git as they are added (from any reader, of
-/// a size declared up front); existing blobs are referenced by id. No
-/// ref is updated. Dropping the writer without committing kills
-/// fast-import; objects already streamed stay as unreachable garbage.
+/// a size declared up front); existing blobs and whole subtrees are
+/// referenced by id. No ref is updated. Dropping the writer without
+/// committing kills fast-import; objects already streamed stay as
+/// unreachable garbage. A crash report fast-import writes when it fails
+/// (it holds recent stream lines: paths, messages) is removed on drop.
 pub struct CommitWriter<'p> {
     process: Process,
     stdin: Option<BufWriter<ChildStdin>>,
     stdout: BufReader<ChildStdout>,
-    entries: Vec<(Vec<u8>, FileMode, DataRef)>,
+    crash_report: PathBuf,
+    /// Path, tree-entry mode bits, content.
+    entries: Vec<(Vec<u8>, u32, DataRef)>,
     next_mark: u64,
     progress: &'p dyn Progress,
     transferred: u64,
@@ -600,8 +707,9 @@ enum DataRef {
 impl CommitWriter<'_> {
     /// Add a new file whose content is exactly `size` bytes from
     /// `reader`, returning its blob id. A reader that yields a different
-    /// number of bytes is [`Error::BlobSizeMismatch`] and aborts the
-    /// commit.
+    /// number of bytes is [`Error::BlobSizeMismatch`], and a read error
+    /// is returned as is; both abort the commit. At most `size + 1`
+    /// bytes are read.
     pub fn add_blob(
         &mut self,
         path: impl Into<Vec<u8>>,
@@ -616,17 +724,16 @@ impl CommitWriter<'_> {
         self.write(format!("blob\nmark :{mark}\ndata {size}\n").as_bytes())?;
         let copied = self.copy_blob(reader, size)?;
         if copied != size {
-            let actual = copied + io::copy(reader, &mut io::sink()).unwrap_or(0);
             self.abort();
             return Err(Error::BlobSizeMismatch {
                 path: String::from_utf8_lossy(&path).into_owned(),
                 expected: size,
-                actual,
+                actual: (copied < size).then_some(copied),
             });
         }
         self.write(format!("\nget-mark :{mark}\n").as_bytes())?;
         let oid = self.read_mark()?;
-        self.entries.push((path, mode, DataRef::Mark(mark)));
+        self.entries.push((path, mode.bits(), DataRef::Mark(mark)));
         Ok(oid)
     }
 
@@ -650,7 +757,20 @@ impl CommitWriter<'_> {
     ) -> Result<()> {
         let path = path.into();
         validate_path(&path)?;
-        self.entries.push((path, mode, DataRef::Oid(oid.clone())));
+        self.entries
+            .push((path, mode.bits(), DataRef::Oid(oid.clone())));
+        Ok(())
+    }
+
+    /// Add a whole existing tree at `path` (e.g. an unchanged document
+    /// subtree carried forward from a base commit), whatever entries it
+    /// holds. Nothing else may be added below `path`. The tree's
+    /// existence is checked at commit.
+    pub fn add_existing_tree(&mut self, path: impl Into<Vec<u8>>, tree: &Oid) -> Result<()> {
+        let path = path.into();
+        validate_path(&path)?;
+        self.entries
+            .push((path, 0o040000, DataRef::Oid(tree.clone())));
         Ok(())
     }
 
@@ -670,7 +790,6 @@ impl CommitWriter<'_> {
             }
         };
         self.write(&stream)?;
-        self.progress.bytes_done();
         let stdin = self.stdin.take().ok_or_else(|| closed("fast-import"))?;
         if let Err(error) = stdin.into_inner().map_err(|e| e.into_error()) {
             return Err(self.broken(error));
@@ -679,7 +798,9 @@ impl CommitWriter<'_> {
         let read = self.stdout.read_until(b'\n', &mut line);
         self.process.wait_checked()?;
         read?;
-        parse_oid_line("fast-import", &line)
+        let oid = parse_oid_line("fast-import", &line)?;
+        self.progress.bytes_done();
+        Ok(oid)
     }
 
     fn copy_blob(&mut self, reader: &mut dyn Read, size: u64) -> Result<u64> {
@@ -738,11 +859,18 @@ impl CommitWriter<'_> {
     }
 }
 
+impl Drop for CommitWriter<'_> {
+    fn drop(&mut self) {
+        self.abort();
+        let _ = fs::remove_file(&self.crash_report);
+    }
+}
+
 /// The fast-import stream for the commit itself: metadata, the full
 /// tree, the commit id request, and a reset so no ref is written.
 fn commit_command(
     meta: &CommitMeta,
-    entries: &[(Vec<u8>, FileMode, DataRef)],
+    entries: &[(Vec<u8>, u32, DataRef)],
     mark: u64,
 ) -> Result<Vec<u8>> {
     let author = format_signature(&meta.author)?;
@@ -751,9 +879,11 @@ fn commit_command(
         "commit {SCRATCH_REF}\nmark :{mark}\nauthor {author}\ncommitter {committer}\ndata {}\n",
         meta.message.len()
     );
+    let mut seen = HashSet::new();
     let parents = meta
         .parents
         .iter()
+        .filter(|parent| seen.insert(*parent))
         .enumerate()
         .map(|(i, parent)| format!("{} {parent}\n", if i == 0 { "from" } else { "merge" }))
         .collect::<String>();
@@ -764,7 +894,7 @@ fn commit_command(
                 DataRef::Mark(mark) => format!(":{mark}"),
                 DataRef::Oid(oid) => oid.to_string(),
             };
-            format!("M {:06o} {data} {}\n", mode.bits(), quote_path(path))
+            format!("M {mode:06o} {data} {}\n", quote_path(path))
         })
         .collect::<String>();
     Ok([
@@ -879,6 +1009,12 @@ fn spawn_error(command: &str, source: io::Error) -> Error {
 }
 
 /// Run to completion with no stdin, capturing output; any exit status.
+///
+/// This waits for EOF on stdout and stderr, not just for git to exit: a
+/// user-configured helper (an ssh wrapper, a credential daemon) that
+/// inherits stderr and never closes it would stall the call. Stock
+/// OpenSSH and `credential-cache` detach from it, so this is accepted
+/// here; `ssh.rs` shows the heavier alternative if it ever matters.
 fn output(name: &str, cmd: &mut Command) -> Result<Output> {
     cmd.stdin(Stdio::null())
         .output()
@@ -1053,39 +1189,70 @@ fn parse_push_porcelain(stdout: &str) -> Vec<PushStatus> {
         .collect()
 }
 
-/// Interpret a finished push of `dst`. A plain [`Error::Git`] result
-/// stands for "failed without a status for `dst`"; the caller fills in
-/// the real exit status and stderr.
-fn push_outcome(dst: &str, success: bool, stdout: &str, stderr: &str) -> Result<()> {
+/// What a finished push of one ref amounted to.
+#[derive(Debug, PartialEq, Eq)]
+enum PushOutcome {
+    Updated,
+    /// Lost to a concurrent writer; fetch and retry.
+    Rejected(String),
+    /// The remote refused for another reason.
+    Refused(String),
+    /// A status the request cannot have asked for.
+    Unexpected(String),
+    /// Git failed without a usable status for the ref.
+    Failed,
+}
+
+/// `[remote rejected]` reasons (and the stderr line) with which a remote
+/// reports that its own compare-and-swap failed: the ref moved between
+/// the advertisement and the update. Older `receive-pack` versions use
+/// the vaguer reasons; misreading a genuine lock failure as a race costs
+/// one bounded retry.
+const REMOTE_RACE_REASONS: &[&str] = &[
+    "incorrect old value provided",
+    "failed to update ref",
+    "failed to lock",
+];
+
+/// Interpret a finished push of `dst`.
+fn push_outcome(dst: &str, leased: bool, success: bool, stdout: &str, stderr: &str) -> PushOutcome {
     let status = parse_push_porcelain(stdout)
         .into_iter()
         .find(|s| s.to == dst);
+    let remote_race = |reason: &str| {
+        REMOTE_RACE_REASONS.contains(&reason)
+            || stderr
+                .lines()
+                .any(|line| line.contains("cannot lock ref") && line.contains("but expected"))
+    };
     match status {
         Some(s) if s.flag == '!' => {
             let reason = s.reason.unwrap_or_else(|| s.summary.clone());
-            if s.summary == "[rejected]" {
-                Err(Error::PushRejected {
-                    reference: dst.to_string(),
-                    reason,
-                })
-            } else {
-                Err(Error::PushFailed {
-                    reference: dst.to_string(),
-                    reason: format!("{} ({reason})", s.summary),
-                    stderr: stderr.trim().to_string(),
-                })
+            match s.summary.as_str() {
+                "[rejected]" => PushOutcome::Rejected(reason),
+                "[remote rejected]" if remote_race(&reason) => PushOutcome::Rejected(reason),
+                summary => PushOutcome::Refused(format!("{summary} ({reason})")),
             }
         }
-        Some(_) if success => Ok(()),
-        None if success => Err(output_error(
-            "push",
-            format!("no status reported for {dst}"),
-        )),
-        _ => Err(Error::Git {
-            command: "push".into(),
-            status: -1,
-            stderr: stderr.trim().to_string(),
-        }),
+        Some(s) if s.flag == '-' => PushOutcome::Unexpected(format!("{dst} was deleted")),
+        Some(s) if s.flag == '+' && !leased => {
+            PushOutcome::Unexpected(format!("{dst} was force-updated without a lease"))
+        }
+        Some(_) if success => PushOutcome::Updated,
+        None if success => PushOutcome::Unexpected(format!("no status reported for {dst}")),
+        _ => PushOutcome::Failed,
+    }
+}
+
+/// The ref names rmu updates: full `refs/...` names, never refspec
+/// syntax (a leading `+` forces, a `:` splits source from destination).
+fn validate_ref_name(name: &str) -> Result<()> {
+    if name.starts_with("refs/") && !name.contains(':') && !name.contains(char::is_control) {
+        Ok(())
+    } else {
+        Err(Error::InvalidGitInput(format!(
+            "not a full ref name (refs/...): {name:?}"
+        )))
     }
 }
 
@@ -1112,8 +1279,8 @@ fn validate_path(path: &[u8]) -> Result<()> {
     }
 }
 
-/// A tree cannot hold the same path twice, nor a file where another
-/// path needs a directory.
+/// A tree cannot hold the same path twice, nor an entry (file or whole
+/// tree) where another path needs a directory.
 fn check_tree_paths<'a>(mut paths: impl Iterator<Item = &'a [u8]> + Clone) -> Result<()> {
     let directories = paths
         .clone()
@@ -1129,7 +1296,7 @@ fn check_tree_paths<'a>(mut paths: impl Iterator<Item = &'a [u8]> + Clone) -> Re
         if !seen.insert(path) {
             Err("listed twice")
         } else if directories.contains(path) {
-            Err("both a file and a directory")
+            Err("both an entry and a directory of other entries")
         } else {
             Ok(())
         }
@@ -1192,6 +1359,7 @@ fn format_signature(sig: &Signature) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::progress::NoProgress;
 
     const A: &str = "0123456789abcdef0123456789abcdef01234567";
     const B: &str = "89abcdef0123456789abcdef0123456789abcdef";
@@ -1391,58 +1559,142 @@ mod tests {
         let line =
             |flag: &str, rest: &str| format!("To o\n{flag}\t{A}:refs/heads/main\t{rest}\nDone\n");
         let main = "refs/heads/main";
-        assert!(push_outcome(main, true, &line("*", "[new branch]"), "").is_ok());
-        assert!(push_outcome(main, true, &line(" ", "1234567..89abcde"), "").is_ok());
-        assert!(push_outcome(main, true, &line("=", "[up to date]"), "").is_ok());
-        ["non-fast-forward", "fetch first", "stale info"].iter().for_each(|reason| {
-            let result = push_outcome(main, false, &line("!", &format!("[rejected] ({reason})")), "error: failed");
-            assert!(
-                matches!(&result, Err(Error::PushRejected { reference, reason: r }) if reference == main && r == reason),
-                "{result:?}"
+        let outcome = |leased, success, stdout: &str, stderr| {
+            push_outcome(main, leased, success, stdout, stderr)
+        };
+        assert_eq!(
+            outcome(false, true, &line("*", "[new branch]"), ""),
+            PushOutcome::Updated
+        );
+        assert_eq!(
+            outcome(false, true, &line(" ", "1234567..89abcde"), ""),
+            PushOutcome::Updated
+        );
+        assert_eq!(
+            outcome(false, true, &line("=", "[up to date]"), ""),
+            PushOutcome::Updated
+        );
+        ["non-fast-forward", "fetch first", "stale info"]
+            .iter()
+            .for_each(|reason| {
+                assert_eq!(
+                    outcome(
+                        true,
+                        false,
+                        &line("!", &format!("[rejected] ({reason})")),
+                        "error: failed"
+                    ),
+                    PushOutcome::Rejected(reason.to_string())
+                );
+            });
+        // The remote's own compare-and-swap lost a race: retry too.
+        REMOTE_RACE_REASONS.iter().for_each(|reason| {
+            assert_eq!(
+                outcome(
+                    false,
+                    false,
+                    &line("!", &format!("[remote rejected] ({reason})")),
+                    ""
+                ),
+                PushOutcome::Rejected(reason.to_string())
             );
         });
-        let hook = push_outcome(
-            main,
-            false,
-            &line("!", "[remote rejected] (pre-receive hook declined)"),
-            "remote: file too large: docs/x/payload.pdf\nerror: failed to push some refs\n",
+        assert_eq!(
+            outcome(
+                false,
+                false,
+                &line("!", "[remote rejected] (some future wording)"),
+                "remote: error: cannot lock ref 'refs/heads/main': is at 1 but expected 2\n",
+            ),
+            PushOutcome::Rejected("some future wording".into())
         );
-        assert!(
-            matches!(&hook, Err(Error::PushFailed { reason, stderr, .. })
-                if reason == "[remote rejected] (pre-receive hook declined)" && stderr.contains("payload.pdf")),
-            "{hook:?}"
+        assert_eq!(
+            outcome(
+                false,
+                false,
+                &line("!", "[remote rejected] (pre-receive hook declined)"),
+                "remote: file too large: docs/x/payload.pdf\nerror: failed to push some refs\n",
+            ),
+            PushOutcome::Refused("[remote rejected] (pre-receive hook declined)".into())
         );
         assert!(matches!(
-            push_outcome(
-                main,
+            outcome(
+                false,
                 false,
                 &line("!", "[remote failure] (remote failed to report status)"),
                 ""
             ),
-            Err(Error::PushFailed { .. })
+            PushOutcome::Refused(_)
         ));
+    }
+
+    #[test]
+    fn push_outcome_rejects_statuses_the_request_cannot_ask_for() {
+        let main = "refs/heads/main";
+        let deleted = format!("To o\n-\t:{main}\t[deleted]\nDone\n");
+        let forced = format!("To o\n+\t{A}:{main}\t1234567...89abcde (forced update)\nDone\n");
+        [true, false].iter().for_each(|&leased| {
+            assert!(matches!(
+                push_outcome(main, leased, true, &deleted, ""),
+                PushOutcome::Unexpected(_)
+            ));
+        });
+        assert!(matches!(
+            push_outcome(main, false, true, &forced, ""),
+            PushOutcome::Unexpected(_)
+        ));
+        assert_eq!(
+            push_outcome(main, true, true, &forced, ""),
+            PushOutcome::Updated
+        );
     }
 
     #[test]
     fn push_outcome_without_a_status_line() {
         let main = "refs/heads/main";
         // Auth or network failure: nothing on stdout.
-        assert!(matches!(
-            push_outcome(main, false, "", "fatal: Could not read"),
-            Err(Error::Git { .. })
-        ));
+        assert_eq!(
+            push_outcome(main, false, false, "", "fatal: Could not read"),
+            PushOutcome::Failed
+        );
         // A status for some other ref only.
         let other = format!("To o\n*\t{A}:refs/heads/other\t[new branch]\nDone\n");
         assert!(matches!(
-            push_outcome(main, true, &other, ""),
-            Err(Error::GitOutput { .. })
+            push_outcome(main, false, true, &other, ""),
+            PushOutcome::Unexpected(_)
         ));
         // A reported success that git still failed on.
         let ok = format!("To o\n*\t{A}:refs/heads/main\t[new branch]\n");
-        assert!(matches!(
-            push_outcome(main, false, &ok, ""),
-            Err(Error::Git { .. })
-        ));
+        assert_eq!(
+            push_outcome(main, false, false, &ok, ""),
+            PushOutcome::Failed
+        );
+    }
+
+    #[test]
+    fn ref_names_must_be_full_and_not_refspecs() {
+        ["refs/heads/main", "refs/rmu/devices/0000aaaa"]
+            .iter()
+            .for_each(|name| assert!(validate_ref_name(name).is_ok(), "{name}"));
+        [
+            "",
+            "main",
+            "HEAD",
+            "objects/x",
+            "--stdin",
+            "-d",
+            "+refs/heads/main",
+            "refs/heads/a:refs/heads/b",
+            ":refs/heads/main",
+            "refs/heads/a\nb",
+        ]
+        .iter()
+        .for_each(|name| {
+            assert!(
+                matches!(validate_ref_name(name), Err(Error::InvalidGitInput(_))),
+                "{name:?}"
+            );
+        });
     }
 
     #[test]
@@ -1521,14 +1773,23 @@ mod tests {
             offset_minutes: 0,
         };
         let meta = CommitMeta {
-            parents: vec![oid(A), oid(B)],
+            parents: vec![oid(A), oid(B), oid(A), oid(B)],
             author: sig.clone(),
             committer: sig,
             message: "merge\n".into(),
         };
         let entries = vec![
-            (b"docs/x".to_vec(), FileMode::Regular, DataRef::Mark(1)),
-            (b"run".to_vec(), FileMode::Executable, DataRef::Oid(oid(B))),
+            (
+                b"docs/x".to_vec(),
+                FileMode::Regular.bits(),
+                DataRef::Mark(1),
+            ),
+            (
+                b"run".to_vec(),
+                FileMode::Executable.bits(),
+                DataRef::Oid(oid(B)),
+            ),
+            (b"docs/y".to_vec(), 0o040000, DataRef::Oid(oid(A))),
         ];
         let stream = String::from_utf8(commit_command(&meta, &entries, 2).unwrap()).unwrap();
         assert_eq!(
@@ -1542,8 +1803,76 @@ mod tests {
                  deleteall\n\
                  M 100644 :1 \"docs/x\"\n\
                  M 100755 {B} \"run\"\n\
+                 M 040000 {A} \"docs/y\"\n\
                  \nget-mark :2\nreset {SCRATCH_REF}\n\ndone\n"
             )
         );
+    }
+
+    /// A temporary directory with a hermetic [`Git`] for it.
+    struct Sandbox(PathBuf);
+
+    impl Sandbox {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("rmu-git-unit-{}", uuid::Uuid::new_v4()));
+            fs::create_dir_all(path.join("home")).unwrap();
+            Self(path)
+        }
+
+        fn git(&self) -> Git {
+            Git::new()
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_COUNT", "0")
+                .env("GIT_CONFIG_PARAMETERS", "")
+                .env("HOME", self.0.join("home"))
+                .env("XDG_CONFIG_HOME", self.0.join("home"))
+        }
+    }
+
+    impl Drop for Sandbox {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    #[test]
+    fn truncated_stream_fails_without_writing_a_ref_or_crash_report() {
+        let sandbox = Sandbox::new();
+        let repo = sandbox
+            .git()
+            .init_bare(&sandbox.0.join("cache.git"), ObjectFormat::Sha1)
+            .unwrap();
+        let mut writer = repo.commit_writer(&NoProgress, None).unwrap();
+        writer.add_bytes("a", FileMode::Regular, b"x").unwrap();
+        let sig = Signature {
+            name: "rmu".into(),
+            email: "rmu@example.invalid".into(),
+            time: 1,
+            offset_minutes: 0,
+        };
+        let meta = CommitMeta {
+            parents: vec![],
+            author: sig.clone(),
+            committer: sig,
+            message: "cut\n".into(),
+        };
+        // As if rmu died after sending the whole commit but before the
+        // reset and `done`: without `--done`, fast-import would accept
+        // this and write the scratch ref.
+        let stream = commit_command(&meta, &writer.entries, 2).unwrap();
+        let cut = stream.windows(9).position(|w| w == b"\nget-mark").unwrap();
+        writer.write(&stream[..=cut]).unwrap();
+        drop(writer.stdin.take());
+        let result = writer.process.wait_checked();
+        assert!(
+            matches!(&result, Err(Error::Git { stderr, .. }) if stderr.contains("stream ends early")),
+            "{result:?}"
+        );
+        let crash_report = writer.crash_report.clone();
+        assert!(crash_report.exists());
+        drop(writer);
+        assert!(!crash_report.exists());
+        assert_eq!(repo.rev_parse(SCRATCH_REF).unwrap(), None);
     }
 }

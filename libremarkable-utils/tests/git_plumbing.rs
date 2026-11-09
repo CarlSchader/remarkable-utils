@@ -1,6 +1,7 @@
 //! `git.rs` against real temporary repositories. Hermetic: every git
-//! process gets `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`, a
-//! private `HOME`/`XDG_CONFIG_HOME` and an explicit identity, so the
+//! process gets `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`,
+//! no `-c`-style config from the environment, SHA-1 as the default hash,
+//! a private `HOME`/`XDG_CONFIG_HOME` and an explicit identity, so the
 //! developer's git configuration never leaks in.
 
 use std::collections::BTreeMap;
@@ -11,7 +12,7 @@ use std::process::Command;
 
 use libremarkable_utils::error::Error;
 use libremarkable_utils::git::{
-    CommitMeta, Expected, FileMode, Git, ObjectKind, Oid, Repo, Signature,
+    CommitMeta, Expected, FileMode, Git, ObjectFormat, ObjectKind, Oid, Repo, Signature,
 };
 use libremarkable_utils::progress::{NoProgress, Progress};
 
@@ -42,6 +43,9 @@ impl Sandbox {
         [
             ("GIT_CONFIG_GLOBAL", PathBuf::from("/dev/null")),
             ("GIT_CONFIG_NOSYSTEM", PathBuf::from("1")),
+            ("GIT_CONFIG_COUNT", PathBuf::from("0")),
+            ("GIT_CONFIG_PARAMETERS", PathBuf::new()),
+            ("GIT_DEFAULT_HASH", PathBuf::from("sha1")),
             ("HOME", self.path("home")),
             ("XDG_CONFIG_HOME", self.path("home")),
         ]
@@ -53,11 +57,13 @@ impl Sandbox {
     fn git(&self) -> Git {
         self.hermetic_env()
             .into_iter()
-            .fold(Git::new().interactive(false), |git, (k, v)| git.env(k, v))
+            .fold(Git::new(), |git, (k, v)| git.env(k, v))
     }
 
     fn init(&self, name: &str) -> Repo {
-        self.git().init_bare(&self.path(name)).unwrap()
+        self.git()
+            .init_bare(&self.path(name), ObjectFormat::Sha1)
+            .unwrap()
     }
 
     /// A git command outside the module under test: same environment,
@@ -153,6 +159,22 @@ fn blobs(repo: &Repo, rev: &str) -> BTreeMap<Vec<u8>, (u32, Oid, Option<u64>)> {
         .filter(|e| e.kind == ObjectKind::Blob)
         .map(|e| (e.path, (e.mode, e.oid, e.size)))
         .collect()
+}
+
+fn crash_reports(repo: &Repo) -> Vec<String> {
+    fs::read_dir(repo.git_dir())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("fast_import_crash_"))
+        .collect()
+}
+
+#[cfg(unix)]
+fn write_hook(path: &Path, script: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, script).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
 #[derive(Default)]
@@ -355,6 +377,13 @@ fn empty_tree_and_merge_commits() {
     );
     assert!(cache.is_ancestor(&ours, &merge).unwrap());
     assert!(cache.is_ancestor(&theirs, &merge).unwrap());
+    // Repeated parents are written once, in first-seen order.
+    let deduped = commit_files(&cache, &[&ours, &theirs, &ours], &[], "dedup\n");
+    let raw = sandbox.raw(cache.git_dir(), &["cat-file", "commit", deduped.as_str()]);
+    assert!(
+        raw.contains(&format!("\nparent {ours}\nparent {theirs}\nauthor ")),
+        "{raw}"
+    );
     assert!(!cache.is_ancestor(&ours, &theirs).unwrap());
     // A missing object is an error, not "not an ancestor".
     let absent: Oid = "1234567890123456789012345678901234567890".parse().unwrap();
@@ -448,7 +477,7 @@ fn commit_writer_rejects_bad_input_without_writing_anything() {
             );
             assert!(
                 matches!(&result, Err(Error::BlobSizeMismatch { path, expected, actual: got })
-                if path == "docs/x/payload.pdf" && *expected == declared && *got == actual),
+                if path == "docs/x/payload.pdf" && *expected == declared && *got == (actual < declared).then_some(actual)),
                 "{result:?}"
             );
             // The aborted writer reports errors, never panics.
@@ -507,6 +536,8 @@ fn commit_writer_rejects_bad_input_without_writing_anything() {
     ));
 
     assert_eq!(sandbox.raw(cache.git_dir(), &["for-each-ref"]), "");
+    // fast-import's crash reports (stream lines: paths, messages) are gone.
+    assert_eq!(crash_reports(&cache), Vec::<String>::new());
     // The cache is still usable.
     commit_files(&cache, &[], &[("a", b"1")], "after\n");
 }
@@ -521,16 +552,16 @@ fn fetch_and_fast_forward_push() {
     assert_eq!(a.ls_remote(url).unwrap(), vec![]);
 
     let c1 = commit_files(&a, &[], &[("docs/x/metadata", b"{}")], "c1\n");
-    a.push(url, c1.as_str(), MAIN, None).unwrap();
+    a.push(url, &c1, MAIN, None).unwrap();
     // Pushing the same value again is a no-op success.
-    a.push(url, c1.as_str(), MAIN, None).unwrap();
+    a.push(url, &c1, MAIN, None).unwrap();
     let advertised = b.ls_remote(url).unwrap();
     assert!(
         advertised.iter().any(|r| r.name == MAIN && r.oid == c1),
         "{advertised:?}"
     );
 
-    b.fetch(url, &["+refs/heads/main:refs/remotes/origin/main"])
+    b.fetch(url, &["+refs/heads/main:refs/remotes/origin/main"], false)
         .unwrap();
     assert_eq!(
         b.rev_parse("refs/remotes/origin/main").unwrap(),
@@ -539,10 +570,10 @@ fn fetch_and_fast_forward_push() {
     assert_eq!(blobs(&b, "refs/remotes/origin/main").len(), 1);
 
     let c2 = commit_files(&b, &[&c1], &[("docs/x/metadata", b"{\"v\":2}")], "c2\n");
-    b.push(url, c2.as_str(), MAIN, None).unwrap();
+    b.push(url, &c2, MAIN, None).unwrap();
     assert_eq!(origin.rev_parse(MAIN).unwrap(), Some(c2.clone()));
 
-    a.fetch(url, &["+refs/heads/main:refs/remotes/origin/main"])
+    a.fetch(url, &["+refs/heads/main:refs/remotes/origin/main"], false)
         .unwrap();
     assert_eq!(a.rev_parse("refs/remotes/origin/main").unwrap(), Some(c2));
 }
@@ -555,24 +586,24 @@ fn concurrent_writer_causes_typed_push_rejection() {
     let a = sandbox.init("a.git");
     let b = sandbox.init("b.git");
     let base = commit_files(&a, &[], &[("f", b"base")], "base\n");
-    a.push(url, base.as_str(), MAIN, None).unwrap();
-    b.fetch(url, &["+refs/heads/main:refs/remotes/origin/main"])
+    a.push(url, &base, MAIN, None).unwrap();
+    b.fetch(url, &["+refs/heads/main:refs/remotes/origin/main"], false)
         .unwrap();
 
     let ours = commit_files(&a, &[&base], &[("f", b"a")], "a\n");
     let theirs = commit_files(&b, &[&base], &[("f", b"b")], "b\n");
-    a.push(url, ours.as_str(), MAIN, None).unwrap();
+    a.push(url, &ours, MAIN, None).unwrap();
 
     // b has not seen a's commit yet...
-    let result = b.push(url, theirs.as_str(), MAIN, None);
+    let result = b.push(url, &theirs, MAIN, None);
     assert!(
         matches!(&result, Err(Error::PushRejected { reference, reason }) if reference == MAIN && reason == "fetch first"),
         "{result:?}"
     );
     // ...and after fetching it, its own commit is still not a fast-forward.
-    b.fetch(url, &["+refs/heads/main:refs/remotes/origin/main"])
+    b.fetch(url, &["+refs/heads/main:refs/remotes/origin/main"], false)
         .unwrap();
-    let result = b.push(url, theirs.as_str(), MAIN, None);
+    let result = b.push(url, &theirs, MAIN, None);
     assert!(
         matches!(&result, Err(Error::PushRejected { reason, .. }) if reason == "non-fast-forward"),
         "{result:?}"
@@ -581,7 +612,7 @@ fn concurrent_writer_causes_typed_push_rejection() {
 
     // Merging on top of what origin has succeeds.
     let merge = commit_files(&b, &[&ours, &theirs], &[("f", b"merged")], "merge\n");
-    b.push(url, merge.as_str(), MAIN, None).unwrap();
+    b.push(url, &merge, MAIN, None).unwrap();
     assert_eq!(origin.rev_parse(MAIN).unwrap(), Some(merge));
 }
 
@@ -596,16 +627,16 @@ fn leased_push_is_a_compare_and_swap() {
     let unrelated = commit_files(&cache, &[], &[("g", b"x")], "x\n");
 
     cache
-        .push(url, first.as_str(), DEVICE_REF, Some(&Expected::Absent))
+        .push(url, &first, DEVICE_REF, Some(&Expected::Absent))
         .unwrap();
-    let stale = cache.push(url, second.as_str(), DEVICE_REF, Some(&Expected::Absent));
+    let stale = cache.push(url, &second, DEVICE_REF, Some(&Expected::Absent));
     assert!(
         matches!(&stale, Err(Error::PushRejected { reference, reason }) if reference == DEVICE_REF && reason == "stale info"),
         "{stale:?}"
     );
     let wrong = cache.push(
         url,
-        second.as_str(),
+        &second,
         DEVICE_REF,
         Some(&Expected::At(unrelated.clone())),
     );
@@ -616,18 +647,13 @@ fn leased_push_is_a_compare_and_swap() {
     assert_eq!(origin.rev_parse(DEVICE_REF).unwrap(), Some(first.clone()));
 
     cache
-        .push(
-            url,
-            second.as_str(),
-            DEVICE_REF,
-            Some(&Expected::At(first.clone())),
-        )
+        .push(url, &second, DEVICE_REF, Some(&Expected::At(first.clone())))
         .unwrap();
     // A matching lease may rewind (not a fast-forward)...
     cache
         .push(
             url,
-            unrelated.as_str(),
+            &unrelated,
             DEVICE_REF,
             Some(&Expected::At(second.clone())),
         )
@@ -637,18 +663,19 @@ fn leased_push_is_a_compare_and_swap() {
         Some(unrelated.clone())
     );
     // ...which a plain push may not.
-    let plain = cache.push(url, first.as_str(), DEVICE_REF, None);
+    let plain = cache.push(url, &first, DEVICE_REF, None);
     assert!(
         matches!(plain, Err(Error::PushRejected { .. })),
         "{plain:?}"
     );
 
     assert!(matches!(
-        cache.push(url, first.as_str(), "main", None),
+        cache.push(url, &first, "main", None),
         Err(Error::InvalidGitInput(_))
     ));
 }
 
+#[cfg(unix)]
 #[test]
 fn remote_refusal_and_unreachable_remote_are_distinct_errors() {
     let sandbox = Sandbox::new();
@@ -657,19 +684,11 @@ fn remote_refusal_and_unreachable_remote_are_distinct_errors() {
     let cache = sandbox.init("cache.git");
     let commit = commit_files(&cache, &[], &[("docs/x/payload.pdf", b"%PDF")], "big\n");
 
-    fs::create_dir_all(origin.git_dir().join("hooks")).unwrap();
-    let hook = origin.git_dir().join("hooks/pre-receive");
-    fs::write(
-        &hook,
+    write_hook(
+        &origin.git_dir().join("hooks/pre-receive"),
         "#!/bin/sh\necho 'file too large: docs/x/payload.pdf' >&2\nexit 1\n",
-    )
-    .unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
-    }
-    let result = cache.push(url, commit.as_str(), MAIN, None);
+    );
+    let result = cache.push(url, &commit, MAIN, None);
     assert!(
         matches!(&result, Err(Error::PushFailed { reference, reason, stderr })
             if reference == MAIN
@@ -685,9 +704,9 @@ fn remote_refusal_and_unreachable_remote_are_distinct_errors() {
         matches!(cache.ls_remote(missing), Err(Error::Git { command, .. }) if command == "ls-remote")
     );
     assert!(
-        matches!(cache.fetch(missing, &["+refs/heads/main:refs/x"]), Err(Error::Git { command, .. }) if command == "fetch")
+        matches!(cache.fetch(missing, &["+refs/heads/main:refs/x"], false), Err(Error::Git { command, .. }) if command == "fetch")
     );
-    let push = cache.push(missing, commit.as_str(), MAIN, None);
+    let push = cache.push(missing, &commit, MAIN, None);
     assert!(
         matches!(&push, Err(Error::Git { command, status, stderr })
         if command == "push" && *status != 0 && !stderr.is_empty()),
@@ -695,30 +714,26 @@ fn remote_refusal_and_unreachable_remote_are_distinct_errors() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn rmu_never_runs_hooks_in_its_own_repositories() {
     let sandbox = Sandbox::new();
     let origin = sandbox.init("origin.git");
     let url = origin.git_dir().to_str().unwrap();
     let cache = sandbox.init("cache.git");
-    let hooks = cache.git_dir().join("hooks");
-    fs::create_dir_all(&hooks).unwrap();
     ["pre-push", "reference-transaction"]
         .iter()
         .for_each(|name| {
-            let hook = hooks.join(name);
-            fs::write(&hook, "#!/bin/sh\necho hook ran >&2\nexit 1\n").unwrap();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
-            }
+            write_hook(
+                &cache.git_dir().join("hooks").join(name),
+                "#!/bin/sh\necho hook ran >&2\nexit 1\n",
+            );
         });
     let commit = commit_files(&cache, &[], &[("f", b"1")], "1\n");
     cache.update_ref("refs/heads/main", &commit, None).unwrap();
-    cache.push(url, MAIN, MAIN, None).unwrap();
+    cache.push(url, &commit, MAIN, None).unwrap();
     cache
-        .fetch(url, &["+refs/heads/main:refs/remotes/origin/main"])
+        .fetch(url, &["+refs/heads/main:refs/remotes/origin/main"], false)
         .unwrap();
     assert_eq!(origin.rev_parse(MAIN).unwrap(), Some(commit));
 }
@@ -804,4 +819,361 @@ fn rev_parse_resolves_or_returns_none() {
         cache.rev_parse(&format!("{absent}^{{commit}}")).unwrap(),
         None
     );
+}
+
+#[test]
+fn push_refuses_refspec_syntax() {
+    let sandbox = Sandbox::new();
+    let origin = sandbox.init("origin.git");
+    let url = origin.git_dir().to_str().unwrap();
+    let cache = sandbox.init("cache.git");
+    let first = commit_files(&cache, &[], &[("f", b"1")], "1\n");
+    let second = commit_files(&cache, &[&first], &[("f", b"2")], "2\n");
+    cache.push(url, &second, MAIN, None).unwrap();
+    cache.push(url, &second, DEVICE_REF, None).unwrap();
+
+    // The source is a commit id: no `+` (force) or empty (delete) source.
+    assert!(format!("+{first}").parse::<Oid>().is_err());
+    assert!("".parse::<Oid>().is_err());
+    // Destinations are full ref names, never refspecs.
+    [
+        "",
+        "main",
+        "+refs/heads/main",
+        ":refs/heads/main",
+        "refs/heads/x:refs/heads/main",
+        "--delete",
+    ]
+    .iter()
+    .for_each(|dst| {
+        let result = cache.push(url, &first, dst, None);
+        assert!(
+            matches!(result, Err(Error::InvalidGitInput(_))),
+            "{dst:?}: {result:?}"
+        );
+    });
+    // Rewinding without a lease is a rejection, never a silent force.
+    let rewind = cache.push(url, &first, MAIN, None);
+    assert!(
+        matches!(rewind, Err(Error::PushRejected { .. })),
+        "{rewind:?}"
+    );
+    assert_eq!(origin.rev_parse(MAIN).unwrap(), Some(second.clone()));
+    assert_eq!(origin.rev_parse(DEVICE_REF).unwrap(), Some(second));
+}
+
+#[cfg(unix)]
+#[test]
+fn remote_compare_and_swap_race_is_a_push_rejection() {
+    let sandbox = Sandbox::new();
+    let origin = sandbox.init("origin.git");
+    let url = origin.git_dir().to_str().unwrap();
+    let cache = sandbox.init("cache.git");
+    let base = commit_files(&cache, &[], &[("f", b"base")], "base\n");
+    let other = commit_files(&cache, &[&base], &[("f", b"other tablet")], "other\n");
+    let ours = commit_files(&cache, &[&base], &[("f", b"ours")], "ours\n");
+    cache.push(url, &base, MAIN, None).unwrap();
+    cache.push(url, &base, DEVICE_REF, None).unwrap();
+    cache.push(url, &other, "refs/heads/other", None).unwrap();
+
+    // Another writer moves the ref after the advertisement but before
+    // receive-pack applies our update, so its compare-and-swap fails.
+    write_hook(
+        &origin.git_dir().join("hooks/pre-receive"),
+        &format!(
+            "#!/bin/sh\nwhile read old new ref; do\n  env -u GIT_QUARANTINE_PATH git update-ref \"$ref\" {other} >&2\ndone\nexit 0\n"
+        ),
+    );
+    let plain = cache.push(url, &ours, MAIN, None);
+    assert!(
+        matches!(&plain, Err(Error::PushRejected { reference, .. }) if reference == MAIN),
+        "{plain:?}"
+    );
+    let leased = cache.push(url, &ours, DEVICE_REF, Some(&Expected::At(base.clone())));
+    assert!(
+        matches!(&leased, Err(Error::PushRejected { reference, .. }) if reference == DEVICE_REF),
+        "{leased:?}"
+    );
+    assert_eq!(origin.rev_parse(MAIN).unwrap(), Some(other.clone()));
+    assert_eq!(origin.rev_parse(DEVICE_REF).unwrap(), Some(other));
+}
+
+#[test]
+fn leading_dash_arguments_are_never_options() {
+    let sandbox = Sandbox::new();
+    let origin = sandbox.init("origin.git");
+    let url = origin.git_dir().to_str().unwrap();
+    let cache = sandbox.init("cache.git");
+    let commit = commit_files(&cache, &[], &[("f", b"1")], "1\n");
+    cache.push(url, &commit, MAIN, None).unwrap();
+    let marker = sandbox.path("marker");
+    let inject = format!("--upload-pack=touch {}; git-upload-pack", marker.display());
+
+    // Taken as a repository (which git then refuses), not an option.
+    let listed = cache.ls_remote(&inject);
+    assert!(
+        matches!(&listed, Err(Error::Git { stderr, .. }) if stderr.contains("'--upload-pack=touch")),
+        "{listed:?}"
+    );
+    assert!(cache.fetch(&inject, &["refs/heads/main"], false).is_err());
+    // A refspec after the URL would otherwise be parsed as an option too.
+    assert!(cache.fetch(url, &[&inject], false).is_err());
+    assert!(!marker.exists());
+
+    let tree = cache.ls_tree_recursive("--name-only");
+    assert!(
+        matches!(&tree, Err(Error::Git { status: 128, stderr, .. }) if stderr.contains("--name-only")),
+        "{tree:?}"
+    );
+    ["-d", "--stdin", "HEAD", "objects/x", "+refs/heads/x"]
+        .iter()
+        .for_each(|name| {
+            assert!(matches!(
+                cache.update_ref(name, &commit, None),
+                Err(Error::InvalidGitInput(_))
+            ));
+        });
+    assert_eq!(sandbox.raw(cache.git_dir(), &["for-each-ref"]), "");
+}
+
+/// Yields `good` bytes, then fails like a dropped SSH stream.
+struct FailingReader {
+    good: usize,
+}
+
+impl Read for FailingReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.good == 0 {
+            return Err(io::Error::other("device went away"));
+        }
+        let n = buf.len().min(self.good);
+        buf[..n].fill(7);
+        self.good -= n;
+        Ok(n)
+    }
+}
+
+#[test]
+fn reader_failure_mid_blob_aborts_without_commit_or_ref() {
+    let sandbox = Sandbox::new();
+    let cache = sandbox.init("cache.git");
+    let mut writer = cache.commit_writer(&NoProgress, None).unwrap();
+    writer
+        .add_bytes("docs/x/metadata", FileMode::Regular, b"{}")
+        .unwrap();
+    let result = writer.add_blob(
+        "docs/x/payload.pdf",
+        FileMode::Regular,
+        200_000,
+        &mut FailingReader { good: 100_000 },
+    );
+    assert!(
+        matches!(&result, Err(Error::Io(e)) if e.to_string() == "device went away"),
+        "{result:?}"
+    );
+    assert!(matches!(
+        writer.commit(&meta(&[], "never\n")),
+        Err(Error::GitOutput { .. })
+    ));
+    assert_eq!(sandbox.raw(cache.git_dir(), &["for-each-ref"]), "");
+    assert_eq!(crash_reports(&cache), Vec::<String>::new());
+    commit_files(&cache, &[], &[("a", b"1")], "after\n");
+}
+
+#[test]
+fn existing_trees_carry_forward_whole_subtrees() {
+    let sandbox = Sandbox::new();
+    let cache = sandbox.init("cache.git");
+    let base = commit_files(
+        &cache,
+        &[],
+        &[
+            ("docs/a/metadata", b"{\"a\":1}"),
+            ("docs/a/pages/p.rm", b"ink"),
+            ("docs/b/metadata", b"{\"b\":1}"),
+        ],
+        "base\n",
+    );
+    let tree_of = |rev: &str, path: &[u8]| {
+        cache
+            .ls_tree_recursive(rev)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.path == path)
+            .map(|e| e.oid)
+            .unwrap()
+    };
+    let doc_a = tree_of(base.as_str(), b"docs/a");
+    // A tree with an entry kind rmu cannot write itself (a gitlink).
+    let gitlink = sandbox
+        .command()
+        .arg("--git-dir")
+        .arg(cache.git_dir())
+        .arg("mktree")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(format!("160000 commit {base}\tsub\n").as_bytes())?;
+            child.wait_with_output()
+        })
+        .unwrap();
+    let foreign: Oid = String::from_utf8(gitlink.stdout)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+
+    let mut writer = cache.commit_writer(&NoProgress, None).unwrap();
+    writer.add_existing_tree("docs/a", &doc_a).unwrap();
+    writer.add_existing_tree("docs/c", &foreign).unwrap();
+    writer
+        .add_bytes("docs/b/metadata", FileMode::Regular, b"{\"b\":2}")
+        .unwrap();
+    let next = writer.commit(&meta(&[&base], "carry\n")).unwrap();
+
+    assert_eq!(tree_of(next.as_str(), b"docs/a"), doc_a);
+    assert_eq!(
+        blobs(&cache, next.as_str())[&b"docs/a/pages/p.rm".to_vec()],
+        blobs(&cache, base.as_str())[&b"docs/a/pages/p.rm".to_vec()]
+    );
+    let sub = cache
+        .ls_tree_recursive(next.as_str())
+        .unwrap()
+        .into_iter()
+        .find(|e| e.path == b"docs/c/sub")
+        .unwrap();
+    assert_eq!(
+        (sub.mode, sub.kind, sub.oid),
+        (0o160000, ObjectKind::Commit, base.clone())
+    );
+
+    // Nothing may be added inside a carried-forward tree.
+    let mut writer = cache.commit_writer(&NoProgress, None).unwrap();
+    writer.add_existing_tree("docs/a", &doc_a).unwrap();
+    writer
+        .add_bytes("docs/a/metadata", FileMode::Regular, b"{}")
+        .unwrap();
+    assert!(matches!(
+        writer.commit(&meta(&[], "x\n")),
+        Err(Error::InvalidGitInput(_))
+    ));
+    // A tree the repository lacks fails in git.
+    let absent: Oid = "1234567890123456789012345678901234567890".parse().unwrap();
+    let mut writer = cache.commit_writer(&NoProgress, None).unwrap();
+    writer.add_existing_tree("docs/z", &absent).unwrap();
+    assert!(matches!(
+        writer.commit(&meta(&[], "x\n")),
+        Err(Error::Git { .. })
+    ));
+    assert_eq!(crash_reports(&cache), Vec::<String>::new());
+}
+
+#[test]
+fn fetch_prunes_only_on_request_and_signing_config_is_ignored() {
+    let sandbox = Sandbox::new();
+    let origin = sandbox.init("origin.git");
+    let url = origin.git_dir().to_str().unwrap();
+    let cache = sandbox.init("cache.git");
+    // A user's config could set these; rmu's commands must not follow them.
+    sandbox.raw(cache.git_dir(), &["config", "fetch.prune", "true"]);
+    sandbox.raw(cache.git_dir(), &["config", "push.gpgSign", "true"]);
+    let commit = commit_files(&cache, &[], &[("f", b"1")], "1\n");
+    cache.push(url, &commit, MAIN, None).unwrap();
+
+    let stale = "refs/remotes/origin/stale";
+    cache.update_ref(stale, &commit, None).unwrap();
+    let all = ["+refs/heads/*:refs/remotes/origin/*"];
+    cache.fetch(url, &all, false).unwrap();
+    assert_eq!(cache.rev_parse(stale).unwrap(), Some(commit.clone()));
+    assert_eq!(
+        cache.rev_parse("refs/remotes/origin/main").unwrap(),
+        Some(commit.clone())
+    );
+    cache.fetch(url, &all, true).unwrap();
+    assert_eq!(cache.rev_parse(stale).unwrap(), None);
+    assert_eq!(
+        cache.rev_parse("refs/remotes/origin/main").unwrap(),
+        Some(commit)
+    );
+}
+
+#[test]
+fn maintenance_auto_follows_the_repositorys_thresholds() {
+    let sandbox = Sandbox::new();
+    let cache = sandbox.init("cache.git");
+    let packs = || {
+        fs::read_dir(cache.git_dir().join("objects/pack"))
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .is_some_and(|x| x == "pack")
+            })
+            .count()
+    };
+    // fast-import keeps imports above 100 objects as packs.
+    let tip = (0..3u32).fold(None, |parent: Option<Oid>, round| {
+        let files = (0..150u32)
+            .map(|i| (format!("f{i}"), format!("{round}-{i}").into_bytes()))
+            .collect::<Vec<_>>();
+        let mut writer = cache.commit_writer(&NoProgress, None).unwrap();
+        files.iter().for_each(|(path, data)| {
+            writer
+                .add_bytes(path.as_str(), FileMode::Regular, data)
+                .unwrap();
+        });
+        let parents = parent.iter().collect::<Vec<_>>();
+        Some(writer.commit(&meta(&parents, "round\n")).unwrap())
+    });
+    cache.update_ref(MAIN, &tip.unwrap(), None).unwrap();
+    assert_eq!(packs(), 3);
+
+    sandbox.raw(cache.git_dir(), &["config", "gc.autoPackLimit", "2"]);
+    cache.maintenance_auto().unwrap();
+    assert_eq!(packs(), 1);
+}
+
+#[test]
+fn sha256_repositories_round_trip() {
+    let sandbox = Sandbox::new();
+    let git = sandbox.git();
+    let origin = git
+        .init_bare(&sandbox.path("origin.git"), ObjectFormat::Sha256)
+        .unwrap();
+    let url = origin.git_dir().to_str().unwrap();
+    let cache = git
+        .init_bare(&sandbox.path("cache.git"), ObjectFormat::Sha256)
+        .unwrap();
+    assert_eq!(cache.object_format().unwrap(), ObjectFormat::Sha256);
+    assert_eq!(
+        sandbox.init("sha1.git").object_format().unwrap(),
+        ObjectFormat::Sha1
+    );
+
+    let commit = commit_files(&cache, &[], &[("docs/x/metadata", b"{}")], "x\n");
+    assert_eq!(commit.as_str().len(), 64);
+    assert_eq!(commit.object_format(), ObjectFormat::Sha256);
+    cache.push(url, &commit, MAIN, None).unwrap();
+    let advertised = sandbox.init("probe.git").ls_remote(url).unwrap();
+    assert!(
+        advertised
+            .iter()
+            .all(|r| r.oid.object_format() == ObjectFormat::Sha256)
+    );
+    let listed = blobs(&cache, commit.as_str());
+    let (_, oid, _) = &listed[&b"docs/x/metadata".to_vec()];
+    let mut cat = cache.cat_file().unwrap();
+    assert_eq!(
+        cat.read(oid).unwrap(),
+        Some((ObjectKind::Blob, b"{}".to_vec()))
+    );
+    cat.finish().unwrap();
 }
