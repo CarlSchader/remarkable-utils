@@ -41,6 +41,8 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Output, 
 use std::str::FromStr;
 use std::thread::{self, JoinHandle};
 
+use serde::{Deserialize, Serialize};
+
 use crate::error::{Error, Result};
 use crate::progress::Progress;
 
@@ -78,7 +80,13 @@ const SCRUBBED_ENV: &[&str] = &[
 const SCRATCH_REF: &str = "refs/rmu/fast-import/scratch";
 
 /// An object id: 40 (SHA-1) or 64 (SHA-256) lowercase hex digits.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+///
+/// Uppercase is rejected rather than normalised: git always prints
+/// lowercase, and so does every state file rmu writes, so uppercase
+/// input means a hand-edited or corrupt file. Shared by this module and
+/// [`crate::hub::model`]; (de)serialised as its string.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
 pub struct Oid(String);
 
 impl Oid {
@@ -116,10 +124,25 @@ impl FromStr for Oid {
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Self> {
-        let valid = matches!(s.len(), 40 | 64) && s.bytes().all(|b| b.is_ascii_hexdigit());
+        let valid =
+            matches!(s.len(), 40 | 64) && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
         valid
-            .then(|| Oid(s.to_ascii_lowercase()))
+            .then(|| Oid(s.to_string()))
             .ok_or_else(|| Error::InvalidGitInput(format!("not an object id: {s:?}")))
+    }
+}
+
+impl TryFrom<String> for Oid {
+    type Error = Error;
+
+    fn try_from(s: String) -> Result<Self> {
+        s.parse()
+    }
+}
+
+impl From<Oid> for String {
+    fn from(oid: Oid) -> Self {
+        oid.0
     }
 }
 
@@ -158,12 +181,15 @@ impl FromStr for ObjectKind {
     }
 }
 
-/// Mode of a file written by [`CommitWriter`].
+/// Mode of a non-tree entry: a file written by [`CommitWriter`], or a
+/// gitlink (a submodule commit), which can only be carried forward
+/// ([`CommitWriter::add_existing`]). Shared with [`crate::hub::model`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FileMode {
     Regular,
     Executable,
     Symlink,
+    Gitlink,
 }
 
 impl FileMode {
@@ -173,14 +199,26 @@ impl FileMode {
             Self::Regular => 0o100644,
             Self::Executable => 0o100755,
             Self::Symlink => 0o120000,
+            Self::Gitlink => 0o160000,
         }
     }
 
-    /// The writable mode for a [`TreeEntry::mode`], if it is a file.
+    /// The mode for a [`TreeEntry::mode`], unless it is a tree (or a
+    /// mode git does not write).
     pub fn from_bits(mode: u32) -> Option<Self> {
-        [Self::Regular, Self::Executable, Self::Symlink]
-            .into_iter()
-            .find(|m| m.bits() == mode)
+        [
+            Self::Regular,
+            Self::Executable,
+            Self::Symlink,
+            Self::Gitlink,
+        ]
+        .into_iter()
+        .find(|m| m.bits() == mode)
+    }
+
+    /// Regular or executable: content that can be written to a file.
+    pub fn is_file(self) -> bool {
+        matches!(self, Self::Regular | Self::Executable)
     }
 }
 
@@ -709,7 +747,8 @@ impl CommitWriter<'_> {
     /// `reader`, returning its blob id. A reader that yields a different
     /// number of bytes is [`Error::BlobSizeMismatch`], and a read error
     /// is returned as is; both abort the commit. At most `size + 1`
-    /// bytes are read.
+    /// bytes are read. [`FileMode::Gitlink`] is refused before anything
+    /// is written: a gitlink has no content.
     pub fn add_blob(
         &mut self,
         path: impl Into<Vec<u8>>,
@@ -718,6 +757,12 @@ impl CommitWriter<'_> {
         reader: &mut dyn Read,
     ) -> Result<Oid> {
         let path = path.into();
+        if mode == FileMode::Gitlink {
+            return Err(Error::InvalidGitInput(format!(
+                "a gitlink has no content to write: {}",
+                String::from_utf8_lossy(&path)
+            )));
+        }
         validate_path(&path)?;
         let mark = self.next_mark;
         self.next_mark += 1;
@@ -748,7 +793,9 @@ impl CommitWriter<'_> {
     }
 
     /// Add a file whose blob is already in the repository (e.g. carried
-    /// forward from a base tree). Its existence is checked at commit.
+    /// forward from a base tree). Its existence is checked at commit. A
+    /// [`FileMode::Gitlink`] entry names a submodule commit, which git
+    /// never requires to exist.
     pub fn add_existing(
         &mut self,
         path: impl Into<Vec<u8>>,
@@ -1369,8 +1416,13 @@ mod tests {
     }
 
     #[test]
-    fn oid_accepts_sha1_and_sha256_hex_only() {
-        assert_eq!(oid(&A.to_uppercase()).as_str(), A);
+    fn oid_accepts_lowercase_sha1_and_sha256_hex_only() {
+        assert_eq!(oid(A).as_str(), A);
+        // Uppercase is refused, not normalised (see `Oid`).
+        assert!(matches!(
+            A.to_uppercase().parse::<Oid>(),
+            Err(Error::InvalidGitInput(_))
+        ));
         assert!(format!("{A}{}", &B[..24]).parse::<Oid>().is_ok());
         assert!(A[..39].parse::<Oid>().is_err());
         assert!(format!("{}g", &A[..39]).parse::<Oid>().is_err());
@@ -1379,11 +1431,29 @@ mod tests {
 
     #[test]
     fn file_mode_bits_round_trip() {
-        [FileMode::Regular, FileMode::Executable, FileMode::Symlink]
-            .into_iter()
-            .for_each(|mode| assert_eq!(FileMode::from_bits(mode.bits()), Some(mode)));
+        [
+            FileMode::Regular,
+            FileMode::Executable,
+            FileMode::Symlink,
+            FileMode::Gitlink,
+        ]
+        .into_iter()
+        .for_each(|mode| assert_eq!(FileMode::from_bits(mode.bits()), Some(mode)));
+        assert_eq!(FileMode::from_bits(0o160000), Some(FileMode::Gitlink));
         assert_eq!(FileMode::from_bits(0o040000), None);
-        assert_eq!(FileMode::from_bits(0o160000), None);
+        assert_eq!(FileMode::from_bits(0o100664), None);
+        assert!(FileMode::Regular.is_file() && FileMode::Executable.is_file());
+        assert!(!FileMode::Symlink.is_file() && !FileMode::Gitlink.is_file());
+    }
+
+    #[test]
+    fn oid_serde_is_its_string_and_validates() {
+        let json = serde_json::to_string(&oid(A)).unwrap();
+        assert_eq!(json, format!("\"{A}\""));
+        assert_eq!(serde_json::from_str::<Oid>(&json).unwrap(), oid(A));
+        [A.to_uppercase(), A[..39].to_string(), "HEAD".to_string()]
+            .iter()
+            .for_each(|bad| assert!(serde_json::from_str::<Oid>(&format!("\"{bad}\"")).is_err()));
     }
 
     #[test]

@@ -610,20 +610,16 @@ impl LocalFs {
 /// Require a nonempty, root-relative path before checking filesystem entries.
 /// In particular, `..` must not undo a checked component.
 fn sync_path_parts(rel_path: &str) -> Result<Vec<&str>> {
-    let parts: Vec<_> = rel_path.split('/').collect();
-    if parts.iter().any(|part| {
-        part.is_empty()
-            || *part == "."
-            || *part == ".."
-            || !matches!(
-                Path::new(part).components().next(),
-                Some(std::path::Component::Normal(_))
-            )
-            || part.contains('\0')
-    }) {
-        return Err(Error::InvalidName(format!("unsafe sync path: {rel_path}")));
-    }
-    Ok(parts)
+    crate::relative_path::split_safe_relative(rel_path)
+        .filter(|parts| {
+            parts.iter().all(|part| {
+                matches!(
+                    Path::new(part).components().next(),
+                    Some(std::path::Component::Normal(_))
+                )
+            })
+        })
+        .ok_or_else(|| Error::InvalidName(format!("unsafe sync path: {rel_path}")))
 }
 
 /// Check every component beneath the selected root, including dangling links.
