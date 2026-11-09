@@ -89,6 +89,16 @@ This repository is **open source** (dual-licensed MIT OR Apache-2.0):
   pull-only), and fs↔fs + tablet↔tablet (one
   shared symmetric table, `decide_pair`). Keep planner logic pure; see
   `docs/sync-design.md` for semantics and archive placement rules.
+- `hub/` — `rmu hub`, git-backed multi-tablet sync (see
+  `docs/hub-design.md`). `hub/model.rs` is the **pure** data model:
+  xochitl ↔ repository layout mapping and allowlist classification,
+  `MirrorRules` (selected by the repository's mirror-rules version;
+  never rmu's newest), `.rmu/hub.json` and tablet-state formats (newer
+  format versions are refused, unknown fields preserved), view-state
+  normalisation and overlay, per-document grouping of tree listings,
+  snapshot validation (quarantine/orphan) and carry-forward. Keep it
+  I/O-free. `hub/merge.rs` (pure merge engine) and `hub/device.rs`
+  (tablet I/O) are declared but not implemented yet.
 - `status.rs` — device system state (`rmu status`): one
   marker-sectioned SSH round trip, pure best-effort parsing (every
   field `Option`al — firmware/models differ), pure rendering.

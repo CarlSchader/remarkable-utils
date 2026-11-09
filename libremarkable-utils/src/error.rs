@@ -143,6 +143,10 @@ pub enum Error {
         expected: u64,
         actual: Option<u64>,
     },
+
+    /// `rmu hub` data-model error (layout, formats, mirror rules).
+    #[error(transparent)]
+    HubModel(#[from] crate::hub::model::ModelError),
 }
 
 fn describe_actual(expected: u64, actual: Option<u64>) -> String {
