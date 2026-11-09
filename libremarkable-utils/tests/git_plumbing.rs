@@ -1213,3 +1213,79 @@ fn sha256_repositories_round_trip() {
     );
     cat.finish().unwrap();
 }
+
+#[test]
+fn rev_list_follows_first_parents_and_stops_at_exclusions() {
+    let sandbox = Sandbox::new();
+    let cache = sandbox.init("cache.git");
+    let root = commit_files(&cache, &[], &[("a", b"1")], "root\n");
+    let side = commit_files(&cache, &[&root], &[("a", b"side")], "side\n");
+    let main = commit_files(&cache, &[&root], &[("a", b"2")], "main\n");
+    let merge = commit_files(&cache, &[&main, &side], &[("a", b"3")], "merge\n");
+    assert_eq!(
+        cache.rev_list(&[merge.as_str()], true).unwrap(),
+        vec![merge.clone(), main.clone(), root.clone()]
+    );
+    let all = cache.rev_list(&[merge.as_str()], false).unwrap();
+    assert_eq!(all.len(), 4);
+    assert_eq!(all[0], merge);
+    let since = format!("^{main}");
+    assert_eq!(
+        cache.rev_list(&[merge.as_str(), &since], false).unwrap(),
+        vec![merge.clone(), side.clone()]
+    );
+    assert!(matches!(
+        cache.rev_list(&["--all"], false),
+        Err(Error::InvalidGitInput(_))
+    ));
+}
+
+#[test]
+fn present_objects_checks_existence_without_reading_content() {
+    let sandbox = Sandbox::new();
+    let cache = sandbox.init("cache.git");
+    let big = pattern(3 * 1024 * 1024, 7);
+    let commit = commit_files(&cache, &[], &[("big", &big)], "big\n");
+    let (_, blob, _) = blobs(&cache, commit.as_str())[&b"big".to_vec()].clone();
+    let absent: Oid = "1234567890123456789012345678901234567890".parse().unwrap();
+    // Many ids: replies must not stall the request.
+    let ids: Vec<Oid> = std::iter::repeat_n(blob.clone(), 20_000)
+        .chain([absent.clone(), commit.clone()])
+        .collect();
+    let present = cache.present_objects(&ids).unwrap();
+    assert_eq!(present.len(), 2);
+    assert!(present.contains(&blob) && present.contains(&commit));
+    assert!(!present.contains(&absent));
+    assert!(cache.present_objects(&[]).unwrap().is_empty());
+}
+
+#[test]
+fn blobs_written_alone_join_the_tree_only_when_added() {
+    let sandbox = Sandbox::new();
+    let cache = sandbox.init("cache.git");
+    let mut writer = cache.commit_writer(&NoProgress, None).unwrap();
+    let kept = writer.write_blob("kept", 4, &mut &b"kept"[..]).unwrap();
+    let loose = writer.write_blob("loose", 5, &mut &b"loose"[..]).unwrap();
+    writer
+        .add_existing("dir/kept", FileMode::Regular, &kept)
+        .unwrap();
+    let commit = writer.commit(&meta(&[], "blobs\n")).unwrap();
+    let listed = blobs(&cache, commit.as_str());
+    assert_eq!(
+        listed.keys().cloned().collect::<Vec<_>>(),
+        vec![b"dir/kept".to_vec()]
+    );
+    // The blob outside the tree is stored too.
+    let mut cat = cache.cat_file().unwrap();
+    assert_eq!(
+        cat.read(&loose).unwrap(),
+        Some((ObjectKind::Blob, b"loose".to_vec()))
+    );
+    cat.finish().unwrap();
+    // A short reader is a size mismatch naming the label.
+    let mut writer = cache.commit_writer(&NoProgress, None).unwrap();
+    assert!(matches!(
+        writer.write_blob("short", 9, &mut &b"abc"[..]),
+        Err(Error::BlobSizeMismatch { path, expected: 9, actual: Some(3) }) if path == "short"
+    ));
+}

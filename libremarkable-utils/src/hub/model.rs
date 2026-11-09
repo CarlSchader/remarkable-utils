@@ -86,6 +86,11 @@ pub enum ModelError {
     #[error("repository path '{path}' has unsupported mode {mode:06o}")]
     UnsupportedEntryMode { path: String, mode: u32 },
 
+    /// A tree listing that names one path twice (a malformed tree):
+    /// keeping either entry would silently drop the other.
+    #[error("repository path '{0}' appears twice in one tree")]
+    DuplicatePath(String),
+
     /// A repository path outside `docs/<uuid>/` and `.rmu/`.
     #[error("repository path '{0}' is outside docs/<uuid>/ and .rmu/")]
     OutsideLayout(String),
@@ -1143,12 +1148,13 @@ pub type TreeListing = BTreeMap<String, ListingEntry>;
 /// refused ([`ModelError::NonUtf8Path`]), never converted lossily, since
 /// a renamed carried-forward path would in effect be deleted. Tree
 /// entries are dropped (their contents imply them); any other mode git
-/// does not write is refused ([`ModelError::UnsupportedEntryMode`]).
+/// does not write is refused ([`ModelError::UnsupportedEntryMode`]), and
+/// so is a path listed twice ([`ModelError::DuplicatePath`]).
 pub fn tree_listing(entries: impl IntoIterator<Item = git::TreeEntry>) -> Result<TreeListing> {
     entries
         .into_iter()
         .filter(|entry| entry.kind != ObjectKind::Tree)
-        .map(|entry| {
+        .try_fold(TreeListing::new(), |mut listing, entry| {
             let path = String::from_utf8(entry.path)
                 .map_err(|err| ModelError::NonUtf8Path(err.into_bytes()))?;
             let mode = FileMode::from_bits(entry.mode).ok_or_else(|| {
@@ -1157,15 +1163,20 @@ pub fn tree_listing(entries: impl IntoIterator<Item = git::TreeEntry>) -> Result
                     mode: entry.mode,
                 }
             })?;
-            Ok((
-                path,
-                ListingEntry {
-                    mode,
-                    id: entry.oid,
-                },
-            ))
+            let entry = ListingEntry {
+                mode,
+                id: entry.oid,
+            };
+            match listing.entry(path) {
+                std::collections::btree_map::Entry::Occupied(taken) => {
+                    Err(ModelError::DuplicatePath(taken.key().clone()))
+                }
+                std::collections::btree_map::Entry::Vacant(free) => {
+                    free.insert(entry);
+                    Ok(listing)
+                }
+            }
         })
-        .collect()
 }
 
 /// One document's version in a tree: its `docs/<uuid>/` subtree.
@@ -3235,6 +3246,18 @@ mod tests {
             err.to_string(),
             "repository path 'old' has unsupported mode 100664"
         );
+    }
+
+    #[test]
+    fn tree_listing_refuses_a_path_listed_twice() {
+        let path = format!("docs/{DOC}/metadata").into_bytes();
+        let err = tree_listing(vec![
+            git_entry(&path, 0o100644, ObjectKind::Blob, 1),
+            git_entry(b"README.md", 0o100644, ObjectKind::Blob, 3),
+            git_entry(&path, 0o100644, ObjectKind::Blob, 2),
+        ])
+        .unwrap_err();
+        assert!(matches!(&err, ModelError::DuplicatePath(p) if p.as_bytes() == path));
     }
 
     #[test]
