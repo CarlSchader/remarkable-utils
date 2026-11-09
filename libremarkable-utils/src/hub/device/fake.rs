@@ -587,6 +587,18 @@ impl FakeTablet {
         }
     }
 
+    fn start_reply_lost(&self, lock: &HeldLock, error: Error) -> Result<i64> {
+        if self.is_disconnected() {
+            return Err(error);
+        }
+        self.owns(lock)?;
+        if self.is_running() {
+            Ok(0)
+        } else {
+            Err(DeviceError::XochitlStart(error.to_string()).into())
+        }
+    }
+
     fn guarded<T>(
         &self,
         kind: OpKind,
@@ -730,11 +742,16 @@ impl Tablet for FakeTablet {
         self.op(OpKind::AcquireLock, || {
             let boot_id = self.boot_id();
             let probe = || -> Result<AcquireProbe> {
-                if fs::create_dir(self.paths.lock_dir()).is_ok() {
-                    self.write_owner(request, &boot_id)?;
-                    return Ok(AcquireProbe::Acquired {
-                        boot_id: boot_id.clone(),
-                    });
+                fs::create_dir_all(&self.state)?;
+                match fs::create_dir(self.paths.lock_dir()) {
+                    Ok(()) => {
+                        self.write_owner(request, &boot_id)?;
+                        return Ok(AcquireProbe::Acquired {
+                            boot_id: boot_id.clone(),
+                        });
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(error.into()),
                 }
                 let owner = fs::read(self.paths.lock_owner()).unwrap_or_default();
                 Ok(AcquireProbe::Held {
@@ -811,13 +828,21 @@ impl Tablet for FakeTablet {
         })
     }
 
+    /// A lost reply is handled as a real tablet handles it: over a new
+    /// connection, check the lock and whether xochitl is up (then `0`).
     fn start_xochitl(&self, lock: &HeldLock) -> Result<i64> {
-        self.op(OpKind::StartXochitl, || {
-            self.owns(lock)?;
-            let time = now_ns();
-            self.state().running = true;
-            Ok(time)
-        })
+        match self.begin(OpKind::StartXochitl) {
+            Ok(ack) => {
+                self.owns(lock)?;
+                let time = now_ns();
+                self.state().running = true;
+                match ack {
+                    Ack::Report => Ok(time),
+                    Ack::Lose(n) => self.start_reply_lost(lock, Self::lost(n)),
+                }
+            }
+            Err(error) => self.start_reply_lost(lock, error),
+        }
     }
 
     fn xochitl_active(&self) -> Result<bool> {

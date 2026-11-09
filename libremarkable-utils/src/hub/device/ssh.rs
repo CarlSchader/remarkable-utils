@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::lock::{self, AcquireProbe, HeldLock, LockRequest, LockState};
-use super::scripts::{self, EXIT_LOCK_CHANGED, EXIT_LOCK_LOST, EXIT_WATCHDOG_FIRED};
+use super::scripts::{self, EXIT_BUSY, EXIT_LOCK_CHANGED, EXIT_LOCK_LOST, EXIT_WATCHDOG_FIRED};
 use super::{
     ApplyPlan, ApplyReport, DeviceError, DeviceInfo, DownloadVisitor, ExactReader, StageContent,
     StatListing, Tablet, TabletPaths, timeout_secs, transfer_paths,
@@ -84,6 +84,7 @@ fn guard_error(status: Option<i32>) -> Option<DeviceError> {
     match status {
         Some(EXIT_WATCHDOG_FIRED) => Some(DeviceError::WatchdogFired),
         Some(EXIT_LOCK_LOST) => Some(DeviceError::LockLost),
+        Some(EXIT_BUSY) => Some(DeviceError::Busy),
         _ => None,
     }
 }
@@ -339,9 +340,11 @@ impl Tablet for SshTablet {
                 return Err(error.into());
             }
             // As in `Client::restart_xochitl`: the command channel can
-            // drop while xochitl comes back; check before failing. The
-            // time printed before the start is lost then, and a later one
-            // would not be conservative: report the earliest possible.
+            // drop while xochitl comes back; check (the lock too, in case
+            // the script never ran) before failing. The time printed
+            // before the start is lost then, and a later one would not be
+            // conservative: report the earliest possible.
+            self.script(&scripts::owned(&self.paths, lock.run(), "true"))?;
             if self.xochitl_active()? {
                 return Ok(0);
             }

@@ -33,6 +33,8 @@ trait Harness {
     /// Make the armed watchdog fire now.
     fn fire_watchdog(&self);
     fn reboot(&self);
+    /// Remove rmu's state directory (lock, state file, staging).
+    fn wipe_state(&self);
 }
 
 struct Scratch(PathBuf);
@@ -419,6 +421,21 @@ fn apply_stops_when_the_watchdog_fired(h: &dyn Harness) {
     assert_eq!(h.get(&format!("{DOC}.metadata")), None);
 }
 
+fn lost_state_dir_reads_as_lost_lock(h: &dyn Harness) {
+    let t = h.tablet();
+    let lock = t.acquire_lock(&request(), false).unwrap();
+    h.wipe_state();
+    assert!(lock_lost(t.check_guard(&lock)));
+    assert!(lock_lost(t.arm_watchdog(&lock, WATCHDOG)));
+    assert!(lock_lost(t.start_xochitl(&lock)));
+    assert!(lock_lost(t.write_state(&lock, &hub_state())));
+    assert!(lock_lost(t.release_lock(&lock)));
+    assert_eq!(t.lock_state().unwrap(), LockState::Free);
+    // A new run starts from scratch.
+    let next = t.acquire_lock(&request(), false).unwrap();
+    t.release_lock(&next).unwrap();
+}
+
 fn stat_pass_lists_odd_names(h: &dyn Harness) {
     let names = [
         " lead",
@@ -481,6 +498,10 @@ const SCENARIOS: &[(&str, Scenario)] = &[
         "apply_stops_when_the_watchdog_fired",
         apply_stops_when_the_watchdog_fired,
     ),
+    (
+        "lost_state_dir_reads_as_lost_lock",
+        lost_state_dir_reads_as_lost_lock,
+    ),
     ("stat_pass_lists_odd_names", stat_pass_lists_odd_names),
 ];
 
@@ -525,6 +546,10 @@ impl Harness for FakeHarness {
 
     fn reboot(&self) {
         self.tablet.reboot();
+    }
+
+    fn wipe_state(&self) {
+        fs::remove_dir_all(self.tablet.state_dir()).unwrap();
     }
 }
 
@@ -602,6 +627,31 @@ fn fake_disconnects_like_a_dead_rmu() {
     assert!(transport(&t.write_state(&next, &hub_state())));
     t.reconnect();
     assert_eq!(t.read_state().unwrap(), None);
+}
+
+#[test]
+fn fake_handles_a_lost_start_reply_like_a_real_tablet() {
+    let h = FakeHarness::new();
+    let t = &h.tablet;
+    let lock = t.acquire_lock(&request(), false).unwrap();
+    t.arm_watchdog(&lock, WATCHDOG).unwrap();
+    t.stop_xochitl(&lock).unwrap();
+    // The start happened but its reply was lost: xochitl is up, time 0.
+    t.inject(Fault::LoseAck(1));
+    assert_eq!(t.start_xochitl(&lock).unwrap(), 0);
+    // The start never ran but xochitl was up anyway: also 0.
+    t.inject(Fault::FailMutation(1));
+    assert_eq!(t.start_xochitl(&lock).unwrap(), 0);
+    // The start never ran and xochitl is down: an error.
+    t.stop_xochitl(&lock).unwrap();
+    t.inject(Fault::FailMutation(1));
+    assert!(device_error(&t.start_xochitl(&lock), |e| matches!(
+        e,
+        DeviceError::XochitlStart(_)
+    )));
+    // The connection is gone: the error as it is.
+    t.inject(Fault::DisconnectAfter(1));
+    assert!(transport(&t.start_xochitl(&lock)));
 }
 
 #[test]
@@ -999,6 +1049,10 @@ mod local_ssh {
         fn reboot(&self) {
             fs::write(&self.boot_file, format!("{}\n", uuid::Uuid::new_v4())).unwrap();
         }
+
+        fn wipe_state(&self) {
+            fs::remove_dir_all(&self.tablet.paths().state_dir).unwrap();
+        }
     }
 }
 
@@ -1077,7 +1131,17 @@ fn ssh_tablet_rearms_before_removing_the_old_watchdog() {
 #[cfg(target_os = "linux")]
 #[test]
 fn ssh_tablet_detects_cloud_pairing_and_fails_closed() {
-    let harness = local_ssh::SshHarness::new(local_ssh::Tools::Host, true);
+    check_cloud_pairing(&local_ssh::SshHarness::new(local_ssh::Tools::Host, true));
+    if let Some(busybox) = local_ssh::busybox() {
+        check_cloud_pairing(&local_ssh::SshHarness::new(
+            local_ssh::Tools::BusyBox(&busybox),
+            true,
+        ));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn check_cloud_pairing(harness: &local_ssh::SshHarness) {
     let t = harness.ssh_tablet();
     [
         ("devicetoken=@Invalid()\n", false),

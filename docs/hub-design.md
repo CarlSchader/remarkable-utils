@@ -426,15 +426,18 @@ clean-up does not require `--allow-deletions` on every tablet.
   `/home/root/.local/share/rmu/` from the guard check to their last
   change, so a takeover can never fall between a run's guard and its
   mutation; the kernel drops it when the command exits, however it ends.
-  Only bounded local work runs under it: staging (a network transfer
-  into the run's own directory) checks the guard without it, and the
-  watchdog never takes it. The apply script repeats the guard before
+  Only bounded local work runs under it, and only once the whole script
+  has arrived; waiters give up after 180 s ("tablet busy"). Staging (a
+  network transfer into the run's own directory) checks the guard
+  without it, and the watchdog never takes it. The apply script repeats the guard before
   every document. Starting xochitl checks only that the lock is still
   ours: bringing the UI back stays allowed after the watchdog fired.
 - **Device-layer details.** The owner record is `key=value` lines
   (`run`, `host`, `pid`, `started`, `boot_id`; unknown keys ignored).
   The run id belongs to the process, so a retry after a lost
-  acknowledgement of the acquisition adopts its own lock. Taking over a
+  acknowledgement of the acquisition adopts its own lock, unless the
+  tablet rebooted or the watchdog fired meanwhile (then it is taken over
+  and reported like anyone else's). Taking over a
   stale lock is a compare-and-swap on a device-side checksum of the
   record as inspected, so two runs taking over at once cannot both win
   and even a corrupt record can be broken with `--break-lock`. A lock
@@ -450,11 +453,14 @@ clean-up does not require `--allow-deletions` on every tablet.
   and fires only if a token file still holds the token written when it
   was armed; disarming removes the token before killing the process
   group, which is recorded with the boot id so that a number from before
-  a reboot is never signalled. The pairing check fails rather than
-  reading an unreadable configuration as unpaired. Device scripts are piped to `sh -s` and file lists to
+  a reboot is never signalled. The pairing check runs the survey's test
+  as `t=$(sed …) || fail; printf '%s\n' "$t" | grep -qvE …`, so a
+  configuration that cannot be read fails rather than reading as
+  unpaired. Device scripts are piped to `sh -s` and file lists to
   `tar -T -`, never put on the remote command line (one argv string,
-  128 KiB on Linux); script bodies are wrapped in a shell function, so
-  a truncated transfer runs nothing.
+  128 KiB on Linux); every script that changes anything is wrapped in a
+  shell function, so a truncated transfer runs nothing (and takes no
+  lock).
 - Other mutating rmu commands (`upload`, `mv`, `rm`, `rename`, `sync`,
   `restart`) refuse while the hub lock is held, and `rmu sync` warns
   when its target tablet is attached to a hub (fresh-UUID copies would

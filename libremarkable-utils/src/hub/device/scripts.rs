@@ -6,18 +6,20 @@
 //! `stat -c` with `%y`/`%z`, `find -exec +`, `tar -T -`, `mv -T`,
 //! `sha256sum`, `mktemp`, `flock`, `setsid`, `sync`); the contract tests
 //! run them under BusyBox and GNU tools. Every interpolated value goes
-//! through [`shell_quote`]. Scripts sent on stdin (`sh -s`) wrap their
-//! body in a function: a truncated transfer is then a syntax error and
-//! runs nothing.
+//! through [`shell_quote`]. Scripts sent on stdin (`sh -s`) that change
+//! anything wrap their body in a function: a truncated transfer is then
+//! a syntax error and runs nothing, and no lock is taken before the
+//! whole script has arrived.
 //!
 //! **Serialisation.** Lock operations and guarded scripts hold an
 //! exclusive `flock` on [`TabletPaths::guard_flock`] from their guard
 //! check to their last change, so a takeover can never fall between an
 //! old run's guard and its mutation. The kernel drops the `flock` when
 //! the script exits, however it ends. Only bounded, local work runs under
-//! it; staging (a network transfer into the run's own directory) checks
-//! the guard without it, and the watchdog never takes it, so a stuck
-//! script cannot keep xochitl down.
+//! it, and waiters give up after [`FLOCK_WAIT_SECS`]; staging (a network
+//! transfer into the run's own directory) checks the guard without it,
+//! and the watchdog never takes it, so a stuck script cannot keep
+//! xochitl down.
 
 use super::apply::ApplyStep;
 use super::lock::{AcquireProbe, LockRequest, LockState, owner_fields, parse_owner, run_line};
@@ -31,6 +33,13 @@ pub(super) const EXIT_WATCHDOG_FIRED: i32 = 75;
 pub(super) const EXIT_LOCK_LOST: i32 = 76;
 /// Exit status of a lock takeover that found the lock changed.
 pub(super) const EXIT_LOCK_CHANGED: i32 = 77;
+/// Exit status of a script that could not get the guard `flock` in time.
+pub(super) const EXIT_BUSY: i32 = 78;
+
+/// Seconds a script waits for the guard `flock`: long enough for any
+/// legitimate holder (an apply, `systemctl stop xochitl`), bounded so a
+/// holder stuck on a dead connection cannot block every later run.
+const FLOCK_WAIT_SECS: u32 = 180;
 
 /// `stat -c` format of the stat pass: raw mode (hex), size, mtime in
 /// seconds and human-readable with nanoseconds, the same for ctime,
@@ -64,19 +73,36 @@ fn q(text: &str) -> String {
 
 // ---- guard and lock --------------------------------------------------------
 
+/// Take the guard `flock` on fd 9 (held until the script exits), waiting
+/// at most [`FLOCK_WAIT_SECS`] ([`EXIT_BUSY`]); BusyBox `flock` has no
+/// `-w`. The file's directory must exist: in `ash`, a failed `exec`
+/// redirection exits the shell at once.
+fn take_flock(paths: &TabletPaths) -> String {
+    format!(
+        "exec 9>>{flock}\n\
+         n=0\n\
+         until flock -n 9; do\n\
+         n=$((n + 1)); [ \"$n\" -le {wait} ] || {{ echo 'rmu: the tablet is busy with another hub operation' >&2; exit {busy}; }}\n\
+         sleep 1\n\
+         done\n",
+        flock = q(&paths.guard_flock()),
+        wait = FLOCK_WAIT_SECS,
+        busy = EXIT_BUSY,
+    )
+}
+
 /// Defines the guard functions:
 ///
-/// - `rmu_lock` takes the `flock` (blocking; held until the script exits).
-///   A missing state dir means the lock is gone: [`EXIT_LOCK_LOST`].
+/// - `rmu_lock` takes the `flock` (see [`take_flock`]). A missing state
+///   dir means the lock is gone: [`EXIT_LOCK_LOST`].
 /// - `rmu_owned` exits [`EXIT_LOCK_LOST`] unless the lock names `run`.
 /// - `rmu_guard` exits [`EXIT_WATCHDOG_FIRED`] if the watchdog marker
 ///   exists, then checks `rmu_owned`.
 pub(super) fn guard_fns(paths: &TabletPaths, run: &str) -> String {
     format!(
         "rmu_lock() {{\n\
-         exec 9>>{flock} || {{ echo 'rmu: the hub state directory is gone' >&2; exit {lost}; }}\n\
-         flock 9 || exit 1\n\
-         }}\n\
+         [ -d {state} ] || {{ echo 'rmu: the hub state directory is gone' >&2; exit {lost}; }}\n\
+         {take_flock}}}\n\
          rmu_owned() {{\n\
          grep -qxF {line} {owner} 2>/dev/null || {{ echo 'rmu: the hub lock is not held by this run' >&2; exit {lost}; }}\n\
          }}\n\
@@ -84,7 +110,8 @@ pub(super) fn guard_fns(paths: &TabletPaths, run: &str) -> String {
          if [ -e {marker} ]; then echo 'rmu: the hub watchdog fired' >&2; exit {fired}; fi\n\
          rmu_owned\n\
          }}\n",
-        flock = q(&paths.guard_flock()),
+        state = q(&paths.state_dir),
+        take_flock = take_flock(paths),
         line = q(&run_line(run)),
         owner = q(&paths.lock_owner()),
         marker = q(&paths.watchdog_marker()),
@@ -93,15 +120,25 @@ pub(super) fn guard_fns(paths: &TabletPaths, run: &str) -> String {
     )
 }
 
+/// A script for `sh -s`: the guard functions, then `check` and `body`
+/// under the `flock`, inside a function, so nothing (the `flock` above
+/// all) happens before the whole script has arrived.
+fn main_with(paths: &TabletPaths, run: &str, check: &str, body: &str) -> String {
+    format!(
+        "{}rmu_main() {{\nrmu_lock\n{check}\n{body}\n}}\nrmu_main </dev/null\n",
+        guard_fns(paths, run)
+    )
+}
+
 /// The guard under the `flock`, then `body`.
 pub(super) fn guarded(paths: &TabletPaths, run: &str, body: &str) -> String {
-    format!("{}rmu_lock\nrmu_guard\n{body}\n", guard_fns(paths, run))
+    main_with(paths, run, "rmu_guard", body)
 }
 
 /// Lock ownership only, under the `flock`, then `body`: for starting
 /// xochitl, which must still work after the watchdog fired.
 pub(super) fn owned(paths: &TabletPaths, run: &str, body: &str) -> String {
-    format!("{}rmu_lock\nrmu_owned\n{body}\n", guard_fns(paths, run))
+    main_with(paths, run, "rmu_owned", body)
 }
 
 /// Variables and the `flock` shared by the lock scripts.
@@ -109,14 +146,13 @@ fn lock_prelude(paths: &TabletPaths) -> String {
     format!(
         "d={state}; l={lock}; o={owner}; m={marker}\n\
          mkdir -p -- \"$d\" || exit 1\n\
-         exec 9>>{flock} || exit 1\n\
-         flock 9 || exit 1\n\
+         {take_flock}\
          read -r boot < {boot_id} || exit 1\n",
         state = q(&paths.state_dir),
         lock = q(&paths.lock_dir()),
         owner = q(&paths.lock_owner()),
         marker = q(&paths.watchdog_marker()),
-        flock = q(&paths.guard_flock()),
+        take_flock = take_flock(paths),
         boot_id = q(&paths.boot_id),
     )
 }
@@ -231,10 +267,11 @@ pub(super) fn parse_boot(output: &str) -> Result<String, DeviceError> {
 
 /// Remove the lock if it is ours; exits [`EXIT_LOCK_LOST`] otherwise.
 pub(super) fn release_script(paths: &TabletPaths, run: &str) -> String {
-    format!(
-        "{fns}rmu_lock\nrmu_owned\nrm -rf -- {lock}\n",
-        fns = guard_fns(paths, run),
-        lock = q(&paths.lock_dir()),
+    main_with(
+        paths,
+        run,
+        "rmu_owned",
+        &format!("rm -rf -- {}", q(&paths.lock_dir())),
     )
 }
 
@@ -294,7 +331,8 @@ pub(super) fn watchdog_unit_name(token: &str) -> String {
 /// The primary watchdog: a transient systemd timer.
 pub(super) fn systemd_watchdog_command(paths: &TabletPaths, secs: u64, unit: &str) -> String {
     format!(
-        "systemd-run --quiet --collect --unit={unit} --on-active={secs}s /bin/sh -c {}",
+        "systemd-run --quiet --collect --unit={} --on-active={secs}s /bin/sh -c {}",
+        q(unit),
         q(&fire_command(paths))
     )
 }
@@ -430,12 +468,14 @@ pub(super) fn parse_device_time(operation: &'static str, output: &str) -> Result
         .ok_or_else(|| output_error(operation, format!("invalid device time {line:?}")))
 }
 
-/// The survey's pairing check: prints only `true` or `false`. An
-/// unreadable configuration fails rather than reading as unpaired.
+/// The survey's pairing check: prints only `true` or `false` (the token
+/// never leaves the device). A configuration that cannot be read fails
+/// rather than reading as unpaired: the `sed` runs on its own, not in a
+/// pipeline whose status is `grep`'s.
 pub(super) fn cloud_paired_script(paths: &TabletPaths) -> String {
     format!(
-        "[ -r {conf} ] || {{ echo 'rmu: cannot read the xochitl configuration' >&2; exit 1; }}\n\
-         sed -n 's/^devicetoken=//p' {conf} \\\n  | grep -qvE '^(|@Invalid\\(\\)|@ByteArray\\(\\)|\"\")$' && echo true || echo false\n",
+        "t=$(sed -n 's/^devicetoken=//p' {conf}) || {{ echo 'rmu: cannot read the xochitl configuration' >&2; exit 1; }}\n\
+         printf '%s\\n' \"$t\" | grep -qvE '^(|@Invalid\\(\\)|@ByteArray\\(\\)|\"\")$' && echo true || echo false\n",
         conf = q(&paths.xochitl_conf)
     )
 }
@@ -984,8 +1024,13 @@ mod tests {
     fn guard_takes_the_flock_then_checks_marker_and_ownership() {
         let paths = TabletPaths::default();
         let fns = guard_fns(&paths, RUN);
+        // The directory is checked first: in ash a failed `exec`
+        // redirection exits the shell before any `||` runs.
         assert!(fns.contains(
-            "exec 9>>/home/root/.local/share/rmu/guard.flock || { echo 'rmu: the hub state directory is gone' >&2; exit 76; }\nflock 9 || exit 1\n"
+            "rmu_lock() {\n[ -d /home/root/.local/share/rmu ] || { echo 'rmu: the hub state directory is gone' >&2; exit 76; }\n\
+             exec 9>>/home/root/.local/share/rmu/guard.flock\nn=0\nuntil flock -n 9; do\n\
+             n=$((n + 1)); [ \"$n\" -le 180 ] || { echo 'rmu: the tablet is busy with another hub operation' >&2; exit 78; }\n\
+             sleep 1\ndone\n}\n"
         ));
         assert!(fns.contains(&format!(
             "grep -qxF 'run={RUN}' /home/root/.local/share/rmu/lock/owner 2>/dev/null || {{ echo 'rmu: the hub lock is not held by this run' >&2; exit 76; }}"
@@ -993,8 +1038,16 @@ mod tests {
         assert!(fns.contains(
             "if [ -e /home/root/.local/share/rmu/watchdog-fired ]; then echo 'rmu: the hub watchdog fired' >&2; exit 75; fi\nrmu_owned\n"
         ));
-        assert!(guarded(&paths, RUN, "body").ends_with("rmu_lock\nrmu_guard\nbody\n"));
-        assert!(owned(&paths, RUN, "body").ends_with("rmu_lock\nrmu_owned\nbody\n"));
+        // Wrapped in a function: nothing runs, the flock above all, before
+        // the whole script has arrived.
+        assert!(
+            guarded(&paths, RUN, "body")
+                .ends_with("rmu_main() {\nrmu_lock\nrmu_guard\nbody\n}\nrmu_main </dev/null\n")
+        );
+        assert!(
+            owned(&paths, RUN, "body")
+                .ends_with("rmu_main() {\nrmu_lock\nrmu_owned\nbody\n}\nrmu_main </dev/null\n")
+        );
         assert_quoted(&guarded(&hostile(), RUN, "true"), &hostile());
     }
 
@@ -1019,7 +1072,10 @@ mod tests {
         ]
         .iter()
         .for_each(|script| {
-            let flock = position(script, "flock 9");
+            // Every lock script runs inside a function and takes the flock
+            // before changing anything.
+            assert!(script.trim_end().ends_with("</dev/null"), "{script}");
+            let flock = script.rfind("until flock -n 9").unwrap();
             let change = script
                 .find("mkdir -- \"$l\"")
                 .or_else(|| script.find("[ -d \"$l\" ]"))
@@ -1111,7 +1167,7 @@ mod tests {
     fn rearming_arms_the_new_watchdog_before_removing_the_old() {
         let paths = TabletPaths::default();
         let arm = arm_script(&paths, RUN, 120, "tok");
-        let guard = position(&arm, "rmu_lock\nrmu_guard\n");
+        let guard = position(&arm, "rmu_main() {\nrmu_lock\nrmu_guard\n");
         let read_old = position(
             &arm,
             "old=; [ -f /home/root/.local/share/rmu/watchdog.unit ] && read -r old <",
@@ -1130,7 +1186,7 @@ mod tests {
         assert!(arm.contains("[ \"$oldb\" = \"$boot\" ]"));
         // Disarm: guard, token gone before any kill.
         let disarm = disarm_script(&paths, RUN);
-        assert!(disarm.contains("rmu_lock\nrmu_guard\n"));
+        assert!(disarm.contains("rmu_main() {\nrmu_lock\nrmu_guard\n"));
         assert!(
             position(
                 &disarm,
@@ -1145,15 +1201,15 @@ mod tests {
     #[test]
     fn start_checks_ownership_and_resets_failed_state_first() {
         let script = start_script(&TabletPaths::default(), RUN);
-        let owned = position(&script, "rmu_lock\nrmu_owned\n");
+        let owned = position(&script, "rmu_main() {\nrmu_lock\nrmu_owned\n");
         let date = position(&script, "date +%s");
         let reset = position(&script, "systemctl reset-failed xochitl.service");
         let start = position(&script, "systemctl start xochitl.service");
         assert!(owned < date && date < reset && reset < start);
-        assert!(!script.contains("rmu_guard\n"));
+        assert!(!script.contains("rmu_lock\nrmu_guard\n"));
         assert!(
             stop_script(&TabletPaths::default(), RUN)
-                .ends_with("rmu_lock\nrmu_guard\nsystemctl stop xochitl.service\n")
+                .contains("rmu_lock\nrmu_guard\nsystemctl stop xochitl.service\n}\n")
         );
         assert_eq!(
             parse_device_time("t", "1790000000\n").unwrap(),
@@ -1166,9 +1222,8 @@ mod tests {
     fn cloud_pairing_is_the_survey_one_liner_and_fails_closed() {
         assert_eq!(
             cloud_paired_script(&TabletPaths::default()),
-            "[ -r /home/root/.config/remarkable/xochitl.conf ] || { echo 'rmu: cannot read the xochitl configuration' >&2; exit 1; }\n\
-             sed -n 's/^devicetoken=//p' /home/root/.config/remarkable/xochitl.conf \\\n  \
-             | grep -qvE '^(|@Invalid\\(\\)|@ByteArray\\(\\)|\"\")$' && echo true || echo false\n"
+            "t=$(sed -n 's/^devicetoken=//p' /home/root/.config/remarkable/xochitl.conf) || { echo 'rmu: cannot read the xochitl configuration' >&2; exit 1; }\n\
+             printf '%s\\n' \"$t\" | grep -qvE '^(|@Invalid\\(\\)|@ByteArray\\(\\)|\"\")$' && echo true || echo false\n"
         );
         assert!(parse_bool("p", "true\n").unwrap());
         assert!(!parse_bool("p", "false\n").unwrap());

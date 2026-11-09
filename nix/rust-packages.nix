@@ -55,9 +55,9 @@ flake-utils.lib.eachDefaultSystem (system: let
   # util-linux, and with BusyBox applets and `ash`, as on a tablet (named
   # by RMU_TEST_BUSYBOX, never put on PATH).
   hermeticGitTestArgs = {
-    nativeCheckInputs = [pkgs.git] ++ lib.optional pkgs.stdenv.isLinux pkgs.util-linux;
+    nativeCheckInputs = [pkgs.git] ++ lib.optional pkgs.stdenv.hostPlatform.isLinux pkgs.util-linux;
     preCheck = ''
-      ${lib.optionalString pkgs.stdenv.isLinux "export RMU_TEST_BUSYBOX=${pkgs.busybox}/bin/busybox"}
+      ${lib.optionalString pkgs.stdenv.hostPlatform.isLinux "export RMU_TEST_BUSYBOX=${pkgs.busybox}/bin/busybox"}
       export HOME="$(mktemp -d)"
       export GIT_CONFIG_GLOBAL=/dev/null
       export GIT_CONFIG_NOSYSTEM=1

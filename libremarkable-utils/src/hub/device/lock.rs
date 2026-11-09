@@ -156,7 +156,9 @@ impl HeldLock {
 
 /// Decide about an existing lock. `existing` is `None` when its owner
 /// record is missing or unreadable: then only a fired watchdog or
-/// `break_lock` frees it.
+/// `break_lock` frees it. Our own lock is adopted only if nothing
+/// happened to it: after a reboot or a fired watchdog it is taken over
+/// like anyone's, so the caller learns that its run ended.
 pub fn decide(
     existing: Option<&LockOwner>,
     own_run: &str,
@@ -165,11 +167,11 @@ pub fn decide(
     break_lock: bool,
 ) -> LockDecision {
     match existing {
-        Some(owner) if owner.run == own_run => LockDecision::Adopt,
         Some(owner) if owner.boot_id != current_boot => {
             LockDecision::TakeOver(StaleReason::BootChanged)
         }
         _ if watchdog_fired => LockDecision::TakeOver(StaleReason::WatchdogFired),
+        Some(owner) if owner.run == own_run => LockDecision::Adopt,
         _ if break_lock => LockDecision::TakeOver(StaleReason::Broken),
         _ => LockDecision::Refuse,
     }
@@ -238,7 +240,6 @@ pub(super) fn acquire(
                         ))
                         .into());
                     }
-                    // Rewritten too, so the record has the current boot id.
                     LockDecision::Adopt => None,
                     LockDecision::TakeOver(reason) => Some((existing, reason)),
                 };
@@ -429,10 +430,22 @@ mod tests {
             d(None, BOOT, false, true),
             LockDecision::TakeOver(StaleReason::Broken)
         );
-        // Our own lock, from any boot, is adopted.
+        // Our own lock is adopted only if nothing happened to it.
         assert_eq!(
-            decide(Some(&held), RUN, OTHER_BOOT, true, false),
+            decide(Some(&held), RUN, BOOT, false, false),
             LockDecision::Adopt
+        );
+        assert_eq!(
+            decide(Some(&held), RUN, BOOT, false, true),
+            LockDecision::Adopt
+        );
+        assert_eq!(
+            decide(Some(&held), RUN, OTHER_BOOT, false, false),
+            LockDecision::TakeOver(StaleReason::BootChanged)
+        );
+        assert_eq!(
+            decide(Some(&held), RUN, BOOT, true, false),
+            LockDecision::TakeOver(StaleReason::WatchdogFired)
         );
     }
 
@@ -525,16 +538,26 @@ mod tests {
     }
 
     #[test]
-    fn acquire_adopts_its_own_lock() {
+    fn acquire_adopts_its_own_lock_unless_something_happened() {
         let adopted = acquire(
             &request(),
             false,
-            &held(owner_record(&request(), BOOT), OTHER_BOOT, false),
-            &|_| Ok(Some(OTHER_BOOT.to_string())),
+            &held(owner_record(&request(), BOOT), BOOT, false),
+            &|_| Ok(Some(BOOT.to_string())),
         )
         .unwrap();
         assert_eq!(adopted.took_over(), None);
-        assert_eq!(adopted.owner().boot_id, OTHER_BOOT);
+        let fired = acquire(
+            &request(),
+            false,
+            &held(owner_record(&request(), BOOT), BOOT, true),
+            &|_| Ok(Some(BOOT.to_string())),
+        )
+        .unwrap();
+        assert_eq!(
+            fired.took_over(),
+            Some((Some(&owner(BOOT)), StaleReason::WatchdogFired))
+        );
     }
 
     #[test]

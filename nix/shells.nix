@@ -33,7 +33,7 @@ flake-utils.lib.eachDefaultSystem (
         export PROJECT_ROOT=$(git rev-parse --show-toplevel)
         # The hub device-layer tests also run the tablet scripts under
         # BusyBox, as on a tablet (never put on PATH).
-        ${pkgs.lib.optionalString pkgs.stdenv.isLinux "export RMU_TEST_BUSYBOX=${pkgs.busybox}/bin/busybox"}
+        ${pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux "export RMU_TEST_BUSYBOX=${pkgs.busybox}/bin/busybox"}
       '';
     };
   }
