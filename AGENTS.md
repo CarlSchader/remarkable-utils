@@ -140,21 +140,28 @@ This repository is **open source** (dual-licensed MIT OR Apache-2.0):
   parity, a scenario.
   `hub/cycle.rs` composes all of it into the operations behind
   `rmu hub` (`Hub`: `init`, `clone_tablet` with reattach, `sync`,
-  `backup`, `status`, `dry_run`): the local cache (`cycle/store.rs`: a
+  `backup`, `status`, `dry_run`, `remote`, `set_remote_url`, `detach`;
+  every report derives `Serialize`, warnings are the typed `Warning`):
+  the local cache (`cycle/store.rs`: a
   bare repository per repo id under `$XDG_CACHE_HOME/rmu/hub`, an
   `flock`, raw commits and trees read through one `cat-file`), reading
   the tablet into `fast-import` (`cycle/snapshot.rs`), the **pure**
   decisions (`cycle/plan.rs`: version equivalence, the apply plan,
-  verification, tree and trash checks, reconciliation verdicts, the
-  manifest; new decisions go there, with tests), commit trailers
-  (`cycle/message.rs`), the steps (`cycle/steps.rs`) and the read-only
-  commands (`cycle/inspect.rs`). `tests/hub_e2e.rs` (harness in
+  verification, step-14 moved paths, tree and trash checks,
+  reconciliation verdicts and finish, the manifest; new decisions go
+  there, with tests), commit trailers (`cycle/message.rs`), the steps
+  (`cycle/steps.rs`), the read-only commands (`cycle/inspect.rs`, which
+  shares the sync's merge setup, `Hub::run_merge`) and `remote`/`detach`
+  (`cycle/admin.rs`). Base inference uses the merge's own "unchanged"
+  predicate (`merge::unchanged`); keep the two from drifting. `tests/hub_e2e.rs` (harness in
   `tests/hub_e2e/world.rs`) runs fake tablets against a bare origin,
-  ending every scenario with one oracle (`World::check`: the tablets
-  equal origin, no ink lost, xochitl up, no lock or journal left) and
-  includes a crash matrix (a fault at every operation of a full
-  cycle); add a scenario for every new cycle rule and keep the matrix
-  passing.
+  ending every scenario that syncs to the end with one oracle
+  (`World::check`: the tablets equal origin, no ink lost, xochitl up, no
+  lock or journal left; refusals check `World::check_idle`) and
+  includes crash matrices (a fault at every operation of a full cycle,
+  of a run reconciling an earlier crash, of a pull-only run, of a clone
+  and of a backup; the run after each recovery must be quiet); add a
+  scenario for every new cycle rule and keep the matrices passing.
 - `status.rs` — device system state (`rmu status`): one
   marker-sectioned SSH round trip, pure best-effort parsing (every
   field `Option`al — firmware/models differ), pure rendering.

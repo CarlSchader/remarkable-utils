@@ -1240,6 +1240,48 @@ fn rev_list_follows_first_parents_and_stops_at_exclusions() {
     ));
 }
 
+#[cfg(unix)]
+#[test]
+fn rev_list_topo_lists_every_ancestor_children_first() {
+    let sandbox = Sandbox::new();
+    let cache = sandbox.init("cache.git");
+    let root = commit_files(&cache, &[], &[("a", b"1")], "root\n");
+    let side = commit_files(&cache, &[&root], &[("a", b"side")], "side\n");
+    let main = commit_files(&cache, &[&root], &[("a", b"2")], "main\n");
+    let merge = commit_files(&cache, &[&main, &side], &[("a", b"3")], "merge\n");
+    let all = cache.rev_list_topo(&[merge.as_str()]).unwrap();
+    assert_eq!(all.len(), 4);
+    assert_eq!(all.first(), Some(&merge));
+    assert_eq!(all.last(), Some(&root));
+}
+
+#[cfg(unix)]
+#[test]
+fn deleting_a_remote_ref_is_leased() {
+    let sandbox = Sandbox::new();
+    let origin = sandbox.init("origin.git");
+    let url = origin.git_dir().to_str().unwrap();
+    let cache = sandbox.init("cache.git");
+    let first = commit_files(&cache, &[], &[("f", b"1")], "1\n");
+    let second = commit_files(&cache, &[&first], &[("f", b"2")], "2\n");
+    cache
+        .push(url, &second, DEVICE_REF, Some(&Expected::Absent))
+        .unwrap();
+    // The ref moved since it was advertised: kept.
+    let stale = cache.delete_remote_ref(url, DEVICE_REF, &first);
+    assert!(
+        matches!(&stale, Err(Error::PushRejected { reference, .. }) if reference == DEVICE_REF),
+        "{stale:?}"
+    );
+    assert_eq!(origin.rev_parse(DEVICE_REF).unwrap(), Some(second.clone()));
+    cache.delete_remote_ref(url, DEVICE_REF, &second).unwrap();
+    assert_eq!(origin.rev_parse(DEVICE_REF).unwrap(), None);
+    assert!(matches!(
+        cache.delete_remote_ref(url, "main", &second),
+        Err(Error::InvalidGitInput(_))
+    ));
+}
+
 #[test]
 fn object_sizes_checks_existence_without_reading_content() {
     let sandbox = Sandbox::new();

@@ -1,11 +1,28 @@
 //! `status` and `sync --dry-run`: read-only. They never stop xochitl,
-//! take the lock or push; their snapshot is taken while xochitl runs, so
-//! it is best effort (files that change while read are left out), and
-//! the commit holding its blobs is local garbage no ref points to.
+//! take the lock or push. Their snapshot is taken while xochitl runs: a
+//! best-effort pre-read, then a full read of what moved since (retried
+//! once if a file changes while read), so it is complete but may be a
+//! moment out of date. The commits holding its blobs and the would-be
+//! merge are local garbage no ref points to.
 
-use super::*;
-use crate::hub::model::DocOutcome;
-use snapshot::ReadMode;
+use std::collections::BTreeSet;
+
+use serde_json::Value;
+
+use super::message;
+use super::plan::{self, Change, JsonBlobs, Planned};
+use super::snapshot::{self, ReadMode, TabletRead};
+use super::store::{self, Store};
+use super::{
+    CycleError, DocChange, DryRunReport, Hub, OpenConflict, OriginCtx, StatusReport, commit_tree,
+    quarantine_report, read_summary, tablet_versions, virtual_base,
+};
+use crate::error::Result;
+use crate::git::Oid;
+use crate::hub::device::Tablet;
+use crate::hub::model::{
+    DocFile, DocId, DocOutcome, DocVersion, MirrorRules, RepoTree, TabletState,
+};
 
 /// The visible name of a document version, if it has one.
 fn visible_name(store: &Store, version: Option<&DocVersion>) -> Result<Option<String>> {
@@ -52,7 +69,22 @@ fn open_conflicts(
                 .collect::<Result<Vec<_>>>()
         })
         .collect::<Result<Vec<_>>>()
-        .map(|nested| nested.into_iter().flatten().collect())
+        .map(|nested| {
+            // A copy recorded by more than one commit (a fork trailer is
+            // carried by every commit that re-records it) is listed once.
+            let mut seen = BTreeSet::new();
+            nested
+                .into_iter()
+                .flatten()
+                .filter(|conflict| seen.insert(conflict.copy.clone()))
+                .collect()
+        })
+}
+
+/// What a sync would do to the tablet and origin.
+struct DryPlan {
+    planned: Vec<Planned>,
+    would_push: bool,
 }
 
 impl Hub<'_> {
@@ -84,62 +116,64 @@ impl Hub<'_> {
         result
     }
 
+    /// The tablet read while xochitl runs, its blobs committed.
+    fn read_running(
+        &self,
+        tablet: &dyn Tablet,
+        origin: &OriginCtx,
+        state: &TabletState,
+    ) -> Result<TabletRead> {
+        let pre = self.pre_read(
+            tablet,
+            origin.rules,
+            &snapshot::known_from_manifest(&state.manifest),
+            &origin.cache.repo,
+            &origin.store,
+        );
+        let known = snapshot::known_from_manifest(&state.manifest)
+            .into_iter()
+            .chain(snapshot::pre_read_known(&pre))
+            .collect();
+        let attempt = || -> Result<TabletRead> {
+            let mut writer = origin.cache.repo.commit_writer(self.progress, None)?;
+            let read = snapshot::read_tablet(
+                tablet,
+                origin.rules,
+                &known,
+                &origin.store,
+                &mut writer,
+                self.progress,
+                ReadMode::Strict,
+            )?;
+            commit_tree(
+                writer,
+                &RepoTree::default(),
+                &Self::meta(
+                    state,
+                    Vec::new(),
+                    "rmu hub: status read (not pushed)\n".to_string(),
+                ),
+            )?;
+            Ok(read)
+        };
+        // A file xochitl changed while it was read: once more.
+        attempt().or_else(|_| attempt())
+    }
+
     fn inspect(&self, tablet: &dyn Tablet) -> Result<(StatusReport, DryPlan)> {
         self.progress.step("Checking origin");
         let state = tablet.read_state()?.ok_or(CycleError::NotAttached)?;
         let url = self.origin_url(&state.origin)?;
-        let cache = store::open_cache(&self.git, &self.cache_dir, &state.repo_id, &url)?;
-        let origin = OriginCtx::new(cache, url, Some(&state.device_id))?;
+        let (cache, refs) = store::open_cache(&self.git, &self.cache_dir, &state.repo_id, &url)?;
+        let origin = OriginCtx::new(cache, url, Some(&state.device_id), Some(refs))?;
         origin.check(&state)?;
         let lock = tablet.lock_state()?;
         let (store, rules) = (&origin.store, origin.rules);
-        let mut writer = origin.cache.repo.commit_writer(self.progress, None)?;
-        let read = snapshot::read_tablet(
-            tablet,
-            rules,
-            &snapshot::known_from_manifest(&state.manifest),
-            store,
-            &mut writer,
-            self.progress,
-            ReadMode::BestEffort,
-        )?;
+        let read = self.read_running(tablet, &origin, &state)?;
         let base_tree = virtual_base(store, rules, &state)?;
         let snapshot = snapshot::build(rules, &read, &base_tree)?;
-        // Stores the blobs read; nothing points at it.
-        commit_tree(
-            writer,
-            &snapshot.tree,
-            &Self::meta(
-                &state,
-                Vec::new(),
-                "rmu hub: status snapshot (not pushed)\n".to_string(),
-            ),
-        )?;
         let main = origin.main.clone();
-        let theirs = store.tree_of(rules, &main)?;
-        let consented = consented_deletions(store, &main, &state, &snapshot.tree, &theirs)?;
-        let date = self.date();
-        let outcome = merge::merge(
-            &MergeInput {
-                base: &base_tree,
-                ours: &snapshot.tree,
-                theirs: &theirs,
-            },
-            store,
-            &StoreHistory {
-                store,
-                rules,
-                tip: &main,
-            },
-            &MergeParams {
-                rules,
-                device_name: &state.device_name,
-                date: &date,
-                allow_deletions: self.options.allow_deletions,
-                thresholds: self.options.thresholds,
-                consented_deletions: &consented,
-            },
-        )?;
+        let run = self.run_merge(&origin, &state, &base_tree, &snapshot, &read)?;
         let present =
             |tree: &RepoTree, doc: &DocId| tree.docs.get(doc).is_some_and(DocVersion::is_present);
         let changes = base_tree
@@ -176,36 +210,29 @@ impl Hub<'_> {
                 .len(),
             None => store.first_parents(&main)?.len(),
         };
-        let open_conflicts = open_conflicts(store, rules, &main, &theirs)?;
+        let open_conflicts = open_conflicts(store, rules, &main, &run.theirs)?;
         // What the sync would write: the merge realised into a commit no
         // ref points to, so the plan can read its new blobs.
-        let mut writer = origin.cache.repo.commit_writer(self.progress, None)?;
-        let merged = realise(&mut writer, &outcome)?;
         commit_tree(
-            writer,
-            &merged,
+            run.writer,
+            &run.merged,
             &Self::meta(
                 &state,
                 Vec::new(),
                 "rmu hub: dry-run merge (not pushed)\n".to_string(),
             ),
         )?;
-        let up_to_date = trees_equivalent(rules, &snapshot.tree, &theirs, store)?
-            && trees_equivalent(rules, &merged, &theirs, store)?;
         let protect: BTreeSet<DocId> = snapshot.quarantined.keys().cloned().collect();
-        let tablet_files = read
-            .doc_files()
-            .iter()
-            .map(|(doc, files)| (doc.clone(), tablet_version(files)))
-            .collect();
         let planned = plan::plan(&plan::PlanInput {
             rules,
-            merged: &merged,
-            tablet: &tablet_files,
+            merged: &run.merged,
+            tablet: &tablet_versions(&read),
             protect: &protect,
             local: &read.local_json(),
             json: store,
-        })?;
+        })?
+        .planned;
+        let outcome = run.outcome;
         let status = StatusReport {
             repo_id: state.repo_id.clone(),
             device_id: state.device_id.clone(),
@@ -213,33 +240,23 @@ impl Hub<'_> {
             origin: origin.url.clone(),
             lock,
             journal_pending: state.journal.is_some(),
-            quarantined: snapshot
-                .quarantined
-                .iter()
-                .map(|(doc, reason)| (doc.clone(), reason.to_string()))
-                .collect(),
+            quarantined: quarantine_report(&snapshot),
             orphans: snapshot.orphans.iter().cloned().collect(),
             read: read_summary(&read),
             changes,
             behind,
             open_conflicts,
-            guard: outcome.guard.clone(),
             summary: outcome.summary(),
-            notes: outcome.notes.clone(),
-            forks: outcome.forks.clone(),
+            guard: outcome.guard,
+            notes: outcome.notes,
+            forks: outcome.forks,
         };
         Ok((
             status,
             DryPlan {
                 planned,
-                would_push: !up_to_date,
+                would_push: !(run.up_to_date || run.pull_only),
             },
         ))
     }
-}
-
-/// What a sync would do to the tablet and origin.
-struct DryPlan {
-    planned: Vec<Planned>,
-    would_push: bool,
 }

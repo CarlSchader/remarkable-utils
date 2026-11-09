@@ -11,9 +11,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 
-use super::CycleError;
 use super::plan::{LocalJson, json_kind};
 use super::store::Store;
+use super::{CycleError, Downloaded};
 use crate::error::Result;
 use crate::git::{CommitWriter, Oid};
 use crate::hub::device::{StatListing, Tablet};
@@ -82,7 +82,7 @@ pub(super) struct TabletRead {
     /// Names that cannot be listed (newlines).
     pub unlisted: usize,
     /// Files downloaded, and their bytes.
-    pub downloaded: (usize, u64),
+    pub downloaded: Downloaded,
 }
 
 impl TabletRead {
@@ -206,11 +206,22 @@ pub(super) enum ReadMode {
 
 /// Pre-read files usable by the stopped read: their stat is trusted only
 /// with a nanosecond mtime, since a coarse one could hide a change xochitl
-/// made within the same second (see "Snapshot validation").
-pub(super) fn trusted_pre_read(read: &TabletRead) -> BTreeMap<XochitlPath, Known> {
+/// made within the same second (see "Snapshot validation"); their blobs
+/// are checked against the cache like manifest entries (the pre-read
+/// commits them on its own, and may not have got that far).
+pub(super) fn pre_read_known(read: &TabletRead) -> BTreeMap<XochitlPath, Known> {
     read.as_known()
         .into_iter()
         .filter(|(_, known)| known.stat.keep_in_manifest(i64::MAX))
+        .map(|(path, known)| {
+            (
+                path,
+                Known {
+                    trusted: false,
+                    ..known
+                },
+            )
+        })
         .collect()
 }
 
@@ -350,7 +361,10 @@ pub(super) fn read_tablet(
         excluded,
         irregular,
         unlisted: listing.unlisted,
-        downloaded: (paths.len(), total),
+        downloaded: Downloaded {
+            files: paths.len(),
+            bytes: total,
+        },
     })
 }
 

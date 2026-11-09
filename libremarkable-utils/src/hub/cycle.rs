@@ -1,5 +1,6 @@
 //! The `rmu hub` operations behind the CLI: `init`, `clone` (with
-//! `--reattach`), `sync`, `backup`, `status` and `--dry-run`, composing
+//! `--reattach`), `sync`, `backup`, `status`, `--dry-run`, `remote` and
+//! `detach`, composing
 //! the local git cache ([`crate::git`]), the data model, the merge engine
 //! and a [`Tablet`] (see "The sync cycle" in `docs/hub-design.md`).
 //!
@@ -8,12 +9,14 @@
 //! 1. preflight: read the tablet state, `ls-remote` origin, take the
 //!    local cache's `flock`, fetch origin `main` and the device ref, read
 //!    the mirror rules, check the repo id and that every base is an
-//!    ancestor of `main` (before the tablet is touched);
+//!    ancestor of `main` (before the tablet is touched); pre-read the
+//!    tablet while xochitl runs;
 //! 2. guard: take the tablet lock, arm the watchdog, refuse a
-//!    cloud-paired tablet, re-read the state under the lock;
+//!    cloud-paired tablet, re-read the state and fetch again under the
+//!    lock;
 //! 3. stop xochitl (watchdog armed);
-//! 4. reconcile a journal left by an interrupted run ([`Hub::reconcile`]),
-//!    while stopped, writing its result before anything else;
+//! 4. reconcile a journal left by an interrupted run, while stopped,
+//!    writing its result before anything else;
 //! 5. read the tablet: stat pass, download of changed files streamed into
 //!    `fast-import` (step 5 reads before step 4 decides, because
 //!    reconciliation judges the files it read; a document reconciliation
@@ -25,20 +28,24 @@
 //!    device ref with a lease, record `device_ref` on the tablet;
 //! 8. fetch, identity and ancestry checks;
 //! 9. merge, deletion guard;
-//! 10. journal, written durably before each push attempt;
+//! 10. journal, written durably before each push attempt (and before the
+//!     apply of a pull-only run, which pushes nothing);
 //! 11. push `main` (fast-forward only), back to 8 on rejection, a bounded
-//!     number of times;
+//!     number of times; nothing when the tablet already matches origin or
+//!     has no changes of its own;
 //! 12. stage (in batches, re-arming the watchdog);
 //! 13. stop (watchdog armed);
 //! 14. re-read, verify, live-tablet tree checks, apply;
 //! 15. record;
-//! 16. start, disarm, release.
+//! 16. start, disarm, release; then `git maintenance run --auto` on the
+//!     cache, still under its `flock`.
 //!
 //! Every error path brings xochitl back (`reset-failed` + `start`) when
 //! this run may have stopped it, then releases the lock; if the
 //! connection is gone, the watchdog brings it back. The library never
 //! prints: progress goes to a [`Progress`], results come back as reports.
 
+mod admin;
 mod inspect;
 mod message;
 mod plan;
@@ -47,30 +54,30 @@ mod steps;
 mod store;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use serde::Serialize;
 use serde_json::Value;
 use thiserror::Error;
 
-use self::message::{Author, MergeRecord};
-use self::plan::{Change, Content, JsonBlobs, Planned, Reread, Verdict};
-use self::snapshot::{Known, Snapshot, TabletRead};
+use self::plan::JsonBlobs;
+use self::snapshot::{Snapshot, TabletRead};
 use self::store::{Cache, Remote, Store, StoreHistory};
 use crate::error::{Error, Result};
 use crate::git::{CommitMeta, CommitWriter, Expected, FileMode, Git, Oid, Signature};
 use crate::hub::device::{
-    ApplyPlan, DeviceError, DeviceInfo, DocApply, HeldLock, LockOwner, LockRequest, LockState,
-    StagedFile, StaleReason, StatEntry, Tablet,
+    DeviceError, DeviceInfo, HeldLock, LockOwner, LockRequest, LockState, StaleReason, Tablet,
 };
 use crate::hub::merge::{
     self, DeletionGuard, Fork, GuardThresholds, MergeInput, MergeOutcome, MergeParams, MergedEntry,
     Note, Summary, TreeItem,
 };
 use crate::hub::model::{
-    DeviceId, DeviceName, DocFile, DocId, DocVersion, Journal, JsonFile, ListingEntry, MirrorRules,
-    RepoConfig, RepoId, RepoTree, StatSignature, TabletState, XochitlPath,
+    DeviceId, DeviceName, DocFile, DocId, DocVersion, ListingEntry, MirrorRules, RepoConfig,
+    RepoId, RepoTree, TabletState, XochitlPath,
 };
 use crate::progress::Progress;
 
@@ -80,6 +87,13 @@ pub enum CycleError {
     /// The tablet has no hub state.
     #[error("the tablet is not attached to a hub; run `rmu hub clone` first")]
     NotAttached,
+
+    /// `clone --reattach` to the same repository while an interrupted
+    /// sync's journal is pending: `sync` reconciles it first.
+    #[error(
+        "an interrupted sync left a journal on the tablet; run `rmu hub sync` first, then reattach if it still fails"
+    )]
+    JournalPending,
 
     /// `clone` on a tablet that already has hub state.
     #[error(
@@ -195,7 +209,9 @@ pub struct HubOptions {
     pub break_lock: bool,
     pub thresholds: GuardThresholds,
     /// Origin URL for this invocation (`--origin`); the tablet's stored
-    /// one otherwise.
+    /// one otherwise. `sync`, `backup`, `status`, `dry_run`, `remote` and
+    /// `detach` use it; `init`, `clone_tablet` and `set_remote_url` take
+    /// their origin as an argument and ignore it.
     pub origin: Option<String>,
     /// The date in fork names, `yyyy-mm-dd`; today (UTC) if `None`.
     pub date: Option<String>,
@@ -240,7 +256,7 @@ pub struct Hub<'a> {
 }
 
 /// What `init` created.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct InitReport {
     pub config: RepoConfig,
     /// The first commit of `main`.
@@ -248,10 +264,14 @@ pub struct InitReport {
 }
 
 /// How `main` was updated.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", content = "commit", rename_all = "snake_case")]
 pub enum MainUpdate {
     /// The tablet already matched origin: nothing pushed.
     UpToDate,
+    /// The tablet had no changes of its own (its documents equal their
+    /// base versions): nothing pushed, origin's changes applied.
+    Pulled,
     /// Origin had not moved: the snapshot became `main`.
     FastForward(Oid),
     /// A merge commit (first parent: origin `main`, second: the snapshot).
@@ -259,7 +279,7 @@ pub enum MainUpdate {
 }
 
 /// What reconciling an interrupted run did.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct Reconciled {
     /// The journaled merge never reached origin: journal dropped, bases
     /// unchanged.
@@ -270,25 +290,95 @@ pub struct Reconciled {
     pub kept: Vec<DocId>,
 }
 
+/// Files read from the tablet.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct Downloaded {
+    pub files: usize,
+    pub bytes: u64,
+}
+
 /// What reading the tablet found besides documents.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct ReadSummary {
-    /// Files downloaded and their bytes (the stopped read; files whose
-    /// stat matched a recorded one are not read again).
-    pub downloaded: (usize, u64),
+    /// Files downloaded while xochitl was stopped (files whose stat
+    /// matched a recorded one, or that the pre-read already read, are not
+    /// read again).
+    pub downloaded: Downloaded,
     /// Files the mirror leaves on the tablet (thumbnails, `.local`,
     /// `.tree`, unknown files, symlinks, unlistable names).
     pub unmirrored: usize,
 }
 
+/// A stale tablet lock this run took over.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TakeOver {
+    /// The previous owner (`None` if its record was unreadable).
+    pub previous: Option<LockOwner>,
+    pub reason: StaleReason,
+}
+
+/// Something the user should know about a run that otherwise succeeded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Warning {
+    /// `clone`: the repository has only seen tablets of another model.
+    MixedModel { seen: String, model: String },
+    /// The watchdog could not be disarmed: it will restart the (running)
+    /// xochitl when it fires, which also makes the lock stale.
+    DisarmFailed { error: String },
+    /// The tablet lock could not be released: it goes stale only when a
+    /// watchdog fires, else `--break-lock` frees it.
+    ReleaseFailed { error: String },
+    /// The staging directory could not be cleared (the next run clears
+    /// it).
+    StagingNotCleared { error: String },
+    /// `git maintenance run --auto` on the local cache failed.
+    MaintenanceFailed { error: String },
+    /// `detach`: the journal of an interrupted sync was discarded.
+    JournalDiscarded,
+    /// `detach`: the device ref on origin could not be deleted.
+    DeviceRefNotPruned { error: String },
+}
+
+impl fmt::Display for Warning {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Warning::MixedModel { seen, model } => write!(
+                f,
+                "this repository has only seen {seen} tablets so far; {model} is untested with it (documents are merged per format, but nothing has been validated across models)"
+            ),
+            Warning::DisarmFailed { error } => write!(f, "could not disarm the watchdog: {error}"),
+            Warning::ReleaseFailed { error } => {
+                write!(f, "could not release the tablet lock: {error}")
+            }
+            Warning::StagingNotCleared { error } => {
+                write!(f, "could not clear the staging directory: {error}")
+            }
+            Warning::MaintenanceFailed { error } => {
+                write!(f, "cache maintenance failed: {error}")
+            }
+            Warning::JournalDiscarded => {
+                f.write_str("the journal of an interrupted sync was discarded")
+            }
+            Warning::DeviceRefNotPruned { error } => {
+                write!(f, "could not delete the device ref on origin: {error}")
+            }
+        }
+    }
+}
+
 /// What one sync (or clone) did.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SyncReport {
     pub update: MainUpdate,
-    /// The snapshot commit (device ref).
+    /// The snapshot commit (device ref). For [`MainUpdate::Pulled`] it is
+    /// a local commit only.
     pub snapshot: Oid,
     /// The commit the tablet now agrees with.
     pub base: Oid,
+    /// `clone`: the documents whose version matched one in origin's
+    /// history, with the commit taken as their base (empty for `sync`).
+    pub inferred: BTreeMap<DocId, Oid>,
     /// Documents written to or deleted from the tablet.
     pub applied: Vec<DocId>,
     /// Documents not applied because they changed during the sync or
@@ -296,7 +386,8 @@ pub struct SyncReport {
     pub skipped: Vec<DocId>,
     /// Malformed documents (neither deleted nor changed), with why.
     pub quarantined: BTreeMap<DocId, String>,
-    /// Files without a `.metadata` for documents origin does not know.
+    /// Files without a `.metadata` that are not rmu's own leftovers
+    /// (left alone).
     pub orphans: Vec<DocId>,
     pub read: ReadSummary,
     pub notes: Vec<Note>,
@@ -305,13 +396,12 @@ pub struct SyncReport {
     pub summary: Summary,
     pub reconciled: Option<Reconciled>,
     pub push_attempts: usize,
-    /// The previous lock owner, if this run took a stale lock over.
-    pub took_over: Option<(Option<LockOwner>, StaleReason)>,
-    pub warnings: Vec<String>,
+    pub took_over: Option<TakeOver>,
+    pub warnings: Vec<Warning>,
 }
 
 /// What `backup` did.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct BackupReport {
     pub snapshot: Oid,
     /// `false` if the device ref already held this snapshot.
@@ -319,12 +409,13 @@ pub struct BackupReport {
     pub quarantined: BTreeMap<DocId, String>,
     pub orphans: Vec<DocId>,
     pub read: ReadSummary,
-    pub took_over: Option<(Option<LockOwner>, StaleReason)>,
-    pub warnings: Vec<String>,
+    pub took_over: Option<TakeOver>,
+    pub warnings: Vec<Warning>,
 }
 
 /// One document's change on the tablet since its base.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DocChange {
     Added,
     Modified,
@@ -332,7 +423,7 @@ pub enum DocChange {
 }
 
 /// A conflict copy that still has its generated name.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct OpenConflict {
     pub original: DocId,
     pub copy: DocId,
@@ -340,7 +431,7 @@ pub struct OpenConflict {
 }
 
 /// `status`: read-only, best effort (xochitl keeps running).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct StatusReport {
     pub repo_id: RepoId,
     pub device_id: DeviceId,
@@ -365,19 +456,68 @@ pub struct StatusReport {
 }
 
 /// `sync --dry-run`: the status plus the planned tablet writes.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct DryRunReport {
     pub status: StatusReport,
     /// Documents the sync would write on the tablet.
     pub writes: Vec<DocId>,
     /// Documents the sync would delete from the tablet.
     pub deletes: Vec<DocId>,
-    /// How `main` would be updated (merge commits are not created: `Merge`
-    /// carries no id meaning).
+    /// Whether the sync would push to origin `main` (it would not when
+    /// the tablet already agrees with origin, or has no changes of its
+    /// own).
     pub would_push: bool,
 }
 
+/// `remote`: the tablet's hub attachment and its origin URL.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RemoteReport {
+    pub repo_id: RepoId,
+    pub device_id: DeviceId,
+    pub device_name: DeviceName,
+    /// The URL stored on the tablet.
+    pub origin: String,
+    /// The URL this invocation uses ([`HubOptions::origin`] if set).
+    pub effective: String,
+}
+
+/// What `remote set-url` changed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SetUrlReport {
+    /// The URL the tablet stored before.
+    pub previous: String,
+    pub remote: RemoteReport,
+    pub took_over: Option<TakeOver>,
+    pub warnings: Vec<Warning>,
+}
+
+/// What `detach` did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DetachReport {
+    pub repo_id: RepoId,
+    pub device_id: DeviceId,
+    /// The device ref deleted from origin, if asked and it existed.
+    pub pruned: Option<String>,
+    pub took_over: Option<TakeOver>,
+    pub warnings: Vec<Warning>,
+}
+
 // ---- helpers ------------------------------------------------------------------
+
+/// Whether `origin` names a local path rather than a remote URL, by git's
+/// own rule: no `scheme://`, and no `host:` before the first `/` (the
+/// scp-like `host:path` form). `init` creates a local path that does not
+/// exist yet.
+pub fn is_local_path(origin: &str) -> bool {
+    if origin.contains("://") {
+        return false;
+    }
+    match (origin.find(':'), origin.find('/')) {
+        (None, _) => true,
+        (Some(colon), Some(slash)) => slash < colon,
+        (Some(_), None) => false,
+    }
+}
 
 /// Refuse URLs that carry a password (`scheme://user:pass@host`).
 fn check_url(url: &str) -> Result<()> {
@@ -455,31 +595,44 @@ fn is_transport(error: &Error) -> bool {
     )
 }
 
-/// JSON blobs read in this run (not in the cache until the snapshot is
-/// committed) in front of the cache.
-struct ReadJson<'a> {
-    read: HashMap<&'a Oid, &'a Vec<u8>>,
-    store: &'a Store,
+/// JSON blobs the cache does not have yet (read in this run, before the
+/// snapshot is committed; new in a merge not committed yet) in front of
+/// the cache.
+struct Overlay<'a> {
+    bytes: HashMap<&'a Oid, &'a [u8]>,
+    below: &'a dyn JsonBlobs,
 }
 
-impl<'a> ReadJson<'a> {
-    fn new(read: &'a TabletRead, store: &'a Store) -> Self {
+impl<'a> Overlay<'a> {
+    /// The `.metadata`/`.content` a tablet read holds.
+    fn read(read: &'a TabletRead, below: &'a dyn JsonBlobs) -> Self {
         Self {
-            read: read
+            bytes: read
                 .files
                 .iter()
-                .filter_map(|(path, file)| Some((&file.blob, read.json.get(path)?)))
+                .filter_map(|(path, file)| Some((&file.blob, read.json.get(path)?.as_slice())))
                 .collect(),
-            store,
+            below,
+        }
+    }
+
+    /// Blobs a merge wrote that are not committed yet.
+    fn new_blobs(blobs: &'a HashMap<Oid, Vec<u8>>, below: &'a dyn JsonBlobs) -> Self {
+        Self {
+            bytes: blobs
+                .iter()
+                .map(|(oid, bytes)| (oid, bytes.as_slice()))
+                .collect(),
+            below,
         }
     }
 }
 
-impl JsonBlobs for ReadJson<'_> {
+impl JsonBlobs for Overlay<'_> {
     fn json(&self, id: &Oid) -> Result<Option<Rc<Value>>> {
-        match self.read.get(id) {
+        match self.bytes.get(id) {
             Some(bytes) => Ok(serde_json::from_slice::<Value>(bytes).ok().map(Rc::new)),
-            None => self.store.json(id),
+            None => self.below.json(id),
         }
     }
 }
@@ -517,6 +670,22 @@ fn tablet_version(files: &BTreeMap<DocFile, Oid>) -> DocVersion {
     }
 }
 
+/// The tablet's files as read, per document, as versions.
+fn tablet_versions(read: &TabletRead) -> BTreeMap<DocId, DocVersion> {
+    read.doc_files()
+        .iter()
+        .map(|(doc, files)| (doc.clone(), tablet_version(files)))
+        .collect()
+}
+
+fn quarantine_report(snapshot: &Snapshot) -> BTreeMap<DocId, String> {
+    snapshot
+        .quarantined
+        .iter()
+        .map(|(doc, reason)| (doc.clone(), reason.to_string()))
+        .collect()
+}
+
 /// The mirrored path of a document's file.
 fn xochitl_path(doc: &DocId, file: &DocFile) -> Result<XochitlPath> {
     Ok(XochitlPath::new(file.xochitl_path(doc))?)
@@ -534,8 +703,15 @@ struct OriginCtx {
 }
 
 impl OriginCtx {
-    fn new(cache: Cache, url: String, device: Option<&DeviceId>) -> Result<Self> {
-        let remote = store::fetch(&cache.repo, &url, device)?;
+    /// Fetch and read origin's configuration; `advertised` is an
+    /// `ls-remote` just made (by [`store::open_cache`]), reused.
+    fn new(
+        cache: Cache,
+        url: String,
+        device: Option<&DeviceId>,
+        advertised: Option<Vec<crate::git::RemoteRef>>,
+    ) -> Result<Self> {
+        let remote = store::fetch(&cache.repo, &url, device, advertised)?;
         let main = remote
             .main
             .clone()
@@ -554,10 +730,11 @@ impl OriginCtx {
         })
     }
 
-    /// Fetch again (steps 4 and 8): `main` may have moved, its
-    /// `.rmu/hub.json` must not have changed.
+    /// Fetch again (under the lock, at step 8, and to resolve a lost
+    /// push acknowledgement): `main` may have moved, its `.rmu/hub.json`
+    /// must not have changed.
     fn refresh(&mut self, device: &DeviceId) -> Result<()> {
-        let remote = store::fetch(&self.cache.repo, &self.url, Some(device))?;
+        let remote = store::fetch(&self.cache.repo, &self.url, Some(device), None)?;
         let main = remote.main.clone().ok_or_else(|| CycleError::OriginEmpty {
             url: self.url.clone(),
         })?;
@@ -676,10 +853,12 @@ fn trees_equivalent(
     a: &RepoTree,
     b: &RepoTree,
     json: &dyn JsonBlobs,
+    except: &BTreeSet<DocId>,
 ) -> Result<bool> {
     a.docs
         .keys()
         .chain(b.docs.keys())
+        .filter(|doc| !except.contains(*doc))
         .collect::<BTreeSet<_>>()
         .into_iter()
         .try_fold(true, |same, doc| {
@@ -687,8 +866,13 @@ fn trees_equivalent(
         })
 }
 
-/// Write every new blob of a merge outcome and return its tree.
-fn realise(writer: &mut CommitWriter, outcome: &MergeOutcome) -> Result<RepoTree> {
+/// Write every new blob of a merge outcome; its tree, and the new
+/// blobs' contents (the cache has them only once the commit is written).
+fn realise(
+    writer: &mut CommitWriter,
+    outcome: &MergeOutcome,
+) -> Result<(RepoTree, HashMap<Oid, Vec<u8>>)> {
+    let mut written = HashMap::new();
     let docs = outcome
         .docs
         .iter()
@@ -699,11 +883,15 @@ fn realise(writer: &mut CommitWriter, outcome: &MergeOutcome) -> Result<RepoTree
                 .map(|(file, entry)| {
                     let entry = match entry {
                         MergedEntry::Existing(entry) => entry.clone(),
-                        MergedEntry::New(bytes) => ListingEntry::regular(writer.write_blob(
-                            &format!("docs/{doc}/{}", file.repo_name()),
-                            bytes.len() as u64,
-                            &mut &bytes[..],
-                        )?),
+                        MergedEntry::New(bytes) => {
+                            let oid = writer.write_blob(
+                                &format!("docs/{doc}/{}", file.repo_name()),
+                                bytes.len() as u64,
+                                &mut &bytes[..],
+                            )?;
+                            written.insert(oid.clone(), bytes.clone());
+                            ListingEntry::regular(oid)
+                        }
                     };
                     Ok((file.clone(), entry))
                 })
@@ -717,10 +905,13 @@ fn realise(writer: &mut CommitWriter, outcome: &MergeOutcome) -> Result<RepoTree
             ))
         })
         .collect::<Result<_>>()?;
-    Ok(RepoTree {
-        docs,
-        extra: outcome.extra.clone(),
-    })
+    Ok((
+        RepoTree {
+            docs,
+            extra: outcome.extra.clone(),
+        },
+        written,
+    ))
 }
 
 /// Add a whole tree to a commit and write it.
@@ -757,18 +948,15 @@ impl<'t> Session<'t> {
     /// Take the lock, retrying once with the same request after a
     /// failure that may have been a lost acknowledgement (the retry then
     /// adopts the lock).
-    fn acquire(
-        &mut self,
-        request: &LockRequest,
-        break_lock: bool,
-    ) -> Result<Option<(Option<LockOwner>, StaleReason)>> {
+    fn acquire(&mut self, request: &LockRequest, break_lock: bool) -> Result<Option<TakeOver>> {
         let lock = match self.tablet.acquire_lock(request, break_lock) {
             Err(error) if is_transport(&error) => self.tablet.acquire_lock(request, break_lock)?,
             other => other?,
         };
-        let took_over = lock
-            .took_over()
-            .map(|(owner, reason)| (owner.cloned(), reason));
+        let took_over = lock.took_over().map(|(owner, reason)| TakeOver {
+            previous: owner.cloned(),
+            reason,
+        });
         self.lock = Some(lock);
         Ok(took_over)
     }
@@ -803,15 +991,19 @@ impl<'t> Session<'t> {
     /// nothing unsafe (a pending watchdog only restarts a running
     /// xochitl; a left lock goes stale when it fires), so they are
     /// warnings.
-    fn finish(&mut self) -> Vec<String> {
+    fn finish(&mut self) -> Vec<Warning> {
         let Some(lock) = self.lock.take() else {
             return Vec::new();
         };
         let disarm = self.tablet.disarm_watchdog(&lock).err();
         let release = self.tablet.release_lock(&lock).err();
         [
-            disarm.map(|e| format!("could not disarm the watchdog: {e}")),
-            release.map(|e| format!("could not release the tablet lock: {e}")),
+            disarm.map(|e| Warning::DisarmFailed {
+                error: e.to_string(),
+            }),
+            release.map(|e| Warning::ReleaseFailed {
+                error: e.to_string(),
+            }),
         ]
         .into_iter()
         .flatten()
@@ -825,10 +1017,7 @@ impl<'t> Session<'t> {
         let Some(lock) = self.lock.take() else {
             return;
         };
-        let running = match self.maybe_stopped {
-            true => self.tablet.start_xochitl(&lock).is_ok(),
-            false => true,
-        };
+        let running = !self.maybe_stopped || self.tablet.start_xochitl(&lock).is_ok();
         if running {
             let _ = self.tablet.disarm_watchdog(&lock);
         }
@@ -846,8 +1035,26 @@ struct Prepared<'p> {
     /// Device time of the step-6 start (racy-entry reference).
     started_at: i64,
     info: DeviceInfo,
-    took_over: Option<(Option<LockOwner>, StaleReason)>,
+    took_over: Option<TakeOver>,
     reconciled: Option<Reconciled>,
+}
+
+/// A merge against origin `main` as a sync runs it (and `--dry-run`
+/// previews it): consent, the merge itself, its new blobs streamed into a
+/// commit writer not committed yet, and what it means for pushing.
+struct MergeRun<'p> {
+    theirs: RepoTree,
+    outcome: MergeOutcome,
+    merged: RepoTree,
+    /// Holds the merge's new blobs, until it commits.
+    writer: CommitWriter<'p>,
+    /// The tablet already agrees with origin: nothing to push or apply.
+    /// Quarantined documents carry their base version, and documents the
+    /// apply leaves alone keep their previous base: neither counts.
+    up_to_date: bool,
+    /// The tablet has no changes of its own (every document equals its
+    /// base version) and the merge is origin's tree: nothing to push.
+    pull_only: bool,
 }
 
 /// What steps 8–11 decided.
@@ -922,16 +1129,23 @@ impl<'a> Hub<'a> {
     }
 
     /// Run `body` on a tablet session: on error, the error path; on
-    /// success, disarm and release (warnings returned).
+    /// success, disarm and release, then (if `body` hands its origin back,
+    /// whose cache `flock` is still held) `git maintenance run --auto` on
+    /// the cache, with the tablet free again. Warnings returned.
     fn session<T>(
         &self,
         tablet: &dyn Tablet,
-        body: impl FnOnce(&mut Session) -> Result<T>,
-    ) -> Result<(T, Vec<String>)> {
+        body: impl FnOnce(&mut Session) -> Result<(T, Option<OriginCtx>)>,
+    ) -> Result<(T, Vec<Warning>)> {
         let mut session = Session::new(tablet, self.options.watchdog);
-        let result = body(&mut session);
-        let result = match result {
-            Ok(value) => Ok((value, session.finish())),
+        let result = match body(&mut session) {
+            Ok((value, origin)) => {
+                let mut warnings = session.finish();
+                if let Some(origin) = origin {
+                    warnings.extend(self.maintain(&origin));
+                }
+                Ok((value, warnings))
+            }
             Err(error) => {
                 session.abort();
                 Err(error)
@@ -941,49 +1155,151 @@ impl<'a> Hub<'a> {
         result
     }
 
+    /// `git maintenance run --auto` on the cache (the user's thresholds
+    /// decide whether anything happens); a failure is only a warning.
+    fn maintain(&self, origin: &OriginCtx) -> Option<Warning> {
+        self.progress.step("Maintaining the local cache");
+        origin
+            .cache
+            .repo
+            .maintenance_auto()
+            .err()
+            .map(|error| Warning::MaintenanceFailed {
+                error: error.to_string(),
+            })
+    }
+
+    /// The merge a sync runs against origin's current `main`.
+    fn run_merge<'p>(
+        &'p self,
+        origin: &OriginCtx,
+        state: &TabletState,
+        base_tree: &RepoTree,
+        snapshot: &Snapshot,
+        read: &TabletRead,
+    ) -> Result<MergeRun<'p>> {
+        let (store, rules, main) = (&origin.store, origin.rules, &origin.main);
+        let theirs = store.tree_of(rules, main)?;
+        let consented = consented_deletions(store, main, state, &snapshot.tree, &theirs)?;
+        let date = self.date();
+        let outcome = merge::merge(
+            &MergeInput {
+                base: base_tree,
+                ours: &snapshot.tree,
+                theirs: &theirs,
+            },
+            store,
+            &StoreHistory {
+                store,
+                rules,
+                tip: main,
+            },
+            &MergeParams {
+                rules,
+                device_name: &state.device_name,
+                date: &date,
+                allow_deletions: self.options.allow_deletions,
+                thresholds: self.options.thresholds,
+                consented_deletions: &consented,
+            },
+        )?;
+        let mut writer = origin.cache.repo.commit_writer(self.progress, None)?;
+        let (merged, new_blobs) = realise(&mut writer, &outcome)?;
+        let merged_json = Overlay::new_blobs(&new_blobs, store);
+        let json = Overlay::read(read, &merged_json);
+        let left_alone = plan::left_alone(rules, &merged, &tablet_versions(read), &json)?;
+        let except: BTreeSet<DocId> = snapshot
+            .quarantined
+            .keys()
+            .cloned()
+            .chain(left_alone)
+            .collect();
+        let none = BTreeSet::new();
+        let merge_is_theirs = trees_equivalent(rules, &merged, &theirs, &json, &none)?;
+        let up_to_date =
+            merge_is_theirs && trees_equivalent(rules, &snapshot.tree, &theirs, &json, &except)?;
+        let pull_only =
+            merge_is_theirs && trees_equivalent(rules, &snapshot.tree, base_tree, &json, &none)?;
+        drop(json);
+        Ok(MergeRun {
+            theirs,
+            outcome,
+            merged,
+            writer,
+            up_to_date,
+            pull_only,
+        })
+    }
+
     // ---- init ---------------------------------------------------------------------
 
     /// `rmu hub init`: give an empty origin its `.rmu/hub.json` (a new repo
     /// id, the newest mirror rules) as the first commit of `main`. A local
-    /// path that does not exist yet becomes a new bare repository.
+    /// path ([`is_local_path`]) that does not exist yet becomes a new bare
+    /// repository. `origin` is used as given: [`HubOptions::origin`] does
+    /// not apply. On failure, whatever this call created (that new
+    /// repository, the cache) is removed again.
     pub fn init(&self, origin: &str) -> Result<InitReport> {
+        self.progress.step("Initialising origin");
+        let result = self.init_inner(origin);
+        self.progress.finished();
+        result
+    }
+
+    fn init_inner(&self, origin: &str) -> Result<InitReport> {
         check_url(origin)?;
         let local = Path::new(origin);
-        if !origin.contains("://") && !local.exists() && !origin.contains(':') {
+        let created = is_local_path(origin) && !local.exists();
+        if created {
             self.git.init_bare(local, crate::git::ObjectFormat::Sha1)?;
         }
         let config = RepoConfig::new(RepoId::random());
-        let cache = store::open_cache(&self.git, &self.cache_dir, &config.repo_id, origin)?;
-        let remote = store::fetch(&cache.repo, origin, None)?;
-        if remote.main.is_some() {
-            return Err(CycleError::AlreadyInitialised {
-                url: origin.to_string(),
+        let cache_path = self.cache_dir.join(format!("{}.git", config.repo_id));
+        let lock_path = self.cache_dir.join(format!("{}.lock", config.repo_id));
+        let attempt = || -> Result<Oid> {
+            let (cache, refs) =
+                store::open_cache(&self.git, &self.cache_dir, &config.repo_id, origin)?;
+            if refs.iter().any(|reference| reference.name == store::MAIN) {
+                return Err(CycleError::AlreadyInitialised {
+                    url: origin.to_string(),
+                }
+                .into());
             }
-            .into());
-        }
-        let signature = rmu_signature(unix_now());
-        let mut writer = cache.repo.commit_writer(self.progress, None)?;
-        writer.add_bytes(
-            crate::hub::model::REPO_CONFIG_PATH,
-            FileMode::Regular,
-            config.to_json().as_bytes(),
-        )?;
-        let commit = writer.commit(&CommitMeta {
-            parents: Vec::new(),
-            author: signature.clone(),
-            committer: signature,
-            message: "rmu hub: init\n".to_string(),
-        })?;
-        store::push(
-            &cache.repo,
-            origin,
-            &commit,
-            store::MAIN,
-            Some(&Expected::Absent),
-            store::LOCAL_MAIN,
-        )?;
-        self.progress.finished();
-        Ok(InitReport { config, commit })
+            let signature = rmu_signature(unix_now());
+            let mut writer = cache.repo.commit_writer(self.progress, None)?;
+            writer.add_bytes(
+                crate::hub::model::REPO_CONFIG_PATH,
+                FileMode::Regular,
+                config.to_json().as_bytes(),
+            )?;
+            let commit = writer.commit(&CommitMeta {
+                parents: Vec::new(),
+                author: signature.clone(),
+                committer: signature,
+                message: "rmu hub: init\n".to_string(),
+            })?;
+            store::push(
+                &cache.repo,
+                origin,
+                &commit,
+                store::MAIN,
+                Some(&Expected::Absent),
+                store::LOCAL_MAIN,
+            )?;
+            Ok(commit)
+        };
+        attempt()
+            .map(|commit| InitReport {
+                config: config.clone(),
+                commit,
+            })
+            .inspect_err(|_| {
+                let _ = std::fs::remove_dir_all(&cache_path);
+                let _ = std::fs::remove_file(&lock_path);
+                if created {
+                    let _ = std::fs::remove_dir_all(local);
+                }
+            })
     }
 }
 
@@ -998,6 +1314,28 @@ mod tests {
         assert_eq!(civil_date(1_794_182_400), "2026-11-09");
         assert_eq!(civil_date(1_794_268_799), "2026-11-09");
         assert_eq!(civil_date(-86_400), "1969-12-31");
+    }
+
+    #[test]
+    fn local_paths_follow_gits_rule() {
+        [
+            "/srv/git/library.git",
+            "library.git",
+            "./a:b",
+            "../x/y.git",
+            "dir/with:colon",
+        ]
+        .iter()
+        .for_each(|origin| assert!(is_local_path(origin), "{origin}"));
+        [
+            "ssh://git@example.invalid/library.git",
+            "file:///srv/git/library.git",
+            "git@example.invalid:library.git",
+            "host:library.git",
+            "host:dir/library.git",
+        ]
+        .iter()
+        .for_each(|origin| assert!(!is_local_path(origin), "{origin}"));
     }
 
     #[test]

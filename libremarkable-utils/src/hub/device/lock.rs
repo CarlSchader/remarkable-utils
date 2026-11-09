@@ -21,6 +21,8 @@
 use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde::Serialize;
+
 use super::DeviceError;
 use crate::error::Result;
 
@@ -72,7 +74,7 @@ impl LockRequest {
 }
 
 /// A parsed owner record.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LockOwner {
     pub run: String,
     pub host: String,
@@ -93,7 +95,8 @@ impl fmt::Display for LockOwner {
 
 /// The lock as seen without taking it (`status`, and the other mutating
 /// commands, which refuse while it is held).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", content = "owner", rename_all = "snake_case")]
 pub enum LockState {
     Free,
     /// Held; `None` if the owner record is missing or unreadable.
@@ -101,7 +104,8 @@ pub enum LockState {
 }
 
 /// Why a held lock was taken over.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum StaleReason {
     /// The tablet rebooted since the lock was taken.
     BootChanged,

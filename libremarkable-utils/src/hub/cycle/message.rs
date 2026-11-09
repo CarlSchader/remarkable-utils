@@ -63,9 +63,10 @@ fn compose(subject: &str, body: &[String], trailers: &[(&'static str, String)]) 
         .map(|(key, value)| format!("{key}: {}", one_line(value)))
         .collect::<Vec<_>>()
         .join("\n");
-    match body.is_empty() {
-        true => format!("{}\n\n{trailers}\n", one_line(subject)),
-        false => format!("{}\n\n{body}\n\n{trailers}\n", one_line(subject)),
+    if body.is_empty() {
+        format!("{}\n\n{trailers}\n", one_line(subject))
+    } else {
+        format!("{}\n\n{body}\n\n{trailers}\n", one_line(subject))
     }
 }
 

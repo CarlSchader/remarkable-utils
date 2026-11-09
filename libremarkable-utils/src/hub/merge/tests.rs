@@ -2997,3 +2997,34 @@ fn the_restore_note_does_not_claim_the_item_itself_was_edited() {
         )
     );
 }
+
+#[test]
+fn unchanged_is_the_per_document_tables_no_change() {
+    let mut lib = Lib::default();
+    let rules = MirrorRules::latest();
+    let skeleton = D::skeleton("Imported", "").tags(&["a", "b"]);
+    let base = skeleton.build(&mut lib);
+    let check = |lib: &mut Lib, side: &D| {
+        let side = side.build(lib);
+        unchanged(rules, &u(1), &base, &side, &lib.blobs).unwrap()
+    };
+    // Opened (materialised), read, tags reordered: no change.
+    assert!(check(
+        &mut lib,
+        &opened(&skeleton, 100, 3).tags(&["a", "b"])
+    ));
+    assert!(check(
+        &mut lib,
+        &skeleton.clone().set("lastOpened", json!("9"))
+    ));
+    assert!(check(&mut lib, &skeleton.clone().tags(&["b", "a"])));
+    // Renamed, inked, tagged: changes.
+    assert!(!check(&mut lib, &skeleton.clone().rename("Other")));
+    assert!(!check(
+        &mut lib,
+        &opened(&skeleton, 100, 3).tags(&["a", "b"]).ink(101, "ink")
+    ));
+    assert!(!check(&mut lib, &skeleton.clone().tags(&["a"])));
+    // Never for an absent side.
+    assert!(!unchanged(rules, &u(1), &base, &DocVersion::default(), &lib.blobs).unwrap());
+}

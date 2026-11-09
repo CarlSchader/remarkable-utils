@@ -472,6 +472,46 @@ impl Repo {
         }
     }
 
+    /// Delete the full remote ref `dst`, only if it is at `expected`
+    /// (`--force-with-lease`): a compare-and-swap like [`Repo::push`]'s,
+    /// with the same errors ([`Error::PushRejected`] when it moved).
+    pub fn delete_remote_ref(&self, url: &str, dst: &str, expected: &Oid) -> Result<()> {
+        validate_ref_name(dst)?;
+        let mut cmd = self.command("push");
+        cmd.args(["--porcelain", "--no-verify"])
+            .arg(format!("--force-with-lease={dst}:{expected}"))
+            .arg("--end-of-options")
+            .arg(url)
+            .arg(format!(":{dst}"));
+        let output = output("push", &mut cmd)?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let status = parse_push_porcelain(&String::from_utf8_lossy(&output.stdout))
+            .into_iter()
+            .find(|status| status.to == dst);
+        match status {
+            Some(status) if status.flag == '-' && output.status.success() => Ok(()),
+            Some(status) if status.flag == '!' => {
+                let reason = status.reason.unwrap_or_else(|| status.summary.clone());
+                match status.summary.as_str() {
+                    "[rejected]" => Err(Error::PushRejected {
+                        reference: dst.to_string(),
+                        reason,
+                    }),
+                    summary => Err(Error::PushFailed {
+                        reference: dst.to_string(),
+                        reason: format!("{summary} ({reason})"),
+                        stderr: stderr.trim().to_string(),
+                    }),
+                }
+            }
+            Some(status) => Err(output_error(
+                "push",
+                format!("unexpected status {:?} deleting {dst}", status.flag),
+            )),
+            None => Err(failure("push", &output)),
+        }
+    }
+
     /// Resolve `rev` like `git rev-parse --verify`; `None` if it does not
     /// resolve. A full hex id resolves even if the object is absent:
     /// append `^{commit}` (or `^{object}`) to require that it exists.
@@ -564,6 +604,15 @@ impl Repo {
     /// followed: on a branch whose every update is a merge with the
     /// previous tip as first parent, that is the branch's own history.
     pub fn rev_list(&self, revisions: &[&str], first_parent: bool) -> Result<Vec<Oid>> {
+        let options: &[&str] = if first_parent {
+            &["--first-parent"]
+        } else {
+            &[]
+        };
+        self.rev_list_with(revisions, options)
+    }
+
+    fn rev_list_with(&self, revisions: &[&str], options: &[&str]) -> Result<Vec<Oid>> {
         if let Some(bad) = revisions
             .iter()
             .find(|rev| rev.is_empty() || rev.starts_with('-') || rev.contains(char::is_control))
@@ -571,15 +620,19 @@ impl Repo {
             return Err(Error::InvalidGitInput(format!("invalid revision {bad:?}")));
         }
         let mut cmd = self.command("rev-list");
-        if first_parent {
-            cmd.arg("--first-parent");
-        }
-        cmd.arg("--end-of-options").args(revisions);
+        cmd.args(options).arg("--end-of-options").args(revisions);
         let out = run("rev-list", &mut cmd)?;
         out.split(|&b| b == b'\n')
             .filter(|line| !line.is_empty())
             .map(|line| parse_oid_line("rev-list", line))
             .collect()
+    }
+
+    /// Every commit reachable from `revisions`, children before their
+    /// parents (`--topo-order`), so the first commit of a line of history
+    /// is its newest.
+    pub fn rev_list_topo(&self, revisions: &[&str]) -> Result<Vec<Oid>> {
+        self.rev_list_with(revisions, &["--topo-order"])
     }
 
     /// The size of each of `oids` the repository has (absent ones are
@@ -1349,14 +1402,17 @@ pub fn parse_tree(data: &[u8], format: ObjectFormat) -> Result<Vec<TreeEntry>> {
     let entry_at = |rest: &[u8]| -> Result<(TreeEntry, usize)> {
         let space = rest.iter().position(|&b| b == b' ').ok_or_else(malformed)?;
         let nul = rest.iter().position(|&b| b == 0).ok_or_else(malformed)?;
-        let mode = std::str::from_utf8(&rest[..space])
-            .ok()
+        // Octal digits only (`from_str_radix` alone would take a sign).
+        let mode = Some(&rest[..space])
+            .filter(|mode| !mode.is_empty() && mode.iter().all(|b| (b'0'..=b'7').contains(b)))
+            .and_then(|mode| std::str::from_utf8(mode).ok())
             .and_then(|mode| u32::from_str_radix(mode, 8).ok())
             .filter(|_| space < nul)
             .ok_or_else(malformed)?;
         let name = &rest[space + 1..nul];
         let id = rest.get(nul + 1..nul + 1 + id_len).ok_or_else(malformed)?;
-        if name.is_empty() {
+        // A name is one path component, as `git fsck` requires.
+        if name.is_empty() || name == b"." || name == b".." || name.contains(&b'/') {
             return Err(malformed());
         }
         let kind = match mode {
@@ -2209,6 +2265,10 @@ mod tests {
             truncated.to_vec(),
             entry("10064x", b"f", A),
             entry("100644", b"", A),
+            entry("+100644", b"f", A),
+            entry("100644", b"a/b", A),
+            entry("40000", b".", A),
+            entry("40000", b"..", A),
             b"100644 f".to_vec(),
             entry("100644", b"f", A)[..10].to_vec(),
         ]

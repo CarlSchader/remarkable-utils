@@ -398,6 +398,10 @@ pub trait Tablet {
     /// (device `sync`) before returning.
     fn write_state(&self, lock: &HeldLock, state: &TabletState) -> Result<()>;
 
+    /// Delete the hub state file (`detach`), under the guard, and flush
+    /// (device `sync`). An absent state file is not an error.
+    fn remove_state(&self, lock: &HeldLock) -> Result<()>;
+
     /// Upload files into this run's staging directory (adding to what
     /// is already staged), in one transfer. Staged files are mode 0644;
     /// [`ApplyPlan`] carries each file's mode, set before it is moved.

@@ -234,8 +234,11 @@ rmu hub add <file.pdf> <folder>  # add a document to origin without a tablet
 The tablet is chosen with rmu's existing global SSH flags (`--host`,
 ssh config aliases), as for every other command. The origin URL stored
 on the tablet can be overridden per invocation (`--origin`) because ssh
-aliases differ between computers. URLs with embedded credentials are
-rejected.
+aliases differ between computers; `init`, `clone` and `remote set-url`
+take their origin as an argument and ignore it. URLs with embedded
+credentials are rejected. `init` creates a bare repository when given a
+local path that does not exist yet (git's rule: no `scheme://`, and no
+`host:` before the first `/`), and removes what it created if it fails.
 
 `status` and `--dry-run` never stop xochitl, take the lock, or push
 anything; their snapshot is best effort and they say so.
@@ -250,9 +253,10 @@ anything; their snapshot is best effort and they say so.
                 history; pre-read the tablet while xochitl still runs
  2. guard       take the tablet lock and arm the watchdog; refuse if the
                 tablet is paired with the reMarkable cloud; re-read the
-                tablet state; with a journal, fetch origin again, so
-                reconciliation never judges a lost push acknowledgement
-                against a stale cache
+                tablet state; fetch origin again, so reconciliation never
+                judges a lost push acknowledgement against a stale cache
+                (and a run that held the lock just before cannot make a
+                newer base read as a rewound origin)
  3. stop        (re-)arm the watchdog; systemctl stop xochitl
  4. reconcile   if a journal is left over, reconcile it now, while stopped
                 (see "Restartability")
@@ -269,13 +273,16 @@ anything; their snapshot is best effort and they say so.
 10. journal     write { merge, snapshot } to the tablet state
 11. push        push the merge to origin main (fast-forward only); on
                 rejection go back to 8 (rewriting the journal), at most
-                N times
+                N times; nothing when the tablet already matches origin
+                or has no changes of its own
 12. stage       upload new and changed files into the staging directory
 13. stop        arm the watchdog; systemctl stop xochitl
 14. apply       re-read changed metadata; verify; tree checks against the
                 live tablet; move staged files into place; device sync
 15. record      update base, overrides, manifest; clear the journal
-16. start       reset-failed + start xochitl; disarm the watchdog
+16. start       reset-failed + start xochitl; disarm the watchdog and
+                release the lock; then `git maintenance run --auto` on
+                the local cache, still under its flock
 ```
 
 The UI is down only for reconcile + snapshot (4–5) and apply (14), not
@@ -301,14 +308,19 @@ while implementing it, beyond the steps above:
   if it changes before step 8 (an upgrade landed meanwhile), the run
   stops rather than merge a snapshot classified under other rules.
 - **Pre-read.** Before taking the lock, while xochitl runs, the tablet is
-  read best effort (files that change while read are left out). The
-  stopped read of step 5 then downloads only files whose stat moved
-  since, so a tablet with gigabytes of new data (a first clone) is down
-  for seconds, not for the whole download. A pre-read stat is trusted
-  only with a nanosecond mtime (a coarse one could hide a change within
-  its second); everything else is read again while stopped. Step 5 reads
-  **before** step 4 decides: reconciliation judges the files just read,
-  and a document it finishes is read again.
+  read best effort (files that change while read are left out) into a
+  `fast-import` of its own, committed apart (nothing points at that
+  commit). The stopped read of step 5 then downloads only files whose
+  stat moved since, so a tablet with gigabytes of new data (a first
+  clone) is down for seconds, not for the whole download. A pre-read
+  entry counts only with a nanosecond mtime (a coarse one could hide a
+  change within its second) and only if its blob is in the cache (a
+  pre-read cut mid-file loses its whole `fast-import`); everything else
+  is read again while stopped. Step 5 reads **before** step 4 decides:
+  reconciliation judges the files just read, and a document it finishes
+  is read again. `status` and `--dry-run` read the same way, with the
+  second read also while xochitl runs (retried once if a file changes
+  while read).
 - **Pure work after the start.** Validation, carry-forward, and (for
   `clone`) base inference run after step 6; while xochitl is stopped
   only the stat pass and downloads (streamed into `fast-import`) happen.
@@ -327,16 +339,36 @@ while implementing it, beyond the steps above:
   outlasts the timeout is not repeated by the next run. Starts per
   cycle: two (one when nothing is applied), plus one if the watchdog
   fires, each after `reset-failed`.
-- **Updating `main`.** If every document of the snapshot is equivalent
-  to origin's (`.metadata`/`.content` compared normalised, other files
-  by blob), nothing is pushed: the merge may have taken the tablet's
-  bytes for a document whose difference is view state, and pushing that
-  would make two tablets push each other's view state on every sync.
-  Otherwise, if the merge result is exactly the snapshot, origin has not
-  moved since the snapshot's base, and no trailer is needed, the
-  snapshot fast-forwards `main`. Otherwise a merge commit is pushed, even
-  when its tree equals origin's: it makes the snapshot an ancestor of
-  `main`, which every base override pointing at the snapshot needs.
+- **Updating `main`.** If the merge result is origin's tree and every
+  document of the snapshot is equivalent to origin's (`.metadata`/
+  `.content` compared normalised, other files by blob), nothing is
+  pushed (`UpToDate`): the merge may have taken the tablet's bytes for a
+  document whose difference is view state, and pushing that would make
+  two tablets push each other's view state on every sync. If the merge
+  result is origin's tree and every document of the snapshot is
+  equivalent to its own base version (the tablet has no changes of its
+  own), nothing is pushed either (`Pulled`): origin's changes are
+  applied as they are (see "Pull-only runs" below). Otherwise, if the
+  merge result is exactly the snapshot, origin has not moved since the
+  snapshot's base, and no trailer is needed, the snapshot fast-forwards
+  `main`. Otherwise a merge commit is pushed, even when its tree equals
+  origin's: it makes the snapshot an ancestor of `main`, which every
+  base override pointing at the snapshot needs.
+- **Pull-only runs.** A run whose snapshot is equivalent to its virtual
+  base adds no merge commit to `main` (one per pull would double
+  first-parent history). The journal is still written before the apply,
+  as `{ merge: origin main as fetched, snapshot }`. Every override such
+  a run (or its reconciliation) would point at the snapshot points at
+  the document's previous base instead, which holds the same version
+  and, unlike the snapshot, is on `main`: documents skipped at step 14,
+  and, when reconciliation finds the journaled snapshot is not an
+  ancestor of the journaled merge, documents kept at their snapshot
+  version or changed since. The snapshot is still committed and pushed
+  to the device ref at step 7 (before the merge is known, and so that
+  another computer can reconcile the journal); a device ref already
+  holding the same tree is reused, so a tablet that changed nothing
+  pushes nothing at all. Device refs are never ancestors of `main`
+  unless merged, so they do not grow what base inference searches.
 - **A lost push acknowledgement** (any push error but a rejection) is
   resolved by fetching: if `main` contains the merge, the push landed
   and the run carries on to apply it.
@@ -347,7 +379,13 @@ while implementing it, beyond the steps above:
   device's own `sizeInBytes` do not ping-pong between tablets); other
   files when their blob or mode differs. Files the tablet has and the
   merge lacks are removed, leftovers without a `.metadata` included once
-  the document arrives. Staged JSON carries the view state read at step
+  the document arrives — but files without a `.metadata` are touched
+  only when every one already equals the merge's (what rmu's own
+  interrupted write leaves); anything else may be the user's document
+  that lost its `.metadata` (one in no base, after `--reattach`, say):
+  it is left alone, reported as an orphan, and keeps its previous base,
+  so a later repair is never read as the tablet undoing the merge.
+  Staged JSON carries the view state read at step
   5; files re-read at step 14 with other view state are re-staged with
   the fresh overlay while stopped. Written bytes that are not a blob rmu
   has (overlaid JSON) are left out of the manifest and read again next
@@ -368,12 +406,41 @@ while implementing it, beyond the steps above:
   never written or deleted, and keep their base version's place in the
   tree checks (a folder deleted above one counts as orphaning it).
 - **Staging sentinel.** Once everything an apply of merge M needs is
-  staged, rmu stages an empty `.rmu-staged-<M>` next to it. Staging is
-  cleared only at step 12 of a run whose journal is already written,
-  and after a recorded apply; reconciliation stages into its own run's
-  directory without clearing. The device layer lists what is still
-  staged (`Tablet::staged_files`), so reconciliation can tell an apply
-  that finished a document from one that did not (see "Restartability").
+  staged, rmu stages `.rmu-staged-<M>/<doc>` (empty) for every document
+  the plan changes, then `.rmu-staged-<M>/done`, in one transfer, next to
+  it. Staging is cleared only at step 12 of a run whose journal is
+  already written, and after a recorded apply; reconciliation stages
+  into its own run's directory, with a sentinel of its own, without
+  clearing. The device layer lists what is still staged
+  (`Tablet::staged_files`), so reconciliation knows which documents an
+  interrupted run planned, and which of their files it had not moved
+  yet (see "Restartability").
+- **Quarantined documents never make a sync push**: the snapshot
+  carries their base version, which the merge never takes over
+  origin's, so they are left out of the "already agrees with origin"
+  test. So are documents the apply leaves alone (files without a
+  `.metadata` that are not rmu's leftovers): they keep their previous
+  base, so no override points at the snapshot for them, and counting
+  them would push a no-op merge commit on every sync.
+- **`remote` and `detach`.** `Hub::remote` reports the stored and the
+  effective origin without the lock. `Hub::set_remote_url` stores a new
+  URL under the lock, after checking that it holds the tablet's
+  repository (repo id, every base in `main`'s history), so a wrong URL
+  fails there and not at the next sync. `Hub::detach` removes the hub
+  state and the staging directories under the lock and leaves every
+  document alone; with `--prune-ref` it first deletes the device ref on
+  origin, leased on the value origin just advertised (a failure there
+  is a warning). A pending journal is discarded with the state, with a
+  warning.
+- **Cache maintenance** (`git maintenance run --auto`, the user's
+  thresholds deciding whether anything happens) runs once the tablet is
+  disarmed and unlocked, with the cache's `flock` still held: a slow
+  repack never keeps other computers off the tablet or outlasts the
+  watchdog. A failure is a warning. Each run opens the cache with one
+  `ls-remote` (its advertisement picks the object format and is reused
+  by the first fetch); a `clone` killed mid-fetch leaves an
+  `incoming-*.git` that the next `clone` on that computer removes,
+  unless a running clone holds its `incoming-*.lock`.
 
 ### Snapshot validation
 
@@ -429,7 +496,10 @@ files are not downloaded again on every sync.
   ancestor of origin `main`. Otherwise origin was rewound or replaced:
   stop with an explanation. (A journaled merge that is not in origin is
   different: it means the push never landed, and reconciliation drops
-  the journal.) Nothing is inferred automatically, because a
+  the journal — unless a complete staging sentinel for it is on the
+  tablet: staging only follows a push that landed, so origin was
+  rewound after it did, and the run stops.) Nothing is inferred
+  automatically, because a
   rewound origin would otherwise read as "everything since was deleted".
   `rmu hub clone --reattach` is the deliberate recovery path; it treats
   the tablet like a fresh clone (below).
@@ -611,7 +681,10 @@ may write files:
 
 - If the journaled merge is **not** an ancestor of origin `main`, the
   push never landed. The journal is dropped; the tablet's bases are
-  unchanged, and its edits are picked up by this run's snapshot.
+  unchanged, and its edits are picked up by this run's snapshot. If a
+  run's complete staging sentinel for that merge is on the tablet, it
+  did land (nothing is staged before a push lands or is confirmed):
+  origin was rewound, and the run stops with `OriginRewound`.
 - Otherwise, the merge is part of origin. For each document whose merge
   version differs from its snapshot version, compared as normalised JSON
   (view-state and derived fields ignored):
@@ -621,17 +694,20 @@ may write files:
     ours = snapshot, theirs = origin) brings the merge's change again,
     staged while xochitl runs instead of during this outage;
   - every file is at its snapshot or merge version, some at each (the
-    apply stopped inside this document) → finish applying it (verify,
-    move, overlay view state, the step-14 tree checks), then base =
-    merge; a deletion interrupted after `.metadata` is finished as a
-    deletion, leftovers included;
+    apply stopped inside this document), and a run's complete staging
+    sentinel names the document → finish applying it (verify, move,
+    overlay view state, the step-14 tree checks), then base = merge; a
+    deletion interrupted after `.metadata` is finished as a deletion,
+    leftovers included. A document no run planned only looks half
+    applied (a quarantined one that lost its `.metadata`, say) and falls
+    under the next rule;
   - anything else (the user changed it since) → base override =
-    snapshot, unless the apply had finished the document: its staging
-    sentinel exists and none of the files it was to write is still
-    staged, and every file it was to remove is gone. Then the change is
-    on top of the merge and the document takes base = merge; without
-    this, an edit made after an unrecorded apply would read the merge as
-    the user's own change and fork it.
+    snapshot, unless the apply had finished the document: a run's
+    complete sentinel names it, none of the files it was to write is
+    still staged by that run, and every file it was to remove is gone.
+    Then the change is on top of the merge and the document takes base =
+    merge; without this, an edit made after an unrecorded apply would
+    read the merge as the user's own change and fork it.
 
   Documents whose merge and snapshot versions agree take base = merge.
   A document is never given base = merge unless its files are at the
@@ -639,7 +715,10 @@ may write files:
   changed them since). A conflict copy is finished only together with
   its original. An override for a document the snapshot lacks stays an
   explicit override: falling back to the default base would read it as
-  deleted by the tablet.
+  deleted by the tablet. For a pull-only journal (its snapshot is not an
+  ancestor of its merge), "base override = snapshot" means the
+  document's previous base, which holds the same version and is on
+  `main`.
 - The result (base = merge plus overrides, journal cleared) is written
   to the tablet before the snapshot, so a crash later in the run never
   pairs a new journal with stale bases. The run then continues with the
@@ -665,19 +744,44 @@ Further:
 - **Device ref bookkeeping**: `device_ref` is written to the tablet
   state immediately after each device-ref push (in `sync` and `backup`).
   If a later push fails its lease, a remote head that descends from the
-  recorded value is our own lost update and is accepted; anything else
-  means another tablet uses this device id, and the run stops. With no
-  recorded value, a remote head is accepted as our own lost first push
-  (device ids are random per clone, and a clone never reuses another
-  tablet's state); a recorded value with no remote ref stops the run.
+  recorded value is our own lost update and is accepted; a remote head
+  that does not (the ref was rewritten, deleted and recreated, or holds
+  an unrelated history) stops the run. That catches a rewritten or
+  replaced device ref, not two tablets sharing one device id (a copied
+  state file): every snapshot takes the remote head as a parent, so the
+  other tablet's pushes always descend from the recorded value, and the
+  ref interleaves both tablets' snapshots. No data is at risk either
+  way (every snapshot stays reachable, and `main` is merged per
+  document), and device ids are random per clone, so only a copied
+  state shares one. With no recorded value, a remote head is accepted
+  as our own lost first push (a clone never reuses another tablet's
+  state); a recorded value with no remote ref stops the run.
   `clone --reattach` is the way out of both stops.
-- **Known limits** (no ink is lost in either): a document the user
-  edits during the window of a sync that forks it is skipped, its copy
-  with it, and the next sync forks it again into a second copy (the
-  first one holds the tablet's version as of the snapshot); and a
-  document edited after the hub state was lost has no known base, so
-  `--reattach` treats it as new on both sides and forks it if it
-  differs from origin's.
+- **Known limits** (no ink is lost in any): a document the user edits
+  during the window of a sync that forks it is skipped, its copy with
+  it, and the next sync forks it again into a second copy (the first
+  one holds the tablet's version as of the snapshot); the same happens
+  when a forking sync's push lands and the run stops before its staging
+  completes, and the user then edits the original; and a document edited
+  after the hub state was lost has no known base, so `--reattach` treats
+  it as new on both sides and forks it if it differs from origin's; and
+  a rename or move the user exactly reverts, after a crash between an
+  apply and its record, is lost (the document reads as never reached by
+  the apply, so the next merge applies the change again; metadata only).
+- **Residual risks** (theoretical; no ink is lost): a pre-read entry is
+  trusted on stat equality alone, which is safe only if a file's
+  download starts at least one timestamp granule after its stat (a
+  jiffy on kernels before multigrain timestamps; it holds in practice
+  over SSH). And with the watchdog armed through the network phase, a
+  `main` push still in flight when the lock goes stale could land after
+  another computer took the lock over and dropped the journal as "never
+  landed"; the tablet's later edits would then fork once. That needs a
+  push longer than the watchdog timeout and a second computer syncing
+  the same tablet meanwhile.
+- **`clone --reattach` with a pending journal** for the same repository
+  refuses (`JournalPending`): only that journal's reconciliation knows
+  which documents an interrupted apply stopped inside, and a fresh state
+  would fork them. `sync` reconciles it first.
 
 ## Merge rules
 
@@ -905,7 +1009,7 @@ When fork-class content changed on both sides:
 - **Environment while the tablet is stopped**: `gc.auto=0`,
   `maintenance.auto=false`, `core.hooksPath` disabled for rmu's own
   pushes, `GIT_TERMINAL_PROMPT=0` without a tty. `git maintenance run
-  --auto` runs at the end.
+  --auto` runs at the end, after the tablet lock is released.
 - **Bulk objects**: snapshots are written with `git fast-import` (blobs,
   trees and the commit in one stream) fed by a **streaming** tar reader.
   The older tar download (`run_checked_bytes`) buffers in memory, which
@@ -940,11 +1044,15 @@ When fork-class content changed on both sides:
 
 As implemented: `clone` locks, stops, reads and restarts as a sync does
 (with the pre-read), then infers bases with xochitl running: the newest
-first-parent ancestor of `main` whose version of the document is
-equivalent (normalised `.metadata`/`.content`, other files by blob) is
-that document's base override; the default base is empty, so documents
-only on origin are added to the tablet. Versions that exist only in
-merged snapshots (second parents) are not searched. The tablet state is
+ancestor of `main` (children before parents, `rev-list --topo-order`,
+so versions only in merged snapshots count too; device refs never)
+whose version of the document the tablet's is an unchanged version of,
+by the merge's own rule (`merge::unchanged`: view state and derived
+fields ignored, tags as sets, page order free, a first-open
+materialisation reading as the empty page list), is that document's
+base override. The tablet's `.metadata`/`.content` are served from the
+read itself (they are not committed yet). The default base is empty, so
+documents only on origin are added to the tablet. The tablet state is
 written before the device-ref push, so an interrupted clone continues
 with `sync`. An empty origin is one whose `main` holds only
 `.rmu/hub.json` (`init` writes it): the tablet's documents are then all
@@ -976,10 +1084,10 @@ clocks and per-model translation.
 |---|---|
 | `libremarkable-utils/src/git.rs` | Plumbing over the `git` binary: `init --bare`, `ls-remote`, `fetch`, `push` (rejection as a typed error, `--force-with-lease`), `ls-tree`, `cat-file --batch`, `fast-import`, `commit-tree`, `merge-base --is-ancestor`, `update-ref`. Explicit environment, no working tree. |
 | `libremarkable-utils/src/hub/mod.rs` | Module root (all submodules declared from the start). |
-| `libremarkable-utils/src/hub/cycle.rs` | The operations composing the parts below (`init`, `clone`, `sync`, `backup`, `status`, `--dry-run`); `Progress` steps; submodules for the local cache (`store`), reading the tablet (`snapshot`), the pure decisions (`plan`: equivalence, apply plan, verification, tree and trash checks, reconciliation verdicts, manifest), commit messages and trailers (`message`), the steps (`steps`) and the read-only commands (`inspect`). |
+| `libremarkable-utils/src/hub/cycle.rs` | The operations composing the parts below (`init`, `clone`, `sync`, `backup`, `status`, `--dry-run`, `remote`, `detach`); `Progress` steps; serialisable reports and typed warnings; submodules for the local cache (`store`), reading the tablet (`snapshot`), the pure decisions (`plan`: equivalence, apply plan, verification, step-14 moved paths, tree and trash checks, reconciliation verdicts and finish, manifest), commit messages and trailers (`message`), the steps (`steps`), the read-only commands (`inspect`) and `remote`/`detach` (`admin`). |
 | `libremarkable-utils/src/hub/model.rs` | Pure: layout mapping, allowlist classification, view-state paths, document grouping, carry-forward, tablet state and journal formats, snapshot validation. |
 | `libremarkable-utils/src/hub/merge.rs` | Pure: merge rules, deletion guard, fork naming and UUIDs, orphan/cycle checks. |
-| `libremarkable-utils/src/hub/device.rs` | Device I/O behind a trait: lock, watchdog, stop/start, stat pass, streaming download, verify, staged apply, journal, listing what is still staged. A local-directory fake implements the trait, with fault injection. |
+| `libremarkable-utils/src/hub/device.rs` | Device I/O behind a trait: lock, watchdog, stop/start, stat pass, streaming download, verify, staged apply, journal and state removal, listing what is still staged. A local-directory fake implements the trait, with fault injection. |
 | `rmu/src/hub.rs` | CLI for `rmu hub …`; stdout = results, stderr = progress, as elsewhere. |
 
 ## Testing strategy
@@ -997,21 +1105,35 @@ clocks and per-model translation.
   injection crashes the run at every step (including a lost push
   acknowledgement and a half-finished apply) and asserts the next run
   converges without spurious or duplicate forks. As built
-  (`libremarkable-utils/tests/hub_e2e.rs`): every scenario ends with the
-  same oracles — the tablets equal origin (`.metadata`/`.content`
-  normalised, other files byte for byte, leftovers included), every ink
-  stroke ever drawn and not deliberately deleted is on origin and on
-  every tablet, xochitl runs, no lock or journal is left. The crash
-  matrix copies one prepared world per fault and injects, in turn, a
+  (`libremarkable-utils/tests/hub_e2e.rs`): every scenario that syncs to
+  the end finishes with the same oracles — the tablets equal origin
+  (`.metadata`/`.content` normalised, other files byte for byte,
+  leftovers included; a quarantined document must still be on its
+  tablet), every ink stroke ever drawn and not deliberately deleted is on
+  origin and on every tablet, xochitl runs, no lock or journal is left;
+  scenarios that are refused check that the tablet is untouched, running
+  and unlocked. The crash scenario includes three documents the crashing
+  tablet holds quarantined (one origin changed, two origin deleted, one
+  of which looks exactly like an interrupted deletion), repaired at the
+  end so their ink is checked too. The crash matrix
+  copies one prepared world per fault and injects, in turn, a
   disconnection before every operation and after every mutation, a lost
   reply to every mutation, a failure of every operation, an apply killed
-  after every move, the watchdog firing after every move, and a download
-  cut after every file; after each, xochitl must be up or have an armed
-  watchdog, and the next run (with `--break-lock` only where the crash
-  left a lock nothing makes stale) must end with exactly the clean run's
-  conflict copies. A lost push acknowledgement is produced for real by
-  a `reference-transaction` hook on the origin that kills `receive-pack`
-  once the update is committed.
+  after every move, the watchdog firing after every move, a cut of the
+  stopped read after every file, and a disconnection at every operation
+  of a run that reconciles an earlier crash (plus a pre-read cut inside
+  a file); after each, xochitl must be
+  up or have an armed watchdog, and the next run (with `--break-lock`
+  only where the crash left a lock nothing makes stale) must end with
+  exactly the clean run's conflict copies. A lost push acknowledgement
+  is produced for real by a `reference-transaction` hook on the origin
+  that kills `receive-pack` once the update is committed. The run after
+  each recovery must be quiet (`UpToDate`, nothing applied); a failed
+  run with a working connection must bring xochitl back itself; and
+  variants of the matrix add a user edit after every crash (a base too
+  old forks the tablet's own change, one too new reverts another's),
+  crash a shared-library `clone` and a `backup` at every operation, and
+  crash a pull-only run at every operation and apply move.
 - **Real device**, only with the owner's explicit go-ahead.
 
 ## Device questions

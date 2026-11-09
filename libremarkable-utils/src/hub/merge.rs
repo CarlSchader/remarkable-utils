@@ -39,6 +39,7 @@ use std::fmt;
 use std::ops::ControlFlow;
 use std::rc::Rc;
 
+use serde::Serialize;
 use serde_json::{Map, Value};
 use thiserror::Error;
 use uuid::Uuid;
@@ -211,7 +212,8 @@ pub struct MergeParams<'a> {
 // ---- outputs ---------------------------------------------------------------
 
 /// A side of the merge.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Side {
     /// The tablet snapshot.
     Ours,
@@ -294,13 +296,15 @@ pub enum Resolution {
 }
 
 /// Something the user should know about one document.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Note {
     pub doc: DocId,
+    #[serde(flatten)]
     pub kind: NoteKind,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum NoteKind {
     /// Both sides changed this `.metadata` field differently; origin's
     /// value was taken.
@@ -378,7 +382,7 @@ impl fmt::Display for Note {
 }
 
 /// A fork, for the merge commit's `Rmu-Fork` trailer.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Fork {
     pub original: DocId,
     pub copy: DocId,
@@ -386,7 +390,7 @@ pub struct Fork {
 }
 
 /// The deletion guard's verdict.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct DeletionGuard {
     /// Present in origin, absent from the merge: deleted from origin.
     pub from_origin: BTreeSet<DocId>,
@@ -422,7 +426,7 @@ impl DeletionGuard {
 }
 
 /// Counts of [`Resolution`]s, for `--dry-run`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct Summary {
     pub unchanged: usize,
     pub changed_ours: usize,
@@ -624,6 +628,45 @@ pub fn merge(
         forks: state.forks,
         guard,
     })
+}
+
+/// Whether `side` is an unchanged version of `base` by the merge's own
+/// rules: what the per-document table calls "no change". View-state and
+/// derived fields are ignored, `tags`/`pageTags` compare as sets, the
+/// page array's order carries no meaning, a first-open materialisation of
+/// `base`'s empty page list reads as that list, and an unknown `.content`
+/// format compares as normalised JSON. Both must be present documents.
+/// `clone` uses it to find a document's base in origin's history.
+pub fn unchanged(
+    rules: &MirrorRules,
+    doc: &DocId,
+    base: &DocVersion,
+    side: &DocVersion,
+    blobs: &dyn BlobSource,
+) -> Result<bool> {
+    if !base.is_present() || !side.is_present() {
+        return Ok(false);
+    }
+    let tree = |version: &DocVersion| RepoTree {
+        docs: [(doc.clone(), version.clone())].into(),
+        extra: TreeListing::new(),
+    };
+    let (base_tree, side_tree) = (tree(base), tree(side));
+    let input = MergeInput {
+        base: &base_tree,
+        ours: &side_tree,
+        theirs: &side_tree,
+    };
+    let ctx = Ctx {
+        rules,
+        input: &input,
+        blobs: Blobs {
+            source: blobs,
+            cache: RefCell::new(HashMap::new()),
+        },
+    };
+    let (keys, base_keys) = ctx.side_and_base_keys(doc, &ctx.sides(doc), Side::Ours)?;
+    Ok(keys == base_keys)
 }
 
 fn validate_date(date: &str) -> Result<()> {

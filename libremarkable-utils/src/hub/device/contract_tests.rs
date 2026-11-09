@@ -192,6 +192,7 @@ fn lock_lifecycle(h: &dyn Harness) {
     assert!(lock_lost(t.check_guard(&second)));
     assert!(lock_lost(t.arm_watchdog(&second, WATCHDOG)));
     assert!(lock_lost(t.write_state(&second, &hub_state())));
+    assert!(lock_lost(t.remove_state(&second)));
     assert!(lock_lost(t.start_xochitl(&second)));
     t.check_guard(&broken).unwrap();
     t.release_lock(&broken).unwrap();
@@ -351,6 +352,10 @@ fn state_round_trip(h: &dyn Harness) {
     state.quarantine.insert(doc(DOC));
     t.write_state(&lock, &state).unwrap();
     assert_eq!(t.read_state().unwrap(), Some(state));
+    t.remove_state(&lock).unwrap();
+    assert_eq!(t.read_state().unwrap(), None);
+    // Absent already: fine.
+    t.remove_state(&lock).unwrap();
     t.release_lock(&lock).unwrap();
 }
 
@@ -751,6 +756,33 @@ fn fake_fails_a_download_part_way() {
     });
     assert!(transport(&result));
     assert_eq!(seen, vec!["a"]);
+    assert_eq!(download_all(t, &[path("a"), path("b")]).unwrap().len(), 2);
+}
+
+#[test]
+fn fake_cuts_a_download_inside_a_file() {
+    let h = FakeHarness::with(|b| {
+        b.file("a", "1")
+            .file("b", "0123456789")
+            .fault(Fault::CutDownloadInFile(1))
+    });
+    let t = &h.tablet;
+    let mut seen = Vec::new();
+    let result = t.download(&[path("a"), path("b")], &mut |file, size, reader| {
+        let mut data = Vec::new();
+        let read = reader.read_to_end(&mut data);
+        seen.push((file.to_string(), size, data, read.is_ok()));
+        read.map(drop).map_err(Into::into)
+    });
+    assert!(result.is_err());
+    // The cut file announced its size, then delivered only part of it.
+    assert_eq!(
+        seen,
+        vec![
+            ("a".to_string(), 1, b"1".to_vec(), true),
+            ("b".to_string(), 10, b"01234".to_vec(), false),
+        ]
+    );
     assert_eq!(download_all(t, &[path("a"), path("b")]).unwrap().len(), 2);
 }
 

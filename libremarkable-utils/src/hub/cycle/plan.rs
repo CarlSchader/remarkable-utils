@@ -247,9 +247,68 @@ pub(super) struct PlanInput<'a> {
     pub json: &'a dyn JsonBlobs,
 }
 
-/// Every document whose tablet files must change to match the merge,
-/// in document order.
-pub(super) fn plan(input: &PlanInput) -> Result<Vec<Planned>> {
+/// Whether the tablet's files of a document without a `.metadata` may be
+/// overwritten: only when every one is already the target's (what rmu's
+/// own interrupted write leaves). Anything else may be the user's
+/// document that lost its `.metadata`; it is left alone (and reported as
+/// an orphan by validation) rather than overwritten.
+fn leftovers_are_ours(
+    rules: &MirrorRules,
+    target: Option<&DocVersion>,
+    current: &DocVersion,
+    json: &dyn JsonBlobs,
+) -> Result<bool> {
+    let Some(target) = present_files(target) else {
+        return Ok(true);
+    };
+    current.files.iter().try_fold(true, |ours, (file, entry)| {
+        Ok(ours
+            && match target.get(file) {
+                Some(wanted) => entries_equivalent(rules, file, wanted, entry, json)?,
+                None => false,
+            })
+    })
+}
+
+/// Documents the apply leaves alone: on the tablet without a
+/// `.metadata`, present in the merge, and not rmu's own leftovers of it
+/// ([`leftovers_are_ours`]).
+pub(super) fn left_alone(
+    rules: &MirrorRules,
+    merged: &RepoTree,
+    tablet: &BTreeMap<DocId, DocVersion>,
+    json: &dyn JsonBlobs,
+) -> Result<BTreeSet<DocId>> {
+    tablet
+        .iter()
+        .filter(|(doc, current)| {
+            !current.is_present() && merged.docs.get(*doc).is_some_and(DocVersion::is_present)
+        })
+        .map(|(doc, current)| {
+            Ok(
+                (!leftovers_are_ours(rules, merged.docs.get(doc), current, json)?)
+                    .then(|| doc.clone()),
+            )
+        })
+        .filter_map(Result::transpose)
+        .collect()
+}
+
+/// What [`plan`] decided.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct PlanOutput {
+    /// Every document whose tablet files must change, in document order.
+    pub planned: Vec<Planned>,
+    /// Documents the merge would change but whose files without a
+    /// `.metadata` are not rmu's leftovers: left alone, they keep their
+    /// previous base (as quarantined ones do), so a later repair never
+    /// reads the merge as the tablet's own change.
+    pub left_alone: BTreeSet<DocId>,
+}
+
+/// Plan the apply. Protected documents, and files without a `.metadata`
+/// that are not rmu's own leftovers, are never touched.
+pub(super) fn plan(input: &PlanInput) -> Result<PlanOutput> {
     let empty = LocalJson::new();
     let ids: BTreeSet<&DocId> = input
         .merged
@@ -259,18 +318,35 @@ pub(super) fn plan(input: &PlanInput) -> Result<Vec<Planned>> {
         .filter(|doc| !input.protect.contains(*doc))
         .collect();
     ids.into_iter()
-        .map(|doc| {
-            plan_doc(
+        .try_fold(PlanOutput::default(), |mut output, doc| {
+            let current = input.tablet.get(doc);
+            let Some(planned) = plan_doc(
                 input.rules,
                 doc,
                 input.merged.docs.get(doc),
-                input.tablet.get(doc),
+                current,
                 input.local.get(doc).unwrap_or(&empty),
                 input.json,
-            )
+            )?
+            else {
+                return Ok(output);
+            };
+            let ours = match current {
+                Some(current) if !current.is_present() => leftovers_are_ours(
+                    input.rules,
+                    input.merged.docs.get(doc),
+                    current,
+                    input.json,
+                )?,
+                _ => true,
+            };
+            if ours {
+                output.planned.push(planned);
+            } else {
+                output.left_alone.insert(doc.clone());
+            }
+            Ok(output)
         })
-        .filter_map(Result::transpose)
-        .collect()
 }
 
 /// Number of ancestors of `id` in `items` (bounded, so a cycle ends).
@@ -497,30 +573,23 @@ pub(super) fn tree_skips(
     })
 }
 
-/// Planned changes that would carry a document the user touched since
-/// the snapshot (`touched`) into the trash, e.g. a folder origin trashed
-/// while the user wrote in a notebook inside it: that notebook would
-/// land in the trash on a side whose own tree then has it there, and
-/// the edit could no longer pull it out. Those changes are skipped (with
-/// fork partners) until no touched document newly lands in the trash.
-pub(super) fn trash_skips(
-    current: &BTreeMap<DocId, TreeItem>,
-    planned: &BTreeMap<DocId, Option<TreeItem>>,
-    touched: &BTreeSet<DocId>,
-    partners: &Partners,
-) -> BTreeSet<DocId> {
-    skip_until_settled(planned, partners, |skipped| {
-        let projected = project(current, planned, skipped);
-        let blamed: BTreeSet<DocId> = touched
-            .iter()
-            .filter(|doc| {
-                projected.contains_key(*doc) && on_trash(&projected, doc) && !on_trash(current, doc)
-            })
-            .flat_map(|doc| chain(&projected, doc))
-            .filter(|doc| planned.contains_key(doc) && !skipped.contains(doc))
-            .collect();
-        (!blamed.is_empty()).then_some(blamed)
-    })
+/// Touched documents (changed by the user since the snapshot) that the
+/// projected tree puts in the trash although they are not there now, and
+/// everything above them: e.g. a folder origin trashed while the user
+/// wrote in a notebook inside it. That notebook would land in the trash
+/// on a side whose own tree then has it there, and the edit could no
+/// longer pull it out; the changes doing it are skipped instead.
+fn trash_blame<'a>(
+    current: &'a BTreeMap<DocId, TreeItem>,
+    projected: &'a BTreeMap<DocId, TreeItem>,
+    touched: &'a BTreeSet<DocId>,
+) -> impl Iterator<Item = DocId> + 'a {
+    touched
+        .iter()
+        .filter(|doc| {
+            projected.contains_key(*doc) && on_trash(projected, doc) && !on_trash(current, doc)
+        })
+        .flat_map(|doc| chain(projected, doc))
 }
 
 // ---- reconciliation ---------------------------------------------------------------
@@ -619,6 +688,388 @@ pub(super) fn apply_finished(
         .filter(|file| !merge.contains_key(*file))
         .all(|file| !tablet.contains_key(file));
     Ok(written && removed)
+}
+
+/// Staged after everything an apply of a merge needs, in the same run's
+/// staging directory: `.rmu-staged-<merge>/<doc>` for every document the
+/// plan changes, then `.rmu-staged-<merge>/done`, in one transfer (in
+/// order, so `done` means the whole list arrived). Reconciliation reads
+/// them back through the staging listing: which documents a run planned,
+/// and which of their files it had not moved yet.
+pub(super) const STAGED_SENTINEL: &str = ".rmu-staged-";
+
+/// The sentinel files for an apply of `merge` changing `docs`, `done`
+/// last.
+pub(super) fn sentinel_files(merge: &Oid, docs: impl IntoIterator<Item = DocId>) -> Vec<String> {
+    docs.into_iter()
+        .map(|doc| format!("{STAGED_SENTINEL}{merge}/{doc}"))
+        .chain(std::iter::once(format!("{STAGED_SENTINEL}{merge}/done")))
+        .collect()
+}
+
+/// One run that completely staged an apply of the journaled merge.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct StagedRun {
+    /// The documents its plan changed.
+    pub planned: BTreeSet<DocId>,
+    /// Its files still staged (xochitl-relative): not moved into place.
+    pub pending: BTreeSet<String>,
+}
+
+/// The runs whose staging directory holds a complete sentinel for
+/// `merge`, from the staging listing (`<run>/<path>` per staged file).
+pub(super) fn staged_runs<'a>(
+    listing: impl IntoIterator<Item = &'a str>,
+    merge: &Oid,
+) -> Vec<StagedRun> {
+    let prefix = format!("{STAGED_SENTINEL}{merge}/");
+    let runs = listing
+        .into_iter()
+        .filter_map(|path| path.split_once('/'))
+        .fold(
+            BTreeMap::<&str, (bool, StagedRun)>::new(),
+            |mut runs, (run, path)| {
+                let (done, staged) = runs.entry(run).or_default();
+                match path.strip_prefix(&prefix) {
+                    Some("done") => *done = true,
+                    Some(doc) => {
+                        if let Ok(doc) = DocId::new(doc) {
+                            staged.planned.insert(doc);
+                        }
+                    }
+                    // Another merge's sentinel says nothing about this one.
+                    None if path.starts_with(STAGED_SENTINEL) => {}
+                    None => {
+                        staged.pending.insert(path.to_string());
+                    }
+                }
+                runs
+            },
+        );
+    runs.into_values()
+        .filter_map(|(done, staged)| done.then_some(staged))
+        .collect()
+}
+
+/// What reconciliation judges.
+pub(super) struct Journaled<'a> {
+    pub rules: &'a MirrorRules,
+    pub merge: &'a RepoTree,
+    pub snapshot: &'a RepoTree,
+    /// The tablet's mirrored files now, per document, by blob.
+    pub tablet: &'a BTreeMap<DocId, BTreeMap<DocFile, Oid>>,
+    /// Runs that completely staged an apply of the merge.
+    pub staged: &'a [StagedRun],
+    /// `(original, copy)` of the merge's forks.
+    pub forks: &'a [(DocId, DocId)],
+    pub json: &'a dyn JsonBlobs,
+}
+
+/// The verdict on every document whose merge and snapshot versions
+/// differ (see "Restartability"). [`verdict`] judges the files; then
+/// only a document some run planned can be a [`Verdict::Mixed`] that
+/// gets finished (anything else that looks half-applied, e.g. a
+/// quarantined document that lost its `.metadata`, was never touched by
+/// an apply and is [`Verdict::Other`]); a [`Verdict::Other`] that a run
+/// planned and finished ([`apply_finished`]) is at the merge with the
+/// user's changes on top; and a conflict copy is finished only together
+/// with its original.
+pub(super) fn verdicts(input: &Journaled) -> Result<BTreeMap<DocId, Verdict>> {
+    let no_files = BTreeMap::new();
+    let planned: BTreeSet<&DocId> = input.staged.iter().flat_map(|run| &run.planned).collect();
+    let ids: BTreeSet<&DocId> = input
+        .merge
+        .docs
+        .keys()
+        .chain(input.snapshot.docs.keys())
+        .collect();
+    let verdicts = ids
+        .into_iter()
+        .map(|doc| -> Result<Option<(DocId, Verdict)>> {
+            let (merge, snapshot) = (input.merge.docs.get(doc), input.snapshot.docs.get(doc));
+            if versions_equivalent(input.rules, merge, snapshot, input.json)? {
+                return Ok(None);
+            }
+            let files = input.tablet.get(doc).unwrap_or(&no_files);
+            let judged = match verdict(input.rules, merge, snapshot, files, input.json)? {
+                Verdict::Mixed if !planned.contains(doc) => Verdict::Other,
+                Verdict::Other => {
+                    let finished = input.staged.iter().try_fold(false, |found, run| {
+                        Ok::<_, crate::Error>(
+                            found
+                                || (run.planned.contains(doc)
+                                    && apply_finished(
+                                        input.rules,
+                                        doc,
+                                        merge,
+                                        snapshot,
+                                        files,
+                                        &run.pending,
+                                        input.json,
+                                    )?),
+                        )
+                    })?;
+                    if finished {
+                        Verdict::AtMerge
+                    } else {
+                        Verdict::Other
+                    }
+                }
+                other => other,
+            };
+            Ok(Some((doc.clone(), judged)))
+        })
+        .filter_map(Result::transpose)
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    Ok(input
+        .forks
+        .iter()
+        .fold(verdicts, |mut verdicts, (original, copy)| {
+            let original_done = matches!(
+                verdicts.get(original),
+                None | Some(Verdict::AtMerge | Verdict::Mixed)
+            );
+            if !original_done && verdicts.get(copy) == Some(&Verdict::Mixed) {
+                verdicts.insert(copy.clone(), Verdict::Other);
+            }
+            verdicts
+        }))
+}
+
+/// What reconciliation finishes.
+pub(super) struct Finish<'a> {
+    pub rules: &'a MirrorRules,
+    pub verdicts: &'a BTreeMap<DocId, Verdict>,
+    pub merge: &'a RepoTree,
+    /// The tablet's mirrored files now, per document, by blob.
+    pub tablet: &'a BTreeMap<DocId, BTreeMap<DocFile, Oid>>,
+    /// The tablet's current JSON, per document (view state to overlay).
+    pub local: &'a BTreeMap<DocId, LocalJson>,
+    /// The tablet's tree as read, and every merged document's item.
+    pub current: &'a BTreeMap<DocId, TreeItem>,
+    pub merged: &'a BTreeMap<DocId, TreeItem>,
+    /// `(original, copy)` of the merge's forks.
+    pub forks: &'a [(DocId, DocId)],
+    pub json: &'a dyn JsonBlobs,
+}
+
+/// Reconciliation's finish (see "Restartability"): a plan for every
+/// [`Verdict::Mixed`] document (an interrupted deletion finished as a
+/// deletion, leftovers included), minus those the step-14 tree checks
+/// refuse on the tablet as read, in apply order; and the refused ones,
+/// which keep the snapshot as their base instead.
+pub(super) fn finish(input: &Finish) -> Result<(Vec<Planned>, BTreeSet<DocId>)> {
+    let empty = LocalJson::new();
+    let planned: Vec<Planned> = input
+        .verdicts
+        .iter()
+        .filter(|(_, verdict)| **verdict == Verdict::Mixed)
+        .map(|(doc, _)| {
+            let Some(target) = input.merge.docs.get(doc).filter(|v| v.is_present()) else {
+                return Ok(Some(Planned {
+                    doc: doc.clone(),
+                    change: Change::Delete,
+                }));
+            };
+            let current = input.tablet.get(doc).map(|files| DocVersion {
+                files: files
+                    .iter()
+                    .map(|(file, blob)| (file.clone(), ListingEntry::regular(blob.clone())))
+                    .collect(),
+                other: BTreeMap::new(),
+            });
+            plan_doc(
+                input.rules,
+                doc,
+                Some(target),
+                current.as_ref(),
+                input.local.get(doc).unwrap_or(&empty),
+                input.json,
+            )
+        })
+        .filter_map(Result::transpose)
+        .collect::<Result<_>>()?;
+    let items: BTreeMap<DocId, Option<TreeItem>> = planned
+        .iter()
+        .map(|entry| {
+            let item = match entry.change {
+                Change::Delete => None,
+                Change::Write { .. } => input.merged.get(&entry.doc).cloned(),
+            };
+            (entry.doc.clone(), item)
+        })
+        .collect();
+    let skipped = tree_skips(
+        input.current,
+        &items,
+        &partners(input.forks.iter().cloned()),
+    );
+    let copies: BTreeSet<DocId> = input.forks.iter().map(|(_, copy)| copy.clone()).collect();
+    let kept = planned
+        .into_iter()
+        .filter(|entry| !skipped.contains(&entry.doc))
+        .collect();
+    Ok((order(kept, input.merged, input.current, &copies), skipped))
+}
+
+/// Step 14: the mirrored files whose stat moved since the read: changed
+/// or gone, new, and those whose read stat is racy (a coarse mtime in the
+/// second of the step-6 start or later, `started_at`: xochitl may have
+/// changed them within that second without moving their stat).
+pub(super) fn moved_since_read(
+    read: &BTreeMap<XochitlPath, StatSignature>,
+    now: &BTreeMap<XochitlPath, StatSignature>,
+    started_at: i64,
+) -> BTreeSet<XochitlPath> {
+    read.iter()
+        .filter(|(path, stat)| now.get(*path) != Some(stat) || !stat.keep_in_manifest(started_at))
+        .map(|(path, _)| path.clone())
+        .chain(now.keys().filter(|path| !read.contains_key(*path)).cloned())
+        .collect()
+}
+
+// ---- step 14 ---------------------------------------------------------------------------
+
+/// What the step-14 checks see.
+pub(super) struct Checks<'a> {
+    pub rules: &'a MirrorRules,
+    pub planned: &'a [Planned],
+    /// The step-5 read, per document, by blob.
+    pub before: &'a BTreeMap<DocId, BTreeMap<DocFile, Oid>>,
+    /// Mirrored files per document now.
+    pub files_now: &'a BTreeMap<DocId, BTreeSet<DocFile>>,
+    /// Re-read files of planned documents whose stat moved.
+    pub moved: &'a BTreeMap<DocId, BTreeMap<DocFile, Reread>>,
+    /// SHA-256 of the read blobs of moved non-JSON files.
+    pub sha256: &'a HashMap<Oid, String>,
+    pub json: &'a dyn JsonBlobs,
+    /// The live tablet's tree, after the re-read.
+    pub current: &'a BTreeMap<DocId, TreeItem>,
+    /// Every merged document's item.
+    pub merged: &'a BTreeMap<DocId, TreeItem>,
+    /// Documents with any file moved, new or gone since the read.
+    pub touched: &'a BTreeSet<DocId>,
+    pub partners: &'a Partners,
+}
+
+/// The documents not to apply: those whose files changed since the read
+/// ([`verified`]), then, to a fixpoint, changes that would carry a
+/// touched document into the trash ([`trash_blame`]) or break the live
+/// tree (as [`tree_skips`] judges), each with its fork partners.
+pub(super) fn skipped(checks: &Checks) -> Result<BTreeSet<DocId>> {
+    let (no_files, no_set, no_moves) = (BTreeMap::new(), BTreeSet::new(), BTreeMap::new());
+    let changed = checks
+        .planned
+        .iter()
+        .map(|entry| {
+            verified(
+                checks.rules,
+                checks.before.get(&entry.doc).unwrap_or(&no_files),
+                checks.files_now.get(&entry.doc).unwrap_or(&no_set),
+                checks.moved.get(&entry.doc).unwrap_or(&no_moves),
+                checks.json,
+                checks.sha256,
+            )
+            .map(|ok| (!ok).then(|| entry.doc.clone()))
+        })
+        .filter_map(Result::transpose)
+        .collect::<Result<BTreeSet<_>>>()?;
+    let items = |skipped: &BTreeSet<DocId>| -> BTreeMap<DocId, Option<TreeItem>> {
+        checks
+            .planned
+            .iter()
+            .filter(|entry| !skipped.contains(&entry.doc))
+            .map(|entry| {
+                let item = match entry.change {
+                    Change::Delete => None,
+                    Change::Write { .. } => checks.merged.get(&entry.doc).cloned(),
+                };
+                (entry.doc.clone(), item)
+            })
+            .collect()
+    };
+    let changed = with_partners(changed, checks.partners);
+    // One fixpoint for both checks: a change skipped by one can make
+    // another fail the other.
+    let planned: BTreeMap<DocId, Option<TreeItem>> = items(&changed);
+    let baseline: BTreeSet<TreeViolation> = tree_violations(checks.current).into_iter().collect();
+    let settled = skip_until_settled(&planned, checks.partners, |skipped| {
+        let projected = project(checks.current, &planned, skipped);
+        let blamed: BTreeSet<DocId> = tree_violations(&projected)
+            .iter()
+            .filter(|violation| !baseline.contains(*violation))
+            .flat_map(involved)
+            .chain(trash_blame(checks.current, &projected, checks.touched))
+            .filter(|doc| planned.contains_key(doc) && !skipped.contains(doc))
+            .collect();
+        (!blamed.is_empty()).then_some(blamed)
+    });
+    Ok(with_partners(
+        changed.union(&settled).cloned().collect(),
+        checks.partners,
+    ))
+}
+
+/// The writes of `plan` whose content differs from what was staged
+/// (`staged`, by xochitl path): overlays re-done with view state re-read
+/// at step 14.
+pub(super) fn restage(plan: &[Planned], staged: &BTreeMap<String, Content>) -> Vec<Planned> {
+    plan.iter()
+        .filter_map(|entry| match &entry.change {
+            Change::Write { writes, .. } => {
+                let changed: Vec<Write> = writes
+                    .iter()
+                    .filter(|write| {
+                        staged.get(&write.file.xochitl_path(&entry.doc)) != Some(&write.content)
+                    })
+                    .cloned()
+                    .collect();
+                (!changed.is_empty()).then(|| Planned {
+                    doc: entry.doc.clone(),
+                    change: Change::Write {
+                        writes: changed,
+                        removes: Vec::new(),
+                    },
+                })
+            }
+            Change::Delete => None,
+        })
+        .collect()
+}
+
+/// Every write of `plan` by xochitl path, with its content.
+pub(super) fn contents(plan: &[Planned]) -> BTreeMap<String, Content> {
+    plan.iter()
+        .flat_map(|entry| match &entry.change {
+            Change::Write { writes, .. } => writes
+                .iter()
+                .map(|write| (write.file.xochitl_path(&entry.doc), write.content.clone()))
+                .collect(),
+            Change::Delete => Vec::new(),
+        })
+        .collect()
+}
+
+/// The files `plan` removes (xochitl paths): removed files, and every
+/// file read of a deleted document.
+pub(super) fn removed(
+    plan: &[Planned],
+    read: &BTreeMap<DocId, BTreeMap<DocFile, Oid>>,
+) -> BTreeSet<String> {
+    plan.iter()
+        .flat_map(|entry| match &entry.change {
+            Change::Write { removes, .. } => removes
+                .iter()
+                .map(|file| file.xochitl_path(&entry.doc))
+                .collect::<Vec<_>>(),
+            Change::Delete => read
+                .get(&entry.doc)
+                .into_iter()
+                .flat_map(BTreeMap::keys)
+                .map(|file| file.xochitl_path(&entry.doc))
+                .collect(),
+        })
+        .collect()
 }
 
 // ---- the manifest --------------------------------------------------------------------
