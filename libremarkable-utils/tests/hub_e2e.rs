@@ -2666,3 +2666,83 @@ fn stale_incoming_repositories_are_swept() {
     drop(live);
     world.check();
 }
+
+/// A pull-only run (A has no changes of its own; B inked, renamed, added
+/// and deleted) crashed before every operation, and with its apply killed
+/// after every move. Its journal names a snapshot `main` does not contain:
+/// reconciliation keeps unfinished documents on their previous bases, the
+/// recovering run pushes nothing either, and the tablet ends in step.
+#[test]
+fn a_pull_only_sync_crashed_at_every_step_recovers() {
+    let (template, lib) = two_tablets();
+    let page = template.pages(1, &lib.notes)[0].clone();
+    template.ink(1, &lib.notes, &page);
+    template.rename(1, &lib.paper, "Paper (B)");
+    template.create(
+        1,
+        Kind::Notebook { pages: 1 },
+        "From B",
+        lib.folder.as_str(),
+    );
+    template.delete(1, &lib.diary);
+    template.sync(1).unwrap();
+    let main = origin_main(&template);
+    let clean = template.duplicate();
+    let before = clean.tablet(0).ops().len();
+    let report = clean.sync(0).unwrap();
+    assert_eq!(report.update, MainUpdate::Pulled, "{report:?}");
+    assert!(report.applied.len() >= 4, "{report:?}");
+    let ops = clean.tablet(0).ops()[before..].to_vec();
+    let faults = (1..=ops.len())
+        .map(|k| {
+            (
+                Fault::DisconnectAtOp(k),
+                format!("disconnect at op {k} ({:?})", ops[k - 1]),
+            )
+        })
+        .chain((0..12).map(|k| (Fault::KillApplyAfter(k), format!("apply killed after {k}"))));
+    faults.for_each(|(fault, what)| {
+        let world = template.duplicate();
+        world.tablet(0).inject(fault);
+        let result = world.sync(0);
+        world::no_contract_violation(&result);
+        let tablet = world.tablet(0);
+        tablet.reconnect();
+        let armed = tablet.watchdog_armed().is_some();
+        assert!(
+            tablet.is_running() || armed,
+            "{what}: xochitl down, no watchdog"
+        );
+        if armed {
+            tablet.fire_watchdog();
+        }
+        match world.sync(0) {
+            Ok(_) => {}
+            Err(error) if is_locked(&error) => {
+                assert!(!armed, "{what}: a lock with a fired watchdog must be stale");
+                world
+                    .sync_with(
+                        0,
+                        HubOptions {
+                            break_lock: true,
+                            ..world.options.clone()
+                        },
+                    )
+                    .unwrap_or_else(|e| panic!("{what}: after --break-lock: {e}"));
+            }
+            Err(error) => panic!("{what}: the next run failed: {error}"),
+        }
+        let quiet = world.sync(0).unwrap();
+        assert!(
+            quiet.update == MainUpdate::UpToDate && quiet.applied.is_empty(),
+            "{what}: not quiet: {quiet:?}"
+        );
+        assert_eq!(origin_main(&world), main, "{what}: pushed to main");
+        world.converge();
+        assert!(
+            world.conflicts().is_empty(),
+            "{what}: {:?}",
+            world.conflicts()
+        );
+    });
+}
