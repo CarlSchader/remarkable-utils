@@ -4,6 +4,7 @@
 //! fabricated; blobs live in an in-memory map.
 
 use super::*;
+use crate::git::FileMode;
 use crate::hub::model::PageId;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -628,6 +629,34 @@ fn deleted_on_one_side_and_changed_on_the_other_is_kept() {
 }
 
 #[test]
+fn trashed_on_one_side_and_emptied_on_the_other_is_deleted_quietly() {
+    let mut lib = Lib::default();
+    let doc = D::pdf("Old", "", 1);
+    let (b, o, t) = three(&mut lib, &[(1, &doc)], &[(1, &doc.clone().trash())], &[]);
+    let outcome = run(&lib, &b, &o, &t);
+    assert_eq!(
+        outcome.resolutions[&u(1)],
+        Resolution::Deleted(Some(Side::Theirs))
+    );
+    assert!(outcome.notes.is_empty());
+    let (b, o, t) = three(&mut lib, &[(1, &doc)], &[], &[(1, &doc.clone().trash())]);
+    let outcome = run(&lib, &b, &o, &t);
+    assert_eq!(
+        outcome.resolutions[&u(1)],
+        Resolution::Deleted(Some(Side::Ours))
+    );
+    // Trashed and renamed: the rename is a change, so it is kept.
+    let (b, o, t) = three(
+        &mut lib,
+        &[(1, &doc)],
+        &[(1, &doc.clone().trash().rename("Renamed"))],
+        &[],
+    );
+    let outcome = run(&lib, &b, &o, &t);
+    assert_eq!(outcome.resolutions[&u(1)], Resolution::Kept(Side::Ours));
+}
+
+#[test]
 fn deleted_on_both_is_deleted() {
     let mut lib = Lib::default();
     let doc = D::pdf("Gone", "", 1);
@@ -668,6 +697,27 @@ fn metadata_merges_per_field() {
         outcome.docs[&u(1)].files[&DocFile::Metadata],
         MergedEntry::New(_)
     ));
+}
+
+#[test]
+fn a_rename_on_one_side_and_ink_on_the_other_merge_without_a_fork() {
+    let mut lib = Lib::default();
+    let doc = D::notebook("Notes", "", 1, "base");
+    let renamed = doc.clone().rename("Renamed");
+    let inked = doc.clone().ink(2, "ink");
+    [(&renamed, &inked), (&inked, &renamed)]
+        .into_iter()
+        .for_each(|(ours, theirs)| {
+            let (b, o, t) = three(&mut lib, &[(1, &doc)], &[(1, ours)], &[(1, theirs)]);
+            let outcome = run(&lib, &b, &o, &t);
+            assert_eq!(outcome.resolutions[&u(1)], Resolution::Merged);
+            assert!(outcome.forks.is_empty());
+            assert_eq!(lib.md(&outcome, &u(1))["visibleName"], json!("Renamed"));
+            assert_eq!(
+                page_blobs(&outcome.docs[&u(1)]),
+                page_blobs(&version_of(&mut lib, &inked))
+            );
+        });
 }
 
 #[test]
@@ -1125,16 +1175,38 @@ fn tag_only_changes_on_both_sides_merge_without_a_fork() {
 }
 
 #[test]
-fn unknown_content_formats_are_compared_whole() {
+fn unknown_content_formats_are_compared_whole_except_view_state() {
     let mut lib = Lib::default();
     let old = D::pdf("Old firmware", "", 1).content_set(&["formatVersion"], json!(1));
-    // Only view state moved, but this rmu cannot tell for an unknown
-    // format: both sides changed it, so it forks rather than guess.
+    // Reading never counts, even for an unknown format: the enumerated
+    // view-state paths are stripped from it too.
     let (b, o, t) = three(
         &mut lib,
         &[(1, &old)],
         &[(1, &old.clone().content_set(&["zoomMode"], json!("a")))],
         &[(1, &old.clone().content_set(&["zoomMode"], json!("b")))],
+    );
+    let outcome = run(&lib, &b, &o, &t);
+    assert!(outcome.forks.is_empty());
+    assert_eq!(outcome.resolutions[&u(1)], Resolution::Unchanged);
+    // Read on one tablet, deleted on the other: deleted.
+    let (b, o, t) = three(
+        &mut lib,
+        &[(1, &old)],
+        &[(1, &old.clone().content_set(&["zoomMode"], json!("a")))],
+        &[],
+    );
+    let outcome = run(&lib, &b, &o, &t);
+    assert_eq!(
+        outcome.resolutions[&u(1)],
+        Resolution::Deleted(Some(Side::Theirs))
+    );
+    // Any other field changed on both sides: opaque, so it forks.
+    let (b, o, t) = three(
+        &mut lib,
+        &[(1, &old)],
+        &[(1, &old.clone().content_set(&["fontName"], json!("a")))],
+        &[(1, &old.clone().content_set(&["fontName"], json!("b")))],
     );
     let outcome = run(&lib, &b, &o, &t);
     assert_eq!(outcome.forks.len(), 1);
@@ -1143,12 +1215,12 @@ fn unknown_content_formats_are_compared_whole() {
     let (b, o, t) = three(
         &mut lib,
         &[(1, &old)],
-        &[(1, &old.clone().content_set(&["zoomMode"], json!("a")))],
+        &[(1, &old.clone().content_set(&["fontName"], json!("a")))],
         &[(1, &old)],
     );
     let outcome = run(&lib, &b, &o, &t);
     assert_eq!(outcome.resolutions[&u(1)], Resolution::Changed(Side::Ours));
-    // Tags of an opaque document are not merged as sets either.
+    // Tags of an opaque document are not merged as sets.
     let (b, o, t) = three(
         &mut lib,
         &[(1, &old)],
@@ -1163,6 +1235,60 @@ fn unknown_content_formats_are_compared_whole() {
         &json!({ "formatVersion": 2, "cPages": { "pages": [1] } })
     ));
     assert!(!content_known(&json!({ "pages": [] })));
+}
+
+#[test]
+fn a_firmware_migration_on_both_tablets_does_not_fork() {
+    // Base still at an old format; both tablets were updated (migrating
+    // every .content to v2) and read the document differently.
+    let mut lib = Lib::default();
+    let migrated = D::pdf("Paper", "", 2);
+    let old = migrated
+        .clone()
+        .content_set(&["formatVersion"], json!(1))
+        .content_set(&["legacyField"], json!(true));
+    let (b, o, t) = three(
+        &mut lib,
+        &[(1, &old)],
+        &[(1, &migrated.clone().scroll(3))],
+        &[(1, &migrated.clone().scroll(4))],
+    );
+    let outcome = run(&lib, &b, &o, &t);
+    assert!(outcome.forks.is_empty());
+    assert_eq!(outcome.resolutions[&u(1)], Resolution::Identical);
+    // Both sides known: their tags still merge as sets (the old base
+    // format does not make the document opaque).
+    let (b, o, t) = three(
+        &mut lib,
+        &[(1, &old)],
+        &[(1, &migrated.clone().tags(&["a"]))],
+        &[(1, &migrated.clone().tags(&["b"]))],
+    );
+    let outcome = run(&lib, &b, &o, &t);
+    assert!(outcome.forks.is_empty());
+    assert_eq!(lib.content(&outcome, &u(1))["tags"], json!(["b", "a"]));
+}
+
+#[test]
+fn one_unknown_side_makes_a_document_opaque() {
+    // The tablet is still at v2, origin's copy was written by a newer
+    // firmware: no set merge, the tag changes fork.
+    let mut lib = Lib::default();
+    let doc = D::pdf("Paper", "", 1);
+    let (b, o, t) = three(
+        &mut lib,
+        &[(1, &doc)],
+        &[(1, &doc.clone().tags(&["a"]))],
+        &[(
+            1,
+            &doc.clone()
+                .tags(&["b"])
+                .content_set(&["formatVersion"], json!(3)),
+        )],
+    );
+    let outcome = run(&lib, &b, &o, &t);
+    assert_eq!(outcome.forks.len(), 1);
+    assert!(notes_of(&outcome, &u(1)).contains(&NoteKind::Opaque));
 }
 
 // ---- first-open materialisation --------------------------------------------
@@ -1279,6 +1405,21 @@ fn non_trivial_materialisations_are_changes() {
         let outcome = run(&lib, &b, &o, &t);
         assert_eq!(outcome.forks.len(), 1, "variant {index}");
     });
+}
+
+#[test]
+fn new_on_both_with_both_sides_materialised_takes_origins_page_ids() {
+    // Lost tablet state or a reattach: two tablets each opened the same
+    // imported PDF, with different random page ids.
+    let mut lib = Lib::default();
+    let skeleton = D::skeleton("Shared upload", "");
+    let ours = opened(&skeleton, 100, 2);
+    let theirs = opened(&skeleton, 200, 2);
+    let (b, o, t) = three(&mut lib, &[], &[(1, &ours)], &[(1, &theirs)]);
+    let outcome = run(&lib, &b, &o, &t);
+    assert!(outcome.forks.is_empty());
+    assert_eq!(outcome.resolutions[&u(1)], Resolution::AddedBoth);
+    assert_eq!(outcome.docs[&u(1)], version_of(&mut lib, &theirs));
 }
 
 #[test]
@@ -1624,14 +1765,16 @@ fn a_three_folder_cycle_terminates_acyclic() {
 }
 
 #[test]
-fn a_folder_restored_from_the_trash_onto_a_cycle_goes_to_the_root() {
+fn a_restore_that_would_close_a_cycle_moves_the_edit_out_instead() {
     let mut lib = Lib::default();
     let a = D::folder("A", "");
     let b_folder = D::folder("B", "");
     let doc = D::notebook("Notes", u(1).as_str(), 1, "base");
     // Origin: trash A, move B into A. Tablet: move A into B, ink the
-    // document in A. Restoring A to the tablet's parent (B) closes a
-    // cycle A -> B -> A; A was restored, so it goes to the root.
+    // document in A. A's pre-trash parent on the tablet is B, which is
+    // now inside A: restoring A there would close a cycle, so the inked
+    // document comes out of A instead (to the root: its tablet and base
+    // parent is A itself).
     let (b, o, t) = three(
         &mut lib,
         &[(1, &a), (2, &b_folder), (3, &doc)],
@@ -1647,16 +1790,71 @@ fn a_folder_restored_from_the_trash_onto_a_cycle_goes_to_the_root() {
         ],
     );
     let outcome = run(&lib, &b, &o, &t);
-    assert_eq!(lib.md(&outcome, &u(1))["parent"], json!(""));
+    assert_eq!(tree_violations(&merged_items(&lib, &outcome)), vec![]);
+    assert!(!in_trash(&lib, &outcome, &u(3)));
+    assert_eq!(lib.md(&outcome, &u(3))["parent"], json!(""));
+    assert_eq!(lib.md(&outcome, &u(1))["parent"], json!(TRASH_PARENT));
     assert_eq!(lib.md(&outcome, &u(2))["parent"], json!(u(1).as_str()));
-    assert_eq!(lib.md(&outcome, &u(3))["parent"], json!(u(1).as_str()));
-    let kinds = notes_of(&outcome, &u(1));
-    assert!(kinds.contains(&NoteKind::RestoredFromTrash {
-        parent: u(2).to_string()
-    }));
-    assert!(kinds.contains(&NoteKind::CycleBroken {
+}
+
+#[test]
+fn a_resurrected_folder_on_a_cycle_goes_to_the_root() {
+    // Origin moved R into S and later deleted R; the tablet moved S into
+    // R. S needs R back, and R's newest version sits in S: a cycle. R was
+    // resurrected, so R goes to the root (not S, although S has the
+    // smaller UUID and differs from origin's parent).
+    let mut lib = Lib::default();
+    let s_folder = D::folder("S", "");
+    let r = D::folder("R", "");
+    let (b, o, t) = three(
+        &mut lib,
+        &[(1, &s_folder), (2, &r)],
+        &[(1, &s_folder.clone().move_to(u(2).as_str())), (2, &r)],
+        &[(1, &s_folder)],
+    );
+    let history: BTreeMap<DocId, Vec<DocVersion>> =
+        BTreeMap::from([(u(2), vec![r.clone().move_to(u(1).as_str()).build(&mut lib)])]);
+    let outcome = Run {
+        history: &history,
+        ..Run::default()
+    }
+    .go(&lib, &b, &o, &t)
+    .unwrap();
+    assert_eq!(outcome.resolutions[&u(2)], Resolution::Resurrected);
+    assert_eq!(lib.md(&outcome, &u(2))["parent"], json!(""));
+    assert_eq!(lib.md(&outcome, &u(1))["parent"], json!(u(2).as_str()));
+    assert!(notes_of(&outcome, &u(2)).contains(&NoteKind::CycleBroken {
         parent: String::new()
     }));
+}
+
+#[test]
+fn a_trashed_folder_the_editing_side_lacks_returns_to_its_base_parent() {
+    // Base: G, T in G, D in T. The tablet deleted T (keeping D, inked);
+    // origin renamed and trashed T. T is kept (renamed) and must come
+    // out of the trash: the tablet has no parent for it, base has G.
+    let mut lib = Lib::default();
+    let g = D::folder("G", "");
+    let t_folder = D::folder("T", u(1).as_str());
+    let doc = D::notebook("Notes", u(2).as_str(), 1, "base");
+    let (b, o, t) = three(
+        &mut lib,
+        &[(1, &g), (2, &t_folder), (3, &doc)],
+        &[(1, &g), (3, &doc.clone().ink(2, "tablet"))],
+        &[
+            (1, &g),
+            (2, &t_folder.clone().rename("T (old)").trash()),
+            (3, &doc),
+        ],
+    );
+    let outcome = run(&lib, &b, &o, &t);
+    assert_eq!(lib.md(&outcome, &u(2))["parent"], json!(u(1).as_str()));
+    assert_eq!(lib.md(&outcome, &u(3))["parent"], json!(u(2).as_str()));
+    assert!(
+        notes_of(&outcome, &u(2)).contains(&NoteKind::RestoredFromTrash {
+            parent: u(1).to_string()
+        })
+    );
 }
 
 #[test]
@@ -1994,6 +2192,65 @@ fn a_quarantined_document_carried_forward_is_never_deleted_by_the_tablet() {
 }
 
 #[test]
+fn carried_forward_paths_and_modes_are_fork_class() {
+    let mut lib = Lib::default();
+    let doc = D::pdf("Paper", "", 2);
+    let base = doc.build(&mut lib);
+    let ours = doc.clone().ink(1, "tablet").build(&mut lib);
+    // Origin gained a file of a newer rule set.
+    let mut newer = base.clone();
+    newer
+        .other
+        .insert("future/thing.bin".into(), lib.put(b"future"));
+    // Origin changed a file's mode.
+    let mut moded = base.clone();
+    moded.files.get_mut(&DocFile::PayloadPdf).unwrap().mode = FileMode::Executable;
+    [newer, moded].into_iter().for_each(|theirs| {
+        let tree = |version: &DocVersion| RepoTree {
+            docs: BTreeMap::from([(u(1), version.clone())]),
+            extra: BTreeMap::new(),
+        };
+        let outcome = run(&lib, &tree(&base), &tree(&ours), &tree(&theirs));
+        assert_eq!(outcome.forks.len(), 1);
+        let copy = &outcome.docs[&outcome.forks[0].copy];
+        assert_eq!(outcome.docs[&u(1)].other, theirs.other);
+        assert_eq!(
+            outcome.docs[&u(1)].files[&DocFile::PayloadPdf],
+            MergedEntry::Existing(theirs.files[&DocFile::PayloadPdf].clone())
+        );
+        assert_eq!(
+            page_blobs(copy),
+            page_blobs(&MergedVersion::existing(&ours))
+        );
+    });
+}
+
+#[test]
+fn a_large_reattach_with_a_trashed_library_part_is_fast() {
+    // Reattach: empty bases, every document new on both and identical,
+    // a few hundred of them in the trash. Trash vs edit used to be cubic
+    // here (minutes); it must stay roughly linear.
+    let mut lib = Lib::default();
+    let docs: Vec<(u32, D)> = (1..=2000u32)
+        .map(|n| {
+            let doc = D::pdf(&format!("Doc {n}"), "", 1);
+            (n, if n % 7 == 0 { doc.trash() } else { doc })
+        })
+        .collect();
+    let all = refs(&docs);
+    let (b, o, t) = three(&mut lib, &[], &all, &all);
+    let started = std::time::Instant::now();
+    let outcome = run(&lib, &b, &o, &t);
+    let elapsed = started.elapsed();
+    assert_eq!(outcome.docs.len(), 2000);
+    assert!(outcome.notes.is_empty());
+    assert!(
+        elapsed < std::time::Duration::from_secs(20),
+        "merge took {elapsed:?}"
+    );
+}
+
+#[test]
 fn errors_are_typed() {
     let mut lib = Lib::default();
     let doc = D::notebook("Notes", "", 1, "base");
@@ -2074,13 +2331,13 @@ impl Rng {
 
 /// Apply random edits for one side.
 fn mutate(rng: &mut Rng, side: &str, docs: &BTreeMap<u32, D>) -> BTreeMap<u32, D> {
-    let folders: Vec<u32> = docs
-        .iter()
-        .filter(|(_, d)| d.md["type"] == json!("CollectionType"))
-        .map(|(n, _)| *n)
-        .collect();
     let edits = rng.below(7);
     (0..edits).fold(docs.clone(), |mut docs, step| {
+        let folders: Vec<u32> = docs
+            .iter()
+            .filter(|(_, d)| d.md["type"] == json!("CollectionType"))
+            .map(|(n, _)| *n)
+            .collect();
         let keys: Vec<u32> = docs.keys().copied().collect();
         let target = keys[rng.below(keys.len() as u64) as usize];
         let parent = match rng.below(folders.len() as u64 + 1) as usize {
@@ -2089,7 +2346,7 @@ fn mutate(rng: &mut Rng, side: &str, docs: &BTreeMap<u32, D>) -> BTreeMap<u32, D
         };
         let d = docs[&target].clone();
         let is_folder = d.md["type"] == json!("CollectionType");
-        match rng.below(10) {
+        match rng.below(11) {
             0..=2 if !is_folder => {
                 let n = 1 + rng.below(4) as u32;
                 docs.insert(
@@ -2119,6 +2376,10 @@ fn mutate(rng: &mut Rng, side: &str, docs: &BTreeMap<u32, D>) -> BTreeMap<u32, D
                     D::notebook(&format!("{side} new"), &parent, 1, &format!("{side} {n}")),
                 );
             }
+            9 => {
+                let n = 2000 + rng.below(1000) as u32;
+                docs.insert(n, D::folder(&format!("{side} folder {n}"), &parent));
+            }
             _ if !is_folder => {
                 docs.insert(target, d.scroll(rng.below(50) as u32));
             }
@@ -2126,6 +2387,37 @@ fn mutate(rng: &mut Rng, side: &str, docs: &BTreeMap<u32, D>) -> BTreeMap<u32, D
         }
         docs
     })
+}
+
+/// The documents whose fork class a side changed against base: new
+/// documents, and those whose page files or page entries (without their
+/// view state) differ. The generator changes nothing else in the fork
+/// class, so this oracle is exact and independent of the engine.
+fn fork_edited(base: &BTreeMap<u32, D>, side: &BTreeMap<u32, D>) -> BTreeSet<u32> {
+    let pages = |d: &D| -> Option<Value> {
+        let mut pages = d.content.as_ref()?.get("cPages")?.get("pages")?.clone();
+        pages.as_array_mut()?.iter_mut().for_each(|page| {
+            if let Some(entry) = page.as_object_mut() {
+                entry.remove("scrollTime");
+                entry.remove("verticalScroll");
+            }
+        });
+        Some(pages)
+    };
+    side.iter()
+        .filter(|(n, d)| match base.get(n) {
+            None => d.md["type"] == json!("DocumentType"),
+            Some(before) => before.files != d.files || pages(before) != pages(d),
+        })
+        .map(|(n, _)| *n)
+        .collect()
+}
+
+/// A side's own tree, as tree items.
+fn items_of(docs: &BTreeMap<u32, D>) -> BTreeMap<DocId, TreeItem> {
+    docs.iter()
+        .map(|(n, d)| (u(*n), TreeItem::from_metadata(&d.md)))
+        .collect()
 }
 
 fn tree_of(lib: &mut Lib, docs: &BTreeMap<u32, D>) -> RepoTree {
@@ -2166,7 +2458,7 @@ fn new_ink(base: &RepoTree, side: &RepoTree) -> BTreeSet<Oid> {
 
 #[test]
 fn property_ink_survives_trees_stay_valid_and_merges_converge() {
-    (1..=500u64).for_each(|seed| {
+    (1..=2000u64).for_each(|seed| {
         let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
         let mut lib = Lib::default();
         let base_docs: BTreeMap<u32, D> = BTreeMap::from([
@@ -2180,6 +2472,8 @@ fn property_ink_survives_trees_stay_valid_and_merges_converge() {
         ]);
         let ours_docs = mutate(&mut rng, "tablet", &base_docs);
         let theirs_docs = mutate(&mut rng, "origin", &base_docs);
+        let ours_edited = fork_edited(&base_docs, &ours_docs);
+        let theirs_edited = fork_edited(&base_docs, &theirs_docs);
         let base = tree_of(&mut lib, &base_docs);
         let ours = tree_of(&mut lib, &ours_docs);
         let theirs = tree_of(&mut lib, &theirs_docs);
@@ -2196,24 +2490,52 @@ fn property_ink_survives_trees_stay_valid_and_merges_converge() {
             ..Run::default()
         };
         let outcome = runner.go(&lib, &base, &ours, &theirs).unwrap();
+        let merged_tree = merged_items(&lib, &outcome);
 
         // Ink is never discarded.
-        let kept: BTreeSet<Oid> = outcome.docs.values().flat_map(page_blobs).collect();
+        let kept: BTreeSet<Oid> = outcome
+            .docs
+            .values()
+            .filter(|version| version.is_present())
+            .flat_map(page_blobs)
+            .collect();
         new_ink(&base, &ours)
             .union(&new_ink(&base, &theirs))
             .for_each(|blob| assert!(kept.contains(blob), "seed {seed}: lost ink {blob}"));
 
+        // Edits beat deletion, hard and soft: a document a side changed
+        // outside its own trash is present and not in the trash.
+        [(&ours_docs, &ours_edited), (&theirs_docs, &theirs_edited)]
+            .into_iter()
+            .for_each(|(docs, edited)| {
+                let own = items_of(docs);
+                edited
+                    .iter()
+                    .filter(|n| docs.contains_key(n))
+                    .map(|n| u(*n))
+                    .filter(|id| trash_path(&own, id).is_none())
+                    .for_each(|id| {
+                        assert!(merged_tree.contains_key(&id), "seed {seed}: {id} deleted");
+                        assert_eq!(
+                            trash_path(&merged_tree, &id),
+                            None,
+                            "seed {seed}: edited {id} left in the trash"
+                        );
+                    });
+            });
+
+        // Forks only where both sides changed the fork class.
+        outcome.forks.iter().for_each(|fork| {
+            let n = (1..3000u32).find(|n| u(*n) == fork.original).unwrap();
+            assert!(
+                ours_edited.contains(&n) && theirs_edited.contains(&n),
+                "seed {seed}: spurious fork of {}",
+                fork.original
+            );
+        });
+
         // The merged tree is valid.
-        let items: BTreeMap<DocId, TreeItem> = outcome
-            .docs
-            .iter()
-            .filter(|(_, version)| version.is_present())
-            .map(|(id, version)| {
-                let md = lib.json(version, &DocFile::Metadata).unwrap();
-                (id.clone(), TreeItem::from_metadata(&md))
-            })
-            .collect();
-        assert_eq!(tree_violations(&items), vec![], "seed {seed}");
+        assert_eq!(tree_violations(&merged_tree), vec![], "seed {seed}");
 
         // Deterministic.
         assert_eq!(
@@ -2240,4 +2562,224 @@ fn property_ink_survives_trees_stay_valid_and_merges_converge() {
         assert!(follow.forks.is_empty(), "seed {seed}");
         assert_eq!(follow.guard.from_origin, BTreeSet::new(), "seed {seed}");
     });
+}
+
+// ---- review regressions: edits never end in the trash -----------------------
+
+/// The merged tree's items.
+fn merged_items(lib: &Lib, outcome: &MergeOutcome) -> BTreeMap<DocId, TreeItem> {
+    outcome
+        .docs
+        .iter()
+        .filter(|(_, version)| version.is_present())
+        .map(|(id, version)| {
+            let md = lib.json(version, &DocFile::Metadata).unwrap();
+            (id.clone(), TreeItem::from_metadata(&md))
+        })
+        .collect()
+}
+
+fn in_trash(lib: &Lib, outcome: &MergeOutcome, id: &DocId) -> bool {
+    trash_path(&merged_items(lib, outcome), id).is_some()
+}
+
+#[test]
+fn p13_an_edit_moved_into_a_folder_both_sides_trashed_comes_out() {
+    // Tablet B trashed Old (empty there) and kept inking N; tablet A
+    // moved N into Old, trashed Old and synced first.
+    let mut lib = Lib::default();
+    let old = D::folder("Old", "");
+    let doc = D::notebook("Notes", "", 1, "base");
+    let (b, o, t) = three(
+        &mut lib,
+        &[(1, &doc), (2, &old)],
+        &[
+            (1, &doc.clone().ink(2, "tablet ink")),
+            (2, &old.clone().trash()),
+        ],
+        &[
+            (1, &doc.clone().move_to(u(2).as_str())),
+            (2, &old.clone().trash()),
+        ],
+    );
+    let outcome = run(&lib, &b, &o, &t);
+    assert!(!in_trash(&lib, &outcome, &u(1)));
+    // Old stays in the trash (both sides put it there); N is taken out to
+    // where the tablet has it.
+    assert_eq!(lib.md(&outcome, &u(2))["parent"], json!(TRASH_PARENT));
+    assert_eq!(lib.md(&outcome, &u(1))["parent"], json!(""));
+    assert!(
+        notes_of(&outcome, &u(1)).contains(&NoteKind::RestoredFromTrash {
+            parent: String::new()
+        })
+    );
+}
+
+#[test]
+fn p14_an_edit_inside_a_folder_filed_into_a_trashed_folder_comes_out() {
+    // The tablet filed folder A into Old and trashed Old; origin trashed
+    // Old too and inked a notebook in A.
+    let mut lib = Lib::default();
+    let old = D::folder("Old", "");
+    let a = D::folder("A", "");
+    let doc = D::notebook("Notes", u(3).as_str(), 1, "base");
+    let (b, o, t) = three(
+        &mut lib,
+        &[(1, &doc), (2, &old), (3, &a)],
+        &[
+            (1, &doc),
+            (2, &old.clone().trash()),
+            (3, &a.clone().move_to(u(2).as_str())),
+        ],
+        &[
+            (1, &doc.clone().ink(2, "origin ink")),
+            (2, &old.clone().trash()),
+            (3, &a),
+        ],
+    );
+    let outcome = run(&lib, &b, &o, &t);
+    assert!(!in_trash(&lib, &outcome, &u(1)));
+    assert_eq!(lib.md(&outcome, &u(3))["parent"], json!(""));
+    assert_eq!(lib.md(&outcome, &u(1))["parent"], json!(u(3).as_str()));
+}
+
+#[test]
+fn p2_an_edit_moved_into_a_new_trashed_folder_comes_out() {
+    // Origin created folder X, moved N into it and trashed X; the tablet
+    // inked N. Neither the tablet nor base has X.
+    let mut lib = Lib::default();
+    let x = D::folder("X", "").trash();
+    let doc = D::notebook("Notes", "", 1, "base");
+    let (b, o, t) = three(
+        &mut lib,
+        &[(1, &doc)],
+        &[(1, &doc.clone().ink(2, "tablet"))],
+        &[(1, &doc.clone().move_to(u(2).as_str())), (2, &x)],
+    );
+    let outcome = run(&lib, &b, &o, &t);
+    assert!(!in_trash(&lib, &outcome, &u(1)));
+    assert_eq!(lib.md(&outcome, &u(1))["parent"], json!(""));
+    assert_eq!(lib.md(&outcome, &u(2))["parent"], json!(TRASH_PARENT));
+}
+
+#[test]
+fn p3_an_edit_resurrected_into_a_trashed_folder_comes_out() {
+    // Origin deleted folder F (with N) and trashed F's parent P; the
+    // tablet inked N. N is kept, F resurrected into P: then P must come
+    // back too.
+    let mut lib = Lib::default();
+    let p = D::folder("P", "");
+    let f = D::folder("F", u(2).as_str());
+    let doc = D::notebook("Notes", u(3).as_str(), 1, "base");
+    let (b, o, t) = three(
+        &mut lib,
+        &[(1, &doc), (2, &p), (3, &f)],
+        &[(1, &doc.clone().ink(2, "tablet")), (2, &p), (3, &f)],
+        &[(2, &p.clone().trash())],
+    );
+    let history: BTreeMap<DocId, Vec<DocVersion>> =
+        BTreeMap::from([(u(3), vec![f.build(&mut lib)])]);
+    let outcome = Run {
+        history: &history,
+        ..Run::default()
+    }
+    .go(&lib, &b, &o, &t)
+    .unwrap();
+    assert_eq!(outcome.resolutions[&u(3)], Resolution::Resurrected);
+    assert!(!in_trash(&lib, &outcome, &u(1)));
+    assert_eq!(lib.md(&outcome, &u(2))["parent"], json!(""));
+}
+
+#[test]
+fn p4_a_cycle_broken_into_a_trashed_folder_does_not_trash_an_edit() {
+    // Base: T, X in T, Y. Tablet: X into Y, ink D in X. Origin: Y into X,
+    // trash T. Cycle X <-> Y; X gets origin's parent T, which is in the
+    // trash with D below it: T must come back.
+    let mut lib = Lib::default();
+    let t_folder = D::folder("T", "");
+    let x = D::folder("X", u(2).as_str());
+    let y = D::folder("Y", "");
+    let doc = D::notebook("Notes", u(3).as_str(), 1, "base");
+    let (b, o, t) = three(
+        &mut lib,
+        &[(1, &doc), (2, &t_folder), (3, &x), (4, &y)],
+        &[
+            (1, &doc.clone().ink(2, "tablet")),
+            (2, &t_folder),
+            (3, &x.clone().move_to(u(4).as_str())),
+            (4, &y),
+        ],
+        &[
+            (1, &doc),
+            (2, &t_folder.clone().trash()),
+            (3, &x),
+            (4, &y.clone().move_to(u(3).as_str())),
+        ],
+    );
+    let outcome = run(&lib, &b, &o, &t);
+    assert_eq!(tree_violations(&merged_items(&lib, &outcome)), vec![]);
+    assert!(!in_trash(&lib, &outcome, &u(1)));
+}
+
+#[test]
+fn p1_a_deep_resurrection_chain_is_resolved_completely() {
+    let mut lib = Lib::default();
+    let folders: Vec<(u32, D)> = (1..=8u32)
+        .map(|n| {
+            let parent = if n == 1 {
+                String::new()
+            } else {
+                u(n - 1).to_string()
+            };
+            (n, D::folder(&format!("F{n}"), &parent))
+        })
+        .collect();
+    let doc = D::notebook("Deep", u(8).as_str(), 1, "base");
+    let inked = doc.clone().ink(2, "tablet");
+    let base: Vec<(u32, &D)> = folders
+        .iter()
+        .map(|(n, d)| (*n, d))
+        .chain([(100, &doc)])
+        .collect();
+    let ours: Vec<(u32, &D)> = folders
+        .iter()
+        .map(|(n, d)| (*n, d))
+        .chain([(100, &inked)])
+        .collect();
+    let (b, o, t) = three(&mut lib, &base, &ours, &[]);
+    let history: BTreeMap<DocId, Vec<DocVersion>> = folders
+        .iter()
+        .map(|(n, d)| (u(*n), vec![d.build(&mut lib)]))
+        .collect();
+    let outcome = Run {
+        history: &history,
+        ..Run::default()
+    }
+    .go(&lib, &b, &o, &t)
+    .unwrap();
+    assert_eq!(tree_violations(&merged_items(&lib, &outcome)), vec![]);
+    assert!((1..=8).all(|n| outcome.resolutions[&u(n)] == Resolution::Resurrected));
+}
+
+#[test]
+fn fixpoint_reports_change_and_refuses_to_run_past_its_bound() {
+    // Counts down to zero: three changing steps, then a quiet one.
+    let countdown =
+        |n: u32| -> Result<(u32, bool)> { Ok(if n == 0 { (0, false) } else { (n - 1, true) }) };
+    assert_eq!(fixpoint(3, 3, "test", countdown).unwrap(), (0, true));
+    assert_eq!(fixpoint(0, 0, "test", countdown).unwrap(), (0, false));
+    assert!(matches!(
+        fixpoint(4, 3, "test", countdown),
+        Err(crate::error::Error::HubMerge(MergeError::NoFixpoint {
+            rule: "test",
+            bound: 3
+        }))
+    ));
+    // Errors from a step pass through.
+    assert!(matches!(
+        fixpoint(1, 3, "test", |_| -> Result<(u32, bool)> {
+            Err(MergeError::InvalidDate("x".into()).into())
+        }),
+        Err(crate::error::Error::HubMerge(MergeError::InvalidDate(_)))
+    ));
 }
