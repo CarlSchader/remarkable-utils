@@ -91,7 +91,9 @@ Read-only inspection of a reMarkable Paper Pro on firmware 3.28:
   "value": ...}`, `A` a per-document author index into `cPages.uuids`,
   `C` a counter. Every register on the sample used author `1`, so
   **timestamps from two tablets are not comparable**.
-- Opening and scrolling a document rewrites view state in `.content`.
+- Opening a document rewrites `.metadata` view state; scrolling rewrites
+  view state in `.content` and moves `lastModified` (see "Device survey
+  results").
 - `.rm` files are `reMarkable .lines file, version=6`, 0.4 KB to about
   1.2 MB per page on the sample.
 - The largest PDF was about 110 MB. GitHub rejects files over 100 MB,
@@ -260,9 +262,12 @@ as `Client::restart_xochitl` does today.
   If base does have that document, it is quarantined; it must never read
   as a deletion.
 
-Stat signatures are size, mtime, ctime and inode. Busybox `stat` has
-whole-second resolution, so a file whose mtime is within the second of
-the previous snapshot is re-read regardless (git's racy-entry rule).
+Stat signatures are size, mtime, ctime and inode. Busybox `stat`'s `%Y`
+and `%Z` are whole seconds, but `%y`/`%z` print nanoseconds on the
+Paper Pro's ext4, and the signature uses those. A file whose mtime is
+within the same second as the previous snapshot is still re-read
+regardless (git's racy-entry rule), in case a filesystem or firmware
+reports coarse timestamps.
 
 ### Ancestry and identity checks (step 8)
 
@@ -301,8 +306,8 @@ clean-up does not require `--allow-deletions` on every tablet.
   stat moved since the snapshot.
 - **Verify**: a document is applied only if its tablet files still match
   the snapshot — compared as normalised JSON for `.metadata`/`.content`
-  (view-state fields ignored, so a document merely being read is not
-  skipped forever) and by one batched `sha256sum` for other files being
+  (view-state and derived fields ignored, so a document merely being
+  read is not skipped forever) and by one batched `sha256sum` for other files being
   replaced. Mismatching documents are skipped and get a base override.
 - **Fork groups are one unit**: if the original is skipped, its conflict
   copy is not written either.
@@ -362,7 +367,7 @@ may write files:
   unchanged, and its edits are picked up by this run's snapshot.
 - Otherwise, the merge is part of origin. For each document whose merge
   version differs from its snapshot version, compared as normalised JSON
-  (view-state fields ignored):
+  (view-state and derived fields ignored):
   - every file is at the merge version → base = merge;
   - every file is at its snapshot or merge version (the user has not
     touched it) → finish applying it (verify, move, overlay view state),
@@ -383,7 +388,7 @@ Further:
 
 - **Deterministic forks**: a fork's UUID is UUIDv5 over (original
   document UUID, tree id of the forked version normalised without view
-  state). Recomputing a merge recreates the identical fork, which merges
+  state and derived fields). Recomputing a merge recreates the identical fork, which merges
   as an identical add — never a duplicate.
 - **Identical changes** on both sides merge to one.
 - **Device ref bookkeeping**: `device_ref` is written to the tablet
@@ -405,16 +410,30 @@ document. JSON is compared parsed, never as bytes.
 - A document is **present** when its `metadata` exists. **Deleted** means
   `metadata` absent. Any other missing file is a change, not a deletion.
 - A document **changed** on a side when anything other than its
-  view-state fields differs from base.
+  view-state and derived fields differs from base.
 - **View state** is an enumerated list of JSON paths, versioned with the
-  mirror rules. Initial list, to be completed by the device survey:
-  `.content`: `cPages.lastOpened`, per-page `scrollTime`,
-  `verticalScroll`, `modifed`, `customZoom*`, `zoomMode`,
-  `extraMetadata` (last pen, tool, colour), `lastOpenedPage`,
-  `transform`, `keyboardMetadata`; `.metadata`: `lastOpened`,
-  `lastOpenedPage`, `metadatamodified`, `modified`, `synced`, `version`.
-- **Fork class**: every mirrored file except `metadata` and view-state
-  fields — page list and other `.content` fields, `.rm` files,
+  mirror rules (list confirmed by the device survey):
+  `.content`: `cPages.lastOpened`, per-page `scrollTime` and
+  `verticalScroll`, `customZoomCenterX`, `customZoomCenterY`,
+  `customZoomOrientation`, `customZoomPageHeight`,
+  `customZoomPageWidth`, `customZoomScale`, `zoomMode`, `extraMetadata`
+  (whole object: last pen, tool, colour), and, not seen on 3.28 but
+  written by other firmware, `lastOpenedPage`, `transform`,
+  `keyboardMetadata`; `.metadata`: `lastOpened`, `lastOpenedPage`,
+  `new`, `metadatamodified`, `modified`, `synced`, `version`.
+- **Derived fields** are ignored when deciding whether a document
+  changed and when verifying, and are never a reason to fork. They are
+  taken from the side whose fork-class content wins (recomputed in
+  phase 2): `.content` `pageCount`, `sizeInBytes`, `cPages.original`,
+  `documentMetadata`, `cPages.uuids` (see phase 2); `.metadata`
+  `lastModified`, merged as the maximum of both sides. The survey found
+  that scrolling alone moves `lastModified`, so it cannot count as a
+  change.
+- Per-page `modifed` is **not** view state: it changes only with the
+  page's ink, so it belongs to the page entry and moves with the `.rm`
+  file.
+- **Fork class**: every mirrored file except `metadata`, view-state and
+  derived fields — page list and other `.content` fields, `.rm` files,
   `pagedata`, highlights, page metadata, templates, payloads.
 
 ### Per document
@@ -497,10 +516,16 @@ When fork-class content changed on both sides:
 - Each `.rm` file merges as a whole file three-way. The same page inked
   on both sides forks the document, as in phase 1.
 - `pageCount` and other derived fields are recomputed.
-- `cPages.uuids` author indices may need renumbering when two tablets'
-  author lists differ. v6 `.rm` scene items carry author indices too, so
-  renumbering must cover `.rm` files or be avoided; the device survey
-  decides which (question 4).
+- **No renumbering.** A tablet writes everything as author index `1`,
+  and each `.rm` file carries its own `AuthorIds` block mapping its
+  indices to UUIDs (survey, question 4). Because `.rm` files merge as
+  whole files, a page stays self-consistent whichever side it comes
+  from, so `.rm` files are never rewritten. In `.content`, the merged
+  document keeps origin's `cPages.uuids` and register timestamps are
+  taken verbatim from the side whose value wins; they are never compared
+  across tablets. Whether xochitl accepts registers whose author index
+  meant a different UUID on the writing tablet is checked with question
+  7 before phase 2 ships.
 
 ## Git details
 
@@ -553,8 +578,10 @@ When fork-class content changed on both sides:
 View state is **device-local**: it never counts as a change, never forks,
 never resurrects a deleted document, and on apply each tablet keeps its
 own values for existing documents (re-read while xochitl is stopped). Documents new to a tablet get the
-values stored in origin, minus model-specific zoom fields (device
-pixels, which differ between models). "Resume where I left off on the
+values stored in origin, minus model-specific zoom fields (the
+`customZoom*` fields; the survey saw `1404`×`1872` page sizes on a
+Paper Pro, so they may be a shared coordinate space, but they are
+dropped until a second model confirms it). "Resume where I left off on the
 other tablet" is a possible later feature; it would need comparable
 clocks and per-model translation.
 
@@ -588,7 +615,8 @@ clocks and per-model translation.
 
 ## Device questions
 
-Read-only (answered by the survey PR, before the merge engine):
+Read-only (questions 1–4 **answered**; see "Device survey results"
+below):
 
 1. How to detect cloud pairing without reading credentials (e.g. check
    on the device whether the token keys in `xochitl.conf` are non-empty,
@@ -616,6 +644,139 @@ Needing writes (answered during device validation, with go-ahead):
    within the start-limit window when repeated?
 7. Does xochitl accept a `.content` whose page list was merged
    externally?
+
+### Device survey results
+
+Read-only survey of one reMarkable Paper Pro on firmware 3.28.0, not
+paired with the cloud, library of about 110 items (70 PDFs, 2 notebooks,
+37 folders, 8 inked pages). Most PDFs had been uploaded by `rmu` and
+never opened, so their files still had rmu's minimal skeleton; only 7
+documents carried a `.content` written by xochitl. Field counts below
+are therefore a floor, not a census of everything xochitl can write.
+Details of the formats are in `notebook-data.md`.
+
+**1. Cloud pairing.** The signal is the `devicetoken` key in
+`/home/root/.config/remarkable/xochitl.conf` (`[General]`). On the
+unpaired tablet it is `@Invalid()` (Qt's encoding of an unset value)
+and `UserToken` is empty; xochitl's log says it cannot fetch a user
+token without a device token. `user-auth/` under
+`~/.local/share/remarkable` and the `.tree` file exist on the unpaired
+tablet too, so neither is a pairing signal. The guard (step 2) runs this
+one-liner, which prints only `true` or `false`:
+
+```sh
+sed -n 's/^devicetoken=//p' /home/root/.config/remarkable/xochitl.conf \
+  | grep -qvE '^(|@Invalid\(\)|@ByteArray\(\)|"")$' && echo true || echo false
+```
+
+It printed `false` on the surveyed tablet; the `true` branch has only
+been checked against synthetic input, since no paired tablet was
+available. `rm-sync.service` (cloud sync) is enabled and running even
+when unpaired; it has `BindsTo=xochitl.service` and
+`PartOf=xochitl.service`, and xochitl `Wants=` it, so it stops and
+starts with xochitl and needs no handling of its own.
+
+**2. Device capabilities.**
+
+- `systemd-run` exists (systemd 255) and supports `--on-active`,
+  `--unit`, `--collect`, `--no-block` and `--timer-property`; the
+  detached-`sleep` fallback is not needed on this model but stays for
+  others. `setsid` and `nohup` exist; `timeout` does not.
+- `/proc/sys/kernel/random/boot_id` exists.
+- xochitl's unit: `StartLimitBurst=4` in `StartLimitIntervalSec=600`,
+  `Restart=on-failure`, `WatchdogSec=60`, `JobTimeoutSec=60s`, and
+  `OnFailure=remarkable-fail.service emergency.target`. Exhausting the
+  start limit therefore drops to the emergency target: one sync cycle
+  uses two starts (steps 6 and 16), so two back-to-back cycles inside 10
+  minutes reach the limit without `reset-failed`. The existing rule
+  (always `reset-failed` before `start`) is essential, and question 6
+  still has to confirm it suffices.
+- BusyBox 1.36 provides `stat`, `sha256sum`, `tar`, `find`, `mv`,
+  `mktemp`, `flock`, `setsid`, `sync`. `stat -c` supports size `%s`,
+  mtime `%Y`, ctime `%Z`, inode `%i` and device `%d`; `%y`/`%z` give
+  nanosecond times (the stat signature now uses them). `tar` takes
+  `-T -` and `--no-recursion` but fails on an empty file list (`tar:
+  empty archive`), so the device layer must skip the call when nothing
+  needs reading. `find` has `-print0`, `-exec ... +`, `-newer`, but no
+  `-printf`. `mv -T`/`-n`, `mktemp -d -p` work. `sync` takes no
+  arguments (flushes everything).
+- `/home` is a single ext4 filesystem (an encrypted device-mapper volume
+  on the Paper Pro). `~/.local/share` and the xochitl data dir report the
+  same device number, so a staging directory under
+  `/home/root/.local/share/rmu/` can be moved into place with `rename`.
+  That directory does not exist yet on a fresh tablet.
+
+**3. Fields and churn.** Every document `.content` is `formatVersion:
+2`; every `.rm` header is `reMarkable .lines file, version=6`; every
+`.local` is `{"contentFormatVersion": 2}`.
+
+- Document `.metadata` written by xochitl has exactly `createdTime`,
+  `lastModified`, `lastOpened`, `lastOpenedPage`, `new`, `parent`,
+  `pinned`, `source`, `type`, `visibleName` (pdf and notebook alike). The
+  folders, all created by rmu, also have `metadatamodified`, `modified`,
+  `synced`, `version`; xochitl leaves them alone.
+- `.content` keys on xochitl-written documents (7 of 7 unless noted):
+  `cPages` {`lastOpened`, `original`, `pages`, `uuids`},
+  `coverPageNumber`, `customZoomCenterX`, `customZoomCenterY`,
+  `customZoomOrientation`, `customZoomPageHeight`, `customZoomPageWidth`,
+  `customZoomScale`, `documentMetadata` (`title`/`authors` on 3 PDFs),
+  `extraMetadata` (19 last-tool keys), `fileType`, `fontName`,
+  `formatVersion`, `lineHeight`, `margins` (PDFs only), `orientation`,
+  `pageCount`, `pageTags`, `sizeInBytes`, `tags`, `textAlignment`,
+  `textScale`, `zoomMode`. Page entries have `id`, `idx`, and optionally
+  `redir`, `modifed`, `scrollTime`, `verticalScroll`, `template`. No
+  `deleted` page was present on the sample; it stays in the rules from
+  earlier inspection.
+- **First open rewrites the whole `.content`** of an imported document:
+  rmu's skeleton has `"pages": []`, and opening it creates one entry per
+  PDF page with a fresh random page id, plus `original`, `uuids`,
+  `pageCount`, `sizeInBytes`, `documentMetadata`, zoom fields,
+  `extraMetadata`, `tags`, and `new: false` in `.metadata`. Two tablets
+  that open the same new PDF would therefore fork it. The merge engine
+  must handle this (see "Follow-ups from design review").
+- **Derived per device**: `sizeInBytes` (payload plus ink),
+  `pageCount`, `cPages.original`, `documentMetadata`. `.local` is
+  device-local. `customZoomPageWidth`/`Height` were `1404`×`1872` on a
+  Paper Pro (whose screen is larger), so they look like a shared
+  coordinate space; still treated as model-specific until a second model
+  is seen.
+- **`lastModified`**: opening a document rewrote `.metadata`
+  (`lastOpened`, `lastOpenedPage`) without moving `lastModified` and
+  without rewriting `.content` (two documents opened days after their
+  last change: `.metadata` mtime equals `lastOpened`, `.content` mtime
+  equals `lastModified`). Scrolling **does** move it: on two documents
+  `lastModified` equals the newest `scrollTime` to the second while the
+  newest ink is weeks older. One document had both files rewritten 26
+  minutes after `lastModified` without a bump. Confidence: medium. The
+  timestamps are consistent across all seven documents, but no
+  controlled before/after test was done. Consequence: `lastModified` is
+  a derived field, not a change signal (see "Definitions").
+  `cPages.lastOpened` counters reach the hundreds on a book being read.
+  `modifed` equals the page's `.rm` mtime, so it tracks ink, not reading.
+- **File kinds in the data dir**: top level `<uuid>.metadata`,
+  `.content`, `.pagedata` (written by rmu; notebooks created on the
+  tablet have none), `.pdf`, `.local`, `<uuid>/` and
+  `<uuid>.thumbnails/`, plus `.tree`. Inside `<uuid>/`: only
+  `<page-id>.rm`. Inside `.thumbnails/`: `<page-id>.png`, only for the 7
+  opened documents. No EPUBs, `.highlights/`, `.template` or
+  `-metadata.json` files on the sample; the allowlist keeps them from
+  earlier knowledge. The allowlist needs no change.
+
+**4. Author indices.** All 7 documents with a `cPages.uuids` list have
+exactly one entry, `{"first": <uuid>, "second": 1}`, and it is the same
+UUID in all of them: one distinct author UUID on the tablet. Every
+register timestamp uses author `1` (about 6,300); the only exceptions are
+three `"0:0"` defaults (`cPages.original` on both notebooks created on
+the tablet, `cPages.lastOpened` on one of them). All 8 `.rm` files start
+with an `AuthorIds` block (type 0x09) holding one entry, index `1` to that same UUID. Every stroke and
+tombstone id uses author `1`; the built-in root/layer references use
+author `0`. Implications for phase 2: a second tablet presumably also
+writes as author `1` with its own UUID, so indices collide rather than
+differ, and renumbering would mean rewriting `.rm` files. It is avoided:
+`.rm` files merge as whole files and carry their own author table, and
+`.content` registers are never compared across tablets (see "Phase 2").
+Whether the author UUID is per tablet or per account, and what xochitl
+does with a merged `cPages.uuids`, needs a second tablet (question 7).
 
 ## Decisions (confirmed by the owner)
 
@@ -648,6 +809,22 @@ To be handled in the implementation PRs named:
   (`sync`) on the tablet before each push. The metadata re-read in step
   14 includes newly created files. Quarantined documents are never
   deleted, not only never overwritten.
+- Merge engine (from the device survey): **first-open
+  materialisation**. A `.content` whose base has `"pages": []` and
+  whose new page list is trivial — one entry per PDF page, `redir` equal
+  to its position, no inserted, deleted or templated pages, no `.rm`
+  files — counts as unchanged (only view state and derived fields
+  moved). If both sides materialised, origin's page ids win and the
+  tablet takes them on apply. Without this, two tablets opening the same
+  new PDF fork it. `rmu hub add` should write a materialised page list
+  with deterministic page ids (UUIDv5 over document UUID and page index)
+  so documents added through the hub never hit the case. Phase 2 matches
+  pages by `redir` when both sides materialised from an empty base.
+- Sync cycle, step 2: the pairing guard runs the one-liner from survey
+  question 1 and refuses on `true`.
+- Device layer: skip the `tar` call when there is nothing to download
+  (BusyBox `tar` fails on an empty file list); stat signatures use
+  `%y`/`%z` for nanosecond times.
 
 ## Implementation plan
 
