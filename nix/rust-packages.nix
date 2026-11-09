@@ -50,9 +50,14 @@ flake-utils.lib.eachDefaultSystem (system: let
   # Tests drive the system `git` binary and create throwaway repositories.
   # Keep them hermetic: no user/system git config, a scratch HOME, and a
   # fabricated identity so commits work without any configuration.
+  # The hub device-layer tests also run the generated tablet scripts
+  # locally (Linux): with the GNU tools plus `flock`/`setsid` from
+  # util-linux, and with BusyBox applets and `ash`, as on a tablet (named
+  # by RMU_TEST_BUSYBOX, never put on PATH).
   hermeticGitTestArgs = {
-    nativeCheckInputs = [pkgs.git];
+    nativeCheckInputs = [pkgs.git] ++ lib.optional pkgs.stdenv.hostPlatform.isLinux pkgs.util-linux;
     preCheck = ''
+      ${lib.optionalString pkgs.stdenv.hostPlatform.isLinux "export RMU_TEST_BUSYBOX=${pkgs.busybox}/bin/busybox"}
       export HOME="$(mktemp -d)"
       export GIT_CONFIG_GLOBAL=/dev/null
       export GIT_CONFIG_NOSYSTEM=1
