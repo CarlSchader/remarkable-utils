@@ -994,6 +994,42 @@ fn edits_after_an_interrupted_apply_are_not_conflicts() {
     });
 }
 
+/// Crashes during reconciliation itself: a first crash leaves a journal
+/// (an apply killed inside a document, or a crash before the record),
+/// then the recovering run is cut at every one of its own operations.
+#[test]
+fn crash_during_reconciliation_at_every_operation() {
+    let template = crash_template();
+    let reference = reference(&template);
+    let record = op_index(&template, 0, OpKind::WriteState, 3, |w| {
+        w.sync(0).unwrap();
+    });
+    [
+        (Fault::KillApplyAfter(6), "apply killed after 6 moves"),
+        (Fault::DisconnectAtOp(record), "crash before the record"),
+    ]
+    .into_iter()
+    .for_each(|(first, what)| {
+        let crashed = template.duplicate();
+        crashed.tablet(0).inject(first);
+        assert!(crashed.sync(0).is_err(), "{what}");
+        crashed.tablet(0).reconnect();
+        crashed.tablet(0).fire_watchdog();
+        // The recovering run, clean, on a copy: its operations.
+        let probe = crashed.duplicate();
+        let report = probe.sync(0).unwrap();
+        assert!(report.reconciled.is_some(), "{what}: {report:?}");
+        let ops = probe.tablet(0).ops();
+        (1..=ops.len()).for_each(|k| {
+            let world = crashed.duplicate();
+            world.tablet(0).inject(Fault::DisconnectAtOp(k));
+            let result = world.sync(0);
+            world::no_contract_violation(&result);
+            recover(&world, &reference, &format!("{what}, then op {k} ({:?})", ops[k - 1]));
+        });
+    });
+}
+
 #[test]
 fn download_cut_after_every_file() {
     let template = crash_template();
@@ -1138,14 +1174,6 @@ fn interleaving(seed: u64) {
         }
     });
     world.converge();
-    if std::env::var_os("RMU_E2E_DEBUG").is_some() {
-        eprintln!(
-            "seed {seed}: {} documents, {} conflict copies, {} ink marks",
-            world.origin_docs().len(),
-            world.conflicts().len(),
-            world.inks.lock().unwrap().expected.len()
-        );
-    }
 }
 
 #[test]
