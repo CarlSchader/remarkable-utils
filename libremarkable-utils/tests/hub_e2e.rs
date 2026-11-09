@@ -9,7 +9,7 @@
 #[path = "hub_e2e/world.rs"]
 mod world;
 
-use libremarkable_utils::hub::cycle::MainUpdate;
+use libremarkable_utils::hub::cycle::{MainUpdate, Warning};
 use world::{Kind, World};
 
 #[test]
@@ -367,19 +367,36 @@ fn a_quarantined_document_is_never_deleted_or_overwritten() {
 
 #[test]
 fn edits_during_the_sync_are_skipped_then_picked_up() {
+    edits_during_the_sync(false);
+    edits_during_the_sync(true);
+}
+
+/// B renames the notes; A will apply that. While A's sync has the UI up
+/// (between staging and stopping xochitl again to apply), the user inks
+/// them on A: that document is skipped, keeps its snapshot version as its
+/// base, and the next sync merges the ink with B's rename. With a change
+/// of A's own (`own_change`), the base is the snapshot commit (`main`
+/// contains it); without, nothing is pushed and it is the notes' previous
+/// base, which holds the same version.
+fn edits_during_the_sync(own_change: bool) {
     let (base, lib) = two_tablets();
-    // B renames the notes; A will apply that. While A's sync has the UI
-    // up (between staging and stopping xochitl again to apply), the user
-    // inks them on A: that document is skipped, keeps its snapshot base,
-    // and the next sync merges the ink with B's rename.
     base.rename(1, &lib.notes, "Notes (renamed on B)");
     base.sync(1).unwrap();
+    if own_change {
+        base.rename(0, &lib.sketch, "Sketch (A)");
+    }
     let page = base.pages(0, &lib.notes)[0].clone();
     // The op after the (last) Stage: the arm before the step-13 stop.
     let stage = op_index(&base, 0, OpKind::Stage, 2, |w| {
         w.sync(0).unwrap();
     });
     let world = base.duplicate();
+    let previous = world
+        .device(0)
+        .state()
+        .unwrap()
+        .base_for(&lib.notes)
+        .cloned();
     world.inks.lock().unwrap().expect("window-ink", &lib.notes);
     let page_path = format!("{}/{page}.rm", lib.notes);
     world.tablet(0).inject(Fault::EditBefore(
@@ -393,12 +410,16 @@ fn edits_during_the_sync_are_skipped_then_picked_up() {
     ));
     let report = world.sync(0).unwrap();
     assert_eq!(report.skipped, vec![lib.notes.clone()], "{report:?}");
+    let expected = if own_change {
+        assert!(matches!(report.update, MainUpdate::Merge(_)), "{report:?}");
+        Some(report.snapshot.clone())
+    } else {
+        assert_eq!(report.update, MainUpdate::Pulled, "{report:?}");
+        previous
+    };
     let device = world.device(0);
     let state = device.state().unwrap();
-    assert_eq!(
-        state.base_overrides.get(&lib.notes),
-        Some(&Some(report.snapshot.clone()))
-    );
+    assert_eq!(state.base_overrides.get(&lib.notes), Some(&expected));
     // Still A's name: the rename was not applied over the edit.
     assert_eq!(device.metadata(&lib.notes).unwrap()["visibleName"], "Notes");
     world.converge();
@@ -1515,7 +1536,10 @@ fn a_second_model_attaching_is_warned_about() {
         .clone_tablet(&other, &world.origin, None, false)
         .unwrap();
     assert_eq!(report.warnings.len(), 1, "{report:?}");
-    assert!(report.warnings[0].contains("reMarkable Other"));
+    assert!(
+        matches!(&report.warnings[0], Warning::MixedModel { model, .. } if model == "reMarkable Other"),
+        "{report:?}"
+    );
     // The same model again: no warning.
     let world = World::new(2);
     world.create(0, Kind::Notebook { pages: 1 }, "Notes", "");

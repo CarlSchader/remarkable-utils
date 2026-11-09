@@ -9,19 +9,18 @@ use serde_json::Value;
 use super::message::{self, Author, MergeRecord};
 use super::plan::{self, Change, Content, JsonBlobs, LocalJson, Planned, Reread};
 use super::snapshot::{self, Known, ReadMode, Snapshot, TabletRead};
-use super::store::{self, Store, StoreHistory};
+use super::store::{self, Store};
 use super::{
     BackupReport, CycleError, Hub, MainUpdate, OriginCtx, Overlay, Prepared, Pushed, Reconciled,
-    Session, SyncReport, check_url, commit_tree, consented_deletions, default_name, read_summary,
-    realise, rmu_signature, tablet_version, tree_items, trees_equivalent, unix_now, virtual_base,
-    xochitl_path,
+    Session, SyncReport, Warning, check_url, commit_tree, default_name, quarantine_report,
+    read_summary, rmu_signature, tablet_versions, tree_items, unix_now, virtual_base, xochitl_path,
 };
 use crate::error::{Error, Result};
 use crate::git::{CommitMeta, Expected, Oid, Repo};
 use crate::hub::device::{
     ApplyPlan, DeviceError, DeviceInfo, DocApply, StagedFile, StatEntry, Tablet,
 };
-use crate::hub::merge::{self, MergeInput, MergeParams, TreeItem};
+use crate::hub::merge::{self, BlobSource, TreeItem};
 use crate::hub::model::{
     Classification, DeviceId, DeviceName, DocFile, DocId, DocOutcome, DocVersion, Journal,
     JsonFile, ManifestEntry, MirrorRules, MirroredFile, RepoTree, StatSignature, TabletState,
@@ -90,20 +89,43 @@ fn read_manifest(read: &TabletRead, started_at: i64) -> BTreeMap<XochitlPath, Ma
     })
 }
 
-fn quarantine_report(snapshot: &Snapshot) -> BTreeMap<DocId, String> {
-    snapshot
-        .quarantined
-        .iter()
-        .map(|(doc, reason)| (doc.clone(), reason.to_string()))
-        .collect()
+/// This tablet as the author of its commits.
+fn author<'a>(state: &'a TabletState, info: &'a DeviceInfo) -> Author<'a> {
+    Author {
+        name: &state.device_name,
+        id: &state.device_id,
+        model: info.model.as_deref(),
+        firmware: info.firmware.as_deref(),
+    }
 }
 
-/// The tablet's files as read, per document, as versions.
-fn tablet_versions(read: &TabletRead) -> BTreeMap<DocId, DocVersion> {
-    read.doc_files()
-        .iter()
-        .map(|(doc, files)| (doc.clone(), tablet_version(files)))
-        .collect()
+/// The tablet's `.metadata`/`.content` bytes as read (not committed to
+/// the cache yet) in front of the cache.
+struct ReadBlobs<'a> {
+    bytes: HashMap<&'a Oid, &'a [u8]>,
+    store: &'a Store,
+}
+
+impl<'a> ReadBlobs<'a> {
+    fn new(read: &'a TabletRead, store: &'a Store) -> Self {
+        Self {
+            bytes: read
+                .files
+                .iter()
+                .filter_map(|(path, file)| Some((&file.blob, read.json.get(path)?.as_slice())))
+                .collect(),
+            store,
+        }
+    }
+}
+
+impl BlobSource for ReadBlobs<'_> {
+    fn read(&self, id: &Oid) -> Result<Vec<u8>> {
+        match self.bytes.get(id) {
+            Some(bytes) => Ok(bytes.to_vec()),
+            None => self.store.blob(id),
+        }
+    }
 }
 
 /// `(original, copy)` of the forks recorded on `main` since `snapshot`
@@ -170,7 +192,8 @@ impl Hub<'_> {
     pub fn sync(&self, tablet: &dyn Tablet) -> Result<SyncReport> {
         let (mut report, warnings) = self.session(tablet, |s| {
             let prepared = self.prepare(s, true)?;
-            self.integrate(s, prepared)
+            let (report, origin) = self.integrate(s, prepared)?;
+            Ok((report, Some(origin)))
         })?;
         report.warnings.extend(warnings);
         Ok(report)
@@ -189,27 +212,31 @@ impl Hub<'_> {
             p.state.manifest = read_manifest(&p.read, p.started_at);
             p.state.quarantine = snapshot.quarantined.keys().cloned().collect();
             s.write_state(&p.state)?;
-            Ok(BackupReport {
+            let report = BackupReport {
                 snapshot: commit,
                 pushed,
                 quarantined: quarantine_report(&snapshot),
                 orphans: snapshot.orphans.iter().cloned().collect(),
                 read: read_summary(&p.read),
-                took_over: p.took_over,
-                warnings: self.maintain(&p.origin),
-            })
+                took_over: p.took_over.take(),
+                warnings: Vec::new(),
+            };
+            Ok((report, Some(p.origin)))
         })?;
         report.warnings.extend(warnings);
         Ok(report)
     }
 
     /// `rmu hub clone`: attach the tablet to `origin` and sync. Documents
-    /// whose version matches one in origin's history (first-parent
-    /// ancestors of `main`, newest first, never device refs) take that
-    /// commit as their base and fast-forward; the others have the empty
-    /// base ("new on both"). `reattach` does the same for a tablet that
-    /// already has hub state (lost, or for a replaced origin), keeping
-    /// its device id and name.
+    /// whose version is, by the merge's own rules ([`merge::unchanged`]),
+    /// one in origin's history (ancestors of `main`, newest first, never
+    /// device refs) take that commit as their base and fast-forward; the
+    /// others have the empty base ("new on both"). `reattach` does the
+    /// same for a tablet that already has hub state (lost, or for a
+    /// replaced origin), keeping its device id and name; it refuses while
+    /// a journal for the same repository is pending (`sync` reconciles
+    /// it). `origin` is used as given: [`super::HubOptions::origin`] does
+    /// not apply.
     pub fn clone_tablet(
         &self,
         tablet: &dyn Tablet,
@@ -239,6 +266,15 @@ impl Hub<'_> {
                 }
                 .into());
             }
+            // An interrupted apply against this very repository: only its
+            // reconciliation knows which documents it half wrote (a fresh
+            // state would fork them).
+            if existing
+                .as_ref()
+                .is_some_and(|state| state.journal.is_some() && state.repo_id == config.repo_id)
+            {
+                return Err(CycleError::JournalPending.into());
+            }
             let info = s.tablet.device_info()?;
             let device_id = existing
                 .as_ref()
@@ -246,7 +282,7 @@ impl Hub<'_> {
             let name = name
                 .or_else(|| existing.as_ref().map(|state| state.device_name.clone()))
                 .unwrap_or_else(|| default_name(&info, &device_id));
-            let ctx = OriginCtx::new(cache, origin.to_string(), Some(&device_id))?;
+            let ctx = OriginCtx::new(cache, origin.to_string(), Some(&device_id), None)?;
             // Pinned from the first fetch: the pre-read was classified
             // under these rules.
             if ctx.config != config {
@@ -269,10 +305,15 @@ impl Hub<'_> {
             s.arm()?;
             self.progress
                 .step("Matching the tablet's documents with origin's history");
-            let json = Overlay::read(&read, &ctx.store);
             let tablet_only = snapshot::build(rules, &read, &RepoTree::default())?;
-            let overrides = infer_bases(&ctx.store, rules, &ctx.main, &tablet_only, &json)?;
-            let mut warnings: Vec<String> = mixed_model_warning(&ctx.store, &ctx.main, &info)?
+            let overrides = infer_bases(
+                &ctx.store,
+                rules,
+                &ctx.main,
+                &tablet_only,
+                &ReadBlobs::new(&read, &ctx.store),
+            )?;
+            let mut warnings: Vec<Warning> = mixed_model_warning(&ctx.store, &ctx.main, &info)?
                 .into_iter()
                 .collect();
             let mut state = TabletState::new(
@@ -281,10 +322,12 @@ impl Hub<'_> {
                 device_id,
                 name,
             );
-            state.base_overrides = overrides;
+            state.base_overrides = overrides
+                .iter()
+                .map(|(doc, commit)| (doc.clone(), Some(commit.clone())))
+                .collect();
             state.quarantine = tablet_only.quarantined.keys().cloned().collect();
             state.manifest = read_manifest(&read, started_at);
-            drop(json);
             // Attached from here on: an interrupted clone continues with
             // `sync`.
             s.write_state(&state)?;
@@ -298,28 +341,14 @@ impl Hub<'_> {
                 took_over,
                 reconciled: None,
             };
-            let mut report = self.integrate(s, prepared)?;
+            let (mut report, origin) = self.integrate(s, prepared)?;
             warnings.append(&mut report.warnings);
             report.warnings = warnings;
-            Ok(report)
+            report.inferred = overrides;
+            Ok((report, Some(origin)))
         })?;
         report.warnings.extend(warnings);
         Ok(report)
-    }
-
-    /// `git maintenance run --auto` on the cache, once the tablet is back
-    /// up (the user's thresholds decide whether anything happens); a
-    /// failure is only a warning.
-    fn maintain(&self, origin: &OriginCtx) -> Vec<String> {
-        self.progress.step("Maintaining the local cache");
-        origin
-            .cache
-            .repo
-            .maintenance_auto()
-            .err()
-            .map(|error| format!("cache maintenance failed: {error}"))
-            .into_iter()
-            .collect()
     }
 
     /// A best-effort read while xochitl runs and before the lock (reads
@@ -365,8 +394,8 @@ impl Hub<'_> {
         self.progress.step("Checking origin");
         let first = s.tablet.read_state()?.ok_or(CycleError::NotAttached)?;
         let url = self.origin_url(&first.origin)?;
-        let cache = store::open_cache(&self.git, &self.cache_dir, &first.repo_id, &url)?;
-        let mut origin = OriginCtx::new(cache, url, Some(&first.device_id))?;
+        let (cache, refs) = store::open_cache(&self.git, &self.cache_dir, &first.repo_id, &url)?;
+        let mut origin = OriginCtx::new(cache, url, Some(&first.device_id), Some(refs))?;
         origin.check(&first)?;
         let rules = origin.rules;
         let pre = self.pre_read(
@@ -452,6 +481,13 @@ impl Hub<'_> {
     /// (`plan::verdicts`), finish an apply that stopped inside a document,
     /// and write the resulting bases (journal cleared) before anything
     /// else. Returns whether it wrote documents.
+    ///
+    /// A merge origin no longer has but that staging proves landed (only
+    /// a push that landed is ever staged for) means origin was rewound:
+    /// stop. A pull-only journal (its snapshot is no ancestor of its
+    /// merge, which is origin's `main` as fetched) keeps the documents
+    /// still at their snapshot version on their previous base, which
+    /// holds the same version and, unlike the snapshot, is on `main`.
     fn reconcile(
         &self,
         s: &mut Session,
@@ -466,6 +502,17 @@ impl Hub<'_> {
                 .cache
                 .repo
                 .is_ancestor(&journal.merge, &origin.main)?;
+        let listing = s.tablet.staged_files()?;
+        let staged = plan::staged_runs(
+            listing.entries.iter().map(|entry| entry.path.as_str()),
+            &journal.merge,
+        );
+        if !landed && !staged.is_empty() {
+            return Err(CycleError::OriginRewound {
+                base: journal.merge.clone(),
+            }
+            .into());
+        }
         if !landed {
             // The push never landed: the tablet's bases are unchanged and
             // its edits are picked up by this run's snapshot.
@@ -486,11 +533,6 @@ impl Hub<'_> {
         let snapshot_tree = store.tree_of(rules, &journal.snapshot)?;
         let json = Overlay::read(read, store);
         let tablet = read.doc_files();
-        let listing = s.tablet.staged_files()?;
-        let staged = plan::staged_runs(
-            listing.entries.iter().map(|entry| entry.path.as_str()),
-            &journal.merge,
-        );
         let forks = message::forks(&message::trailers(&store.commit(&journal.merge)?.message));
         let verdicts = plan::verdicts(&plan::Journaled {
             rules,
@@ -501,57 +543,18 @@ impl Hub<'_> {
             forks: &forks,
             json: &json,
         })?;
-        let local = read.local_json();
-        let no_json = LocalJson::new();
-        let finish: Vec<Planned> = verdicts
-            .iter()
-            .filter(|(_, verdict)| **verdict == plan::Verdict::Mixed)
-            .map(|(doc, _)| {
-                let Some(target) = merge_tree.docs.get(doc).filter(|v| v.is_present()) else {
-                    // An interrupted deletion (`.metadata` goes first):
-                    // finish it, leftovers included.
-                    return Ok(Some(Planned {
-                        doc: doc.clone(),
-                        change: Change::Delete,
-                    }));
-                };
-                let current = tablet.get(doc).map(tablet_version);
-                plan::plan_doc(
-                    rules,
-                    doc,
-                    Some(target),
-                    current.as_ref(),
-                    local.get(doc).unwrap_or(&no_json),
-                    &json,
-                )
-            })
-            .filter_map(Result::transpose)
-            .collect::<Result<_>>()?;
         // The step-14 tree checks, against the tablet as just read.
-        let merged_items = tree_items(&merge_tree, &json)?;
-        let current_items = read.items();
-        let partners = plan::partners(forks.iter().cloned());
-        let finish_items = finish
-            .iter()
-            .map(|planned| {
-                let item = match planned.change {
-                    Change::Delete => None,
-                    Change::Write { .. } => merged_items.get(&planned.doc).cloned(),
-                };
-                (planned.doc.clone(), item)
-            })
-            .collect();
-        let skipped = plan::tree_skips(&current_items, &finish_items, &partners);
-        let copies: BTreeSet<DocId> = forks.iter().map(|(_, copy)| copy.clone()).collect();
-        let finish = plan::order(
-            finish
-                .into_iter()
-                .filter(|planned| !skipped.contains(&planned.doc))
-                .collect(),
-            &merged_items,
-            &current_items,
-            &copies,
-        );
+        let (finish, skipped) = plan::finish(&plan::Finish {
+            rules,
+            verdicts: &verdicts,
+            merge: &merge_tree,
+            tablet: &tablet,
+            local: &read.local_json(),
+            current: &read.items(),
+            merged: &tree_items(&merge_tree, &json)?,
+            forks: &forks,
+            json: &json,
+        })?;
         let finished: Vec<DocId> = finish.iter().map(|planned| planned.doc.clone()).collect();
         if !finish.is_empty() {
             // Into this run's own staging directory, with a sentinel of its
@@ -570,13 +573,25 @@ impl Hub<'_> {
             })
             .map(|(doc, _)| doc.clone())
             .collect();
+        let pull_only = !origin
+            .cache
+            .repo
+            .is_ancestor(&journal.snapshot, &journal.merge)?;
+        let previous = state.clone();
         state.base = Some(journal.merge.clone());
         // An explicit override even where the snapshot lacks the
         // document: falling back to the default base would read it as
         // deleted by the tablet.
         state.base_overrides = kept
             .iter()
-            .map(|doc| (doc.clone(), Some(journal.snapshot.clone())))
+            .map(|doc| {
+                let base = if pull_only {
+                    previous.base_for(doc).cloned()
+                } else {
+                    Some(journal.snapshot.clone())
+                };
+                (doc.clone(), base)
+            })
             .collect();
         state.journal = None;
         s.write_state(state)?;
@@ -690,12 +705,7 @@ impl Hub<'_> {
         snapshot: &Snapshot,
     ) -> Result<(Oid, bool)> {
         let (reference, head, lease) = device_ref(&p.origin, &p.state)?;
-        let author = Author {
-            name: &p.state.device_name,
-            id: &p.state.device_id,
-            model: p.info.model.as_deref(),
-            firmware: p.info.firmware.as_deref(),
-        };
+        let author = author(&p.state, &p.info);
         let quarantined: BTreeSet<DocId> = snapshot.quarantined.keys().cloned().collect();
         let parents: Vec<Oid> = p.state.base.iter().chain(head.iter()).cloned().collect();
         let writer = p.writer.take().expect("one snapshot per run");
@@ -745,8 +755,8 @@ impl Hub<'_> {
         Ok((commit, true))
     }
 
-    /// Steps 7–16.
-    fn integrate(&self, s: &mut Session, mut p: Prepared) -> Result<SyncReport> {
+    /// Steps 7–16; the origin handed back for maintenance.
+    fn integrate(&self, s: &mut Session, mut p: Prepared) -> Result<(SyncReport, OriginCtx)> {
         let rules = p.origin.rules;
         let base_tree = virtual_base(&p.origin.store, rules, &p.state)?;
         let snapshot = snapshot::build(rules, &p.read, &base_tree)?;
@@ -791,38 +801,13 @@ impl Hub<'_> {
         snapshot_commit: &Oid,
         attempt: usize,
     ) -> Result<Option<Pushed>> {
-        let rules = p.origin.rules;
         s.arm()?;
         self.progress.step("Fetching origin");
         p.origin.refresh(&p.state.device_id)?;
         p.origin.check(&p.state)?;
-        let store = &p.origin.store;
-        let main = p.origin.main.clone();
-        let theirs = store.tree_of(rules, &main)?;
-        let consented = consented_deletions(store, &main, &p.state, &snapshot.tree, &theirs)?;
         self.progress.step("Merging");
-        let date = self.date();
-        let outcome = merge::merge(
-            &MergeInput {
-                base: base_tree,
-                ours: &snapshot.tree,
-                theirs: &theirs,
-            },
-            store,
-            &StoreHistory {
-                store,
-                rules,
-                tip: &main,
-            },
-            &MergeParams {
-                rules,
-                device_name: &p.state.device_name,
-                date: &date,
-                allow_deletions: self.options.allow_deletions,
-                thresholds: self.options.thresholds,
-                consented_deletions: &consented,
-            },
-        )?;
+        let run = self.run_merge(&p.origin, &p.state, base_tree, snapshot, &p.read)?;
+        let outcome = run.outcome;
         if outcome.guard.blocked() {
             return Err(CycleError::DeletionsNeedConsent {
                 from_origin: outcome.guard.from_origin.iter().cloned().collect(),
@@ -830,6 +815,41 @@ impl Hub<'_> {
                 empty_snapshot: outcome.guard.empty_snapshot,
             }
             .into());
+        }
+        let store = &p.origin.store;
+        let main = p.origin.main.clone();
+        // The tablet already agrees with origin: nothing to push, even if
+        // the merge took the tablet's bytes for documents that differ only
+        // in view state or derived fields (pushing those would make two
+        // tablets push each other's view state on every sync). Nothing to
+        // apply either (the plan is empty): no journal.
+        if run.up_to_date {
+            return Ok(Some(Pushed {
+                update: MainUpdate::UpToDate,
+                base: main,
+                merged: run.theirs,
+                outcome,
+                attempts: attempt,
+            }));
+        }
+        // The tablet has no changes of its own: origin's tree is applied
+        // as it is, with no merge commit (the snapshot is on the device
+        // ref, for the journal). Documents that keep the snapshot as their
+        // base keep their previous one instead, which holds the same
+        // version and is on `main`.
+        if run.pull_only {
+            p.state.journal = Some(Journal {
+                merge: main.clone(),
+                snapshot: snapshot_commit.clone(),
+            });
+            s.write_state(&p.state)?;
+            return Ok(Some(Pushed {
+                update: MainUpdate::Pulled,
+                base: main,
+                merged: run.theirs,
+                outcome,
+                attempts: attempt,
+            }));
         }
         let record = MergeRecord {
             notes: outcome.notes.iter().map(ToString::to_string).collect(),
@@ -840,27 +860,7 @@ impl Hub<'_> {
                 .collect(),
             consented: outcome.guard.consented(),
         };
-        let mut writer = p.origin.cache.repo.commit_writer(self.progress, None)?;
-        let (merged, new_blobs) = realise(&mut writer, &outcome)?;
-        let merged_json = Overlay::new_blobs(&new_blobs, store);
-        // The tablet already agrees with origin: nothing to push, even if
-        // the merge took the tablet's bytes for documents that differ only
-        // in view state or derived fields (pushing those would make two
-        // tablets push each other's view state on every sync).
-        // Quarantined documents carry their base version, which the merge
-        // never takes over origin's: nothing to push for them.
-        let quarantined: BTreeSet<DocId> = snapshot.quarantined.keys().cloned().collect();
-        if trees_equivalent(rules, &snapshot.tree, &theirs, store, &quarantined)?
-            && trees_equivalent(rules, &merged, &theirs, &merged_json, &BTreeSet::new())?
-        {
-            return Ok(Some(Pushed {
-                update: MainUpdate::UpToDate,
-                base: main,
-                merged: theirs,
-                outcome,
-                attempts: attempt,
-            }));
-        }
+        let (merged, writer) = (run.merged, run.writer);
         let listing = merged.to_listing();
         let first_parent = store.commit(snapshot_commit)?.parents.first().cloned();
         let (update, commit) = if listing == snapshot.tree.to_listing()
@@ -873,19 +873,13 @@ impl Hub<'_> {
                 snapshot_commit.clone(),
             )
         } else {
-            let author = Author {
-                name: &p.state.device_name,
-                id: &p.state.device_id,
-                model: p.info.model.as_deref(),
-                firmware: p.info.firmware.as_deref(),
-            };
             let commit = commit_tree(
                 writer,
                 &merged,
                 &Self::meta(
                     &p.state,
                     vec![main.clone(), snapshot_commit.clone()],
-                    message::merge(&author, &record),
+                    message::merge(&author(&p.state, &p.info), &record),
                 ),
             )?;
             (MainUpdate::Merge(commit.clone()), commit)
@@ -957,16 +951,17 @@ impl Hub<'_> {
                 Err(error) => Some(Err(error.into())),
             })
             .collect::<Result<_>>()?;
-        let moved_paths: BTreeSet<&XochitlPath> = read
-            .files
-            .iter()
-            .filter(|(path, file)| {
-                now.get(*path).map(|(_, stat)| stat) != Some(&file.stat)
-                    || !file.stat.keep_in_manifest(started_at)
-            })
-            .map(|(path, _)| path)
-            .chain(now.keys().filter(|path| !read.files.contains_key(*path)))
-            .collect();
+        let moved_paths = plan::moved_since_read(
+            &read
+                .files
+                .iter()
+                .map(|(path, file)| (path.clone(), file.stat))
+                .collect(),
+            &now.iter()
+                .map(|(path, (_, stat))| (path.clone(), *stat))
+                .collect(),
+            started_at,
+        );
         let file_of = |path: &XochitlPath| {
             now.get(path)
                 .map(|(file, _)| file)
@@ -974,7 +969,7 @@ impl Hub<'_> {
         };
         let present_moved: Vec<(&XochitlPath, &MirroredFile)> = moved_paths
             .iter()
-            .filter_map(|path| now.get(*path).map(|(file, _)| (*path, file)))
+            .filter_map(|path| now.get(path).map(|(file, _)| (path, file)))
             .collect();
         let json_paths: Vec<XochitlPath> = present_moved
             .iter()
@@ -1001,7 +996,7 @@ impl Hub<'_> {
             .filter_map(|path| {
                 let file = file_of(path)?;
                 let kind = plan::json_kind(&file.file)?;
-                Some(((file.doc.clone(), kind), reread.get(*path).and_then(parse)))
+                Some(((file.doc.clone(), kind), reread.get(path).and_then(parse)))
             })
             .collect();
         let moved = present_moved
@@ -1056,7 +1051,7 @@ impl Hub<'_> {
         snapshot: &Snapshot,
         snapshot_commit: &Oid,
         pushed: Pushed,
-    ) -> Result<SyncReport> {
+    ) -> Result<(SyncReport, OriginCtx)> {
         let protect: BTreeSet<DocId> = snapshot.quarantined.keys().cloned().collect();
         let tablet = tablet_versions(&p.read);
         let local = p.read.local_json();
@@ -1073,6 +1068,10 @@ impl Hub<'_> {
                 local: &local,
                 json: &json,
             })?;
+            debug_assert!(
+                pushed.update != MainUpdate::UpToDate || planned.is_empty(),
+                "a run that found the tablet up to date applies nothing (it has no journal)"
+            );
             let applied = if planned.is_empty() {
                 Applied::default()
             } else {
@@ -1097,10 +1096,20 @@ impl Hub<'_> {
         self.progress.step("Recording the sync on the tablet");
         let previous = p.state.clone();
         p.state.base = Some(pushed.base.clone());
+        // A skipped document keeps its snapshot version as its base: the
+        // snapshot commit itself when `main` now contains it; otherwise
+        // (nothing pushed) a commit on `main` holding the same version:
+        // `main` when the tablet matched it, else the document's previous
+        // base (the tablet had no changes of its own).
+        let skipped_base = |doc: &DocId| match &pushed.update {
+            MainUpdate::Merge(_) | MainUpdate::FastForward(_) => Some(snapshot_commit.clone()),
+            MainUpdate::UpToDate => Some(pushed.base.clone()),
+            MainUpdate::Pulled => previous.base_for(doc).cloned(),
+        };
         p.state.base_overrides = applied
             .skipped
             .iter()
-            .map(|doc| (doc.clone(), Some(snapshot_commit.clone())))
+            .map(|doc| (doc.clone(), skipped_base(doc)))
             .chain(
                 protect
                     .iter()
@@ -1123,18 +1132,20 @@ impl Hub<'_> {
         if applied.before.is_some()
             && let Err(error) = s.tablet.clear_staging(s.lock())
         {
-            warnings.push(format!("could not clear the staging directory: {error}"));
+            warnings.push(Warning::StagingNotCleared {
+                error: error.to_string(),
+            });
         }
         // 16.
         if s.maybe_stopped {
             self.progress.step("Starting xochitl");
             s.start()?;
         }
-        warnings.extend(self.maintain(&p.origin));
-        Ok(SyncReport {
+        let report = SyncReport {
             update: pushed.update,
             snapshot: snapshot_commit.clone(),
             base: pushed.base,
+            inferred: BTreeMap::new(),
             applied: applied.applied,
             skipped: applied.skipped.into_iter().collect(),
             quarantined: quarantine_report(snapshot),
@@ -1148,7 +1159,8 @@ impl Hub<'_> {
             push_attempts: pushed.attempts,
             took_over: p.took_over.take(),
             warnings,
-        })
+        };
+        Ok((report, p.origin))
     }
 
     /// Steps 12–14 for a non-empty plan.
@@ -1335,38 +1347,29 @@ fn apply_plan(planned: &[Planned], sizes: &BTreeMap<XochitlPath, u64>) -> Result
     Ok(ApplyPlan { docs })
 }
 
-/// Per-document base inference for `clone`: the newest first-parent
-/// ancestor of `main` whose version of the document is equivalent to the
-/// tablet's.
+/// Per-document base inference for `clone`: the newest ancestor of `main`
+/// whose version of the document the tablet's is, by the merge's own
+/// rules, an unchanged version of ([`merge::unchanged`]: opening a PDF,
+/// view state, tag order and so on are no change). Blobs come from
+/// `blobs`, which serves the tablet's JSON before the cache's.
 fn infer_bases(
     store: &Store,
     rules: &MirrorRules,
     main: &Oid,
     tablet: &Snapshot,
-    json: &dyn JsonBlobs,
-) -> Result<BTreeMap<DocId, Option<Oid>>> {
-    let history = StoreHistory {
-        store,
-        rules,
-        tip: main,
-    };
+    blobs: &dyn BlobSource,
+) -> Result<BTreeMap<DocId, Oid>> {
     tablet
         .validation
         .docs
         .iter()
         .filter(|(_, outcome)| **outcome == DocOutcome::Ok)
-        .map(|(doc, _)| -> Result<Option<(DocId, Option<Oid>)>> {
-            let ours = tablet.tree.docs.get(doc);
-            let found = history
-                .versions(doc)?
-                .into_iter()
-                .map(|(commit, candidate)| {
-                    plan::versions_equivalent(rules, Some(&candidate), ours, json)
-                        .map(|same| same.then_some(commit))
-                })
-                .find_map(Result::transpose)
-                .transpose()?;
-            Ok(found.map(|commit| (doc.clone(), Some(commit))))
+        .filter_map(|(doc, _)| Some((doc, tablet.tree.docs.get(doc)?)))
+        .map(|(doc, ours)| -> Result<Option<(DocId, Oid)>> {
+            let found = store.newest_matching(rules, main, doc, &mut |candidate| {
+                merge::unchanged(rules, doc, candidate, ours, blobs)
+            })?;
+            Ok(found.map(|commit| (doc.clone(), commit)))
         })
         .filter_map(Result::transpose)
         .collect()
@@ -1374,7 +1377,7 @@ fn infer_bases(
 
 /// The warning `clone` gives when a tablet of a new model attaches to a
 /// repository that has seen exactly one model.
-fn mixed_model_warning(store: &Store, main: &Oid, info: &DeviceInfo) -> Result<Option<String>> {
+fn mixed_model_warning(store: &Store, main: &Oid, info: &DeviceInfo) -> Result<Option<Warning>> {
     let Some(model) = info.model.as_deref() else {
         return Ok(None);
     };
@@ -1389,9 +1392,10 @@ fn mixed_model_warning(store: &Store, main: &Oid, info: &DeviceInfo) -> Result<O
         })
         .collect();
     Ok(match models.iter().next() {
-        Some(seen) if models.len() == 1 && seen != model => Some(format!(
-            "this repository has only seen {seen} tablets so far; {model} is untested with it (documents are merged per format, but nothing has been validated across models)"
-        )),
+        Some(seen) if models.len() == 1 && seen != model => Some(Warning::MixedModel {
+            seen: seen.clone(),
+            model: model.to_string(),
+        }),
         _ => None,
     })
 }

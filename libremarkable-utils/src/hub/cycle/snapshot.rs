@@ -11,9 +11,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 
-use super::CycleError;
 use super::plan::{LocalJson, json_kind};
 use super::store::Store;
+use super::{CycleError, Downloaded};
 use crate::error::Result;
 use crate::git::{CommitWriter, Oid};
 use crate::hub::device::{StatListing, Tablet};
@@ -82,7 +82,7 @@ pub(super) struct TabletRead {
     /// Names that cannot be listed (newlines).
     pub unlisted: usize,
     /// Files downloaded, and their bytes.
-    pub downloaded: (usize, u64),
+    pub downloaded: Downloaded,
 }
 
 impl TabletRead {
@@ -361,7 +361,10 @@ pub(super) fn read_tablet(
         excluded,
         irregular,
         unlisted: listing.unlisted,
-        downloaded: (paths.len(), total),
+        downloaded: Downloaded {
+            files: paths.len(),
+            bytes: total,
+        },
     })
 }
 

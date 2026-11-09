@@ -5,22 +5,21 @@
 //! moment out of date. The commits holding its blobs and the would-be
 //! merge are local garbage no ref points to.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use serde_json::Value;
 
 use super::message;
 use super::plan::{self, Change, JsonBlobs, Planned};
 use super::snapshot::{self, ReadMode, TabletRead};
-use super::store::{self, Store, StoreHistory};
+use super::store::{self, Store};
 use super::{
     CycleError, DocChange, DryRunReport, Hub, OpenConflict, OriginCtx, StatusReport, commit_tree,
-    consented_deletions, read_summary, realise, tablet_version, trees_equivalent, virtual_base,
+    quarantine_report, read_summary, tablet_versions, virtual_base,
 };
 use crate::error::Result;
 use crate::git::Oid;
 use crate::hub::device::Tablet;
-use crate::hub::merge::{self, MergeInput, MergeParams};
 use crate::hub::model::{
     DocFile, DocId, DocOutcome, DocVersion, MirrorRules, RepoTree, TabletState,
 };
@@ -70,7 +69,16 @@ fn open_conflicts(
                 .collect::<Result<Vec<_>>>()
         })
         .collect::<Result<Vec<_>>>()
-        .map(|nested| nested.into_iter().flatten().collect())
+        .map(|nested| {
+            // A copy recorded by more than one commit (a fork trailer is
+            // carried by every commit that re-records it) is listed once.
+            let mut seen = BTreeSet::new();
+            nested
+                .into_iter()
+                .flatten()
+                .filter(|conflict| seen.insert(conflict.copy.clone()))
+                .collect()
+        })
 }
 
 /// What a sync would do to the tablet and origin.
@@ -156,8 +164,8 @@ impl Hub<'_> {
         self.progress.step("Checking origin");
         let state = tablet.read_state()?.ok_or(CycleError::NotAttached)?;
         let url = self.origin_url(&state.origin)?;
-        let cache = store::open_cache(&self.git, &self.cache_dir, &state.repo_id, &url)?;
-        let origin = OriginCtx::new(cache, url, Some(&state.device_id))?;
+        let (cache, refs) = store::open_cache(&self.git, &self.cache_dir, &state.repo_id, &url)?;
+        let origin = OriginCtx::new(cache, url, Some(&state.device_id), Some(refs))?;
         origin.check(&state)?;
         let lock = tablet.lock_state()?;
         let (store, rules) = (&origin.store, origin.rules);
@@ -165,30 +173,7 @@ impl Hub<'_> {
         let base_tree = virtual_base(store, rules, &state)?;
         let snapshot = snapshot::build(rules, &read, &base_tree)?;
         let main = origin.main.clone();
-        let theirs = store.tree_of(rules, &main)?;
-        let consented = consented_deletions(store, &main, &state, &snapshot.tree, &theirs)?;
-        let date = self.date();
-        let outcome = merge::merge(
-            &MergeInput {
-                base: &base_tree,
-                ours: &snapshot.tree,
-                theirs: &theirs,
-            },
-            store,
-            &StoreHistory {
-                store,
-                rules,
-                tip: &main,
-            },
-            &MergeParams {
-                rules,
-                device_name: &state.device_name,
-                date: &date,
-                allow_deletions: self.options.allow_deletions,
-                thresholds: self.options.thresholds,
-                consented_deletions: &consented,
-            },
-        )?;
+        let run = self.run_merge(&origin, &state, &base_tree, &snapshot, &read)?;
         let present =
             |tree: &RepoTree, doc: &DocId| tree.docs.get(doc).is_some_and(DocVersion::is_present);
         let changes = base_tree
@@ -225,14 +210,12 @@ impl Hub<'_> {
                 .len(),
             None => store.first_parents(&main)?.len(),
         };
-        let open_conflicts = open_conflicts(store, rules, &main, &theirs)?;
+        let open_conflicts = open_conflicts(store, rules, &main, &run.theirs)?;
         // What the sync would write: the merge realised into a commit no
         // ref points to, so the plan can read its new blobs.
-        let mut writer = origin.cache.repo.commit_writer(self.progress, None)?;
-        let (merged, _) = realise(&mut writer, &outcome)?;
         commit_tree(
-            writer,
-            &merged,
+            run.writer,
+            &run.merged,
             &Self::meta(
                 &state,
                 Vec::new(),
@@ -240,22 +223,16 @@ impl Hub<'_> {
             ),
         )?;
         let protect: BTreeSet<DocId> = snapshot.quarantined.keys().cloned().collect();
-        let up_to_date = trees_equivalent(rules, &snapshot.tree, &theirs, store, &protect)?
-            && trees_equivalent(rules, &merged, &theirs, store, &BTreeSet::new())?;
-        let tablet_files: BTreeMap<DocId, DocVersion> = read
-            .doc_files()
-            .iter()
-            .map(|(doc, files)| (doc.clone(), tablet_version(files)))
-            .collect();
         let planned = plan::plan(&plan::PlanInput {
             rules,
-            merged: &merged,
-            tablet: &tablet_files,
+            merged: &run.merged,
+            tablet: &tablet_versions(&read),
             protect: &protect,
             local: &read.local_json(),
             json: store,
         })?
         .planned;
+        let outcome = run.outcome;
         let status = StatusReport {
             repo_id: state.repo_id.clone(),
             device_id: state.device_id.clone(),
@@ -263,26 +240,22 @@ impl Hub<'_> {
             origin: origin.url.clone(),
             lock,
             journal_pending: state.journal.is_some(),
-            quarantined: snapshot
-                .quarantined
-                .iter()
-                .map(|(doc, reason)| (doc.clone(), reason.to_string()))
-                .collect(),
+            quarantined: quarantine_report(&snapshot),
             orphans: snapshot.orphans.iter().cloned().collect(),
             read: read_summary(&read),
             changes,
             behind,
             open_conflicts,
-            guard: outcome.guard.clone(),
             summary: outcome.summary(),
-            notes: outcome.notes.clone(),
-            forks: outcome.forks.clone(),
+            guard: outcome.guard,
+            notes: outcome.notes,
+            forks: outcome.forks,
         };
         Ok((
             status,
             DryPlan {
                 planned,
-                would_push: !up_to_date,
+                would_push: !(run.up_to_date || run.pull_only),
             },
         ))
     }

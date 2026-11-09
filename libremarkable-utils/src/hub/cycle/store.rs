@@ -122,25 +122,51 @@ fn open_or_create(git: &Git, path: &Path, format: ObjectFormat) -> Result<Repo> 
 }
 
 /// Open (or create) the cache of `repo_id` under `root`, matching the
-/// object format origin advertises (`url`), and take its lock.
-pub(super) fn open_cache(git: &Git, root: &Path, repo_id: &RepoId, url: &str) -> Result<Cache> {
+/// object format origin advertises (`url`), and take its lock. Returns
+/// the advertisement too, for the first [`fetch`] to reuse.
+pub(super) fn open_cache(
+    git: &Git,
+    root: &Path,
+    repo_id: &RepoId,
+    url: &str,
+) -> Result<(Cache, Vec<git::RemoteRef>)> {
     let lock = take_lock(&lock_path(root, repo_id))?;
     let path = root.join(format!("{repo_id}.git"));
     let repo = open_or_create(git, &path, ObjectFormat::Sha1)?;
-    let advertised = advertised_format(&repo, url)?;
-    let repo = match advertised {
+    let refs = repo.ls_remote(url)?;
+    let repo = match refs.first().map(|reference| reference.oid.object_format()) {
         Some(format) if format != repo.object_format()? => open_or_create(git, &path, format)?,
         _ => repo,
     };
-    Ok(Cache { repo, _lock: lock })
+    Ok((Cache { repo, _lock: lock }, refs))
 }
 
-/// The object format of origin's refs (`None` if it advertises none).
-fn advertised_format(repo: &Repo, url: &str) -> Result<Option<ObjectFormat>> {
-    Ok(repo
-        .ls_remote(url)?
-        .first()
-        .map(|reference| reference.oid.object_format()))
+/// Remove `incoming-*.git` directories that no clone is using any more
+/// (one killed mid-fetch leaves its own, possibly gigabytes): each has an
+/// `incoming-*.lock` its clone holds while it runs.
+fn sweep_incoming(root: &Path) -> Result<()> {
+    fs::read_dir(root)?
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            name.strip_prefix("incoming-")?
+                .strip_suffix(".git")
+                .map(str::to_string)
+        })
+        .try_for_each(|token| {
+            let lock = root.join(format!("incoming-{token}.lock"));
+            let file = File::options()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(&lock)?;
+            if file.try_lock().is_ok() {
+                fs::remove_dir_all(root.join(format!("incoming-{token}.git")))?;
+                drop(file);
+                let _ = fs::remove_file(&lock);
+            }
+            Ok(())
+        })
 }
 
 /// For a first contact (`clone`), when the repo id is not known yet:
@@ -148,7 +174,11 @@ fn advertised_format(repo: &Repo, url: &str) -> Result<Option<ObjectFormat>> {
 /// then make that the cache (or fetch from it into an existing cache).
 pub(super) fn bootstrap_cache(git: &Git, root: &Path, url: &str) -> Result<(Cache, Oid)> {
     fs::create_dir_all(root)?;
-    let temp = root.join(format!("incoming-{}.git", uuid::Uuid::new_v4().simple()));
+    sweep_incoming(root)?;
+    let token = uuid::Uuid::new_v4().simple().to_string();
+    let temp = root.join(format!("incoming-{token}.git"));
+    let temp_lock = root.join(format!("incoming-{token}.lock"));
+    let held = take_lock(&temp_lock)?;
     let result = (|| {
         let probe = git.init_bare(&temp, ObjectFormat::Sha1)?;
         let refs = probe.ls_remote(url)?;
@@ -199,13 +229,24 @@ pub(super) fn bootstrap_cache(git: &Git, root: &Path, url: &str) -> Result<(Cach
     if temp.exists() {
         let _ = fs::remove_dir_all(&temp);
     }
+    drop(held);
+    let _ = fs::remove_file(&temp_lock);
     result
 }
 
-/// `ls-remote` origin, then fetch `main` and the device ref (if origin
-/// has them) into the cache.
-pub(super) fn fetch(repo: &Repo, url: &str, device: Option<&DeviceId>) -> Result<Remote> {
-    let refs = repo.ls_remote(url)?;
+/// `ls-remote` origin (unless `advertised` is the advertisement just
+/// read), then fetch `main` and the device ref (if origin has them) into
+/// the cache.
+pub(super) fn fetch(
+    repo: &Repo,
+    url: &str,
+    device: Option<&DeviceId>,
+    advertised: Option<Vec<git::RemoteRef>>,
+) -> Result<Remote> {
+    let refs = match advertised {
+        Some(refs) => refs,
+        None => repo.ls_remote(url)?,
+    };
     let advertised = |name: &str| refs.iter().any(|reference| reference.name == name);
     let has_main = advertised(MAIN);
     let device_name = device.and_then(|device| {
@@ -262,6 +303,7 @@ pub(super) struct Store {
     trees: RefCell<HashMap<Oid, Rc<Vec<TreeEntry>>>>,
     json: RefCell<HashMap<Oid, Option<Rc<Value>>>>,
     chains: RefCell<HashMap<Oid, Rc<Vec<Oid>>>>,
+    topo: RefCell<HashMap<Oid, Rc<Vec<Oid>>>>,
 }
 
 impl Store {
@@ -275,6 +317,7 @@ impl Store {
             trees: RefCell::default(),
             json: RefCell::default(),
             chains: RefCell::default(),
+            topo: RefCell::default(),
         })
     }
 
@@ -432,6 +475,43 @@ impl Store {
     pub fn tree_of(&self, rules: &MirrorRules, commit: &Oid) -> Result<RepoTree> {
         let listing = model::tree_listing(self.repo.ls_tree_recursive(commit.as_str())?)?;
         Ok(rules.group_tree(listing)?)
+    }
+
+    /// Every ancestor of `tip`, children before parents.
+    pub fn ancestors(&self, tip: &Oid) -> Result<Rc<Vec<Oid>>> {
+        if let Some(found) = self.topo.borrow().get(tip) {
+            return Ok(Rc::clone(found));
+        }
+        let all = Rc::new(self.repo.rev_list_topo(&[tip.as_str()])?);
+        self.topo.borrow_mut().insert(tip.clone(), Rc::clone(&all));
+        Ok(all)
+    }
+
+    /// The newest ancestor of `tip` (children before parents; device refs
+    /// are never ancestors of `main` unless merged into it) whose version
+    /// of `doc` satisfies `matches`. Each distinct version is judged once.
+    pub fn newest_matching(
+        &self,
+        rules: &MirrorRules,
+        tip: &Oid,
+        doc: &DocId,
+        matches: &mut dyn FnMut(&DocVersion) -> Result<bool>,
+    ) -> Result<Option<Oid>> {
+        let commits = self.ancestors(tip)?;
+        let mut tried = std::collections::HashSet::new();
+        commits.iter().try_fold(None, |found, commit| {
+            if found.is_some() {
+                return Ok(found);
+            }
+            let Some(subtree) = self.doc_subtree(commit, doc)? else {
+                return Ok(None);
+            };
+            if !tried.insert(subtree.clone()) {
+                return Ok(None);
+            }
+            let version = self.doc_version(rules, doc, &subtree)?;
+            Ok(matches(&version)?.then(|| commit.clone()))
+        })
     }
 
     /// `tip` and its first-parent ancestors, newest first.
