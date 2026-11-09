@@ -2,15 +2,13 @@
 //! SSH endpoints run shell commands against synthetic local trees, never hosts.
 #![cfg(unix)]
 
-use std::fs::{self, File, FileTimes};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, UNIX_EPOCH};
 
 use serde_json::Value;
-
-static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
+use test_support::Scratch;
 
 #[derive(Clone, Copy)]
 enum Pair {
@@ -21,23 +19,16 @@ enum Pair {
 }
 
 struct Fixture {
-    root: PathBuf,
+    root: Scratch,
     paths: [PathBuf; 2],
     endpoints: [String; 2],
 }
 
 impl Fixture {
     fn new(pair: Pair) -> Self {
-        let root = std::env::temp_dir().join(format!(
-            "rmu-archive-roles-{}-{}",
-            std::process::id(),
-            NEXT_DIR.fetch_add(1, Ordering::Relaxed),
-        ));
-        fs::create_dir(&root).unwrap();
+        let root = Scratch::new("archive-roles");
         let paths = [root.join("a"), root.join("b")];
         paths.iter().for_each(|path| fs::create_dir(path).unwrap());
-        let bin = root.join("bin");
-        fs::create_dir(&bin).unwrap();
         let ssh = if matches!(pair, Pair::SshHomeRoot) {
             // Never execute the supplied shell command here: absolute paths
             // must address the synthetic root, not the machine running tests.
@@ -80,7 +71,7 @@ fi
              case \"$2\" in mock-a|mock-b) ;; *) exit 99 ;; esac\n\
              exec sh -c \"$3\"\n"
         };
-        test_support::write_script(&bin.join("ssh"), ssh);
+        root.mock_command("ssh", ssh);
         let local = |i: usize| paths[i].display().to_string();
         let remote = |i: usize| format!("mock-{}:{}", ["a", "b"][i], paths[i].display());
         let endpoints = match pair {
@@ -97,16 +88,12 @@ fi
     }
 
     fn sync(&self, src: usize, flags: &[&str]) -> Output {
-        let path = std::env::join_paths(std::iter::once(self.root.join("bin")).chain(
-            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
-        ))
-        .unwrap();
         let output = Command::new(env!("CARGO_BIN_EXE_rmu"))
             .env("XDG_STATE_HOME", self.root.join("state"))
-            .env("HOME", &self.root)
+            .env("HOME", self.root.path())
             .env("MOCK_HOME", &self.paths[0])
             .env("MOCK_ROOT", &self.paths[1])
-            .env("PATH", path)
+            .env("PATH", self.root.mock_path())
             .env_remove("RMU_SSH_PASSWORD")
             .env_remove("RMU_ASKPASS_MODE")
             .env_remove("RMU_ASKPASS_PASSWORD")
@@ -116,24 +103,14 @@ fi
             .arg(&self.endpoints[1 - src])
             .output()
             .unwrap();
-        assert!(
-            output.status.success(),
-            "stdout: {}\nstderr: {}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
+        test_support::assert_success(&output);
         output
     }
 
     fn write(&self, side: usize, name: &str, bytes: &[u8], seconds: u64) {
         let path = self.paths[side].join(name);
         fs::write(&path, bytes).unwrap();
-        File::options()
-            .write(true)
-            .open(path)
-            .unwrap()
-            .set_times(FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(seconds)))
-            .unwrap();
+        test_support::set_modified(&path, UNIX_EPOCH + Duration::from_secs(seconds));
     }
 
     fn assert_bytes(&self, side: usize, name: &str, expected: &[u8]) {
@@ -156,12 +133,6 @@ fi
             "unexpected plan: {}",
             String::from_utf8_lossy(&output.stdout),
         );
-    }
-}
-
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        fs::remove_dir_all(&self.root).unwrap();
     }
 }
 

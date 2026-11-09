@@ -1,9 +1,95 @@
-//! Test-only helpers shared by the workspace's unit and integration tests.
+//! Test-only helpers shared by the workspace's unit and integration tests:
+//! scratch directories, mock executables, and running test subprocesses.
 #![cfg(unix)]
 
+use std::ffi::OsString;
+use std::fs::{self, File, FileTimes};
 use std::io::Write;
-use std::path::Path;
-use std::process::{Command, Stdio};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
+use std::time::SystemTime;
+
+/// A uniquely named directory under the system temporary directory,
+/// removed together with its contents on drop.
+pub struct Scratch(PathBuf);
+
+impl Scratch {
+    /// Create `rmu-<prefix>-<uuid>` in the system temporary directory.
+    pub fn new(prefix: &str) -> Self {
+        let path = std::env::temp_dir().join(format!("rmu-{prefix}-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&path).unwrap();
+        Self(path)
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+
+    pub fn join(&self, path: impl AsRef<Path>) -> PathBuf {
+        self.0.join(path)
+    }
+
+    /// Install `body` as the mock executable `bin/<name>` (see
+    /// [`write_script`]), creating `bin/` if needed.
+    pub fn mock_command(&self, name: &str, body: &str) {
+        let bin = self.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        write_script(&bin.join(name), body);
+    }
+
+    /// The current `PATH` with this directory's `bin/` first, so the
+    /// [mock commands](Self::mock_command) shadow the real ones. Pass it to
+    /// child processes only; tests never change their own environment.
+    pub fn mock_path(&self) -> OsString {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        std::env::join_paths(std::iter::once(self.join("bin")).chain(std::env::split_paths(&path)))
+            .unwrap()
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        // A failed cleanup is a test bug, but panicking while a failing test
+        // unwinds would abort the process and hide the original failure.
+        if let Err(error) = fs::remove_dir_all(&self.0)
+            && !std::thread::panicking()
+        {
+            panic!("failed to remove {}: {error}", self.0.display());
+        }
+    }
+}
+
+/// A command that re-runs only the test `name` of the current test binary.
+/// Tests use it to give one scenario a private environment (such as a
+/// [mock `PATH`](Scratch::mock_path)) without mutating the environment the
+/// rest of the test process shares.
+pub fn rerun_test(name: &str) -> Command {
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command.args(["--exact", name, "--nocapture"]);
+    command
+}
+
+/// Panic with a process's captured output unless it exited successfully.
+#[track_caller]
+pub fn assert_success(output: &Output) {
+    assert!(
+        output.status.success(),
+        "{}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Set the modification time of the existing file at `path`.
+pub fn set_modified(path: &Path, time: SystemTime) {
+    File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_times(FileTimes::new().set_modified(time))
+        .unwrap();
+}
 
 /// Install an executable `/bin/sh` script at `path`, replacing any existing
 /// file, such that tests running concurrently in this process can exec it.

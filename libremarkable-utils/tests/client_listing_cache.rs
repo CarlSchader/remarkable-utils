@@ -2,15 +2,15 @@
 //! PATH, so no process-global environment changes or real SSH connections occur.
 #![cfg(unix)]
 
-use std::fs::{self, File, FileTimes};
+use std::fs::{self, File};
 use std::path::PathBuf;
-use std::process::Command;
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use libremarkable_utils::client::Client;
 use libremarkable_utils::error::Error;
 use libremarkable_utils::ssh::{SshOptions, SshSession};
 use serde_json::{Value, json};
+use test_support::Scratch;
 
 struct Device {
     root: PathBuf,
@@ -47,12 +47,7 @@ impl Device {
             serde_json::to_string_pretty(&metadata).unwrap(),
         )
         .unwrap();
-        File::options()
-            .write(true)
-            .open(self.metadata_path(uuid))
-            .unwrap()
-            .set_times(fixed_times())
-            .unwrap();
+        test_support::set_modified(&self.metadata_path(uuid), fixed_time());
     }
 
     fn signature(&self, uuid: &str) -> (u64, u64) {
@@ -79,8 +74,8 @@ impl Device {
     }
 }
 
-fn fixed_times() -> FileTimes {
-    FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(1_700_000_000))
+fn fixed_time() -> SystemTime {
+    UNIX_EPOCH + Duration::from_secs(1_700_000_000)
 }
 
 fn with_device(test_name: &str, test: impl FnOnce(Device)) {
@@ -89,15 +84,12 @@ fn with_device(test_name: &str, test: impl FnOnce(Device)) {
         return;
     }
 
-    let root = std::env::temp_dir().join(format!("rmu-cache-test-{}", uuid::Uuid::new_v4()));
-    fs::create_dir_all(root.join("bin")).unwrap();
-    fs::create_dir(root.join("data")).unwrap();
-    File::create(root.join("stamp"))
-        .unwrap()
-        .set_times(fixed_times())
-        .unwrap();
-    test_support::write_script(
-        &root.join("bin/ssh"),
+    let scratch = Scratch::new("cache-test");
+    fs::create_dir(scratch.join("data")).unwrap();
+    File::create(scratch.join("stamp")).unwrap();
+    test_support::set_modified(&scratch.join("stamp"), fixed_time());
+    scratch.mock_command(
+        "ssh",
         r##"[ "$#" = 3 ] && [ "$1" = -- ] && [ "$2" = mock-device ] || exit 90
 printf 'call\n' >> "$RMU_CACHE_TEST_ROOT/calls"
 sh -c "$3"
@@ -114,24 +106,12 @@ esac
 exit "$status"
 "##,
     );
-    let path = std::env::join_paths(
-        std::iter::once(root.join("bin"))
-            .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
-    )
-    .unwrap();
-    let result = Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", test_name, "--nocapture"])
-        .env("RMU_CACHE_TEST_ROOT", &root)
-        .env("PATH", path)
+    let result = test_support::rerun_test(test_name)
+        .env("RMU_CACHE_TEST_ROOT", scratch.path())
+        .env("PATH", scratch.mock_path())
         .output()
         .unwrap();
-    fs::remove_dir_all(root).unwrap();
-    assert!(
-        result.status.success(),
-        "{}\n{}",
-        String::from_utf8_lossy(&result.stdout),
-        String::from_utf8_lossy(&result.stderr)
-    );
+    test_support::assert_success(&result);
 }
 
 #[test]
