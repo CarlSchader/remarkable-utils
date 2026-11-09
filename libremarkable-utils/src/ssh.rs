@@ -485,9 +485,13 @@ impl StreamingChild {
     }
 
     fn finish(mut self, transfer: std::io::Result<u64>) -> Result<()> {
-        transfer?;
-        checked(self.wait_for_output()?)?;
-        Ok(())
+        match transfer {
+            // Other local errors leave the child to `Drop`, which kills it.
+            Err(error) if error.kind() != std::io::ErrorKind::BrokenPipe => Err(error.into()),
+            // SSH closes its stdin only as its channel ends, so reaping it
+            // here does not hang, and its exit status may explain the pipe.
+            transfer => settle(transfer, self.wait_for_output()),
+        }
     }
 
     fn finish_upload(mut self, transfer: std::io::Result<u64>) -> Result<()> {
@@ -495,9 +499,7 @@ impl StreamingChild {
         // Killing SSH here can strand the remote sibling. As before, this wait
         // has no command timeout; a nonresponsive remote requires interruption.
         let output = self.wait_for_output();
-        transfer?;
-        checked(output?)?;
-        Ok(())
+        settle(transfer, output)
     }
 
     fn wait_for_output(&mut self) -> std::io::Result<Output> {
@@ -511,6 +513,24 @@ impl StreamingChild {
             stdout,
             stderr,
         })
+    }
+}
+
+/// Local transfer errors win over the remote result, except a broken pipe:
+/// that only says the remote stopped reading, while a non-zero exit and its
+/// stderr say why. After a successful exit the input was still not fully
+/// delivered, so the broken pipe remains an error.
+fn settle(transfer: std::io::Result<u64>, output: std::io::Result<Output>) -> Result<()> {
+    match transfer {
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {
+            checked(output?)?;
+            Err(error.into())
+        }
+        transfer => {
+            transfer?;
+            checked(output?)?;
+            Ok(())
+        }
     }
 }
 

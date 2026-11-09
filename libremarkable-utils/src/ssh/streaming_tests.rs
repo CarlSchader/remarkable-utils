@@ -27,6 +27,7 @@ fn transfers_drain_and_reap() {
     if std::env::var_os(CHILD_ENV).is_some() {
         (0..2).for_each(|_| {
             [0, 23].into_iter().for_each(check_transfers);
+            [0, 93].into_iter().for_each(check_broken_pipes);
             check_early_errors();
             check_inherited_outputs();
             [false, true].into_iter().for_each(|with_stdin| {
@@ -187,6 +188,51 @@ fn check_transfers(status: i32) {
     assert_result(result, status, &progress, total);
     assert_eq!(fs::read(&captured).unwrap(), data);
     assert_pid_file_reaped(&pid_file);
+}
+
+fn check_broken_pipes(status: i32) {
+    // The remote exits without reading more than a pipe buffer of input, so
+    // the write fails with EPIPE on every run, not only when the exit wins a
+    // race against a small write. Both finish paths must report the remote
+    // failure; after a clean exit the undelivered input is still an error.
+    let scratch = Scratch::new();
+    let pid_file = scratch.0.join("pid");
+    let session = scratch.session(&format!(
+        "echo $$ > {}\nprintf 'remote refused input' >&2\nexit {status}",
+        shell_quote(pid_file.to_str().unwrap())
+    ));
+    let data = vec![7; PIPE_FILL];
+    let local = scratch.0.join("source");
+    fs::write(&local, &data).unwrap();
+
+    let progress = Recorder::default();
+    let result = session.run_checked_with_stdin("mock command", &data, &progress);
+    assert_broken_pipe_result(result, status, &progress);
+    assert_pid_file_reaped(&pid_file);
+
+    let progress = Recorder::default();
+    let result = session.upload_local_file(&local, "mock remote", &progress);
+    assert_broken_pipe_result(result, status, &progress);
+    assert_pid_file_reaped(&pid_file);
+}
+
+fn assert_broken_pipe_result(result: Result<()>, status: i32, progress: &Recorder) {
+    match result {
+        Err(Error::Remote {
+            status: actual,
+            stderr,
+        }) if status != 0 => {
+            assert_eq!(actual, status);
+            assert_eq!(stderr, "remote refused input");
+        }
+        Err(Error::Io(error)) if status == 0 => {
+            assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+        }
+        result => panic!("exit {status}: unexpected result {result:?}"),
+    }
+    // The pipe really broke partway through the input.
+    assert!(progress.transferred.get() < PIPE_FILL as u64);
+    assert_eq!(progress.done.get(), 0);
 }
 
 fn assert_no_download_temps(directory: &Path) {
@@ -424,6 +470,8 @@ fn check_staged_upload_errors() {
 
     // Deliberately delay the shell after it closes stdin: immediate kill on
     // BrokenPipe would bypass the EXIT trap and leave the staged sibling.
+    // The broken pipe is only a symptom of the remote giving up; its non-zero
+    // exit is the cause the user can act on, so it is what gets reported.
     let session = scratch.session(&format!(
         "echo $$ > {}\nfor cmd do :; done\nexec sh -c 'cat() {{ exec 0<&-; sleep 0.05; return 1; }}; '\"$cmd\"",
         shell_quote(pid_file.to_str().unwrap())
@@ -435,9 +483,7 @@ fn check_staged_upload_errors() {
         PIPE_FILL as u64,
         &progress,
     );
-    assert!(
-        matches!(result, Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::BrokenPipe)
-    );
+    assert!(matches!(result, Err(Error::Remote { status: 1, .. })));
     assert_eq!(progress.done.get(), 0);
     assert_eq!(fs::read(remote).unwrap(), b"existing remote");
     assert_pid_file_reaped(&pid_file);
