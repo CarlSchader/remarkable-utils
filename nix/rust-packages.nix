@@ -45,6 +45,22 @@ flake-utils.lib.eachDefaultSystem (system: let
     };
 
   vendorDir = craneLib.vendorCargoDeps {src = ./..;};
+
+  # Tests drive the system `git` binary and create throwaway repositories.
+  # Keep them hermetic: no user/system git config, a scratch HOME, and a
+  # fabricated identity so commits work without any configuration.
+  hermeticGitTestArgs = {
+    nativeCheckInputs = [pkgs.git];
+    preCheck = ''
+      export HOME="$(mktemp -d)"
+      export GIT_CONFIG_GLOBAL=/dev/null
+      export GIT_CONFIG_NOSYSTEM=1
+      export GIT_AUTHOR_NAME="Test Author"
+      export GIT_AUTHOR_EMAIL="author@example.invalid"
+      export GIT_COMMITTER_NAME="Test Committer"
+      export GIT_COMMITTER_EMAIL="committer@example.invalid"
+    '';
+  };
 in {
   packages = {
     inherit rustToolchain;
@@ -56,14 +72,30 @@ in {
         cargoClippyExtraArgs = "--all-features --all-targets -- -D warnings";
       });
 
+    # Every workspace crate's tests; `rmu`'s build only tests `-p rmu`.
+    workspace-tests = craneLib.cargoTest (commonArgs
+      // hermeticGitTestArgs
+      // {
+        inherit cargoArtifacts;
+        cargoTestExtraArgs = "--workspace";
+      });
+
     rmu = craneLib.buildPackage (
       individualCrateArgs
+      // hermeticGitTestArgs
       // {
         # Crate versions are inherited from [workspace.package], which crane's
         # crateNameFromCargoToml cannot resolve; version comes from commonArgs.
         pname = "rmu";
         cargoExtraArgs = "-p rmu";
         src = fileSetForCrate ../rmu;
+        nativeBuildInputs = [pkgs.makeWrapper];
+        # rmu shells out to `git` and `ssh`. Suffix (not prefix) PATH so the
+        # user's own binaries and their configuration win; ours are a fallback.
+        postInstall = ''
+          wrapProgram $out/bin/rmu \
+            --suffix PATH : ${lib.makeBinPath [pkgs.git pkgs.openssh]}
+        '';
       }
     );
   };

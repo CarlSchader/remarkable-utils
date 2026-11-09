@@ -32,9 +32,9 @@ This repository is **open source** (dual-licensed MIT OR Apache-2.0):
 |-------------------------|--------------------------------------------------------|
 | `flake.nix`             | Flake entry point — melds modules from `nix/` via `flake-utils.lib.meld` |
 | `nix/default.nix`       | Melds `checks.nix`, `formatter.nix`, `rust-packages.nix`, `shells.nix` |
-| `nix/rust-packages.nix` | crane-based Rust builds, toolchain, vendor dir, clippy check |
-| `nix/checks.nix`        | `nix flake check` targets (pre-commit hooks, clippy)   |
-| `nix/shells.nix`        | Dev shell (rust toolchain, treefmt, openssh, hooks)    |
+| `nix/rust-packages.nix` | crane-based Rust builds, toolchain, vendor dir, clippy check, workspace tests (hermetic git env); `rmu` wrapped with git/ssh as PATH fallbacks |
+| `nix/checks.nix`        | `nix flake check` targets (pre-commit hooks, clippy, workspace tests) |
+| `nix/shells.nix`        | Dev shell (rust toolchain, treefmt, openssh, git, hooks) |
 | `nix/formatter.nix`     | treefmt wrapper (`nix fmt`)                            |
 | `nix/lib/treefmt.nix`   | Formatter config: rustfmt, alejandra, statix, deadnix  |
 | `nix/lib/git-hooks.nix` | Pre-commit hooks: treefmt + clippy (offline vendored)  |
@@ -121,7 +121,8 @@ cargo build --workspace            # build everything
 cargo test --workspace             # run tests
 cargo clippy --all-features --all-targets -- -D warnings  # mandatory lint
 nix fmt                            # format (rustfmt + Nix formatters)
-nix flake check                    # full check: pre-commit hooks + clippy
+nix flake check                    # full check: pre-commit hooks + clippy + workspace tests
+nix build .#workspace-tests        # just the sandboxed workspace test suite
 nix build .#rmu                    # build the CLI via crane
 ```
 
