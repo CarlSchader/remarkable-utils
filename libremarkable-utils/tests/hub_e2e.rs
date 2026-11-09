@@ -265,7 +265,7 @@ fn the_deletion_guard_needs_consent_which_other_tablets_honour() {
         "{refused}"
     );
     assert_eq!(world.origin_docs().len(), before.len());
-    assert!(world.tablet(1).is_running());
+    world.check_idle(1);
     // With consent the deletions go to origin, recorded in a trailer...
     let report = world
         .sync_with(
@@ -315,6 +315,7 @@ fn an_empty_tablet_never_wipes_origin() {
         "{refused}"
     );
     assert_eq!(world.origin_docs().len(), 6);
+    world.check_idle(1);
 }
 
 #[test]
@@ -366,43 +367,33 @@ fn a_quarantined_document_is_never_deleted_or_overwritten() {
 
 #[test]
 fn edits_during_the_sync_are_skipped_then_picked_up() {
-    let (world, lib) = two_tablets();
+    let (base, lib) = two_tablets();
     // B renames the notes; A will apply that. While A's sync has the UI
-    // up (before it stops xochitl again to apply), the user inks them on
-    // A: that document is skipped, keeps its snapshot base, and the next
-    // sync merges the ink with B's rename.
-    world.rename(1, &lib.notes, "Notes (renamed on B)");
-    world.sync(1).unwrap();
-    let page = world.pages(0, &lib.notes)[0].clone();
-    let target = lib.notes.clone();
-    let device = world.device(0);
-    // Find the step-13 arm: the first ArmWatchdog after the Stage.
-    let probe = world.duplicate();
-    probe.sync(0).unwrap();
-    let ops = probe.tablet(0).ops();
-    let stage = ops
-        .iter()
-        .position(|op| *op == libremarkable_utils::hub::device::OpKind::Stage)
-        .expect("a stage");
-    let marker = "stroke window-ink\n".to_string();
-    world
-        .inks
-        .lock()
-        .unwrap()
-        .expected
-        .insert("window-ink".to_string());
-    let page_path = format!("{target}/{page}.rm");
-    device.tablet.inject(Fault::EditBefore(
-        stage + 2,
+    // up (between staging and stopping xochitl again to apply), the user
+    // inks them on A: that document is skipped, keeps its snapshot base,
+    // and the next sync merges the ink with B's rename.
+    base.rename(1, &lib.notes, "Notes (renamed on B)");
+    base.sync(1).unwrap();
+    let page = base.pages(0, &lib.notes)[0].clone();
+    // The op after the (last) Stage: the arm before the step-13 stop.
+    let stage = op_index(&base, 0, OpKind::Stage, 2, |w| {
+        w.sync(0).unwrap();
+    });
+    let world = base.duplicate();
+    world.inks.lock().unwrap().expect("window-ink", &lib.notes);
+    let page_path = format!("{}/{page}.rm", lib.notes);
+    world.tablet(0).inject(Fault::EditBefore(
+        stage + 1,
         Box::new(move |dir: &Path| {
             let path = dir.join(&page_path);
             let mut bytes = std::fs::read(&path).unwrap();
-            bytes.extend_from_slice(marker.as_bytes());
+            bytes.extend_from_slice(b"stroke window-ink\n");
             std::fs::write(&path, bytes).unwrap();
         }),
     ));
     let report = world.sync(0).unwrap();
     assert_eq!(report.skipped, vec![lib.notes.clone()], "{report:?}");
+    let device = world.device(0);
     let state = device.state().unwrap();
     assert_eq!(
         state.base_overrides.get(&lib.notes),
@@ -441,7 +432,7 @@ fn a_rewound_or_replaced_origin_stops_the_sync() {
         "{error}"
     );
     assert_eq!(world.device(1).docs(), before);
-    assert!(world.tablet(1).is_running());
+    world.check_idle(1);
     // Refused before the tablet was touched.
     assert!(
         world.tablet(1).ops()[ops..]
@@ -456,6 +447,7 @@ fn a_rewound_or_replaced_origin_stops_the_sync() {
         is_cycle(&error, |e| matches!(e, CycleError::RepoMismatch { .. })),
         "{error}"
     );
+    world.check_idle(0);
     // Reattaching is the deliberate way back.
     world.reattach(0).unwrap();
     world.reattach(1).unwrap();
@@ -477,6 +469,7 @@ fn guards_refuse_paired_attached_and_unattached_tablets() {
         is_cycle(&error, |e| matches!(e, CycleError::AlreadyAttached { .. })),
         "{error}"
     );
+    world.check_idle(0);
     let error = world.hub(0).init(&world.origin).unwrap_err();
     assert!(
         is_cycle(&error, |e| matches!(
@@ -514,6 +507,7 @@ fn guards_refuse_paired_attached_and_unattached_tablets() {
         "{error}"
     );
     assert!(tablet.is_running());
+    assert!(!Path::new(&tablet.paths().lock_dir()).exists());
     assert!(!is_locked(&error));
 }
 
@@ -538,40 +532,20 @@ fn op_index(world: &World, tablet: usize, kind: OpKind, nth: usize, run: impl Fn
 
 #[test]
 fn a_concurrent_pusher_makes_the_push_retry() {
-    let (world, lib) = two_tablets();
-    let page = world.pages(0, &lib.notes)[1].clone();
-    world.ink(0, &lib.notes, &page);
-    world.rename(1, &lib.archive, "Attic");
+    let (base, lib) = two_tablets();
+    let page = base.pages(0, &lib.notes)[1].clone();
+    base.ink(0, &lib.notes, &page);
+    base.rename(1, &lib.archive, "Attic");
     // Right before A writes its journal, B syncs: A's push is rejected
     // and A goes back to fetch and merge.
-    let journal = op_index(&world, 0, OpKind::WriteState, 2, |w| {
+    let journal = op_index(&base, 0, OpKind::WriteState, 2, |w| {
         w.sync(0).unwrap();
     });
-    let (git, origin, options) = (
-        world.git.clone(),
-        world.origin.clone(),
-        world.options.clone(),
-    );
-    let (other, cache) = (
-        Arc::clone(&world.device(1).tablet),
-        world.device(1).cache.clone(),
-    );
+    let world = base.duplicate();
     world.tablet(0).inject(Fault::EditBefore(
         journal,
-        Box::new(move |_| {
-            static PROGRESS: libremarkable_utils::progress::NoProgress =
-                libremarkable_utils::progress::NoProgress;
-            let hub = libremarkable_utils::hub::cycle::Hub::new(
-                git,
-                cache,
-                libremarkable_utils::hub::device::LockRequest::for_this_process("other-host"),
-                &PROGRESS,
-            )
-            .with_options(HubOptions {
-                origin: Some(origin),
-                ..options
-            });
-            let report = hub.sync(&*other).unwrap();
+        other_computer(&world, 1, |hub, tablet, _| {
+            let report = hub.sync(tablet).unwrap();
             assert_ne!(report.update, MainUpdate::UpToDate);
         }),
     ));
@@ -582,6 +556,44 @@ fn a_concurrent_pusher_makes_the_push_retry() {
         world.device(0).metadata(&lib.archive).unwrap()["visibleName"],
         "Attic"
     );
+}
+
+/// An edit (for `Fault::EditBefore`) that runs `run` on tablet `i` from
+/// its own computer: another rmu acting while this one is mid-run.
+fn other_computer(
+    world: &World,
+    i: usize,
+    run: impl FnOnce(
+        &libremarkable_utils::hub::cycle::Hub<'static>,
+        &dyn libremarkable_utils::hub::device::Tablet,
+        &str,
+    ) + Send
+    + 'static,
+) -> libremarkable_utils::hub::device::Edit {
+    let (git, origin, options) = (
+        world.git.clone(),
+        world.origin.clone(),
+        world.options.clone(),
+    );
+    let (tablet, cache) = (
+        Arc::clone(&world.device(i).tablet),
+        world.device(i).cache.clone(),
+    );
+    Box::new(move |_| {
+        static PROGRESS: libremarkable_utils::progress::NoProgress =
+            libremarkable_utils::progress::NoProgress;
+        let hub = libremarkable_utils::hub::cycle::Hub::new(
+            git,
+            cache,
+            libremarkable_utils::hub::device::LockRequest::for_this_process("other-host"),
+            &PROGRESS,
+        )
+        .with_options(HubOptions {
+            origin: Some(origin.clone()),
+            ..options
+        });
+        run(&hub, &*tablet, &origin);
+    })
 }
 
 /// Make origin take the next push to `main` and then drop the connection
@@ -747,12 +759,19 @@ fn status_and_dry_run_change_nothing() {
 // ---- crash at every step ---------------------------------------------------------
 
 /// The crash scenario: B's changes are on origin (a rename, a new
-/// notebook, a deletion, ink on a page A also inks), A has its own
-/// (that ink, an inserted page, a rename, a new folder with a move, a
-/// trashed document). A's sync therefore reads, merges with a fork,
-/// pushes, stages, applies writes and deletions, and records.
+/// notebook, a deletion, ink on a page A also inks, ink in a notebook A
+/// holds quarantined, the deletion of another A holds quarantined), A
+/// has its own (that ink, an inserted page, a rename, a new folder with a
+/// move, a trashed document, a corrupt `.metadata`, a lost `.metadata`
+/// with new ink). A's sync therefore reads, merges with a fork, pushes,
+/// stages, applies writes and deletions, leaves two quarantined
+/// documents alone, and records. [`settle`] repairs them at the end.
 fn crash_template() -> World {
     let (world, lib) = two_tablets();
+    let ledger = world.create(0, Kind::Notebook { pages: 1 }, "Ledger", "");
+    let scratch = world.create(0, Kind::Notebook { pages: 1 }, "Scratch", "");
+    world.sync(0).unwrap();
+    world.sync(1).unwrap();
     let page = world.pages(0, &lib.notes)[0].clone();
     world.rename(1, &lib.paper, "Paper (B)");
     world.create(
@@ -763,6 +782,8 @@ fn crash_template() -> World {
     );
     world.delete(1, &lib.diary);
     world.ink(1, &lib.notes, &page);
+    world.insert_page(1, &ledger);
+    world.delete(1, &scratch);
     world.sync(1).unwrap();
     world.ink(0, &lib.notes, &page);
     world.insert_page(0, &lib.sketch);
@@ -770,7 +791,22 @@ fn crash_template() -> World {
     let inbox = world.create(0, Kind::Folder, "Inbox", "");
     world.move_to(0, &lib.sketch, inbox.as_str());
     world.trash(0, &lib.paper);
+    world.corrupt(0, &ledger);
+    let scratch_page = world.pages(0, &scratch)[0].clone();
+    world.ink(0, &scratch, &scratch_page);
+    world.lose_metadata(0, &scratch);
     world
+}
+
+/// Converge, repair what A holds quarantined, converge again; the
+/// conflict copies at the end. With the repairs, the ledger takes B's
+/// page (A never changed it) and the scratch notebook comes back (A's
+/// ink beats B's deletion); the ink oracle then covers both on A too.
+fn settle(world: &World) -> Vec<(libremarkable_utils::hub::model::DocId, String)> {
+    world.converge();
+    world.repair(0);
+    world.converge();
+    world.conflicts()
 }
 
 /// What a clean run of the scenario ends with: A's op log, and the
@@ -793,11 +829,11 @@ fn reference(template: &World) -> Reference {
     let count = |kind: OpKind| ops.iter().filter(|op| **op == kind).count();
     assert_eq!(count(OpKind::StartXochitl), 2, "{ops:?}");
     assert_eq!(count(OpKind::StopXochitl), 2, "{ops:?}");
-    world.converge();
+    assert_eq!(report.quarantined.len(), 2, "{report:?}");
     Reference {
         ops,
         mutations,
-        conflicts: world.conflicts(),
+        conflicts: settle(&world),
     }
 }
 
@@ -838,9 +874,8 @@ fn recover(world: &World, reference: &Reference, what: &str) {
         }
         Err(error) => panic!("{what}: the next run failed: {error}"),
     }
-    world.converge();
     assert_eq!(
-        world.conflicts(),
+        settle(world),
         reference.conflicts,
         "{what}: conflict copies"
     );
@@ -994,51 +1029,192 @@ fn edits_after_an_interrupted_apply_are_not_conflicts() {
     });
 }
 
-/// Crashes during reconciliation itself: a first crash leaves a journal
-/// (an apply killed inside a document, or a crash before the record),
-/// then the recovering run is cut at every one of its own operations.
+/// The first kill point whose recovery finishes a half-applied
+/// document, and the documents it finishes.
+fn kill_leaving_a_half_applied_document(
+    template: &World,
+) -> (usize, Vec<libremarkable_utils::hub::model::DocId>) {
+    (0..30)
+        .find_map(|k| {
+            let crashed = crashed_by(template, Fault::KillApplyAfter(k));
+            let report = crashed.sync(0).unwrap();
+            let finished = report.reconciled?.finished;
+            (!finished.is_empty()).then_some((k, finished))
+        })
+        .expect("a kill point that leaves a half-applied document")
+}
+
+/// Crashes during reconciliation itself: after a first crash that left a
+/// journal, the recovering run is cut at every one of its operations.
+fn crash_during_reconciliation(template: &World, reference: &Reference, first: Fault, what: &str) {
+    let crashed = crashed_by(template, first);
+    // The recovering run, clean, on a copy: its operations.
+    let probe = crashed.duplicate();
+    let report = probe.sync(0).unwrap();
+    assert!(report.reconciled.is_some(), "{what}: {report:?}");
+    let ops = probe.tablet(0).ops();
+    (1..=ops.len()).for_each(|k| {
+        let world = crashed.duplicate();
+        world.tablet(0).inject(Fault::DisconnectAtOp(k));
+        let result = world.sync(0);
+        world::no_contract_violation(&result);
+        recover(
+            &world,
+            reference,
+            &format!("{what}, then op {k} ({:?})", ops[k - 1]),
+        );
+    });
+}
+
 #[test]
-fn crash_during_reconciliation_at_every_operation() {
+fn crash_during_reconciliation_after_a_killed_apply() {
+    let template = crash_template();
+    let reference = reference(&template);
+    let (kill, _) = kill_leaving_a_half_applied_document(&template);
+    crash_during_reconciliation(
+        &template,
+        &reference,
+        Fault::KillApplyAfter(kill),
+        &format!("apply killed after {kill} moves"),
+    );
+}
+
+#[test]
+fn crash_during_reconciliation_after_an_unrecorded_apply() {
     let template = crash_template();
     let reference = reference(&template);
     let record = op_index(&template, 0, OpKind::WriteState, 3, |w| {
         w.sync(0).unwrap();
     });
-    [
-        (Fault::KillApplyAfter(6), "apply killed after 6 moves"),
-        (Fault::DisconnectAtOp(record), "crash before the record"),
-    ]
-    .into_iter()
-    .for_each(|(first, what)| {
-        let crashed = template.duplicate();
-        crashed.tablet(0).inject(first);
-        assert!(crashed.sync(0).is_err(), "{what}");
-        crashed.tablet(0).reconnect();
-        crashed.tablet(0).fire_watchdog();
-        // The recovering run, clean, on a copy: its operations.
-        let probe = crashed.duplicate();
-        let report = probe.sync(0).unwrap();
-        assert!(report.reconciled.is_some(), "{what}: {report:?}");
-        let ops = probe.tablet(0).ops();
-        (1..=ops.len()).for_each(|k| {
-            let world = crashed.duplicate();
-            world.tablet(0).inject(Fault::DisconnectAtOp(k));
-            let result = world.sync(0);
-            world::no_contract_violation(&result);
-            recover(&world, &reference, &format!("{what}, then op {k} ({:?})", ops[k - 1]));
-        });
+    crash_during_reconciliation(
+        &template,
+        &reference,
+        Fault::DisconnectAtOp(record),
+        "crash before the record",
+    );
+}
+
+/// Reconciliation finished a document, then crashed before writing the
+/// result; the user then writes in that document. Its own sentinel shows
+/// the document finished: the edit is on top of the merge, not a
+/// conflict.
+#[test]
+fn an_edit_after_a_crashed_reconciliation_is_not_a_conflict() {
+    let template = crash_template();
+    let reference = reference(&template);
+    let (kill, finished) = kill_leaving_a_half_applied_document(&template);
+    let crashed = crashed_by(&template, Fault::KillApplyAfter(kill));
+    let written = op_index(&crashed, 0, OpKind::WriteState, 1, |w| {
+        w.sync(0).unwrap();
     });
+    let world = crashed.duplicate();
+    world.tablet(0).inject(Fault::DisconnectAtOp(written));
+    assert!(world.sync(0).is_err());
+    world.tablet(0).reconnect();
+    world.tablet(0).fire_watchdog();
+    finished.iter().for_each(|doc| {
+        if let Some(page) = world
+            .device(0)
+            .content(doc)
+            .and_then(|content| world::pages_of(&content).first().cloned())
+        {
+            world.ink(0, doc, &page);
+        }
+    });
+    world.sync(0).unwrap();
+    assert_eq!(settle(&world), reference.conflicts);
+}
+
+/// A copy of `template` after A's sync failed with `fault`, the
+/// connection back and the watchdog fired.
+fn crashed_by(template: &World, fault: Fault) -> World {
+    let crashed = template.duplicate();
+    crashed.tablet(0).inject(fault);
+    assert!(crashed.sync(0).is_err());
+    crashed.tablet(0).reconnect();
+    crashed.tablet(0).fire_watchdog();
+    crashed
 }
 
 #[test]
 fn download_cut_after_every_file() {
     let template = crash_template();
-    let reference = reference(&template);
-    (0..12).for_each(|k| {
-        crash_with(
-            &template,
+    // A backup first records the manifest, so the next pre-read finds
+    // nothing to download; files A's user writes right after it (before
+    // the lock) are what the stopped read downloads, and what the cut
+    // hits.
+    let prepared = || {
+        let world = template.duplicate();
+        world.backup(0).unwrap();
+        world
+    };
+    let probe = prepared();
+    let before = probe.tablet(0).ops().len();
+    probe.sync(0).unwrap();
+    let ops = probe.tablet(0).ops();
+    let lock = ops[before..]
+        .iter()
+        .position(|op| *op == OpKind::AcquireLock)
+        .unwrap()
+        + 1;
+    assert!(!ops[before..before + lock].contains(&OpKind::Download));
+    let edit = |world: &World| -> usize {
+        let device = world.device(0);
+        let pages: Vec<(String, libremarkable_utils::hub::model::DocId)> = device
+            .names()
+            .into_keys()
+            .filter_map(|doc| {
+                let page = world::pages_of(&device.content(&doc)?).first()?.clone();
+                device.metadata(&doc)?;
+                Some((format!("{doc}/{page}.rm"), doc))
+            })
+            .take(4)
+            .collect();
+        pages.iter().enumerate().for_each(|(n, (_, doc))| {
+            world
+                .inks
+                .lock()
+                .unwrap()
+                .expect(&format!("cut-ink-{n}"), doc);
+        });
+        let edited = pages.len();
+        world.tablet(0).inject(Fault::EditBefore(
+            lock,
+            Box::new(move |dir: &Path| {
+                pages.iter().enumerate().for_each(|(n, (path, _))| {
+                    let file = dir.join(path);
+                    let mut bytes = std::fs::read(&file).unwrap();
+                    bytes.extend_from_slice(format!("stroke cut-ink-{n}\n").as_bytes());
+                    std::fs::write(&file, bytes).unwrap();
+                });
+            }),
+        ));
+        edited
+    };
+    // The same edits without a cut: the conflict copies to expect.
+    let clean = prepared();
+    let edited = edit(&clean);
+    assert!(edited >= 2, "{edited}");
+    clean.sync(0).unwrap();
+    let reference = Reference {
+        ops: Vec::new(),
+        mutations: 0,
+        conflicts: settle(&clean),
+    };
+    // The stopped read downloads exactly the edited pages.
+    (0..edited).for_each(|k| {
+        let world = prepared();
+        edit(&world);
+        world.tablet(0).inject(Fault::FailDownloadAfter(k));
+        let result = world.sync(0);
+        world::no_contract_violation(&result);
+        assert!(
+            result.is_err(),
+            "cut after {k} file(s): the stopped read was not cut"
+        );
+        recover(
+            &world,
             &reference,
-            Fault::FailDownloadAfter(k),
             &format!("download cut after {k} file(s)"),
         );
     });
@@ -1104,7 +1280,7 @@ fn interleaving(seed: u64) {
             .filter(|doc| kind(doc).as_deref() == Some("CollectionType"))
             .cloned()
             .collect();
-        match rng.below(12) {
+        match rng.below(13) {
             0 | 1 => {
                 if let Some(doc) = rng.pick(&notebooks) {
                     let pages = world.pages(i, doc);
@@ -1166,6 +1342,16 @@ fn interleaving(seed: u64) {
                     world.read(i, doc);
                 }
             }
+            11 => {
+                if let Some(doc) = rng.pick(&notebooks) {
+                    let pages = world.pages(i, doc);
+                    if pages.len() > 1
+                        && let Some(page) = rng.pick(&pages)
+                    {
+                        world.remove_page(i, doc, page);
+                    }
+                }
+            }
             _ => {
                 world
                     .sync(i)
@@ -1188,38 +1374,17 @@ fn concurrent_first_clones_into_an_empty_origin() {
     // Both tablets clone at once; B's clone lands while A's is between
     // its journal and its push. A loses the race, falls back to merging
     // with what B pushed, and nothing is duplicated.
-    let world = World::new(2);
-    let mine = world.create(0, Kind::Notebook { pages: 1 }, "A's notes", "");
-    let theirs = world.create(1, Kind::Notebook { pages: 1 }, "B's notes", "");
-    let journal = op_index(&world, 0, OpKind::WriteState, 3, |w| {
+    let base = World::new(2);
+    let mine = base.create(0, Kind::Notebook { pages: 1 }, "A's notes", "");
+    let theirs = base.create(1, Kind::Notebook { pages: 1 }, "B's notes", "");
+    let journal = op_index(&base, 0, OpKind::WriteState, 3, |w| {
         w.clone_tablet(0).unwrap();
     });
-    let (git, origin, options) = (
-        world.git.clone(),
-        world.origin.clone(),
-        world.options.clone(),
-    );
-    let (other, cache) = (
-        Arc::clone(&world.device(1).tablet),
-        world.device(1).cache.clone(),
-    );
+    let world = base.duplicate();
     world.tablet(0).inject(Fault::EditBefore(
         journal,
-        Box::new(move |_| {
-            static PROGRESS: libremarkable_utils::progress::NoProgress =
-                libremarkable_utils::progress::NoProgress;
-            libremarkable_utils::hub::cycle::Hub::new(
-                git,
-                cache,
-                libremarkable_utils::hub::device::LockRequest::for_this_process("other-host"),
-                &PROGRESS,
-            )
-            .with_options(HubOptions {
-                origin: Some(origin.clone()),
-                ..options
-            })
-            .clone_tablet(&*other, &origin, None, false)
-            .unwrap();
+        other_computer(&world, 1, |hub, tablet, origin| {
+            hub.clone_tablet(tablet, origin, None, false).unwrap();
         }),
     ));
     let report = world.clone_tablet(0).unwrap();
@@ -1279,26 +1444,22 @@ fn a_device_ref_that_does_not_continue_the_tablets_stops_the_sync() {
         "{error}"
     );
     assert_eq!(repo.rev_parse("refs/heads/main").unwrap(), Some(main));
-    assert!(world.tablet(0).is_running());
+    world.check_idle(0);
 }
 
 #[test]
 fn a_folder_trashed_on_origin_spares_a_notebook_written_in_during_the_sync() {
-    let (world, lib) = two_tablets();
+    let (base, lib) = two_tablets();
     // B trashes the folder holding the notes; while A's sync has the UI
     // up, the user writes in those notes on A.
-    world.trash(1, &lib.folder);
-    world.sync(1).unwrap();
-    let page = world.pages(0, &lib.notes)[0].clone();
-    let stage = op_index(&world, 0, OpKind::Stage, 1, |w| {
+    base.trash(1, &lib.folder);
+    base.sync(1).unwrap();
+    let page = base.pages(0, &lib.notes)[0].clone();
+    let stage = op_index(&base, 0, OpKind::Stage, 2, |w| {
         w.sync(0).unwrap();
     });
-    world
-        .inks
-        .lock()
-        .unwrap()
-        .expected
-        .insert("late-ink".to_string());
+    let world = base.duplicate();
+    world.inks.lock().unwrap().expect("late-ink", &lib.notes);
     let path = format!("{}/{page}.rm", lib.notes);
     world.tablet(0).inject(Fault::EditBefore(
         stage + 1,

@@ -54,23 +54,20 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde_json::Value;
 use thiserror::Error;
 
-use self::message::{Author, MergeRecord};
-use self::plan::{Change, Content, JsonBlobs, Planned, Reread, Verdict};
-use self::snapshot::{Known, Snapshot, TabletRead};
-use self::store::{Cache, Remote, Store, StoreHistory};
+use self::plan::JsonBlobs;
+use self::snapshot::TabletRead;
+use self::store::{Cache, Remote, Store};
 use crate::error::{Error, Result};
 use crate::git::{CommitMeta, CommitWriter, Expected, FileMode, Git, Oid, Signature};
 use crate::hub::device::{
-    ApplyPlan, DeviceError, DeviceInfo, DocApply, HeldLock, LockOwner, LockRequest, LockState,
-    StagedFile, StaleReason, StatEntry, Tablet,
+    DeviceError, DeviceInfo, HeldLock, LockOwner, LockRequest, LockState, StaleReason, Tablet,
 };
 use crate::hub::merge::{
-    self, DeletionGuard, Fork, GuardThresholds, MergeInput, MergeOutcome, MergeParams, MergedEntry,
-    Note, Summary, TreeItem,
+    DeletionGuard, Fork, GuardThresholds, MergeOutcome, MergedEntry, Note, Summary, TreeItem,
 };
 use crate::hub::model::{
-    DeviceId, DeviceName, DocFile, DocId, DocVersion, Journal, JsonFile, ListingEntry, MirrorRules,
-    RepoConfig, RepoId, RepoTree, StatSignature, TabletState, XochitlPath,
+    DeviceId, DeviceName, DocFile, DocId, DocVersion, ListingEntry, MirrorRules, RepoConfig,
+    RepoId, RepoTree, TabletState, XochitlPath,
 };
 use crate::progress::Progress;
 
@@ -372,8 +369,8 @@ pub struct DryRunReport {
     pub writes: Vec<DocId>,
     /// Documents the sync would delete from the tablet.
     pub deletes: Vec<DocId>,
-    /// How `main` would be updated (merge commits are not created: `Merge`
-    /// carries no id meaning).
+    /// Whether the sync would push to origin `main` (it would not when
+    /// the tablet already agrees with origin).
     pub would_push: bool,
 }
 
@@ -455,31 +452,44 @@ fn is_transport(error: &Error) -> bool {
     )
 }
 
-/// JSON blobs read in this run (not in the cache until the snapshot is
-/// committed) in front of the cache.
-struct ReadJson<'a> {
-    read: HashMap<&'a Oid, &'a Vec<u8>>,
-    store: &'a Store,
+/// JSON blobs the cache does not have yet (read in this run, before the
+/// snapshot is committed; new in a merge not committed yet) in front of
+/// the cache.
+struct Overlay<'a> {
+    bytes: HashMap<&'a Oid, &'a [u8]>,
+    below: &'a dyn JsonBlobs,
 }
 
-impl<'a> ReadJson<'a> {
-    fn new(read: &'a TabletRead, store: &'a Store) -> Self {
+impl<'a> Overlay<'a> {
+    /// The `.metadata`/`.content` a tablet read holds.
+    fn read(read: &'a TabletRead, below: &'a dyn JsonBlobs) -> Self {
         Self {
-            read: read
+            bytes: read
                 .files
                 .iter()
-                .filter_map(|(path, file)| Some((&file.blob, read.json.get(path)?)))
+                .filter_map(|(path, file)| Some((&file.blob, read.json.get(path)?.as_slice())))
                 .collect(),
-            store,
+            below,
+        }
+    }
+
+    /// Blobs a merge wrote that are not committed yet.
+    fn new_blobs(blobs: &'a HashMap<Oid, Vec<u8>>, below: &'a dyn JsonBlobs) -> Self {
+        Self {
+            bytes: blobs
+                .iter()
+                .map(|(oid, bytes)| (oid, bytes.as_slice()))
+                .collect(),
+            below,
         }
     }
 }
 
-impl JsonBlobs for ReadJson<'_> {
+impl JsonBlobs for Overlay<'_> {
     fn json(&self, id: &Oid) -> Result<Option<Rc<Value>>> {
-        match self.read.get(id) {
+        match self.bytes.get(id) {
             Some(bytes) => Ok(serde_json::from_slice::<Value>(bytes).ok().map(Rc::new)),
-            None => self.store.json(id),
+            None => self.below.json(id),
         }
     }
 }
@@ -554,8 +564,9 @@ impl OriginCtx {
         })
     }
 
-    /// Fetch again (steps 4 and 8): `main` may have moved, its
-    /// `.rmu/hub.json` must not have changed.
+    /// Fetch again (under the lock, at step 8, and to resolve a lost
+    /// push acknowledgement): `main` may have moved, its `.rmu/hub.json`
+    /// must not have changed.
     fn refresh(&mut self, device: &DeviceId) -> Result<()> {
         let remote = store::fetch(&self.cache.repo, &self.url, Some(device))?;
         let main = remote.main.clone().ok_or_else(|| CycleError::OriginEmpty {
@@ -676,10 +687,12 @@ fn trees_equivalent(
     a: &RepoTree,
     b: &RepoTree,
     json: &dyn JsonBlobs,
+    except: &BTreeSet<DocId>,
 ) -> Result<bool> {
     a.docs
         .keys()
         .chain(b.docs.keys())
+        .filter(|doc| !except.contains(*doc))
         .collect::<BTreeSet<_>>()
         .into_iter()
         .try_fold(true, |same, doc| {
@@ -687,8 +700,13 @@ fn trees_equivalent(
         })
 }
 
-/// Write every new blob of a merge outcome and return its tree.
-fn realise(writer: &mut CommitWriter, outcome: &MergeOutcome) -> Result<RepoTree> {
+/// Write every new blob of a merge outcome; its tree, and the new
+/// blobs' contents (the cache has them only once the commit is written).
+fn realise(
+    writer: &mut CommitWriter,
+    outcome: &MergeOutcome,
+) -> Result<(RepoTree, HashMap<Oid, Vec<u8>>)> {
+    let mut written = HashMap::new();
     let docs = outcome
         .docs
         .iter()
@@ -699,11 +717,15 @@ fn realise(writer: &mut CommitWriter, outcome: &MergeOutcome) -> Result<RepoTree
                 .map(|(file, entry)| {
                     let entry = match entry {
                         MergedEntry::Existing(entry) => entry.clone(),
-                        MergedEntry::New(bytes) => ListingEntry::regular(writer.write_blob(
-                            &format!("docs/{doc}/{}", file.repo_name()),
-                            bytes.len() as u64,
-                            &mut &bytes[..],
-                        )?),
+                        MergedEntry::New(bytes) => {
+                            let oid = writer.write_blob(
+                                &format!("docs/{doc}/{}", file.repo_name()),
+                                bytes.len() as u64,
+                                &mut &bytes[..],
+                            )?;
+                            written.insert(oid.clone(), bytes.clone());
+                            ListingEntry::regular(oid)
+                        }
                     };
                     Ok((file.clone(), entry))
                 })
@@ -717,10 +739,13 @@ fn realise(writer: &mut CommitWriter, outcome: &MergeOutcome) -> Result<RepoTree
             ))
         })
         .collect::<Result<_>>()?;
-    Ok(RepoTree {
-        docs,
-        extra: outcome.extra.clone(),
-    })
+    Ok((
+        RepoTree {
+            docs,
+            extra: outcome.extra.clone(),
+        },
+        written,
+    ))
 }
 
 /// Add a whole tree to a commit and write it.
@@ -825,10 +850,7 @@ impl<'t> Session<'t> {
         let Some(lock) = self.lock.take() else {
             return;
         };
-        let running = match self.maybe_stopped {
-            true => self.tablet.start_xochitl(&lock).is_ok(),
-            false => true,
-        };
+        let running = !self.maybe_stopped || self.tablet.start_xochitl(&lock).is_ok();
         if running {
             let _ = self.tablet.disarm_watchdog(&lock);
         }

@@ -7,16 +7,15 @@
 //!
 //! The tablet "user" edits files the way xochitl does (ink appends stroke
 //! markers to a page's `.rm` file, renames rewrite `.metadata`, ...), and
-//! every ink marker ever drawn is remembered unless the user deliberately
-//! deleted the page holding it on the tablet that deleted it: the ink
-//! oracle requires every remembered marker to survive on origin and on
-//! every tablet after convergence.
-
-#![allow(dead_code)]
+//! every ink marker ever drawn is remembered, with the document it was
+//! drawn in, unless the user deliberately deleted the last copy of it
+//! (deleting a document whose ink a conflict copy also holds forgets
+//! nothing): the ink oracle requires every remembered marker to survive
+//! on origin and on every tablet after convergence, except on a tablet
+//! where the document it was drawn in is quarantined.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -25,7 +24,7 @@ use libremarkable_utils::git::{Git, ObjectKind};
 use libremarkable_utils::hub::cycle::{
     BackupReport, CycleError, DryRunReport, Hub, HubOptions, MainUpdate, StatusReport, SyncReport,
 };
-use libremarkable_utils::hub::device::{DeviceError, FakeTablet, LockRequest, Tablet};
+use libremarkable_utils::hub::device::{DeviceError, FakeTablet, LockRequest};
 use libremarkable_utils::hub::model::{
     self, Classification, DeviceName, DocFile, DocId, JsonFile, MirrorRules, TabletState,
 };
@@ -50,14 +49,6 @@ pub fn uuid(n: u64) -> DocId {
 /// A fabricated page id.
 pub fn page_id(n: u64) -> String {
     format!("9d2e1c0f-0000-4000-8000-{n:012x}")
-}
-
-/// What a fresh scratch directory is called.
-fn scratch(name: &str) -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "rmu-hub-e2e-{name}-{}",
-        uuid::Uuid::new_v4().simple()
-    ))
 }
 
 /// Copy a directory tree (regular files and directories only).
@@ -216,11 +207,20 @@ fn walk(root: &Path, dir: &Path) -> Vec<(String, Vec<u8>)> {
         .collect()
 }
 
-/// Ink markers: every stroke drawn, unless deliberately deleted.
-#[derive(Default)]
+/// Ink markers: every stroke drawn (with the document it was drawn in),
+/// unless deliberately deleted.
+#[derive(Default, Clone)]
 pub struct Inks {
-    pub expected: BTreeSet<String>,
+    pub expected: BTreeMap<String, DocId>,
     counter: u64,
+}
+
+impl Inks {
+    /// Remember a marker drawn outside `World::ink` (e.g. by an edit
+    /// injected into a fault).
+    pub fn expect(&mut self, marker: &str, doc: &DocId) {
+        self.expected.insert(marker.to_string(), doc.clone());
+    }
 }
 
 /// A fabricated document before it is written to a tablet.
@@ -233,7 +233,7 @@ pub enum Kind {
 /// The world (see the module docs).
 pub struct World {
     /// Everything lives here; removed on drop.
-    scratch: Scratch,
+    _scratch: Scratch,
     pub root: PathBuf,
     pub git: Git,
     pub origin: String,
@@ -264,7 +264,7 @@ impl World {
             })
             .collect();
         let world = Self {
-            scratch,
+            _scratch: scratch,
             root,
             git,
             origin,
@@ -289,12 +289,8 @@ impl World {
         let scratch = Scratch::new("hub-e2e");
         copy_dir(&self.root, scratch.path());
         let copy = Self::at(scratch, self.devices.len(), false);
-        let inks = self.inks.lock().unwrap();
-        *copy.inks.lock().unwrap() = Inks {
-            expected: inks.expected.clone(),
-            counter: inks.counter,
-        };
-        drop(inks);
+        let inks = self.inks.lock().unwrap().clone();
+        *copy.inks.lock().unwrap() = inks;
         let ids = *self.ids.lock().unwrap();
         *copy.ids.lock().unwrap() = ids;
         copy
@@ -404,43 +400,85 @@ impl World {
         docs
     }
 
+    /// The tablet is idle: xochitl running, no lock held.
+    pub fn check_idle(&self, i: usize) {
+        let device = self.device(i);
+        assert!(
+            device.tablet.is_running(),
+            "{}: xochitl is down",
+            device.name
+        );
+        assert!(
+            !Path::new(&device.tablet.paths().lock_dir()).exists(),
+            "{}: the lock is still held",
+            device.name
+        );
+    }
+
     /// Everything the end of a run must leave: xochitl running, no lock,
     /// no journal; the tablets equal to origin (`.metadata`/`.content`
-    /// once normalised, other files byte for byte, leftovers included);
-    /// every remembered ink marker on origin and on every tablet.
+    /// once normalised, other files byte for byte, leftovers included),
+    /// except documents a tablet holds quarantined, which must still be
+    /// there; every remembered ink marker on origin and on every tablet.
     pub fn check(&self) {
         let origin = self.origin_docs();
-        self.devices.iter().for_each(|device| {
-            assert!(
-                device.tablet.is_running(),
-                "{}: xochitl is down",
-                device.name
-            );
-            assert!(
-                !Path::new(&device.tablet.paths().lock_dir()).exists(),
-                "{}: the lock is still held",
-                device.name
-            );
+        self.devices.iter().enumerate().for_each(|(i, device)| {
+            self.check_idle(i);
             let state = device.state().expect("attached");
             assert!(
                 state.journal.is_none(),
                 "{}: a journal is left",
                 device.name
             );
-            assert_equivalent(&device.name, &device.docs(), &origin);
+            let docs = device.docs();
+            state.quarantine.iter().for_each(|doc| {
+                assert!(
+                    docs.contains_key(doc),
+                    "{}: quarantined {doc} is gone",
+                    device.name
+                );
+            });
+            let keep = |docs: &BTreeMap<DocId, BTreeMap<DocFile, Vec<u8>>>| {
+                docs.iter()
+                    .filter(|(doc, _)| !state.quarantine.contains(*doc))
+                    .map(|(doc, files)| (doc.clone(), files.clone()))
+                    .collect::<BTreeMap<_, _>>()
+            };
+            assert_equivalent(&device.name, &keep(&docs), &keep(&origin));
         });
         self.check_ink(&origin);
     }
 
-    /// The ink oracle alone.
+    /// The ink oracle alone. Ink drawn in a document some tablet holds
+    /// quarantined cannot have left that tablet yet: it is checked once
+    /// the document is repaired.
     pub fn check_ink(&self, origin: &BTreeMap<DocId, BTreeMap<DocFile, Vec<u8>>>) {
-        let on_origin = ink_markers(origin);
-        let expected = self.inks.lock().unwrap().expected.clone();
-        let lost: Vec<&String> = expected.difference(&on_origin).collect();
+        let quarantined: BTreeSet<DocId> = self
+            .devices
+            .iter()
+            .filter_map(Device::state)
+            .flat_map(|state| state.quarantine)
+            .collect();
+        let expected: BTreeMap<String, DocId> = self
+            .inks
+            .lock()
+            .unwrap()
+            .expected
+            .iter()
+            .filter(|(_, doc)| !quarantined.contains(*doc))
+            .map(|(marker, doc)| (marker.clone(), doc.clone()))
+            .collect();
+        let missing = |present: &BTreeSet<String>| -> Vec<String> {
+            expected
+                .keys()
+                .filter(|marker| !present.contains(*marker))
+                .cloned()
+                .collect()
+        };
+        let lost = missing(&ink_markers(origin));
         assert!(lost.is_empty(), "ink lost from origin: {lost:?}");
         self.devices.iter().for_each(|device| {
-            let on_tablet = ink_markers(&device.docs());
-            let lost: Vec<&String> = expected.difference(&on_tablet).collect();
+            let lost = missing(&ink_markers(&device.docs()));
             assert!(lost.is_empty(), "{}: ink lost: {lost:?}", device.name);
         });
     }
@@ -524,7 +562,7 @@ impl World {
             let mut inks = self.inks.lock().unwrap();
             inks.counter += 1;
             let marker = format!("ink-{}-{}", device.name.replace(' ', "_"), inks.counter);
-            inks.expected.insert(marker.clone());
+            inks.expected.insert(marker.clone(), doc.clone());
             marker
         };
         let path = format!("{doc}/{page}.rm");
@@ -633,10 +671,16 @@ impl World {
     }
 
     /// Delete a document's files outright (as emptying the trash does);
-    /// its ink is deliberately gone.
+    /// its ink is deliberately gone, unless another document (a conflict
+    /// copy) holds it somewhere.
     pub fn delete(&self, i: usize, doc: &DocId) {
         let device = self.device(i);
-        self.forget_ink(device.docs().get(doc));
+        let held: BTreeSet<String> = device
+            .docs()
+            .get(doc)
+            .map(|files| ink_markers(&[(doc.clone(), files.clone())].into()))
+            .unwrap_or_default();
+        self.forget(&held, doc);
         walk(device.xochitl(), device.xochitl())
             .into_iter()
             .map(|(path, _)| path)
@@ -645,6 +689,29 @@ impl World {
             })
             .for_each(|path| device.tablet.remove_file(&path).unwrap());
         let _ = fs::remove_dir_all(device.xochitl().join(doc.as_str()));
+    }
+
+    /// Forget `markers` deleted with `doc`, except those another document
+    /// holds on some tablet or on origin.
+    fn forget(&self, markers: &BTreeSet<String>, doc: &DocId) {
+        let elsewhere: BTreeSet<String> = self
+            .devices
+            .iter()
+            .map(Device::docs)
+            .chain(std::iter::once(self.origin_docs()))
+            .flat_map(|docs| {
+                let others: BTreeMap<DocId, BTreeMap<DocFile, Vec<u8>>> =
+                    docs.into_iter().filter(|(other, _)| other != doc).collect();
+                ink_markers(&others)
+            })
+            .collect();
+        let mut inks = self.inks.lock().unwrap();
+        markers
+            .iter()
+            .filter(|marker| !elsewhere.contains(*marker))
+            .for_each(|marker| {
+                inks.expected.remove(marker);
+            });
     }
 
     /// Empty the trash: delete every item whose path reaches it.
@@ -675,15 +742,13 @@ impl World {
         trashed
     }
 
-    /// Remove an inked page from a notebook: its ink is deliberately gone.
+    /// Remove an inked page from a notebook: its ink is deliberately gone
+    /// (unless another document holds it).
     pub fn remove_page(&self, i: usize, doc: &DocId, page: &str) {
         let device = self.device(i);
         let path = format!("{doc}/{page}.rm");
         if let Some(bytes) = device.file(&path) {
-            let mut inks = self.inks.lock().unwrap();
-            markers(&bytes).iter().for_each(|marker| {
-                inks.expected.remove(marker);
-            });
+            self.forget(&markers(&bytes).into_iter().collect(), doc);
         }
         device.tablet.remove_file(&path).unwrap();
         let mut content = device.content(doc).unwrap();
@@ -694,23 +759,47 @@ impl World {
         device.put_json(&format!("{doc}.content"), &content);
     }
 
-    fn forget_ink(&self, files: Option<&BTreeMap<DocFile, Vec<u8>>>) {
-        let mut inks = self.inks.lock().unwrap();
-        files.into_iter().flatten().for_each(|(file, bytes)| {
-            if matches!(file, DocFile::Page(_)) {
-                markers(bytes).iter().for_each(|marker| {
-                    inks.expected.remove(marker);
-                });
-            }
-        });
-    }
-
-    /// Break a document's `.metadata` (it must be quarantined).
+    /// Break a document's `.metadata` (it must be quarantined), keeping
+    /// the original beside it (as a file the mirror ignores) for
+    /// [`World::repair`].
     pub fn corrupt(&self, i: usize, doc: &DocId) {
+        self.stash_metadata(i, doc);
         self.device(i)
             .tablet
             .write_file(&format!("{doc}.metadata"), b"{ not json")
             .unwrap();
+    }
+
+    /// Lose a document's `.metadata` (it must be quarantined, never read
+    /// as deleted), keeping the original for [`World::repair`].
+    pub fn lose_metadata(&self, i: usize, doc: &DocId) {
+        self.stash_metadata(i, doc);
+        self.device(i)
+            .tablet
+            .remove_file(&format!("{doc}.metadata"))
+            .unwrap();
+    }
+
+    fn stash_metadata(&self, i: usize, doc: &DocId) {
+        let device = self.device(i);
+        let original = device.file(&format!("{doc}.metadata")).unwrap();
+        device
+            .tablet
+            .write_file(&format!("{doc}.metadata.stash"), &original)
+            .unwrap();
+    }
+
+    /// Put back every `.metadata` [`World::corrupt`] or
+    /// [`World::lose_metadata`] took away on tablet `i`.
+    pub fn repair(&self, i: usize) {
+        let device = self.device(i);
+        walk(device.xochitl(), device.xochitl())
+            .into_iter()
+            .filter_map(|(path, bytes)| Some((path.strip_suffix(".stash")?.to_string(), bytes)))
+            .for_each(|(path, bytes)| {
+                device.tablet.write_file(&path, &bytes).unwrap();
+                device.tablet.remove_file(&format!("{path}.stash")).unwrap();
+            });
     }
 }
 
@@ -863,16 +952,4 @@ pub fn no_contract_violation<T: std::fmt::Debug>(result: &Result<T>) {
     if let Err(Error::HubDevice(DeviceError::ContractViolation(what))) = result {
         panic!("device contract violated: {what}");
     }
-}
-
-/// Read the whole of a reader (helper for tests that stream).
-pub fn read_all(mut reader: impl Read) -> Vec<u8> {
-    let mut out = Vec::new();
-    reader.read_to_end(&mut out).unwrap();
-    out
-}
-
-/// Tablet trait object of a device.
-pub fn as_tablet(device: &Device) -> &dyn Tablet {
-    &*device.tablet
 }

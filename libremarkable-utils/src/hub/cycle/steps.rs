@@ -1,46 +1,38 @@
 //! The cycle's steps: `sync`, `clone` and `backup` (see the parent
 //! module for the step list).
 
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::ControlFlow;
 
-use super::*;
-use crate::hub::model::{Classification, DocOutcome, ManifestEntry, MirroredFile};
-use snapshot::ReadMode;
+use serde_json::Value;
+
+use super::message::{self, Author, MergeRecord};
+use super::plan::{self, Change, Content, JsonBlobs, LocalJson, Planned, Reread};
+use super::snapshot::{self, Known, ReadMode, Snapshot, TabletRead};
+use super::store::{self, Store, StoreHistory};
+use super::{
+    BackupReport, CycleError, Hub, MainUpdate, OriginCtx, Overlay, Prepared, Pushed, Reconciled,
+    Session, SyncReport, check_url, commit_tree, consented_deletions, default_name, read_summary,
+    realise, rmu_signature, tablet_version, tree_items, trees_equivalent, unix_now, virtual_base,
+    xochitl_path,
+};
+use crate::error::{Error, Result};
+use crate::git::{CommitMeta, Expected, Oid, Repo};
+use crate::hub::device::{
+    ApplyPlan, DeviceError, DeviceInfo, DocApply, StagedFile, StatEntry, Tablet,
+};
+use crate::hub::merge::{self, MergeInput, MergeParams, TreeItem};
+use crate::hub::model::{
+    Classification, DeviceId, DeviceName, DocFile, DocId, DocOutcome, DocVersion, Journal,
+    JsonFile, ManifestEntry, MirrorRules, MirroredFile, RepoTree, StatSignature, TabletState,
+    XochitlPath,
+};
 
 /// Staging uploads go in batches of about this many bytes, with the
 /// watchdog re-armed before each: a timeout then bounds one batch, not a
 /// whole (first-clone sized) upload, which would otherwise fire it
 /// mid-transfer on every attempt.
 const STAGE_BATCH_BYTES: u64 = 64 * 1024 * 1024;
-
-/// Staged last, as `.rmu-staged-<merge>`, once everything an apply of
-/// that merge needs is staged: reconciliation then knows that a planned
-/// file missing from that run's staging directory was moved into place.
-const STAGED_SENTINEL: &str = ".rmu-staged-";
-
-/// The files still staged by the run that completely staged `merge`
-/// (`None` if no run did), from the staging listing.
-fn pending_for(staged: &crate::hub::device::StatListing, merge: &Oid) -> Option<BTreeSet<String>> {
-    let sentinel = format!("{STAGED_SENTINEL}{merge}");
-    let runs: BTreeSet<&str> = staged
-        .entries
-        .iter()
-        .filter_map(|entry| {
-            let (run, path) = entry.path.split_once('/')?;
-            (path == sentinel).then_some(run)
-        })
-        .collect();
-    (!runs.is_empty()).then(|| {
-        staged
-            .entries
-            .iter()
-            .filter_map(|entry| {
-                let (run, path) = entry.path.split_once('/')?;
-                (runs.contains(run) && path != sentinel).then(|| path.to_string())
-            })
-            .collect()
-    })
-}
 
 /// The device ref to push to, its current head (the snapshot's second
 /// parent) and the lease. A head that does not continue the recorded
@@ -126,22 +118,11 @@ fn recorded_forks(store: &Store, tip: &Oid, snapshot: &Oid) -> Result<Vec<(DocId
         .collect())
 }
 
-/// The documents a plan changes, with their item after the apply.
-fn planned_items(
-    planned: &[Planned],
-    skipped: &BTreeSet<DocId>,
-    merged: &BTreeMap<DocId, TreeItem>,
-) -> BTreeMap<DocId, Option<TreeItem>> {
-    planned
-        .iter()
-        .filter(|entry| !skipped.contains(&entry.doc))
-        .map(|entry| {
-            let item = match entry.change {
-                Change::Delete => None,
-                Change::Write { .. } => merged.get(&entry.doc).cloned(),
-            };
-            (entry.doc.clone(), item)
-        })
+/// String paths (from the pure helpers) as tablet paths.
+fn tablet_paths(paths: BTreeSet<String>) -> Result<BTreeSet<XochitlPath>> {
+    paths
+        .into_iter()
+        .map(|path| Ok(XochitlPath::new(path)?))
         .collect()
 }
 
@@ -158,6 +139,30 @@ struct Recheck {
     json: BTreeMap<(DocId, JsonFile), Option<Value>>,
     /// Documents with any file moved, new or gone since the read.
     touched: BTreeSet<DocId>,
+}
+
+/// What an apply did, for the record.
+#[derive(Default)]
+struct Applied {
+    applied: Vec<DocId>,
+    skipped: BTreeSet<DocId>,
+    /// The step-14 stat pass.
+    before: Option<BTreeMap<XochitlPath, StatSignature>>,
+    written: BTreeMap<XochitlPath, (StatSignature, Option<Oid>)>,
+    removed: BTreeSet<XochitlPath>,
+    written_at: i64,
+}
+
+/// Everything step 12 onwards works on.
+struct ApplyInput<'a> {
+    snapshot: &'a Snapshot,
+    snapshot_commit: &'a Oid,
+    pushed: &'a Pushed,
+    planned: Vec<Planned>,
+    json: &'a dyn JsonBlobs,
+    local: BTreeMap<DocId, LocalJson>,
+    tablet: &'a BTreeMap<DocId, DocVersion>,
+    protect: &'a BTreeSet<DocId>,
 }
 
 impl Hub<'_> {
@@ -217,9 +222,9 @@ impl Hub<'_> {
             self.progress.step("Checking origin");
             let (cache, main) = store::bootstrap_cache(&self.git, &self.cache_dir, origin)?;
             let probe = Store::new(cache.repo.clone())?;
-            let rules = probe.repo_config(&main)?.rules()?;
-            let mut writer = cache.repo.commit_writer(self.progress, None)?;
-            let pre = self.pre_read(s.tablet, rules, &BTreeMap::new(), &probe, &mut writer);
+            let config = probe.repo_config(&main)?;
+            let rules = config.rules()?;
+            let pre = self.pre_read(s.tablet, rules, &BTreeMap::new(), &cache.repo, &probe);
             drop(probe);
             self.progress.step("Locking the tablet");
             let took_over = s.acquire(&self.request, self.options.break_lock)?;
@@ -242,15 +247,18 @@ impl Hub<'_> {
                 .or_else(|| existing.as_ref().map(|state| state.device_name.clone()))
                 .unwrap_or_else(|| default_name(&info, &device_id));
             let ctx = OriginCtx::new(cache, origin.to_string(), Some(&device_id))?;
-            if ctx.rules.version() != rules.version() {
+            // Pinned from the first fetch: the pre-read was classified
+            // under these rules.
+            if ctx.config != config {
                 return Err(CycleError::RepoConfigChanged.into());
             }
             self.progress.step("Stopping xochitl");
             s.stop()?;
+            let mut writer = ctx.cache.repo.commit_writer(self.progress, None)?;
             let read = snapshot::read_tablet(
                 s.tablet,
                 rules,
-                &snapshot::trusted_pre_read(&pre),
+                &snapshot::pre_read_known(&pre),
                 &ctx.store,
                 &mut writer,
                 self.progress,
@@ -261,7 +269,7 @@ impl Hub<'_> {
             s.arm()?;
             self.progress
                 .step("Matching the tablet's documents with origin's history");
-            let json = ReadJson::new(&read, &ctx.store);
+            let json = Overlay::read(&read, &ctx.store);
             let tablet_only = snapshot::build(rules, &read, &RepoTree::default())?;
             let overrides = infer_bases(&ctx.store, rules, &ctx.main, &tablet_only, &json)?;
             let mut warnings: Vec<String> = mixed_model_warning(&ctx.store, &ctx.main, &info)?
@@ -300,27 +308,41 @@ impl Hub<'_> {
     }
 
     /// A best-effort read while xochitl runs and before the lock (reads
-    /// need none): the stopped read then downloads only files whose stat
-    /// moved since, so the UI is down for seconds even when the tablet
-    /// has gigabytes of new data. Failures only make it smaller.
-    fn pre_read(
+    /// need none), into a commit of its own that nothing points at: the
+    /// stopped read then downloads only files whose stat moved since, so
+    /// the UI is down for seconds even when the tablet has gigabytes of
+    /// new data. Any failure (a download cut, even mid-file, which ends
+    /// the `fast-import` it streamed into) only makes it smaller, down to
+    /// nothing.
+    pub(super) fn pre_read(
         &self,
         tablet: &dyn Tablet,
         rules: &MirrorRules,
         known: &BTreeMap<XochitlPath, Known>,
+        repo: &Repo,
         store: &Store,
-        writer: &mut CommitWriter,
     ) -> TabletRead {
-        snapshot::read_tablet(
-            tablet,
-            rules,
-            known,
-            store,
-            writer,
-            self.progress,
-            ReadMode::BestEffort,
-        )
-        .unwrap_or_default()
+        let attempt = || -> Result<TabletRead> {
+            let mut writer = repo.commit_writer(self.progress, None)?;
+            let read = snapshot::read_tablet(
+                tablet,
+                rules,
+                known,
+                store,
+                &mut writer,
+                self.progress,
+                ReadMode::BestEffort,
+            )?;
+            let time = unix_now();
+            writer.commit(&CommitMeta {
+                parents: Vec::new(),
+                author: rmu_signature(time),
+                committer: rmu_signature(time),
+                message: "rmu hub: pre-read (not pushed)\n".to_string(),
+            })?;
+            Ok(read)
+        };
+        attempt().unwrap_or_default()
     }
 
     /// Steps 1–6 (with step 4 only if `reconcile`).
@@ -332,13 +354,12 @@ impl Hub<'_> {
         let mut origin = OriginCtx::new(cache, url, Some(&first.device_id))?;
         origin.check(&first)?;
         let rules = origin.rules;
-        let mut writer = origin.cache.repo.commit_writer(self.progress, None)?;
         let pre = self.pre_read(
             s.tablet,
             rules,
             &snapshot::known_from_manifest(&first.manifest),
+            &origin.cache.repo,
             &origin.store,
-            &mut writer,
         );
         self.progress.step("Locking the tablet");
         let took_over = s.acquire(&self.request, self.options.break_lock)?;
@@ -353,19 +374,19 @@ impl Hub<'_> {
         {
             return Err(CycleError::StateChanged.into());
         }
-        if reconcile && state.journal.is_some() {
-            // Judge the journal against a fetch made under the lock: a run
-            // whose lock this one took over may have pushed since step 1.
-            origin.refresh(&state.device_id)?;
-        }
+        // Under the lock: a run that held it before this one may have
+        // pushed since step 1 (a journal must be judged against that, and
+        // a newer base or device ref must not read as a rewound origin).
+        origin.refresh(&state.device_id)?;
         origin.check(&state)?;
         let info = s.tablet.device_info()?;
         self.progress.step("Stopping xochitl");
         s.stop()?;
         let known: BTreeMap<XochitlPath, Known> = snapshot::known_from_manifest(&state.manifest)
             .into_iter()
-            .chain(snapshot::trusted_pre_read(&pre))
+            .chain(snapshot::pre_read_known(&pre))
             .collect();
+        let mut writer = origin.cache.repo.commit_writer(self.progress, None)?;
         let mut read = snapshot::read_tablet(
             s.tablet,
             rules,
@@ -412,7 +433,8 @@ impl Hub<'_> {
 
     /// Step 4 (see "Restartability"): with xochitl stopped, judge every
     /// document whose journaled merge and snapshot versions differ by the
-    /// files just read, finish an apply that stopped inside a document,
+    /// files just read and by what the interrupted runs left staged
+    /// (`plan::verdicts`), finish an apply that stopped inside a document,
     /// and write the resulting bases (journal cleared) before anything
     /// else. Returns whether it wrote documents.
     fn reconcile(
@@ -447,83 +469,42 @@ impl Hub<'_> {
         }
         let merge_tree = store.tree_of(rules, &journal.merge)?;
         let snapshot_tree = store.tree_of(rules, &journal.snapshot)?;
-        let json = ReadJson::new(read, store);
+        let json = Overlay::read(read, store);
         let tablet = read.doc_files();
-        let no_files = BTreeMap::new();
-        let verdicts: BTreeMap<DocId, Verdict> = merge_tree
-            .docs
-            .keys()
-            .chain(snapshot_tree.docs.keys())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .map(|doc| -> Result<Option<(DocId, Verdict)>> {
-                let (merged, snapshotted) = (merge_tree.docs.get(doc), snapshot_tree.docs.get(doc));
-                if plan::versions_equivalent(rules, merged, snapshotted, &json)? {
-                    return Ok(None);
-                }
-                let files = tablet.get(doc).unwrap_or(&no_files);
-                Ok(Some((
-                    doc.clone(),
-                    plan::verdict(rules, merged, snapshotted, files, &json)?,
-                )))
-            })
-            .filter_map(Result::transpose)
-            .collect::<Result<_>>()?;
-        // A document changed since an apply that finished it: the change
-        // is on top of the merge (see `plan::apply_finished`).
-        let pending = pending_for(&s.tablet.staged_files()?, &journal.merge);
-        let verdicts = verdicts
-            .into_iter()
-            .map(|(doc, verdict)| -> Result<(DocId, Verdict)> {
-                let finished = match (verdict, &pending) {
-                    (Verdict::Other, Some(pending)) => plan::apply_finished(
-                        rules,
-                        &doc,
-                        merge_tree.docs.get(&doc),
-                        snapshot_tree.docs.get(&doc),
-                        tablet.get(&doc).unwrap_or(&no_files),
-                        pending,
-                        &json,
-                    )?,
-                    _ => false,
-                };
-                Ok((doc, if finished { Verdict::AtMerge } else { verdict }))
-            })
-            .collect::<Result<BTreeMap<_, _>>>()?;
-        // A conflict copy is finished only together with its original.
+        let listing = s.tablet.staged_files()?;
+        let staged = plan::staged_runs(
+            listing.entries.iter().map(|entry| entry.path.as_str()),
+            &journal.merge,
+        );
         let forks = message::forks(&message::trailers(&store.commit(&journal.merge)?.message));
-        let verdicts = forks
-            .iter()
-            .fold(verdicts, |mut verdicts, (original, copy)| {
-                let original_done = matches!(
-                    verdicts.get(original),
-                    None | Some(Verdict::AtMerge | Verdict::Mixed)
-                );
-                if !original_done && verdicts.get(copy) == Some(&Verdict::Mixed) {
-                    verdicts.insert(copy.clone(), Verdict::Other);
-                }
-                verdicts
-            });
+        let verdicts = plan::verdicts(&plan::Journaled {
+            rules,
+            merge: &merge_tree,
+            snapshot: &snapshot_tree,
+            tablet: &tablet,
+            staged: &staged,
+            forks: &forks,
+            json: &json,
+        })?;
         let local = read.local_json();
-        let no_json = plan::LocalJson::new();
+        let no_json = LocalJson::new();
         let finish: Vec<Planned> = verdicts
             .iter()
-            .filter(|(_, verdict)| **verdict == Verdict::Mixed)
+            .filter(|(_, verdict)| **verdict == plan::Verdict::Mixed)
             .map(|(doc, _)| {
-                let target = merge_tree.docs.get(doc).filter(|v| v.is_present());
-                if target.is_none() {
+                let Some(target) = merge_tree.docs.get(doc).filter(|v| v.is_present()) else {
                     // An interrupted deletion (`.metadata` goes first):
                     // finish it, leftovers included.
                     return Ok(Some(Planned {
                         doc: doc.clone(),
                         change: Change::Delete,
                     }));
-                }
+                };
                 let current = tablet.get(doc).map(tablet_version);
                 plan::plan_doc(
                     rules,
                     doc,
-                    target,
+                    Some(target),
                     current.as_ref(),
                     local.get(doc).unwrap_or(&no_json),
                     &json,
@@ -535,11 +516,17 @@ impl Hub<'_> {
         let merged_items = tree_items(&merge_tree, &json)?;
         let current_items = read.items();
         let partners = plan::partners(forks.iter().cloned());
-        let skipped = plan::tree_skips(
-            &current_items,
-            &planned_items(&finish, &BTreeSet::new(), &merged_items),
-            &partners,
-        );
+        let finish_items = finish
+            .iter()
+            .map(|planned| {
+                let item = match planned.change {
+                    Change::Delete => None,
+                    Change::Write { .. } => merged_items.get(&planned.doc).cloned(),
+                };
+                (planned.doc.clone(), item)
+            })
+            .collect();
+        let skipped = plan::tree_skips(&current_items, &finish_items, &partners);
         let copies: BTreeSet<DocId> = forks.iter().map(|(_, copy)| copy.clone()).collect();
         let finish = plan::order(
             finish
@@ -552,15 +539,18 @@ impl Hub<'_> {
         );
         let finished: Vec<DocId> = finish.iter().map(|planned| planned.doc.clone()).collect();
         if !finish.is_empty() {
-            // Into this run's own staging directory: the interrupted run's
-            // is what this judgement rests on until the state is written.
-            let sizes = self.stage(s, store, &finish, None)?;
+            // Into this run's own staging directory, with a sentinel of its
+            // own: the interrupted run's directory is what this judgement
+            // rests on until the state is written, and a crash before that
+            // must find these documents finished too.
+            let sizes = self.stage(s, store, &finish, Some(&journal.merge))?;
             s.tablet.apply(s.lock(), &apply_plan(&finish, &sizes)?)?;
         }
         let kept: Vec<DocId> = verdicts
             .iter()
             .filter(|(doc, verdict)| {
-                matches!(verdict, Verdict::AtSnapshot | Verdict::Other) || skipped.contains(*doc)
+                matches!(verdict, plan::Verdict::AtSnapshot | plan::Verdict::Other)
+                    || skipped.contains(*doc)
             })
             .map(|(doc, _)| doc.clone())
             .collect();
@@ -585,8 +575,9 @@ impl Hub<'_> {
     }
 
     /// Upload the planned writes into this run's staging directory, in
-    /// batches with the watchdog re-armed before each, then the sentinel
-    /// of `merge` if given; the size of each staged file.
+    /// batches with the watchdog re-armed before each, then, for an apply
+    /// of `merge`, the sentinel naming the planned documents
+    /// (`plan::sentinel_files`); the size of each staged file.
     fn stage(
         &self,
         s: &Session,
@@ -658,11 +649,14 @@ impl Hub<'_> {
             })
         })?;
         if let Some(merge) = merge {
-            let sentinel = XochitlPath::new(format!("{STAGED_SENTINEL}{merge}"))?;
-            s.tablet
-                .stage(s.lock(), std::slice::from_ref(&sentinel), &mut |_, sink| {
-                    sink(0, &mut std::io::empty())
-                })?;
+            let sentinel =
+                plan::sentinel_files(merge, planned.iter().map(|entry| entry.doc.clone()))
+                    .into_iter()
+                    .map(XochitlPath::new)
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+            s.tablet.stage(s.lock(), &sentinel, &mut |_, sink| {
+                sink(0, &mut std::io::empty())
+            })?;
         }
         self.progress.bytes_done();
         Ok(sizes)
@@ -830,13 +824,17 @@ impl Hub<'_> {
             consented: outcome.guard.consented(),
         };
         let mut writer = p.origin.cache.repo.commit_writer(self.progress, None)?;
-        let merged = realise(&mut writer, &outcome)?;
+        let (merged, new_blobs) = realise(&mut writer, &outcome)?;
+        let merged_json = Overlay::new_blobs(&new_blobs, store);
         // The tablet already agrees with origin: nothing to push, even if
         // the merge took the tablet's bytes for documents that differ only
         // in view state or derived fields (pushing those would make two
         // tablets push each other's view state on every sync).
-        if trees_equivalent(rules, &snapshot.tree, &theirs, store)?
-            && trees_equivalent(rules, &merged, &theirs, store)?
+        // Quarantined documents carry their base version, which the merge
+        // never takes over origin's: nothing to push for them.
+        let quarantined: BTreeSet<DocId> = snapshot.quarantined.keys().cloned().collect();
+        if trees_equivalent(rules, &snapshot.tree, &theirs, store, &quarantined)?
+            && trees_equivalent(rules, &merged, &theirs, &merged_json, &BTreeSet::new())?
         {
             return Ok(Some(Pushed {
                 update: MainUpdate::UpToDate,
@@ -1042,267 +1040,44 @@ impl Hub<'_> {
         snapshot_commit: &Oid,
         pushed: Pushed,
     ) -> Result<SyncReport> {
-        let rules = p.origin.rules;
-        let store = &p.origin.store;
-        let json = ReadJson::new(&p.read, store);
         let protect: BTreeSet<DocId> = snapshot.quarantined.keys().cloned().collect();
         let tablet = tablet_versions(&p.read);
-        let mut local = p.read.local_json();
-        let planned = plan::plan(&plan::PlanInput {
-            rules,
-            merged: &pushed.merged,
-            tablet: &tablet,
-            protect: &protect,
-            local: &local,
-            json: &json,
-        })?;
-        let mut skipped = BTreeSet::new();
-        let mut applied = Vec::new();
-        let mut before_apply = None;
-        let mut written = BTreeMap::new();
-        let mut removed = BTreeSet::new();
-        let mut written_at = 0;
-        if !planned.is_empty() {
-            let pairs = recorded_forks(store, &pushed.base, snapshot_commit)?;
-            let partners = plan::partners(pairs.iter().cloned());
-            let copies: BTreeSet<DocId> = pairs.iter().map(|(_, copy)| copy.clone()).collect();
-            let merged_items = tree_items(&pushed.merged, &json)?;
-            // Quarantined documents keep their base version's place: a
-            // folder deleted under one must count as orphaning it.
-            let mut current_items: BTreeMap<DocId, TreeItem> = tree_items(&snapshot.tree, &json)?
-                .into_iter()
-                .filter(|(doc, _)| protect.contains(doc))
-                .chain(p.read.items())
-                .collect();
-            let planned = plan::order(planned, &merged_items, &current_items, &copies);
-            // 12. Stage while xochitl runs.
-            self.progress.step("Staging changes on the tablet");
-            s.arm()?;
-            s.tablet.clear_staging(s.lock())?;
-            let mut sizes = self.stage(s, store, &planned, Some(&pushed.base))?;
-            // 13.
-            self.progress.step("Stopping xochitl");
-            s.stop()?;
-            // 14. Re-read, verify, check the live tree.
-            self.progress.step("Applying changes");
-            let planned_docs: BTreeSet<DocId> =
-                planned.iter().map(|entry| entry.doc.clone()).collect();
-            let recheck = self.recheck(s, rules, &p.read, p.started_at, &planned_docs)?;
-            let before = p.read.doc_files();
-            let no_files = BTreeMap::new();
-            let no_moves = BTreeMap::new();
-            let no_set = BTreeSet::new();
-            let sha256: HashMap<Oid, String> = recheck
-                .moved
-                .iter()
-                .flat_map(|(doc, files)| {
-                    files
-                        .iter()
-                        .filter(|(_, reread)| matches!(reread, Reread::Sha256(_)))
-                        .filter_map(|(file, _)| before.get(doc)?.get(file).cloned())
-                })
-                .collect::<BTreeSet<Oid>>()
-                .into_iter()
-                .map(|blob| Ok((blob.clone(), store.blob_sha256(&blob)?)))
-                .collect::<Result<_>>()?;
-            planned.iter().try_for_each(|entry| -> Result<()> {
-                let ok = plan::verified(
-                    rules,
-                    before.get(&entry.doc).unwrap_or(&no_files),
-                    recheck.files_now.get(&entry.doc).unwrap_or(&no_set),
-                    recheck.moved.get(&entry.doc).unwrap_or(&no_moves),
-                    &json,
-                    &sha256,
-                )?;
-                if !ok {
-                    skipped.insert(entry.doc.clone());
-                }
-                Ok(())
+        let local = p.read.local_json();
+        let applied = {
+            let json = Overlay::read(&p.read, &p.origin.store);
+            let planned = plan::plan(&plan::PlanInput {
+                rules: p.origin.rules,
+                merged: &pushed.merged,
+                tablet: &tablet,
+                protect: &protect,
+                local: &local,
+                json: &json,
             })?;
-            recheck.json.iter().for_each(|((doc, kind), value)| {
-                match value {
-                    Some(value) => {
-                        local
-                            .entry(doc.clone())
-                            .or_default()
-                            .insert(*kind, value.clone());
-                    }
-                    None => {
-                        if let Some(files) = local.get_mut(doc) {
-                            files.remove(kind);
-                        }
-                    }
-                }
-                if *kind == JsonFile::Metadata && !protect.contains(doc) {
-                    match value.as_ref().filter(|value| value.is_object()) {
-                        Some(metadata) => {
-                            current_items.insert(doc.clone(), TreeItem::from_metadata(metadata));
-                        }
-                        None => {
-                            current_items.remove(doc);
-                        }
-                    }
-                }
-            });
-            // The overlay again, with view state re-read while stopped.
-            let no_json = plan::LocalJson::new();
-            let replanned: BTreeMap<DocId, Planned> = planned
-                .iter()
-                .filter(|entry| !skipped.contains(&entry.doc))
-                .filter(|entry| matches!(entry.change, Change::Write { .. }))
-                .map(|entry| {
-                    plan::plan_doc(
-                        rules,
-                        &entry.doc,
-                        pushed.merged.docs.get(&entry.doc),
-                        tablet.get(&entry.doc),
-                        local.get(&entry.doc).unwrap_or(&no_json),
-                        &json,
-                    )
-                    .map(|again| again.map(|again| (entry.doc.clone(), again)))
-                })
-                .filter_map(Result::transpose)
-                .collect::<Result<_>>()?;
-            let shape = |change: &Change| match change {
-                Change::Write { writes, removes } => Some((
-                    writes
-                        .iter()
-                        .map(|write| write.file.clone())
-                        .collect::<Vec<_>>(),
-                    removes.clone(),
-                )),
-                Change::Delete => None,
-            };
-            // Verified, so it cannot happen; never apply a plan that no
-            // longer fits.
-            let misfits: Vec<DocId> = planned
-                .iter()
-                .filter(|entry| matches!(entry.change, Change::Write { .. }))
-                .filter(|entry| !skipped.contains(&entry.doc))
-                .filter(|entry| {
-                    replanned
-                        .get(&entry.doc)
-                        .is_none_or(|again| shape(&again.change) != shape(&entry.change))
-                })
-                .map(|entry| entry.doc.clone())
-                .collect();
-            skipped.extend(misfits);
-            skipped = plan::with_partners(skipped, &partners);
-            let items = planned_items(&planned, &skipped, &merged_items);
-            skipped.extend(plan::trash_skips(
-                &current_items,
-                &items,
-                &recheck.touched,
-                &partners,
-            ));
-            let items = planned_items(&planned, &skipped, &merged_items);
-            skipped.extend(plan::tree_skips(&current_items, &items, &partners));
-            skipped = plan::with_partners(skipped, &partners);
-            let staged: BTreeMap<XochitlPath, Content> = planned
-                .iter()
-                .flat_map(|entry| match &entry.change {
-                    Change::Write { writes, .. } => writes
-                        .iter()
-                        .map(|write| {
-                            xochitl_path(&entry.doc, &write.file)
-                                .map(|path| (path, write.content.clone()))
-                        })
-                        .collect(),
-                    Change::Delete => Vec::new(),
-                })
-                .collect::<Result<_>>()?;
-            let final_plan: Vec<Planned> = planned
-                .into_iter()
-                .filter(|entry| !skipped.contains(&entry.doc))
-                .map(|entry| match entry.change {
-                    Change::Write { .. } => replanned.get(&entry.doc).cloned().unwrap_or(entry),
-                    Change::Delete => entry,
-                })
-                .collect();
-            // Re-stage only overlays that came out differently.
-            let restage: Vec<Planned> = final_plan
-                .iter()
-                .filter_map(|entry| match &entry.change {
-                    Change::Write { writes, .. } => {
-                        let changed: Vec<plan::Write> = writes
-                            .iter()
-                            .filter(|write| {
-                                xochitl_path(&entry.doc, &write.file)
-                                    .map(|path| staged.get(&path) != Some(&write.content))
-                                    .unwrap_or(true)
-                            })
-                            .cloned()
-                            .collect();
-                        (!changed.is_empty()).then(|| Planned {
-                            doc: entry.doc.clone(),
-                            change: Change::Write {
-                                writes: changed,
-                                removes: Vec::new(),
-                            },
-                        })
-                    }
-                    Change::Delete => None,
-                })
-                .collect();
-            if !restage.is_empty() {
-                sizes.extend(self.stage(s, store, &restage, None)?);
+            if planned.is_empty() {
+                Applied::default()
+            } else {
+                self.apply_planned(
+                    s,
+                    &p,
+                    ApplyInput {
+                        snapshot,
+                        snapshot_commit,
+                        pushed: &pushed,
+                        planned,
+                        json: &json,
+                        local,
+                        tablet: &tablet,
+                        protect: &protect,
+                    },
+                )?
             }
-            if !final_plan.is_empty() {
-                s.arm()?;
-                let report = s
-                    .tablet
-                    .apply(s.lock(), &apply_plan(&final_plan, &sizes)?)?;
-                let blobs: BTreeMap<XochitlPath, Option<Oid>> = final_plan
-                    .iter()
-                    .flat_map(|entry| match &entry.change {
-                        Change::Write { writes, .. } => writes
-                            .iter()
-                            .map(|write| {
-                                let blob = match &write.content {
-                                    Content::Blob(oid) => Some(oid.clone()),
-                                    Content::Bytes(_) => None,
-                                };
-                                xochitl_path(&entry.doc, &write.file).map(|path| (path, blob))
-                            })
-                            .collect(),
-                        Change::Delete => Vec::new(),
-                    })
-                    .collect::<Result<_>>()?;
-                written = report
-                    .written
-                    .iter()
-                    .map(|entry: &StatEntry| {
-                        let path = XochitlPath::new(entry.path.as_str())?;
-                        let blob = blobs.get(&path).cloned().flatten();
-                        Ok((path, (entry.stat, blob)))
-                    })
-                    .collect::<Result<_>>()?;
-                removed = final_plan
-                    .iter()
-                    .flat_map(|entry| match &entry.change {
-                        Change::Write { removes, .. } => removes
-                            .iter()
-                            .map(|file| xochitl_path(&entry.doc, file))
-                            .collect::<Vec<_>>(),
-                        Change::Delete => p
-                            .read
-                            .files
-                            .iter()
-                            .filter(|(_, read)| read.file.doc == entry.doc)
-                            .map(|(path, _)| Ok(path.clone()))
-                            .collect(),
-                    })
-                    .collect::<Result<_>>()?;
-                written_at = report.recorded_at_ns;
-                applied = report.applied;
-            }
-            before_apply = Some(recheck.now);
-        }
+        };
         // 15. Record.
         self.progress.step("Recording the sync on the tablet");
         let previous = p.state.clone();
         p.state.base = Some(pushed.base.clone());
-        p.state.base_overrides = skipped
+        p.state.base_overrides = applied
+            .skipped
             .iter()
             .map(|doc| (doc.clone(), Some(snapshot_commit.clone())))
             .chain(
@@ -1314,16 +1089,16 @@ impl Hub<'_> {
         p.state.manifest = plan::manifest(&plan::ManifestInput {
             read: &p.read.stats(),
             read_reference_ns: p.started_at,
-            before_apply: before_apply.as_ref(),
-            written: &written,
-            removed: &removed,
-            written_reference_ns: written_at,
+            before_apply: applied.before.as_ref(),
+            written: &applied.written,
+            removed: &applied.removed,
+            written_reference_ns: applied.written_at,
         });
-        p.state.quarantine = protect.clone();
+        p.state.quarantine = protect;
         p.state.journal = None;
         s.write_state(&p.state)?;
         let mut warnings = Vec::new();
-        if before_apply.is_some()
+        if applied.before.is_some()
             && let Err(error) = s.tablet.clear_staging(s.lock())
         {
             warnings.push(format!("could not clear the staging directory: {error}"));
@@ -1337,8 +1112,8 @@ impl Hub<'_> {
             update: pushed.update,
             snapshot: snapshot_commit.clone(),
             base: pushed.base,
-            applied,
-            skipped: skipped.into_iter().collect(),
+            applied: applied.applied,
+            skipped: applied.skipped.into_iter().collect(),
             quarantined: quarantine_report(snapshot),
             orphans: snapshot.orphans.iter().cloned().collect(),
             read: read_summary(&p.read),
@@ -1351,6 +1126,154 @@ impl Hub<'_> {
             took_over: p.took_over.take(),
             warnings,
         })
+    }
+
+    /// Steps 12–14 for a non-empty plan.
+    fn apply_planned(&self, s: &mut Session, p: &Prepared, input: ApplyInput) -> Result<Applied> {
+        let ApplyInput {
+            snapshot,
+            snapshot_commit,
+            pushed,
+            planned,
+            json,
+            mut local,
+            tablet,
+            protect,
+        } = input;
+        let (rules, store) = (p.origin.rules, &p.origin.store);
+        let pairs = recorded_forks(store, &pushed.base, snapshot_commit)?;
+        let partners = plan::partners(pairs.iter().cloned());
+        let copies: BTreeSet<DocId> = pairs.iter().map(|(_, copy)| copy.clone()).collect();
+        let merged_items = tree_items(&pushed.merged, json)?;
+        // Quarantined documents keep their base version's place: a folder
+        // deleted above one must count as orphaning it.
+        let mut current_items: BTreeMap<DocId, TreeItem> = tree_items(&snapshot.tree, json)?
+            .into_iter()
+            .filter(|(doc, _)| protect.contains(doc))
+            .chain(p.read.items())
+            .collect();
+        let planned = plan::order(planned, &merged_items, &current_items, &copies);
+        // 12. Stage while xochitl runs.
+        self.progress.step("Staging changes on the tablet");
+        s.arm()?;
+        s.tablet.clear_staging(s.lock())?;
+        let mut sizes = self.stage(s, store, &planned, Some(&pushed.base))?;
+        // 13.
+        self.progress.step("Stopping xochitl");
+        s.stop()?;
+        // 14. Re-read, verify, check the live tree.
+        self.progress.step("Applying changes");
+        let planned_docs: BTreeSet<DocId> = planned.iter().map(|entry| entry.doc.clone()).collect();
+        let recheck = self.recheck(s, rules, &p.read, p.started_at, &planned_docs)?;
+        let before = p.read.doc_files();
+        let sha256: HashMap<Oid, String> = recheck
+            .moved
+            .iter()
+            .flat_map(|(doc, files)| {
+                files
+                    .iter()
+                    .filter(|(_, reread)| matches!(reread, Reread::Sha256(_)))
+                    .filter_map(|(file, _)| before.get(doc)?.get(file).cloned())
+            })
+            .collect::<BTreeSet<Oid>>()
+            .into_iter()
+            .map(|blob| Ok((blob.clone(), store.blob_sha256(&blob)?)))
+            .collect::<Result<_>>()?;
+        recheck.json.iter().for_each(|((doc, kind), value)| {
+            match value {
+                Some(value) => {
+                    local
+                        .entry(doc.clone())
+                        .or_default()
+                        .insert(*kind, value.clone());
+                }
+                None => {
+                    if let Some(files) = local.get_mut(doc) {
+                        files.remove(kind);
+                    }
+                }
+            }
+            if *kind == JsonFile::Metadata && !protect.contains(doc) {
+                match value.as_ref().filter(|value| value.is_object()) {
+                    Some(metadata) => {
+                        current_items.insert(doc.clone(), TreeItem::from_metadata(metadata));
+                    }
+                    None => {
+                        current_items.remove(doc);
+                    }
+                }
+            }
+        });
+        let skipped = plan::skipped(&plan::Checks {
+            rules,
+            planned: &planned,
+            before: &before,
+            files_now: &recheck.files_now,
+            moved: &recheck.moved,
+            sha256: &sha256,
+            json,
+            current: &current_items,
+            merged: &merged_items,
+            touched: &recheck.touched,
+            partners: &partners,
+        })?;
+        let staged = plan::contents(&planned);
+        // The overlay again, with view state re-read while stopped.
+        let no_json = LocalJson::new();
+        let final_plan: Vec<Planned> = planned
+            .into_iter()
+            .filter(|entry| !skipped.contains(&entry.doc))
+            .map(|entry| match entry.change {
+                Change::Write { .. } => Ok(plan::plan_doc(
+                    rules,
+                    &entry.doc,
+                    pushed.merged.docs.get(&entry.doc),
+                    tablet.get(&entry.doc),
+                    local.get(&entry.doc).unwrap_or(&no_json),
+                    json,
+                )?
+                .unwrap_or(entry)),
+                Change::Delete => Ok(entry),
+            })
+            .collect::<Result<_>>()?;
+        let restage = plan::restage(&final_plan, &staged);
+        if !restage.is_empty() {
+            sizes.extend(self.stage(s, store, &restage, None)?);
+        }
+        let mut applied = Applied {
+            skipped,
+            before: Some(recheck.now),
+            ..Applied::default()
+        };
+        if final_plan.is_empty() {
+            return Ok(applied);
+        }
+        s.arm()?;
+        let report = s
+            .tablet
+            .apply(s.lock(), &apply_plan(&final_plan, &sizes)?)?;
+        let blobs: BTreeMap<String, Option<Oid>> = plan::contents(&final_plan)
+            .into_iter()
+            .map(|(path, content)| {
+                let blob = match content {
+                    Content::Blob(oid) => Some(oid),
+                    Content::Bytes(_) => None,
+                };
+                (path, blob)
+            })
+            .collect();
+        applied.written = report
+            .written
+            .iter()
+            .map(|entry: &StatEntry| {
+                let blob = blobs.get(&entry.path).cloned().flatten();
+                Ok((XochitlPath::new(entry.path.as_str())?, (entry.stat, blob)))
+            })
+            .collect::<Result<_>>()?;
+        applied.removed = tablet_paths(plan::removed(&final_plan, &before))?;
+        applied.written_at = report.recorded_at_ns;
+        applied.applied = report.applied;
+        Ok(applied)
     }
 }
 
@@ -1448,43 +1371,4 @@ fn mixed_model_warning(store: &Store, main: &Oid, info: &DeviceInfo) -> Result<O
         )),
         _ => None,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::hub::device::{StatEntry, StatListing};
-
-    #[test]
-    fn pending_files_come_from_the_run_that_staged_the_merge_completely() {
-        let merge: Oid = format!("{:040x}", 7).parse().unwrap();
-        let other: Oid = format!("{:040x}", 8).parse().unwrap();
-        let entry = |path: &str| StatEntry {
-            path: path.to_string(),
-            mode: 0o100_644,
-            stat: StatSignature {
-                size: 0,
-                mtime_ns: 1,
-                ctime_ns: 1,
-                inode: 1,
-            },
-        };
-        let listing = StatListing {
-            entries: vec![
-                entry(&format!("run1/{STAGED_SENTINEL}{merge}")),
-                entry("run1/a.metadata"),
-                entry("run1/b/p.rm"),
-                entry(&format!("run2/{STAGED_SENTINEL}{other}")),
-                entry("run2/c.metadata"),
-                entry("run3/d.metadata"),
-            ],
-            unlisted: 0,
-        };
-        assert_eq!(
-            pending_for(&listing, &merge),
-            Some(["a.metadata".to_string(), "b/p.rm".to_string()].into())
-        );
-        let none: Oid = format!("{:040x}", 9).parse().unwrap();
-        assert_eq!(pending_for(&listing, &none), None);
-    }
 }

@@ -227,9 +227,10 @@ pub(super) fn fetch(repo: &Repo, url: &str, device: Option<&DeviceId>) -> Result
         let specs: Vec<&str> = specs.iter().map(String::as_str).collect();
         repo.fetch(url, &specs, false)?;
     }
-    let main = match has_main {
-        true => repo.rev_parse(LOCAL_MAIN)?,
-        false => None,
+    let main = if has_main {
+        repo.rev_parse(LOCAL_MAIN)?
+    } else {
+        None
     };
     let device = match device_name {
         Some((name, local)) => repo.rev_parse(&local)?.map(|oid| RemoteRef { name, oid }),

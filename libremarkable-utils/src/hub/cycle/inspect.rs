@@ -1,11 +1,29 @@
 //! `status` and `sync --dry-run`: read-only. They never stop xochitl,
-//! take the lock or push; their snapshot is taken while xochitl runs, so
-//! it is best effort (files that change while read are left out), and
-//! the commit holding its blobs is local garbage no ref points to.
+//! take the lock or push. Their snapshot is taken while xochitl runs: a
+//! best-effort pre-read, then a full read of what moved since (retried
+//! once if a file changes while read), so it is complete but may be a
+//! moment out of date. The commits holding its blobs and the would-be
+//! merge are local garbage no ref points to.
 
-use super::*;
-use crate::hub::model::DocOutcome;
-use snapshot::ReadMode;
+use std::collections::{BTreeMap, BTreeSet};
+
+use serde_json::Value;
+
+use super::message;
+use super::plan::{self, Change, JsonBlobs, Planned};
+use super::snapshot::{self, ReadMode, TabletRead};
+use super::store::{self, Store, StoreHistory};
+use super::{
+    CycleError, DocChange, DryRunReport, Hub, OpenConflict, OriginCtx, StatusReport, commit_tree,
+    consented_deletions, read_summary, realise, tablet_version, trees_equivalent, virtual_base,
+};
+use crate::error::Result;
+use crate::git::Oid;
+use crate::hub::device::Tablet;
+use crate::hub::merge::{self, MergeInput, MergeParams};
+use crate::hub::model::{
+    DocFile, DocId, DocOutcome, DocVersion, MirrorRules, RepoTree, TabletState,
+};
 
 /// The visible name of a document version, if it has one.
 fn visible_name(store: &Store, version: Option<&DocVersion>) -> Result<Option<String>> {
@@ -55,6 +73,12 @@ fn open_conflicts(
         .map(|nested| nested.into_iter().flatten().collect())
 }
 
+/// What a sync would do to the tablet and origin.
+struct DryPlan {
+    planned: Vec<Planned>,
+    would_push: bool,
+}
+
 impl Hub<'_> {
     /// `rmu hub status`: the tablet's changes since its base, how far
     /// behind origin it is, quarantined documents, open conflict copies,
@@ -84,6 +108,50 @@ impl Hub<'_> {
         result
     }
 
+    /// The tablet read while xochitl runs, its blobs committed.
+    fn read_running(
+        &self,
+        tablet: &dyn Tablet,
+        origin: &OriginCtx,
+        state: &TabletState,
+    ) -> Result<TabletRead> {
+        let pre = self.pre_read(
+            tablet,
+            origin.rules,
+            &snapshot::known_from_manifest(&state.manifest),
+            &origin.cache.repo,
+            &origin.store,
+        );
+        let known = snapshot::known_from_manifest(&state.manifest)
+            .into_iter()
+            .chain(snapshot::pre_read_known(&pre))
+            .collect();
+        let attempt = || -> Result<TabletRead> {
+            let mut writer = origin.cache.repo.commit_writer(self.progress, None)?;
+            let read = snapshot::read_tablet(
+                tablet,
+                origin.rules,
+                &known,
+                &origin.store,
+                &mut writer,
+                self.progress,
+                ReadMode::Strict,
+            )?;
+            commit_tree(
+                writer,
+                &RepoTree::default(),
+                &Self::meta(
+                    state,
+                    Vec::new(),
+                    "rmu hub: status read (not pushed)\n".to_string(),
+                ),
+            )?;
+            Ok(read)
+        };
+        // A file xochitl changed while it was read: once more.
+        attempt().or_else(|_| attempt())
+    }
+
     fn inspect(&self, tablet: &dyn Tablet) -> Result<(StatusReport, DryPlan)> {
         self.progress.step("Checking origin");
         let state = tablet.read_state()?.ok_or(CycleError::NotAttached)?;
@@ -93,28 +161,9 @@ impl Hub<'_> {
         origin.check(&state)?;
         let lock = tablet.lock_state()?;
         let (store, rules) = (&origin.store, origin.rules);
-        let mut writer = origin.cache.repo.commit_writer(self.progress, None)?;
-        let read = snapshot::read_tablet(
-            tablet,
-            rules,
-            &snapshot::known_from_manifest(&state.manifest),
-            store,
-            &mut writer,
-            self.progress,
-            ReadMode::BestEffort,
-        )?;
+        let read = self.read_running(tablet, &origin, &state)?;
         let base_tree = virtual_base(store, rules, &state)?;
         let snapshot = snapshot::build(rules, &read, &base_tree)?;
-        // Stores the blobs read; nothing points at it.
-        commit_tree(
-            writer,
-            &snapshot.tree,
-            &Self::meta(
-                &state,
-                Vec::new(),
-                "rmu hub: status snapshot (not pushed)\n".to_string(),
-            ),
-        )?;
         let main = origin.main.clone();
         let theirs = store.tree_of(rules, &main)?;
         let consented = consented_deletions(store, &main, &state, &snapshot.tree, &theirs)?;
@@ -180,7 +229,7 @@ impl Hub<'_> {
         // What the sync would write: the merge realised into a commit no
         // ref points to, so the plan can read its new blobs.
         let mut writer = origin.cache.repo.commit_writer(self.progress, None)?;
-        let merged = realise(&mut writer, &outcome)?;
+        let (merged, _) = realise(&mut writer, &outcome)?;
         commit_tree(
             writer,
             &merged,
@@ -190,10 +239,10 @@ impl Hub<'_> {
                 "rmu hub: dry-run merge (not pushed)\n".to_string(),
             ),
         )?;
-        let up_to_date = trees_equivalent(rules, &snapshot.tree, &theirs, store)?
-            && trees_equivalent(rules, &merged, &theirs, store)?;
         let protect: BTreeSet<DocId> = snapshot.quarantined.keys().cloned().collect();
-        let tablet_files = read
+        let up_to_date = trees_equivalent(rules, &snapshot.tree, &theirs, store, &protect)?
+            && trees_equivalent(rules, &merged, &theirs, store, &BTreeSet::new())?;
+        let tablet_files: BTreeMap<DocId, DocVersion> = read
             .doc_files()
             .iter()
             .map(|(doc, files)| (doc.clone(), tablet_version(files)))
@@ -236,10 +285,4 @@ impl Hub<'_> {
             },
         ))
     }
-}
-
-/// What a sync would do to the tablet and origin.
-struct DryPlan {
-    planned: Vec<Planned>,
-    would_push: bool,
 }

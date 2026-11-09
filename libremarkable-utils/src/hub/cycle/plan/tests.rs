@@ -590,3 +590,195 @@ fn the_manifest_leaves_out_racy_moved_removed_and_unknown_entries() {
         ])
     );
 }
+
+#[test]
+fn staged_runs_read_complete_sentinels_only() {
+    let merge = oid(7);
+    let sentinel = sentinel_files(&merge, [doc(1), doc(2)]);
+    assert_eq!(
+        sentinel.last().unwrap(),
+        &format!("{STAGED_SENTINEL}{merge}/done")
+    );
+    let listing: Vec<String> = sentinel
+        .iter()
+        .map(|path| format!("run1/{path}"))
+        .chain([
+            format!("run1/{}", page(1).xochitl_path(&doc(1))),
+            // Incomplete: no `done`.
+            format!("run2/{STAGED_SENTINEL}{merge}/{}", doc(3)),
+            "run2/x.metadata".to_string(),
+            // Another merge's sentinel.
+            format!("run3/{STAGED_SENTINEL}{}/done", oid(8)),
+            format!("run3/{STAGED_SENTINEL}{}/{}", oid(8), doc(4)),
+            "run3/y.metadata".to_string(),
+        ])
+        .collect();
+    let runs = staged_runs(listing.iter().map(String::as_str), &merge);
+    assert_eq!(
+        runs,
+        vec![StagedRun {
+            planned: [doc(1), doc(2)].into(),
+            pending: [page(1).xochitl_path(&doc(1))].into(),
+        }]
+    );
+    assert!(staged_runs(listing.iter().map(String::as_str), &oid(9)).is_empty());
+}
+
+#[test]
+fn reconciliation_only_finishes_or_trusts_documents_a_run_planned() {
+    let mut blobs = Blobs::default();
+    let snapshot_doc = notebook(&mut blobs, "Notes", "", &[(1, 10)]);
+    let merge_doc = notebook(&mut blobs, "Notes", "", &[(1, 10), (2, 20)]);
+    let merge = RepoTree {
+        docs: [(doc(1), merge_doc.clone())].into(),
+        extra: BTreeMap::new(),
+    };
+    let snapshot = RepoTree {
+        docs: [(doc(1), snapshot_doc.clone())].into(),
+        extra: BTreeMap::new(),
+    };
+    let files = |version: &DocVersion| -> BTreeMap<DocFile, Oid> {
+        version
+            .files
+            .iter()
+            .map(|(file, entry)| (file.clone(), entry.id.clone()))
+            .collect()
+    };
+    // Half applied (the new page moved in, the content not).
+    let mut half = files(&snapshot_doc);
+    half.insert(page(2), oid(20));
+    // Applied, then inked.
+    let mut edited = files(&merge_doc);
+    edited.insert(page(1), oid(11));
+    let judge = |tablet_files: BTreeMap<DocFile, Oid>, staged: &[StagedRun]| {
+        let tablet = [(doc(1), tablet_files)].into();
+        verdicts(&Journaled {
+            rules: rules(),
+            merge: &merge,
+            snapshot: &snapshot,
+            tablet: &tablet,
+            staged,
+            forks: &[],
+            json: &blobs.0,
+        })
+        .unwrap()[&doc(1)]
+    };
+    let planned = [StagedRun {
+        planned: [doc(1)].into(),
+        pending: BTreeSet::new(),
+    }];
+    let unplanned = [StagedRun {
+        planned: [doc(2)].into(),
+        pending: BTreeSet::new(),
+    }];
+    assert_eq!(judge(half.clone(), &planned), Verdict::Mixed);
+    // Never planned (e.g. quarantined): it only looks half applied.
+    assert_eq!(judge(half, &unplanned), Verdict::Other);
+    assert_eq!(judge(edited.clone(), &[]), Verdict::Other);
+    assert_eq!(judge(edited.clone(), &planned), Verdict::AtMerge);
+    assert_eq!(judge(edited.clone(), &unplanned), Verdict::Other);
+    let pending = [StagedRun {
+        planned: [doc(1)].into(),
+        pending: [page(2).xochitl_path(&doc(1))].into(),
+    }];
+    assert_eq!(judge(edited.clone(), &pending), Verdict::Other);
+    // Either of two runs (an interrupted one and the reconciliation that
+    // finished it) is evidence.
+    assert_eq!(
+        judge(edited, &[pending[0].clone(), planned[0].clone()]),
+        Verdict::AtMerge
+    );
+}
+
+#[test]
+fn step_14_skips_changed_documents_and_their_partners() {
+    let mut blobs = Blobs::default();
+    let metadata_blob = blobs.json(metadata("A", "", "DocumentType"));
+    let before: BTreeMap<DocId, BTreeMap<DocFile, Oid>> = [
+        (doc(1), [(DocFile::Metadata, metadata_blob.clone())].into()),
+        (doc(2), [(DocFile::Metadata, metadata_blob.clone())].into()),
+        (doc(3), [(DocFile::Metadata, metadata_blob)].into()),
+    ]
+    .into();
+    let files_now: BTreeMap<DocId, BTreeSet<DocFile>> = before
+        .iter()
+        .map(|(doc, files)| (doc.clone(), files.keys().cloned().collect()))
+        .collect();
+    // 1 was renamed by the user since the read; 2 is its conflict copy.
+    let moved: BTreeMap<DocId, BTreeMap<DocFile, Reread>> = [(
+        doc(1),
+        [(
+            DocFile::Metadata,
+            Reread::Json(Some(metadata("B", "", "DocumentType"))),
+        )]
+        .into(),
+    )]
+    .into();
+    let current: BTreeMap<DocId, TreeItem> = [
+        (doc(1), item("", false)),
+        (doc(2), item("", false)),
+        (doc(3), item("", false)),
+    ]
+    .into();
+    let planned = vec![write(1), write(2), write(3)];
+    let skipped = skipped(&Checks {
+        rules: rules(),
+        planned: &planned,
+        before: &before,
+        files_now: &files_now,
+        moved: &moved,
+        sha256: &HashMap::new(),
+        json: &blobs.0,
+        current: &current,
+        merged: &current,
+        touched: &[doc(1)].into(),
+        partners: &partners([(doc(1), doc(2))]),
+    })
+    .unwrap();
+    assert_eq!(skipped, [doc(1), doc(2)].into());
+}
+
+#[test]
+fn restage_contents_and_removals() {
+    let entry = |n: u32, content: Content| Planned {
+        doc: doc(n),
+        change: Change::Write {
+            writes: vec![Write {
+                file: DocFile::Content,
+                mode: FileMode::Regular,
+                content,
+            }],
+            removes: vec![page(9)],
+        },
+    };
+    let staged = contents(&[
+        entry(1, Content::Bytes(b"old".to_vec())),
+        entry(2, Content::Blob(oid(1))),
+    ]);
+    assert_eq!(staged.len(), 2);
+    let again = restage(
+        &[
+            entry(1, Content::Bytes(b"new".to_vec())),
+            entry(2, Content::Blob(oid(1))),
+        ],
+        &staged,
+    );
+    assert_eq!(again.len(), 1);
+    assert_eq!(again[0].doc, doc(1));
+    assert!(matches!(&again[0].change, Change::Write { removes, .. } if removes.is_empty()));
+    let read: BTreeMap<DocId, BTreeMap<DocFile, Oid>> = [(
+        doc(3),
+        [(DocFile::Metadata, oid(1)), (page(1), oid(2))].into(),
+    )]
+    .into();
+    let removed = removed(&[entry(1, Content::Blob(oid(1))), delete(3)], &read);
+    assert_eq!(
+        removed,
+        [
+            page(9).xochitl_path(&doc(1)),
+            DocFile::Metadata.xochitl_path(&doc(3)),
+            page(1).xochitl_path(&doc(3)),
+        ]
+        .into()
+    );
+}
