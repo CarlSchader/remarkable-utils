@@ -14,3 +14,6 @@ clap = { workspace = true }
 serde_json = { workspace = true }
 rpassword = { workspace = true }
 indicatif = { workspace = true }
+
+[dev-dependencies]
+test-support = { workspace = true }

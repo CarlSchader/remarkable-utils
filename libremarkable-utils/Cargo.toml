@@ -21,3 +21,4 @@ rustix = { workspace = true }
 
 [target.'cfg(unix)'.dev-dependencies]
 rustix = { workspace = true, features = ["pipe"] }
+test-support = { workspace = true }

@@ -3,7 +3,6 @@
 #![cfg(unix)]
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -30,19 +29,15 @@ impl Fixture {
         ["bin", "local", "device", "state"].iter().for_each(|dir| {
             fs::create_dir(root.join(dir)).unwrap();
         });
-        let ssh = root.join("bin/ssh");
-        fs::write(
-            &ssh,
-            "#!/bin/sh\n\
-             while [ \"$#\" -gt 0 ] && [ \"$1\" != -- ]; do shift; done\n\
+        test_support::write_script(
+            &root.join("bin/ssh"),
+            "while [ \"$#\" -gt 0 ] && [ \"$1\" != -- ]; do shift; done\n\
              [ \"$#\" -eq 3 ] || exit 97\n\
              shift\n\
              [ \"$1\" = mock-tablet ] || exit 98\n\
              shift\n\
              exec sh -c \"$1\"\n",
-        )
-        .unwrap();
-        fs::set_permissions(ssh, fs::Permissions::from_mode(0o700)).unwrap();
+        );
         Self { root }
     }
 

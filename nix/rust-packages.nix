@@ -40,6 +40,7 @@ flake-utils.lib.eachDefaultSystem (system: let
         ../Cargo.lock
         # Workspace library crates every binary crate may depend on.
         (craneLib.fileset.commonCargoSources ../libremarkable-utils)
+        (craneLib.fileset.commonCargoSources ../test-support)
         (craneLib.fileset.commonCargoSources crate)
       ];
     };

@@ -1,0 +1,9 @@
+[package]
+name = "test-support"
+description = "Test-only helpers shared by the remarkable-utils workspace (not published)"
+publish = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true

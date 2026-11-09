@@ -2,7 +2,7 @@
 //! group so a pipe deadlock fails within a deadline and leaves no mock children.
 use super::*;
 use std::cell::Cell;
-use std::os::unix::{fs::PermissionsExt, process::CommandExt};
+use std::os::unix::process::CommandExt;
 use std::time::{Duration, Instant};
 
 const PIPE_FILL: usize = 1024 * 1024;
@@ -75,8 +75,7 @@ impl Scratch {
 
     fn session(&self, script: &str) -> SshSession {
         let exe = self.0.join("mock-ssh");
-        fs::write(&exe, format!("#!/bin/sh\nset -eu\n{script}\n")).unwrap();
-        fs::set_permissions(&exe, fs::Permissions::from_mode(0o700)).unwrap();
+        test_support::write_script(&exe, &format!("set -eu\n{script}\n"));
         let mut session = SshSession::new(SshOptions {
             destination: "mock.invalid".into(),
             multiplex: false,

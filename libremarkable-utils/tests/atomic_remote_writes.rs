@@ -37,11 +37,9 @@ fn mock_remote_write_scenarios() {
     let sandbox = Sandbox::new();
     let bin = sandbox.0.join("bin");
     fs::create_dir(&bin).unwrap();
-    let ssh = bin.join("ssh");
-    fs::write(
-        &ssh,
-        r#"#!/bin/sh
-for cmd do :; done
+    test_support::write_script(
+        &bin.join("ssh"),
+        r#"for cmd do :; done
 case "$cmd" in
     *'cat >'*) ;;
     *) exec sh -c "$cmd" ;;
@@ -80,9 +78,7 @@ case "$RMU_TEST_MODE" in
         ;;
 esac
 "#,
-    )
-    .unwrap();
-    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).unwrap();
+    );
     let path = std::env::join_paths(
         std::iter::once(bin).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
     )
