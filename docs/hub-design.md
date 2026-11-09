@@ -206,7 +206,9 @@ anything; their snapshot is best effort and they say so.
 
 ```
  1. preflight   git ls-remote origin (auth, reachability) and a local-cache
-                flock — before the tablet is touched
+                flock — before the tablet is touched; if the tablet has a
+                journal, fetch origin now, so reconciliation never judges
+                a lost push acknowledgement against a stale cache
  2. guard       take the tablet lock; refuse if the tablet is paired with
                 the reMarkable cloud; check tablet state ↔ origin repo id
  3. stop        arm the watchdog; systemctl stop xochitl
@@ -266,9 +268,11 @@ the previous snapshot is re-read regardless (git's racy-entry rule).
 
 - The tablet's `repo_id` must equal origin's. Otherwise: wrong or
   replaced origin; stop.
-- Every base commit (default, overrides, and a journaled merge being
-  reconciled) must exist and be an ancestor of origin `main`. Otherwise origin was rewound or replaced:
-  stop with an explanation. Nothing is inferred automatically, because a
+- Every base commit (default and overrides) must exist and be an
+  ancestor of origin `main`. Otherwise origin was rewound or replaced:
+  stop with an explanation. (A journaled merge that is not in origin is
+  different: it means the push never landed, and reconciliation drops
+  the journal.) Nothing is inferred automatically, because a
   rewound origin would otherwise read as "everything since was deleted".
   `rmu hub clone --reattach` is the deliberate recovery path; it treats
   the tablet like a fresh clone (below).
@@ -613,7 +617,7 @@ Needing writes (answered during device validation, with go-ahead):
 7. Does xochitl accept a `.content` whose page list was merged
    externally?
 
-## Decisions taken (owner may revise)
+## Decisions (confirmed by the owner)
 
 - The tablet that syncs second after a same-page conflict gets origin's
   version under the original name and its own as a conflict copy. Each
@@ -629,8 +633,21 @@ Needing writes (answered during device validation, with go-ahead):
   that has only seen one model.
 - The origin must be private and self-hosted.
 
-The trash and view-state decisions are encoded by the merge engine, so
-the owner confirms them before that PR starts.
+## Follow-ups from design review
+
+To be handled in the implementation PRs named:
+
+- Merge engine: the deletion-guard exemption applies only to deletions
+  that carry recorded consent in a trailer, not to every deletion already
+  in origin (one pushed by hand has none). Prove the cycle rule
+  terminates when a folder restored from the trash sits on a cycle (send
+  it to the root).
+- Sync cycle: reconciliation that finishes an interrupted apply uses the
+  same verify and tree checks as step 14. `backup` skips reconciliation,
+  since reconciliation can write files. The journal is flushed to disk
+  (`sync`) on the tablet before each push. The metadata re-read in step
+  14 includes newly created files. Quarantined documents are never
+  deleted, not only never overwritten.
 
 ## Implementation plan
 
