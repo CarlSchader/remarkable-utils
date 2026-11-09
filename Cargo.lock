@@ -347,6 +347,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tar",
+ "test-support",
  "thiserror",
  "uuid",
  "zip",
@@ -438,6 +439,7 @@ dependencies = [
  "libremarkable-utils",
  "rpassword",
  "serde_json",
+ "test-support",
 ]
 
 [[package]]
@@ -590,6 +592,10 @@ dependencies = [
  "libc",
  "xattr",
 ]
+
+[[package]]
+name = "test-support"
+version = "0.1.0"
 
 [[package]]
 name = "thiserror"

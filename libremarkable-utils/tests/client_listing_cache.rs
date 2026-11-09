@@ -3,7 +3,6 @@
 #![cfg(unix)]
 
 use std::fs::{self, File, FileTimes};
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, UNIX_EPOCH};
@@ -97,11 +96,9 @@ fn with_device(test_name: &str, test: impl FnOnce(Device)) {
         .unwrap()
         .set_times(fixed_times())
         .unwrap();
-    let ssh = root.join("bin/ssh");
-    fs::write(
-        &ssh,
-        r##"#!/bin/sh
-[ "$#" = 3 ] && [ "$1" = -- ] && [ "$2" = mock-device ] || exit 90
+    test_support::write_script(
+        &root.join("bin/ssh"),
+        r##"[ "$#" = 3 ] && [ "$1" = -- ] && [ "$2" = mock-device ] || exit 90
 printf 'call\n' >> "$RMU_CACHE_TEST_ROOT/calls"
 sh -c "$3"
 status=$?
@@ -116,9 +113,7 @@ case "$3" in
 esac
 exit "$status"
 "##,
-    )
-    .unwrap();
-    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+    );
     let path = std::env::join_paths(
         std::iter::once(root.join("bin"))
             .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),

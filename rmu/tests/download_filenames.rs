@@ -2,7 +2,6 @@
 #![cfg(unix)]
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -27,11 +26,9 @@ impl Fixture {
         for dir in ["bin", "device", "out", "state"] {
             fs::create_dir(fixture.path(dir)).unwrap();
         }
-        let ssh = fixture.path("bin/ssh");
-        fs::write(
-            &ssh,
-            r#"#!/bin/sh
-for arg do command=$arg; done
+        test_support::write_script(
+            &fixture.path("bin/ssh"),
+            r#"for arg do command=$arg; done
 case "$command" in
     cat\ *|*'tar -cf -'*)
         printf 'transfer\n' >> "$MOCK_TRANSFERS"
@@ -40,9 +37,7 @@ case "$command" in
 esac
 exec sh -c "$command"
 "#,
-        )
-        .unwrap();
-        fs::set_permissions(ssh, fs::Permissions::from_mode(0o755)).unwrap();
+        );
         fixture
     }
 

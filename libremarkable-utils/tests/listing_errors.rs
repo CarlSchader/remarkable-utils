@@ -1,15 +1,14 @@
 #![cfg(unix)]
 
 use std::fs;
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use libremarkable_utils::client::Client;
 use libremarkable_utils::ssh::{SshOptions, SshSession};
 
-const MOCK_SSH: &str = r#"#!/bin/sh
-[ "$#" -eq 3 ] && [ "$1" = -- ] && [ "$2" = mock-device ] || exit 99
+const MOCK_SSH: &str = r#"[ "$#" -eq 3 ] && [ "$1" = -- ] && [ "$2" = mock-device ] || exit 99
 case "$3" in
   *'stat -c'*) phase=stat;;
   *'__sizes__'*) phase=full;;
@@ -134,9 +133,7 @@ fn with_mock_ssh(name: &str, test: impl FnOnce(&Fixture)) {
     fs::create_dir_all(fixture.data()).unwrap();
     let bin = fixture.root.join("bin");
     fs::create_dir(&bin).unwrap();
-    let ssh = bin.join("ssh");
-    fs::write(&ssh, MOCK_SSH).unwrap();
-    fs::set_permissions(ssh, fs::Permissions::from_mode(0o700)).unwrap();
+    test_support::write_script(&bin.join("ssh"), MOCK_SSH);
     let path = std::env::var_os("PATH").unwrap_or_default();
     let paths = std::iter::once(bin).chain(std::env::split_paths(&path));
     let output = Command::new(std::env::current_exe().unwrap())

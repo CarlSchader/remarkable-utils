@@ -33,8 +33,7 @@ impl Fixture {
         fs::create_dir(fixture.0.join("bin")).unwrap();
         fixture.script(
             "ssh",
-            r#"#!/bin/sh
-while [ "$1" != -- ]; do
+            r#"while [ "$1" != -- ]; do
     [ "$#" -gt 0 ] || exit 90
     shift
 done
@@ -64,15 +63,13 @@ exec sh -c "$command"
         );
         fixture.script(
             "systemctl",
-            "#!/bin/sh\nprintf '%s: %s\\n' \"$PWD\" \"$*\" >> \"$MOCK_ROOT/restarts\"\n",
+            "printf '%s: %s\\n' \"$PWD\" \"$*\" >> \"$MOCK_ROOT/restarts\"\n",
         );
         fixture
     }
 
     fn script(&self, name: &str, body: &str) {
-        let path = self.0.join("bin").join(name);
-        fs::write(&path, body).unwrap();
-        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        test_support::write_script(&self.0.join("bin").join(name), body);
     }
 
     fn endpoint(&self, kind: Kind, side: &str, exists: bool, populated: bool) -> String {

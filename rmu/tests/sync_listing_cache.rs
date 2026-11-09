@@ -3,7 +3,6 @@
 #![cfg(unix)]
 
 use std::fs::{self, File, FileTimes};
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -31,11 +30,9 @@ impl Fixture {
         for dir in ["bin", "a/device", "b/device", "local", "state"] {
             fs::create_dir_all(fixture.0.join(dir)).unwrap();
         }
-        let ssh = fixture.0.join("bin/ssh");
-        fs::write(
-            &ssh,
-            r#"#!/bin/sh
-[ "$#" = 3 ] && [ "$1" = -- ] || exit 90
+        test_support::write_script(
+            &fixture.0.join("bin/ssh"),
+            r#"[ "$#" = 3 ] && [ "$1" = -- ] || exit 90
 case "$2" in
     root@a.invalid) cd "$MOCK_ROOT/a" || exit 91;;
     root@b.invalid) cd "$MOCK_ROOT/b" || exit 91;;
@@ -49,9 +46,7 @@ case "$3" in
 esac
 exec sh -c "$3"
 "#,
-        )
-        .unwrap();
-        fs::set_permissions(ssh, fs::Permissions::from_mode(0o755)).unwrap();
+        );
         fixture
     }
 

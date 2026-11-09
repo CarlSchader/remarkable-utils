@@ -3,16 +3,16 @@
 #![cfg(unix)]
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use libremarkable_utils::sync::{SyncState, hash_bytes};
 use serde_json::json;
 
 const ORIGINAL: &[u8] = b"synthetic original PDF payload";
 const CHANGED: &[u8] = b"synthetic changed PDF payload, with a different size";
+static NEXT: AtomicUsize = AtomicUsize::new(0);
 
 struct Fixture {
     root: PathBuf,
@@ -20,29 +20,24 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root =
-            std::env::temp_dir().join(format!("rmu-copy-sources-{}-{nonce}", std::process::id()));
+        let root = std::env::temp_dir().join(format!(
+            "rmu-copy-sources-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
         fs::create_dir(&root).unwrap();
         ["bin", "local", "device", "state"].iter().for_each(|dir| {
             fs::create_dir(root.join(dir)).unwrap();
         });
-        let ssh = root.join("bin/ssh");
-        fs::write(
-            &ssh,
-            "#!/bin/sh\n\
-             while [ \"$#\" -gt 0 ] && [ \"$1\" != -- ]; do shift; done\n\
+        test_support::write_script(
+            &root.join("bin/ssh"),
+            "while [ \"$#\" -gt 0 ] && [ \"$1\" != -- ]; do shift; done\n\
              [ \"$#\" -eq 3 ] || exit 97\n\
              shift\n\
              [ \"$1\" = mock-tablet ] || exit 98\n\
              shift\n\
              exec sh -c \"$1\"\n",
-        )
-        .unwrap();
-        fs::set_permissions(ssh, fs::Permissions::from_mode(0o700)).unwrap();
+        );
         Self { root }
     }
 

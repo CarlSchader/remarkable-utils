@@ -171,10 +171,8 @@ fn crash_reports(repo: &Repo) -> Vec<String> {
 
 #[cfg(unix)]
 fn write_hook(path: &Path, script: &str) {
-    use std::os::unix::fs::PermissionsExt;
     fs::create_dir_all(path.parent().unwrap()).unwrap();
-    fs::write(path, script).unwrap();
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    test_support::write_script(path, script);
 }
 
 #[derive(Default)]
@@ -686,7 +684,7 @@ fn remote_refusal_and_unreachable_remote_are_distinct_errors() {
 
     write_hook(
         &origin.git_dir().join("hooks/pre-receive"),
-        "#!/bin/sh\necho 'file too large: docs/x/payload.pdf' >&2\nexit 1\n",
+        "echo 'file too large: docs/x/payload.pdf' >&2\nexit 1\n",
     );
     let result = cache.push(url, &commit, MAIN, None);
     assert!(
@@ -726,7 +724,7 @@ fn rmu_never_runs_hooks_in_its_own_repositories() {
         .for_each(|name| {
             write_hook(
                 &cache.git_dir().join("hooks").join(name),
-                "#!/bin/sh\necho hook ran >&2\nexit 1\n",
+                "echo hook ran >&2\nexit 1\n",
             );
         });
     let commit = commit_files(&cache, &[], &[("f", b"1")], "1\n");
@@ -881,7 +879,7 @@ fn remote_compare_and_swap_race_is_a_push_rejection() {
     write_hook(
         &origin.git_dir().join("hooks/pre-receive"),
         &format!(
-            "#!/bin/sh\nwhile read old new ref; do\n  env -u GIT_QUARANTINE_PATH git update-ref \"$ref\" {other} >&2\ndone\nexit 0\n"
+            "while read old new ref; do\n  env -u GIT_QUARANTINE_PATH git update-ref \"$ref\" {other} >&2\ndone\nexit 0\n"
         ),
     );
     let plain = cache.push(url, &ours, MAIN, None);

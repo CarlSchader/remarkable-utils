@@ -3,7 +3,6 @@
 #![cfg(unix)]
 
 use std::fs::{self, File, FileTimes};
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -39,22 +38,10 @@ impl Fixture {
         paths.iter().for_each(|path| fs::create_dir(path).unwrap());
         let bin = root.join("bin");
         fs::create_dir(&bin).unwrap();
-        let ssh = bin.join("ssh");
-        fs::write(
-            &ssh,
-            "#!/bin/sh\n\
-             [ \"$#\" = 3 ] && [ \"$1\" = -- ] || exit 98\n\
-             case \"$2\" in mock-a|mock-b) ;; *) exit 99 ;; esac\n\
-             exec sh -c \"$3\"\n",
-        )
-        .unwrap();
-        if matches!(pair, Pair::SshHomeRoot) {
+        let ssh = if matches!(pair, Pair::SshHomeRoot) {
             // Never execute the supplied shell command here: absolute paths
             // must address the synthetic root, not the machine running tests.
-            fs::write(
-                &ssh,
-                r#"#!/bin/sh
-[ "$#" = 3 ] && [ "$1" = -- ] && [ "$2" = mock-same ] || exit 98
+            r#"[ "$#" = 3 ] && [ "$1" = -- ] && [ "$2" = mock-same ] || exit 98
 stamp() {
     stat -c "$1" -- "$3" 2>/dev/null || stat -f "$2" "$3"
 }
@@ -87,11 +74,13 @@ esac
 if [ -f book.pdf ]; then
     stamp '%s %Y ./book.pdf' '%z %m ./book.pdf' book.pdf
 fi
-"#,
-            )
-            .unwrap();
-        }
-        fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).unwrap();
+"#
+        } else {
+            "[ \"$#\" = 3 ] && [ \"$1\" = -- ] || exit 98\n\
+             case \"$2\" in mock-a|mock-b) ;; *) exit 99 ;; esac\n\
+             exec sh -c \"$3\"\n"
+        };
+        test_support::write_script(&bin.join("ssh"), ssh);
         let local = |i: usize| paths[i].display().to_string();
         let remote = |i: usize| format!("mock-{}:{}", ["a", "b"][i], paths[i].display());
         let endpoints = match pair {

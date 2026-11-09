@@ -40,6 +40,7 @@ This repository is **open source** (dual-licensed MIT OR Apache-2.0):
 | `nix/lib/git-hooks.nix` | Pre-commit hooks: treefmt + clippy (offline vendored)  |
 | `libremarkable-utils/`  | Library crate (see module map below)                   |
 | `rmu/`                  | `rmu` CLI binary crate (clap; all config via flags, no config file) |
+| `test-support/`         | Unpublished dev-dependency: helpers shared by tests (`write_script` for mock executables) |
 | `Cargo.toml`            | Workspace root; shared deps in `[workspace.dependencies]` |
 
 ### `libremarkable-utils` module map
@@ -163,6 +164,10 @@ nix build .#rmu                    # build the CLI via crane
 - Logic that can be pure must be pure and unit-tested (see `xochitl.rs`
   and the `parse_listing` tests in `client.rs`). Device I/O is a thin
   shell around tested logic.
+- Tests that install mock executables (a fake `ssh`, `systemctl`, …)
+  must write them with `test_support::write_script`, never `fs::write`
+  plus `chmod`: a test thread holding a script open for writing while
+  another thread spawns makes exec fail with "Text file busy".
 
 ## Testing against real devices
 
