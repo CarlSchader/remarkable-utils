@@ -42,13 +42,13 @@ pub fn report(report: &Report) -> Value {
 
 /// The JSON for an error: `{"error": {"kind", "exit_code", "message", …}}`,
 /// with the documents for the deletion guard.
-pub fn error(error: &Error, failure: Failure) -> Value {
+pub fn error(failure: Failure, message: &str, error: Option<&Error>) -> Value {
     let details = match error {
-        Error::HubCycle(CycleError::DeletionsNeedConsent {
+        Some(Error::HubCycle(CycleError::DeletionsNeedConsent {
             from_origin,
             from_tablet,
             empty_snapshot,
-        }) => Some(GuardRefusal {
+        })) => Some(GuardRefusal {
             from_origin,
             from_tablet,
             empty_snapshot: *empty_snapshot,
@@ -59,7 +59,7 @@ pub fn error(error: &Error, failure: Failure) -> Value {
         error: ErrorBody {
             kind: failure.kind(),
             exit_code: failure.code(),
-            message: error.to_string(),
+            message: message.to_string(),
             details,
         },
     })

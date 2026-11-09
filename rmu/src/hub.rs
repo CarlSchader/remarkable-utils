@@ -42,12 +42,14 @@ Exit status:
   1  error
   2  invalid arguments
   3  the deletion guard refused: the sync would delete many documents;
-     nothing was pushed (rerun with --allow-deletions if that is intended)
-  4  the tablet is locked by another rmu hub run (--break-lock takes the
-     lock over once you are sure that run is gone)
-  5  origin does not match the tablet: it was rewound, replaced or
-     emptied, or another tablet uses this device id
-     (`rmu hub clone --reattach` attaches the tablet to it deliberately)
+     origin's main and the tablet were left unchanged (the tablet's backup
+     was pushed); rerun with --allow-deletions if that is intended
+  4  the tablet is locked or busy with another rmu hub run (if that run
+     is gone, --break-lock takes the lock over)
+  5  origin does not match the tablet: it was rewound or replaced, or
+     another tablet uses this device id (`rmu hub clone --reattach`
+     attaches the tablet to it deliberately), or it was emptied (`rmu hub
+     init` it again first)
   6  the tablet is paired with the reMarkable cloud (unpair it first)
 
 Output: stdout carries the result only: a summary on a terminal, JSON
@@ -80,14 +82,16 @@ pub enum HubCommand {
         /// Local path or git URL of the origin
         origin: String,
         /// This tablet's name in the library's history (default: its
-        /// model and a short id)
+        /// model and a short id, or its current name with --reattach)
         #[arg(long, value_parser = parse_device_name)]
         name: Option<DeviceName>,
         /// Attach a tablet that already has hub state again (its state
-        /// was lost, or origin was replaced), keeping its device id and
-        /// name
+        /// was lost, or origin was replaced), keeping its device id
         #[arg(long)]
         reattach: bool,
+        /// Allow a first sync that deletes many documents (see `sync`)
+        #[arg(long)]
+        allow_deletions: bool,
         #[command(flatten)]
         run: RunArgs,
     },
@@ -197,7 +201,9 @@ impl Failure {
     pub fn of(error: &Error) -> Self {
         match error {
             Error::HubCycle(CycleError::DeletionsNeedConsent { .. }) => Self::DeletionsNeedConsent,
-            Error::HubDevice(DeviceError::Locked(_)) => Self::LockHeld,
+            Error::HubDevice(
+                DeviceError::Locked(_) | DeviceError::LockContended | DeviceError::Busy,
+            ) => Self::LockHeld,
             Error::HubCycle(
                 CycleError::OriginRewound { .. }
                 | CycleError::RepoMismatch { .. }
@@ -275,12 +281,19 @@ pub fn options(command: &HubCommand) -> HubOptions {
         ..options
     };
     let origin = |origin: &OriginArg| HubOptions {
-        origin: origin.origin.clone(),
+        origin: origin.origin.as_deref().map(absolute_origin),
         ..HubOptions::default()
     };
     match command {
         HubCommand::Init { .. } => HubOptions::default(),
-        HubCommand::Clone { run: args, .. } => run(args, HubOptions::default()),
+        HubCommand::Clone {
+            allow_deletions,
+            run: args,
+            ..
+        } => HubOptions {
+            allow_deletions: *allow_deletions,
+            ..run(args, HubOptions::default())
+        },
         HubCommand::Sync {
             allow_deletions,
             run: args,
@@ -296,6 +309,17 @@ pub fn options(command: &HubCommand) -> HubOptions {
         } => run(args, origin(url)),
         HubCommand::Status { origin: url } => origin(url),
     }
+}
+
+/// A local origin path made absolute (it is stored on the tablet, and
+/// later runs start elsewhere); URLs and scp-style `host:path` are kept.
+/// The same rule as the library's: anything with a `:` is remote.
+pub fn absolute_origin(origin: &str) -> String {
+    if origin.contains(':') {
+        return origin.to_string();
+    }
+    std::path::absolute(origin)
+        .map_or_else(|_| origin.to_string(), |path| path.display().to_string())
 }
 
 /// This computer's name for the lock record on the tablet (never
@@ -324,9 +348,25 @@ pub fn run(
     connect: impl FnOnce() -> Result<SshSession>,
 ) -> Result<()> {
     let output = Output::detect(args.json);
+    // Setup failures (no cache directory, no ssh session) are errors too.
+    let setup_error = |error: anyhow::Error| {
+        if output == Output::Json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json::error(
+                    Failure::Error,
+                    &format!("{error:#}"),
+                    None
+                ))
+                .expect("errors serialise")
+            );
+        }
+        error
+    };
     let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
     let cache = cycle::default_cache_dir()
-        .context("no cache directory for rmu hub: set XDG_CACHE_HOME or HOME")?;
+        .context("no cache directory for rmu hub: set XDG_CACHE_HOME or HOME")
+        .map_err(setup_error)?;
     let hub = Hub::new(
         Git::new().interactive(interactive),
         cache,
@@ -337,7 +377,7 @@ pub fn run(
     let tablet = match &args.command {
         HubCommand::Init { .. } => None,
         _ => Some(
-            SshTablet::new(connect()?)
+            SshTablet::new(connect().map_err(setup_error)?)
                 .with_paths(TabletPaths {
                     xochitl_dir: env.xochitl_dir.to_string(),
                     ..TabletPaths::default()
@@ -367,17 +407,18 @@ pub fn execute(
 ) -> libremarkable_utils::Result<Report> {
     let tablet = || tablet.expect("every command but init has a tablet");
     match command {
-        HubCommand::Init { origin } => hub.init(origin).map(|report| Report::Init {
-            origin: origin.clone(),
-            report,
-        }),
+        HubCommand::Init { origin } => {
+            let origin = absolute_origin(origin);
+            hub.init(&origin)
+                .map(|report| Report::Init { origin, report })
+        }
         HubCommand::Clone {
             origin,
             name,
             reattach,
             ..
         } => hub
-            .clone_tablet(tablet(), origin, name.clone(), *reattach)
+            .clone_tablet(tablet(), &absolute_origin(origin), name.clone(), *reattach)
             .map(Report::Clone),
         HubCommand::Sync { dry_run: true, .. } => hub.dry_run(tablet()).map(Report::DryRun),
         HubCommand::Sync { .. } => hub.sync(tablet()).map(Report::Sync),
@@ -460,17 +501,20 @@ pub fn finish(
             Ok(())
         }
         Err(error) => {
+            // Best effort: a failed write must not replace the error (and
+            // its exit status).
             let failure = Failure::of(&error);
             let details = render::error_details(&error, &names(render::error_docs(&error)));
-            details
+            let _ = details
                 .iter()
-                .try_for_each(|line| writeln!(stderr, "{line}"))?;
+                .try_for_each(|line| writeln!(stderr, "{line}"));
             if output == Output::Json {
-                writeln!(
+                let value = json::error(failure, &error.to_string(), Some(&error));
+                let _ = writeln!(
                     stdout,
                     "{}",
-                    serde_json::to_string_pretty(&json::error(&error, failure))?
-                )?;
+                    serde_json::to_string_pretty(&value).expect("errors serialise")
+                );
             }
             Err(error.into())
         }

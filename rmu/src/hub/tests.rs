@@ -61,6 +61,7 @@ fn parses_every_subcommand() {
         "--name",
         "Desk tablet",
         "--reattach",
+        "--allow-deletions",
         "--break-lock",
         "--watchdog",
         "120",
@@ -72,11 +73,12 @@ fn parses_every_subcommand() {
             origin,
             name,
             reattach,
+            allow_deletions,
             run,
         } => {
             assert_eq!(origin, "ssh://git@example.invalid/library.git");
             assert_eq!(name.as_ref().unwrap().as_str(), "Desk tablet");
-            assert!(*reattach);
+            assert!(*reattach && *allow_deletions);
             assert_eq!(
                 run,
                 &RunArgs {
@@ -164,6 +166,29 @@ fn rejects_bad_arguments() {
 }
 
 #[test]
+fn local_origins_become_absolute() {
+    let cwd = std::env::current_dir().unwrap();
+    assert_eq!(
+        absolute_origin("library.git"),
+        cwd.join("library.git").display().to_string()
+    );
+    assert_eq!(absolute_origin("/srv/library.git"), "/srv/library.git");
+    [
+        "ssh://git@example.invalid/library.git",
+        "server.example:library.git",
+        "https://example.invalid/library.git",
+    ]
+    .iter()
+    .for_each(|url| assert_eq!(absolute_origin(url), *url));
+    let clone = options(&hub_args(&["clone", "/o.git", "--allow-deletions"]).command);
+    assert!(clone.allow_deletions);
+    assert_eq!(
+        options(&hub_args(&["status", "--origin", "rel.git"]).command).origin,
+        Some(cwd.join("rel.git").display().to_string())
+    );
+}
+
+#[test]
 fn options_follow_the_flags() {
     let sync = options(
         &hub_args(&[
@@ -235,7 +260,9 @@ fn exit_codes() {
     );
     assert_eq!(code(Error::HubCycle(CycleError::CloudPaired)), 6);
     assert_eq!(code(Error::HubCycle(CycleError::NotAttached)), 1);
-    assert_eq!(code(Error::HubDevice(DeviceError::Busy)), 1);
+    assert_eq!(code(Error::HubDevice(DeviceError::Busy)), 4);
+    assert_eq!(code(Error::HubDevice(DeviceError::LockContended)), 4);
+    assert_eq!(code(Error::HubDevice(DeviceError::LockLost)), 1);
     assert_eq!(code(Error::PathNotFound("x".into())), 1);
     assert_eq!(exit_code(&anyhow::anyhow!("not a library error")), 1);
     // Context does not hide the cause.
@@ -273,8 +300,8 @@ fn sync_report() -> SyncReport {
         update: MainUpdate::Merge(oid('c')),
         snapshot: oid('b'),
         base: oid('c'),
-        applied: vec![doc(1), doc(2), doc(3)],
-        skipped: vec![doc(4)],
+        applied: vec![doc(1), doc(2), doc(3), doc(21), doc(23)],
+        skipped: vec![doc(4), doc(22)],
         quarantined: BTreeMap::from([(doc(5), "unparsable .metadata".to_string())]),
         orphans: vec![doc(6)],
         read: ReadSummary {
@@ -379,17 +406,17 @@ fn renders_sync_reports() {
     [
         "Synced: merged with origin and pushed cccccccccccc (after 2 push attempts)",
         "The tablet is at cccccccccccc (its backup: bbbbbbbbbbbb)",
-        "Wrote 3 documents to the tablet",
+        "Updated 5 documents on the tablet",
         "Read 7 files (2.00 KiB) from the tablet; 3 files stay not mirrored",
         "Documents: 2 changed on the tablet, 3 changed on origin, 1 forked",
         "Deletions: 1 from origin, 2 from the tablet",
         "Conflict copies (1):\n  \"Lecture notes (conflict Desk tablet 2026-11-09)\" (8c1f0b9e-0000-4000-8000-00000000000a), the tablet's version of \"Lecture notes\" (8c1f0b9e-0000-4000-8000-000000000009)",
-        "Skipped, changed on the tablet during the sync (the next sync picks them up) (1):\n  \"Edited meanwhile\" (8c1f0b9e-0000-4000-8000-000000000004)",
+        "Skipped: changed on the tablet during the sync, or would break its folder tree (the next sync picks them up) (2):\n  \"Edited meanwhile\" (8c1f0b9e-0000-4000-8000-000000000004)",
         "Quarantined, malformed on the tablet (left untouched until it parses again) (1):\n  8c1f0b9e-0000-4000-8000-000000000005: unparsable .metadata",
         "Files without a .metadata",
         "  \"Kept book\" (8c1f0b9e-0000-4000-8000-000000000007): kept over a deletion: deleted on origin but changed on the other side",
         "  8c1f0b9e-0000-4000-8000-000000000008: restored from the trash to the root, so an edit is not lost",
-        "Deleted from the tablet (2):\n  \"Old draft\" (8c1f0b9e-0000-4000-8000-000000000015)",
+        "Deleted from the tablet (1):\n  \"Old draft\" (8c1f0b9e-0000-4000-8000-000000000015)\n",
         "1 document also deleted from the tablet: origin deleted them with recorded consent",
         "These deletions are allowed by --allow-deletions",
         "Reconciled an interrupted sync: finished 1 document, 1 left for the next sync",
@@ -415,8 +442,13 @@ fn renders_sync_reports() {
         ..sync.clone()
     };
     let human = text(&render::human(&Report::Sync(up_to_date), &BTreeMap::new()));
-    assert!(human.contains("Synced: origin already had the tablet's changes"));
-    assert!(human.contains("Nothing to write to the tablet"));
+    assert!(human.contains("Synced: already in sync with origin; nothing pushed"));
+    assert!(human.contains("Nothing to change on the tablet"));
+    assert!(human.contains("Deletions: 1 from origin, 0 from the tablet"));
+    assert!(
+        !human.contains("Deleted from the tablet"),
+        "nothing was applied"
+    );
 
     assert_eq!(render::plain(&report), vec!["c".repeat(40)]);
     assert_eq!(
@@ -442,8 +474,11 @@ fn sync_json_is_stable() {
     );
     assert_eq!(value["base"], "c".repeat(40));
     assert_eq!(value["snapshot"], "b".repeat(40));
-    assert_eq!(value["applied"].as_array().unwrap().len(), 3);
-    assert_eq!(value["skipped"], json!([doc(4).to_string()]));
+    assert_eq!(value["applied"].as_array().unwrap().len(), 5);
+    assert_eq!(
+        value["skipped"],
+        json!([doc(4).to_string(), doc(22).to_string()])
+    );
     assert_eq!(
         value["quarantined"],
         json!([{"doc": doc(5).to_string(), "reason": "unparsable .metadata"}])
@@ -731,7 +766,7 @@ fn renders_errors() {
     assert!(details.contains("--allow-deletions"));
     assert_eq!(render::error_docs(&error), vec![doc(3), doc(1), doc(2)]);
 
-    let value = json::error(&error, Failure::of(&error));
+    let value = json::error(Failure::of(&error), &error.to_string(), Some(&error));
     assert_eq!(value["error"]["kind"], "deletions_need_consent");
     assert_eq!(value["error"]["exit_code"], 3);
     assert_eq!(
@@ -747,9 +782,15 @@ fn renders_errors() {
             .contains("--allow-deletions")
     );
 
+    let setup = json::error(Failure::Error, "ssh: connection refused", None);
+    assert_eq!(
+        setup,
+        json!({"error": {"kind": "error", "exit_code": 1, "message": "ssh: connection refused"}})
+    );
+
     let locked = Error::HubDevice(DeviceError::Locked("pid 1 on laptop".into()));
     assert!(render::error_details(&locked, &BTreeMap::new()).is_empty());
-    let value = json::error(&locked, Failure::of(&locked));
+    let value = json::error(Failure::of(&locked), &locked.to_string(), Some(&locked));
     assert_eq!(
         value,
         json!({"error": {
@@ -898,7 +939,7 @@ fn init_clone_sync_status_backup() {
     assert_eq!(code, 0, "{stderr}");
     assert!(stdout.starts_with("Cloned:"), "{stdout}");
     assert!(
-        stdout.contains("Wrote 2 documents to the tablet"),
+        stdout.contains("Updated 2 documents on the tablet"),
         "{stdout}"
     );
     assert!(b.read_file(&format!("{}.pdf", doc(1))).is_some());
@@ -954,7 +995,7 @@ fn init_clone_sync_status_backup() {
         "the summary goes to stderr: {stderr}"
     );
     assert!(
-        stderr.contains("Wrote 1 document to the tablet"),
+        stderr.contains("Updated 1 document on the tablet"),
         "{stderr}"
     );
     assert!(b.read_file(&format!("{id}.pdf")).is_some());

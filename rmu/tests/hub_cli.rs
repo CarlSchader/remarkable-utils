@@ -56,14 +56,16 @@ const MOCK_SSH: &str = r#"while [ "$#" -gt 0 ] && [ "$1" != -- ]; do shift; done
 shift 2
 PATH=$MOCK_TOOLS
 export PATH
+# The scratch directory, escaped for a sed replacement.
+dev=$(printf '%s\n' "$MOCK_DEVICE" | sed 's/[\\&#]/\\&/g')
 rewrite() {
-    sed -e "s#/home/root/#$MOCK_DEVICE/home/root/#g" \
-        -e "s#/proc/sys/kernel/random/boot_id#$MOCK_DEVICE/boot_id#g" \
-        -e "s#/sys/devices/soc0/machine#$MOCK_DEVICE/machine#g" \
-        -e "s#/proc/device-tree/#$MOCK_DEVICE/device-tree/#g" \
-        -e "s#/etc/os-release#$MOCK_DEVICE/os-release#g" \
-        -e "s#/etc/version#$MOCK_DEVICE/version#g" \
-        -e "s#/usr/share/remarkable/#$MOCK_DEVICE/usr-share/#g"
+    sed -e "s#/home/root/#$dev/home/root/#g" \
+        -e "s#/proc/sys/kernel/random/boot_id#$dev/boot_id#g" \
+        -e "s#/sys/devices/soc0/machine#$dev/machine#g" \
+        -e "s#/proc/device-tree/#$dev/device-tree/#g" \
+        -e "s#/etc/os-release#$dev/os-release#g" \
+        -e "s#/etc/version#$dev/version#g" \
+        -e "s#/usr/share/remarkable/#$dev/usr-share/#g"
 }
 command=$(printf '%s\n' "$1" | rewrite)
 printf '%s\n' "$command" | head -n 1 >> "$MOCK_DEVICE/ssh.log"
@@ -181,17 +183,27 @@ impl World {
 
     /// `rmu --host tablet --no-multiplex hub <args>`, stdout not a terminal.
     fn rmu(&self, args: &[&str]) -> Output {
+        self.rmu_in(&self.scratch.join("home"), args)
+    }
+
+    fn rmu_in(&self, dir: &Path, args: &[&str]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_rmu"))
+            .current_dir(dir)
             .args(["--host", "tablet", "--no-multiplex", "hub"])
             .args(args)
             .env("PATH", self.scratch.mock_path())
             .env("MOCK_TOOLS", self.scratch.join("tools"))
             .env("MOCK_DEVICE", self.device())
             .env("HOME", self.scratch.join("home"))
+            .env("XDG_CONFIG_HOME", self.scratch.join("home"))
             .env("XDG_CACHE_HOME", self.scratch.join("cache"))
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_COUNT", "0")
+            .env("GIT_DEFAULT_HASH", "sha1")
+            .env_remove("GIT_TRACE")
+            .env_remove("GIT_TRACE_PACKET")
+            .env_remove("GIT_CONFIG_PARAMETERS")
             .env_remove("RMU_SSH_PASSWORD")
             .output()
             .unwrap()
@@ -268,12 +280,24 @@ fn init_clone_status_sync_backup(busybox: Option<&Path>) {
     let origin = world.origin();
     let first = world.put_pdf(1, "Paper one");
 
-    let value = world.json(&["init", &origin]);
+    // A relative origin is stored absolute: later runs start elsewhere.
+    let output = world.rmu_in(world.scratch.path(), &["init", "origin.git", "--json"]);
+    assert_success(&output);
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["command"], "init");
+    assert_eq!(
+        fs::canonicalize(value["origin"].as_str().unwrap()).unwrap(),
+        fs::canonicalize(&origin).unwrap()
+    );
     assert!(Path::new(&origin).join("HEAD").exists());
     assert!(world.ssh_log().is_empty(), "init never contacts the tablet");
 
-    let value = world.json(&["clone", &origin, "--name", "Tablet A"]);
+    let output = world.rmu_in(
+        world.scratch.path(),
+        &["clone", "origin.git", "--name", "Tablet A", "--json"],
+    );
+    assert_success(&output);
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["command"], "clone");
     assert_eq!(value["summary"]["added"], 1);
     assert!(

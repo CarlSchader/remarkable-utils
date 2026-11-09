@@ -187,8 +187,8 @@ Things to know:
   before pushing and lists them; rerun with
   `--allow-deletions` if that is what you want.
 - **Every state is recoverable**: every sync is a git commit on origin,
-  and every tablet's own state is backed up under
-  `refs/rmu/devices/<id>` before anything is merged.
+  and every tablet's own state is backed up to its own ref on origin
+  (`refs/rmu/devices/<id>`) before anything is merged.
 
 Recovery:
 
@@ -204,9 +204,12 @@ Recovery:
   merge as new.
 
 Every `rmu hub` command prints a summary on a terminal and stable JSON
-with `--json`; when stdout is not a terminal it prints plain ids (the
-commit the tablet is at, one line per change for `status`) and the
-summary goes to stderr. Exit statuses:
+with `--json` (errors included). When stdout is not a terminal it prints
+plain results instead, and the summary goes to stderr: the repository id
+for `init`, the commit the tablet is at for `clone` and `sync`, the
+backup commit for `backup`, `A`/`M`/`D <id>` per change for `status`,
+and `write`/`delete <id>` per document for `sync --dry-run`. Exit
+statuses:
 
 | Status | Meaning                                                           |
 |--------|-------------------------------------------------------------------|
@@ -214,7 +217,7 @@ summary goes to stderr. Exit statuses:
 | 1      | error                                                             |
 | 2      | invalid arguments                                                 |
 | 3      | the deletion guard refused (see `--allow-deletions`)              |
-| 4      | the tablet is locked by another run (see `--break-lock`)          |
+| 4      | the tablet is locked or busy (see `--break-lock`)                 |
 | 5      | origin does not match the tablet (see `clone --reattach`)         |
 | 6      | the tablet is paired with the reMarkable cloud                    |
 

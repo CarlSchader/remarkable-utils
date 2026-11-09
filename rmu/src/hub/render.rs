@@ -5,7 +5,7 @@
 //! (capped at [`LIST_LIMIT`] entries) only for what needs attention:
 //! conflict copies, skipped and quarantined documents, notes, deletions.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use indicatif::HumanBytes;
 use libremarkable_utils::Error;
@@ -292,7 +292,17 @@ fn orphans(lines: &mut Vec<String>, docs: &[DocId]) {
     );
 }
 
-fn deletions(lines: &mut Vec<String>, guard: &DeletionGuard, names: &Names, planned: bool) {
+/// The deletion guard's lists. `applied`: after a sync, only what was
+/// actually deleted counts (a skipped document was not); `None` for a
+/// plan.
+fn deletions(
+    lines: &mut Vec<String>,
+    guard: &DeletionGuard,
+    names: &Names,
+    applied: Option<&BTreeSet<&DocId>>,
+) {
+    let planned = applied.is_none();
+    let done = |doc: &&DocId| applied.is_none_or(|applied| applied.contains(doc));
     let verb = match planned {
         true => "Would delete",
         false => "Deleted",
@@ -312,13 +322,15 @@ fn deletions(lines: &mut Vec<String>, guard: &DeletionGuard, names: &Names, plan
         guard
             .from_tablet
             .iter()
+            .filter(done)
             .map(|doc| label(names, doc))
             .collect(),
     );
-    if !guard.exempt.is_empty() {
+    let exempt = guard.exempt.iter().filter(done).count();
+    if exempt > 0 {
         lines.push(format!(
             "{} also {} from the tablet: origin deleted them with recorded consent",
-            docs(guard.exempt.len()),
+            docs(exempt),
             if planned {
                 "would be deleted"
             } else {
@@ -385,49 +397,54 @@ fn warning_lines(lines: &mut Vec<String>, warnings: &[String]) {
 }
 
 fn sync(report: &SyncReport, names: &Names, verb: &str) -> Vec<String> {
+    let attempts = match report.push_attempts {
+        0 | 1 => String::new(),
+        n => format!(" (after {n} push attempts)"),
+    };
     let mut lines = vec![match &report.update {
-        MainUpdate::UpToDate => format!("{verb}: origin already had the tablet's changes"),
-        MainUpdate::FastForward(commit) => {
-            format!(
-                "{verb}: pushed the tablet's changes to origin ({})",
-                short(commit)
-            )
-        }
+        MainUpdate::UpToDate => format!("{verb}: already in sync with origin; nothing pushed"),
+        MainUpdate::FastForward(commit) => format!(
+            "{verb}: pushed the tablet's changes to origin ({}){attempts}",
+            short(commit)
+        ),
         MainUpdate::Merge(commit) => format!(
-            "{verb}: merged with origin and pushed {}{}",
-            short(commit),
-            match report.push_attempts {
-                0 | 1 => String::new(),
-                n => format!(" (after {n} push attempts)"),
-            }
+            "{verb}: merged with origin and pushed {}{attempts}",
+            short(commit)
         ),
     }];
+    let applied: BTreeSet<&DocId> = report.applied.iter().collect();
     lines.push(format!(
         "The tablet is at {} (its backup: {})",
         short(&report.base),
         short(&report.snapshot)
     ));
     lines.push(match report.applied.len() {
-        0 => "Nothing to write to the tablet".to_string(),
-        n => format!("Wrote {} to the tablet", docs(n)),
+        0 => "Nothing to change on the tablet".to_string(),
+        n => format!("Updated {} on the tablet", docs(n)),
     });
     lines.push(read_line(&report.read));
     lines.extend(summary_line(&report.summary));
     lines.push(format!(
         "Deletions: {} from origin, {} from the tablet",
         report.deletions.from_origin.len(),
-        report.deletions.from_tablet.len()
+        report
+            .deletions
+            .from_tablet
+            .iter()
+            .chain(&report.deletions.exempt)
+            .filter(|doc| applied.contains(doc))
+            .count()
     ));
     forks(&mut lines, "Conflict copies", &report.forks, names);
     list(
         &mut lines,
-        "Skipped, changed on the tablet during the sync (the next sync picks them up)",
+        "Skipped: changed on the tablet during the sync, or would break its folder tree (the next sync picks them up)",
         report.skipped.iter().map(|doc| label(names, doc)).collect(),
     );
     quarantined(&mut lines, &report.quarantined, names);
     orphans(&mut lines, &report.orphans);
     notes(&mut lines, &report.notes, names);
-    deletions(&mut lines, &report.deletions, names, false);
+    deletions(&mut lines, &report.deletions, names, Some(&applied));
     reconciled(&mut lines, &report.reconciled, names);
     took_over(&mut lines, &report.took_over);
     warning_lines(&mut lines, &report.warnings);
@@ -513,7 +530,7 @@ fn status(report: &StatusReport, names: &Names) -> Vec<String> {
         names,
     );
     notes(&mut lines, &report.notes, names);
-    deletions(&mut lines, &report.guard, names, true);
+    deletions(&mut lines, &report.guard, names, None);
     lines.push("(read while xochitl runs: best effort)".to_string());
     lines
 }
