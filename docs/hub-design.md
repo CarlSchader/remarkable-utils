@@ -30,15 +30,16 @@ These hold across every design decision below; a change that weakens
 one needs to say so explicitly.
 
 1. **The tablet's state reaches the origin before anything is merged or
-   written anywhere** (the device ref, step 6 of the cycle).
+   written anywhere** (the device ref, step 7 of the cycle).
 2. **The tablet is only ever written from a merge that origin has
    accepted.** Origin is never behind any tablet.
 3. **A merge never discards ink.** Concurrent ink on the same thing
    forks; deletion loses to edits.
 4. **Nothing is deleted on a large scale without explicit consent**
    (`--allow-deletions`).
-5. **A snapshot that cannot be read completely and correctly is not
-   committed.** Failure is closed, never partial.
+5. **A snapshot that cannot be read reliably is not committed.** I/O
+   failures abort the run; a single malformed document is quarantined
+   (neither deleted nor changed), never guessed at.
 6. **Every run is restartable**: a crash at any point leaves state from
    which the next run converges, without spurious or duplicate forks.
 7. **xochitl comes back** even if the computer running rmu disappears.
@@ -124,9 +125,11 @@ Read-only inspection of a reMarkable Paper Pro on firmware 3.28:
   "device_id": "…", "device_name": "…",
   "base": "<commit>",          // default base for every document
   "base_overrides": { "<doc-uuid>": "<commit>" },
-  "device_ref": "<commit>",    // last value pushed, for --force-with-lease
+  "device_ref": "<commit>",    // written right after each device-ref push
   "manifest": { "<path>": [size, mtime, ctime, inode, "<blob-id>"] },
-  "journal": null              // present only while an apply is in flight
+  "quarantine": ["<doc-uuid>"],  // malformed documents, reported every run
+  "journal": null              // { merge, snapshot } from before the push
+                               // attempt until the apply is reconciled
 }
 ```
 
@@ -159,12 +162,19 @@ anything unrecognised stay on the tablet, are reported, and are never
 copied or deleted by a merge.
 
 **Carry-forward.** A snapshot is built from the base tree, replacing
-only the paths this binary's allowlist covers; every other path in the
+only the paths the allowlist covers; every other path in the
 repository is carried forward unchanged. An older rmu, or one with a
 narrower allowlist, therefore cannot delete what it does not understand.
-rmu refuses to sync when `.rmu/hub.json`'s format or mirror-rules
-version is newer than it supports. `.rmu/*` is never changed by sync;
-only `init` and explicit upgrade commands write it.
+Deleting a document removes its whole `docs/<uuid>/` subtree,
+carried-forward paths included.
+
+**Rules version.** rmu always mirrors with the **repository's**
+mirror-rules version, never its own newest: otherwise a newer binary
+would commit a file kind that older binaries never apply, and the next
+snapshot of such a tablet would read it as deleted. rmu refuses to sync
+when `.rmu/hub.json`'s format or mirror-rules version is newer than it
+supports. `.rmu/*` is never changed by sync; only `init` and an explicit
+upgrade command (run once every computer has a new enough rmu) write it.
 
 ## Commands
 
@@ -172,7 +182,7 @@ only `init` and explicit upgrade commands write it.
 rmu hub init <path|url>          # create a bare origin (or initialise an empty one)
 rmu hub clone <origin> --name N  # attach the tablet; first sync
 rmu hub sync                     # the full cycle below
-rmu hub backup                   # steps 1–6 only: snapshot to the device ref, no tablet writes
+rmu hub backup                   # steps 1–7 only: snapshot to the device ref, no tablet writes
 rmu hub status                   # read-only: changes since base, ahead/behind, open conflict copies
 rmu hub sync --dry-run           # read-only: merge result and planned tablet writes
 rmu hub remote [set-url <url>]   # show/change the origin URL stored on the tablet
@@ -198,82 +208,118 @@ anything; their snapshot is best effort and they say so.
  1. preflight   git ls-remote origin (auth, reachability) and a local-cache
                 flock — before the tablet is touched
  2. guard       take the tablet lock; refuse if the tablet is paired with
-                the reMarkable cloud; check tablet state ↔ origin repo id;
-                reconcile any leftover journal (see "Restartability")
+                the reMarkable cloud; check tablet state ↔ origin repo id
  3. stop        arm the watchdog; systemctl stop xochitl
- 4. snapshot    stat every allowlisted file; download only files whose
-                stat signature moved; validate (fail closed); build the
-                snapshot tree with carry-forward
- 5. start       start xochitl (UI is back; network work happens with it up)
- 6. backup      commit the snapshot (parents: base, previous device ref);
-                push the device ref with --force-with-lease
- 7. fetch       fetch origin main; check ancestry
- 8. merge       pure three-way merge; deletion guard
- 9. push        push the merge to origin main (fast-forward only);
-                on rejection go back to 7, at most N times
-10. stop        arm the watchdog; systemctl stop xochitl
-11. apply       write the journal; verify each tablet file still matches
-                the snapshot; stage, then move into place; device sync
-12. record      update base, overrides, manifest; clear the journal
-13. start       systemctl reset-failed xochitl; start; disarm the watchdog
+ 4. reconcile   if a journal is left over, reconcile it now, while stopped
+                (see "Restartability")
+ 5. snapshot    stat every allowlisted file; download only files whose
+                stat signature moved; validate; build the snapshot tree
+                with carry-forward
+ 6. start       reset-failed + start xochitl (UI back; network work
+                happens with it up)
+ 7. backup      commit the snapshot (parents: base, previous device ref);
+                push the device ref; record device_ref on the tablet
+ 8. fetch       fetch origin main; check identity and ancestry
+ 9. merge       pure three-way merge; deletion guard
+10. journal     write { merge, snapshot } to the tablet state
+11. push        push the merge to origin main (fast-forward only); on
+                rejection go back to 8 (rewriting the journal), at most
+                N times
+12. stage       upload new and changed files into the staging directory
+13. stop        arm the watchdog; systemctl stop xochitl
+14. apply       re-read changed metadata; verify; tree checks against the
+                live tablet; move staged files into place; device sync
+15. record      update base, overrides, manifest; clear the journal
+16. start       reset-failed + start xochitl; disarm the watchdog
 ```
 
-The UI is down only for the snapshot (4) and the apply (11), not for
-network transfers. If the tablet is edited between 5 and 10, step 11's
-verification notices: those documents are not overwritten, keep their
-snapshot version as a base override, and are picked up by the next
-sync.
+The UI is down only for reconcile + snapshot (4–5) and apply (14), not
+for network transfers. If the tablet is edited between 6 and 13, step
+14 notices: those documents are not overwritten, keep their snapshot
+version as a base override, and are picked up by the next sync.
 
-### Snapshot validation (fail closed)
+Every `systemctl start xochitl` — steps 6 and 16, the watchdog, and
+error paths — is preceded by `systemctl reset-failed xochitl.service`,
+as `Client::restart_xochitl` does today.
 
-Step 4 aborts — nothing committed, nothing pushed — on any stat or read
-error, an unparsable `.metadata` or `.content`, a zero-length `.rm`, a
-document directory or page files without a `.metadata`, or a byte count
-that differs from the stat pass. The error names the path.
+### Snapshot validation
+
+- **I/O failures abort the run** — nothing committed, nothing pushed:
+  stat or read errors, and byte counts that differ from the stat pass.
+  The error names the path.
+- **A malformed document is quarantined**, not fatal: unparsable
+  `.metadata` or `.content`, a zero-length `.rm`, or files that
+  contradict each other. Its base version is carried forward (neither
+  deleted nor changed), it gets a base override, it is never overwritten,
+  and it is reported on every run and by `status` until it parses again.
+- **Files without a `.metadata`** under a UUID that has no document in
+  base are an orphan — typically the by-design leftovers of an
+  interrupted `rmu upload` or `rmu sync`. They are ignored and reported.
+  If base does have that document, it is quarantined; it must never read
+  as a deletion.
 
 Stat signatures are size, mtime, ctime and inode. Busybox `stat` has
 whole-second resolution, so a file whose mtime is within the second of
 the previous snapshot is re-read regardless (git's racy-entry rule).
 
-### Ancestry and identity checks (step 7)
+### Ancestry and identity checks (step 8)
 
 - The tablet's `repo_id` must equal origin's. Otherwise: wrong or
   replaced origin; stop.
-- Every base commit (default and overrides) must exist and be an
-  ancestor of origin `main`. Otherwise origin was rewound or replaced:
+- Every base commit (default, overrides, and a journaled merge being
+  reconciled) must exist and be an ancestor of origin `main`. Otherwise origin was rewound or replaced:
   stop with an explanation. Nothing is inferred automatically, because a
   rewound origin would otherwise read as "everything since was deleted".
   `rmu hub clone --reattach` is the deliberate recovery path; it treats
   the tablet like a fresh clone (below).
 
-### Deletion guard (step 8)
+### Deletion guard (step 9)
 
 The merge result is checked in both directions — documents it would
-delete from origin, and documents step 11 would delete from the tablet.
-Above a threshold (default: more than 10 documents and more than 10% of
-the library, configurable), or whenever the snapshot is empty and the
-base is not, the sync stops before pushing unless `--allow-deletions`
-is given. `--dry-run` shows what would be deleted.
+delete from origin, and documents step 14 would delete from the tablet.
+The sync stops before pushing, unless `--allow-deletions` is given, when
+the deletions exceed a threshold (default: more than 10 documents and
+more than 10% of the library, or more than 50 documents regardless;
+configurable), or whenever the snapshot is empty and the base is not.
+`--dry-run` shows what would be deleted.
 
-### Apply (step 11)
+Consent is recorded in the merge commit's trailer. Deletions that origin
+has already accepted (they are in theirs, not introduced by this merge)
+are applied to other tablets without asking again, so one deliberate
+clean-up does not require `--allow-deletions` on every tablet.
 
-- The **journal** written first records the target merge commit, the
-  snapshot commit, and per-document status.
-- Before replacing or deleting a tablet file, rmu verifies it still
-  matches the snapshot version (one batched `sha256sum` over just the
-  files being replaced). Mismatching documents are skipped and get a
-  base override.
+### Stage and apply (steps 12–14)
+
 - New and changed files are uploaded into a staging directory under
-  `/home/root/.local/share/rmu/` (same filesystem), then moved into
-  place in one batch. Within a document: pages and payload, then
-  `.content`, then `.metadata`.
+  `/home/root/.local/share/rmu/` (same filesystem) **before** xochitl is
+  stopped, so the outage covers only verification and moves.
+- While stopped, rmu re-reads every `.metadata` and `.content` whose
+  stat moved since the snapshot.
+- **Verify**: a document is applied only if its tablet files still match
+  the snapshot — compared as normalised JSON for `.metadata`/`.content`
+  (view-state fields ignored, so a document merely being read is not
+  skipped forever) and by one batched `sha256sum` for other files being
+  replaced. Mismatching documents are skipped and get a base override.
+- **Fork groups are one unit**: if the original is skipped, its conflict
+  copy is not written either.
+- **Tree checks on the live tablet**: using the re-read metadata, rmu
+  computes the tablet tree as it will be after the apply and runs the
+  merge's tree checks against it — no parent cycles, no folder deleted
+  that has gained children, no orphans. Documents that would violate them
+  are skipped with a base override.
+- Staged files are moved into place in one batch script. Within a
+  document: pages and payload, then `.content`, then `.metadata`.
 - A document deletion removes the whole `<uuid>`/`<uuid>.*` set,
   including thumbnails and `.local`. Otherwise apply never deletes files
   outside the mirror.
-- View-state fields are restored from the tablet's own snapshot values
-  (see "View state").
-- `sync` runs on the device before step 12. `write_remote_file` is
+- View-state fields of existing documents are overlaid with the values
+  re-read in the stopped window (see "View state").
+- `sync` runs on the device before step 15. `write_remote_file` is
   atomic but not durable on its own.
+- **Manifest**: files apply did not write keep their step-5 stat; written
+  files are stat'ed after the write. A manifest blob id this computer
+  does not have (blobs that exist only on the tablet, e.g. view-state
+  overlays) is treated as dirty and re-read next time.
 
 ### Watchdog and lock
 
@@ -288,6 +334,10 @@ is given. `--dry-run` shows what would be deleted.
   It is stale only if the boot id changed or the watchdog fired; anything
   else needs `--break-lock`. No time-based staleness (tablet clocks
   drift).
+- **A fired watchdog ends the run.** When it fires it leaves a marker;
+  rmu checks the marker before every device mutation and inside the
+  apply's move script itself, and aborts if it is present, so a slow but
+  live run can never overlap a second run that considered the lock stale.
 - Other mutating rmu commands (`upload`, `mv`, `rm`, `rename`, `sync`,
   `restart`) refuse while the hub lock is held, and `rmu sync` warns
   when its target tablet is attached to a hub (fresh-UUID copies would
@@ -295,23 +345,48 @@ is given. `--dry-run` shows what would be deleted.
 
 ### Restartability
 
-- **Leftover journal** (crash during or after apply): before
-  snapshotting, each journaled document is checked. If every file equals
-  either its snapshot version or its merge version, the document counts
-  as applied: its base becomes the merge commit. Otherwise its base
-  becomes the snapshot commit (override). The journal is then cleared.
-  This prevents both "changed on both" forks of half-applied documents
-  and spurious forks when another tablet pushed in between.
-- **Lost push acknowledgement or crash before apply**: if the new
-  snapshot tree equals the device ref's tree on the same base, that
-  commit is reused. If it is already an ancestor of origin `main`, the
-  merge is skipped and origin `main` is applied directly.
+The journal `{ merge, snapshot }` is written before **every** push
+attempt (step 10), so every window in which origin may know about a
+merge the tablet has not fully applied is covered: a crash before the
+push, a lost push acknowledgement, a crash before or during the apply.
+
+Reconciliation (step 4) runs **while xochitl is stopped**, because it
+may write files:
+
+- If the journaled merge is **not** an ancestor of origin `main`, the
+  push never landed. The journal is dropped; the tablet's bases are
+  unchanged, and its edits are picked up by this run's snapshot.
+- Otherwise, the merge is part of origin. For each document whose merge
+  version differs from its snapshot version, compared as normalised JSON
+  (view-state fields ignored):
+  - every file is at the merge version → base = merge;
+  - every file is at its snapshot or merge version (the user has not
+    touched it) → finish applying it (verify, move, overlay view state),
+    then base = merge;
+  - anything else → base override = snapshot.
+
+  Documents whose merge and snapshot versions agree take base = merge.
+  A document is never given base = merge unless its files are at the
+  merge version.
+- The journal is then cleared and the run continues with the snapshot.
+
+This is what keeps a half-finished run from reverting other tablets'
+edits ("base = merge" for files still at the snapshot version would
+read as the tablet undoing the merge) and from forking or resurrecting
+documents that another tablet changed or deleted in the meantime.
+
+Further:
+
 - **Deterministic forks**: a fork's UUID is UUIDv5 over (original
-  document UUID, tree id of the forked version). Recomputing a merge
-  recreates the identical fork, which merges as an identical add —
-  never a duplicate.
-- **Identical changes** on both sides merge to one, so a run that died
-  after pushing converges.
+  document UUID, tree id of the forked version normalised without view
+  state). Recomputing a merge recreates the identical fork, which merges
+  as an identical add — never a duplicate.
+- **Identical changes** on both sides merge to one.
+- **Device ref bookkeeping**: `device_ref` is written to the tablet
+  state immediately after each device-ref push (in `sync` and `backup`).
+  If a later push fails its lease, a remote head that descends from the
+  recorded value is our own lost update and is accepted; anything else
+  means another tablet uses this device id, and the run stops.
 
 ## Merge rules
 
@@ -360,10 +435,7 @@ reMarkable cloud account, and the case after lost tablet state.
 - **`metadata`** — three-way merge per field. Concurrent different
   values for one field (renamed differently on two tablets) take
   origin's value, with a note. Unknown fields are preserved.
-  `lastModified` becomes the maximum of both. **Trash vs edit**: if one
-  side moved the document to the trash (`parent: "trash"`) and the other
-  changed fork-class content, the document stays out of the trash, with
-  a note — edits beat deletion, including soft deletion.
+  `lastModified` becomes the maximum of both.
 - **Fork class** — phase 1: if fork-class content changed on both sides
   differently, the document **forks**. Origin keeps the UUID; the
   tablet's version becomes a new document (deterministic UUID, above)
@@ -380,13 +452,25 @@ reMarkable cloud account, and the case after lost tablet state.
 
 ### Tree-level rules, after per-document merging
 
-- **Orphans**: a present item whose parent is missing gets its whole
-  ancestor chain resurrected from the newest version in history; with no
-  such version it is moved to the root, with a note. A resurrected folder
-  that was in the trash comes back to its last non-trash location.
-- **Cycles**: folder moves on two tablets that would form a cycle —
-  the tablet's move is reverted, with a note.
-- **Trash** is ordinary metadata; emptying the trash is deletion.
+Applied in this order:
+
+1. **Trash vs edit**: edits beat deletion, including soft deletion. If
+   one side moved a document — or any of its ancestor folders — to the
+   trash (`parent: "trash"`) and the other side changed the document's
+   fork-class content, the nearest trashed item on its path (the
+   document, or the trashed folder) is restored to its pre-trash parent,
+   with a note.
+2. **Orphans**: a present item whose parent is missing gets its whole
+   ancestor chain resurrected from the newest version in history; with
+   no such version it is moved to the root, with a note. A resurrected
+   folder that was in the trash comes back to its last non-trash
+   location.
+3. **Cycles**: while the folder tree has a cycle, a folder on the cycle
+   that the tablet moved takes origin's parent instead, with a note.
+   This terminates because origin's tree is acyclic. A resurrected folder
+   that is still on a cycle is moved to the root.
+
+Trash is ordinary metadata; emptying the trash is deletion.
 
 ### Per-document format gating
 
@@ -452,8 +536,9 @@ When fork-class content changed on both sides:
 - **Empty origin**: the tablet's snapshot becomes the first commit.
 - **Non-empty origin**: per-document base inference. For each tablet
   document, if its normalised version matches a version of that document
-  anywhere in origin's history, that commit is its base; the tablet then
-  fast-forwards instead of forking. Otherwise its base is empty (rules
+  in a commit that is an ancestor of origin `main` (never a device ref),
+  the newest such commit is its base; the tablet then fast-forwards
+  instead of forking. Otherwise its base is empty (rules
   for "new on both"). Documents only on the tablet are added; documents
   only on origin are applied to the tablet.
 - `--reattach` runs the same inference for a tablet whose state was lost
@@ -463,7 +548,7 @@ When fork-class content changed on both sides:
 
 View state is **device-local**: it never counts as a change, never forks,
 never resurrects a deleted document, and on apply each tablet keeps its
-own values for existing documents. Documents new to a tablet get the
+own values for existing documents (re-read while xochitl is stopped). Documents new to a tablet get the
 values stored in origin, minus model-specific zoom fields (device
 pixels, which differ between models). "Resume where I left off on the
 other tablet" is a possible later feature; it would need comparable
@@ -508,7 +593,13 @@ Read-only (answered by the survey PR, before the merge engine):
    `/proc/sys/kernel/random/boot_id` present?
 3. The complete set of `.content` and `.metadata` fields on current
    firmware, to finalise the view-state list; `formatVersion` and `.rm`
-   header versions present.
+   header versions present. In particular: does opening or scrolling a
+   document touch `.metadata` `lastModified`, and are any `.content`
+   fields derived per device (e.g. `sizeInBytes`)? Either would defeat
+   view-state normalisation (forks on first clone, resurrections after
+   deletes) and must be handled in the list. Answering this needs a
+   before/after comparison around opening a document on the tablet, which
+   the owner can do by hand while rmu only reads.
 4. `cPages.uuids` and `.rm` author indices: what one device writes, so
    phase 2 can decide on renumbering. (Two-device behaviour needs a
    second tablet.)
@@ -525,13 +616,21 @@ Needing writes (answered during device validation, with go-ahead):
 ## Decisions taken (owner may revise)
 
 - The tablet that syncs second after a same-page conflict gets origin's
-  version under the original name and its own as a conflict copy;
-  `status` lists open conflict copies.
+  version under the original name and its own as a conflict copy. Each
+  fork is recorded in the merge commit's trailer (`Rmu-Fork: <original>
+  <copy>`); `status` lists conflict copies that still exist under their
+  generated name. Deleting or renaming the copy closes it.
 - View state is per tablet.
-- An edit pulls a document out of the trash.
+- An edit pulls a document — or its trashed ancestor folder — out of the
+  trash.
 - Phase 1 is validated on the Paper Pro; other models are handled by
   per-document format gating but untested until hardware is available.
+  `clone` warns when a tablet of a different model attaches to a repo
+  that has only seen one model.
 - The origin must be private and self-hosted.
+
+The trash and view-state decisions are encoded by the merge engine, so
+the owner confirms them before that PR starts.
 
 ## Implementation plan
 
