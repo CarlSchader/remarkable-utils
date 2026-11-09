@@ -859,3 +859,115 @@ fn restage_contents_and_removals() {
         .into()
     );
 }
+
+#[test]
+fn step_14_counts_moved_new_gone_and_racy_files() {
+    let second = 1_000_000_000i64;
+    let stat = |mtime_ns: i64, inode: u64| StatSignature {
+        size: 1,
+        mtime_ns,
+        ctime_ns: mtime_ns,
+        inode,
+    };
+    let path = |name: &str| XochitlPath::new(name).unwrap();
+    let read: BTreeMap<XochitlPath, StatSignature> = [
+        (path("fine"), stat(5 * second + 7, 1)),
+        (path("coarse-old"), stat(4 * second, 2)),
+        // A coarse mtime in the second of the step-6 start: xochitl may
+        // have changed it within that second without moving the stat.
+        (path("coarse-racy"), stat(10 * second, 3)),
+        (path("changed"), stat(5 * second + 1, 4)),
+        (path("gone"), stat(5 * second + 2, 5)),
+    ]
+    .into();
+    let now: BTreeMap<XochitlPath, StatSignature> = [
+        (path("fine"), stat(5 * second + 7, 1)),
+        (path("coarse-old"), stat(4 * second, 2)),
+        (path("coarse-racy"), stat(10 * second, 3)),
+        (path("changed"), stat(6 * second + 1, 4)),
+        (path("new"), stat(6 * second + 2, 6)),
+    ]
+    .into();
+    let started_at = 10 * second + 500_000_000;
+    assert_eq!(
+        moved_since_read(&read, &now, started_at),
+        [
+            path("changed"),
+            path("coarse-racy"),
+            path("gone"),
+            path("new")
+        ]
+        .into()
+    );
+    // Started a second later, the coarse entry is settled too.
+    assert_eq!(
+        moved_since_read(&read, &now, 11 * second),
+        [path("changed"), path("gone"), path("new")].into()
+    );
+}
+
+#[test]
+fn reconciliation_finishes_mixed_documents_the_live_tree_allows() {
+    let mut blobs = Blobs::default();
+    let files = |version: &DocVersion| -> BTreeMap<DocFile, Oid> {
+        version
+            .files
+            .iter()
+            .map(|(file, entry)| (file.clone(), entry.id.clone()))
+            .collect()
+    };
+    // 1: the merge moves it into folder 4, which the tablet deleted.
+    // 2: a folder the merge deletes; the tablet put document 3 into it.
+    // 5: a plain write. 6: still at the snapshot (not finished).
+    let one_merged = notebook(&mut blobs, "One", doc(4).as_str(), &[(1, 11)]);
+    let one_now = notebook(&mut blobs, "One", "", &[(1, 10)]);
+    let five_merged = notebook(&mut blobs, "Five", "", &[(1, 51)]);
+    let five_now = notebook(&mut blobs, "Five", "", &[(1, 50)]);
+    let merge = RepoTree {
+        docs: [(doc(1), one_merged), (doc(5), five_merged)].into(),
+        extra: Default::default(),
+    };
+    let tablet: BTreeMap<DocId, BTreeMap<DocFile, Oid>> =
+        [(doc(1), files(&one_now)), (doc(5), files(&five_now))].into();
+    let verdicts: BTreeMap<DocId, Verdict> = [
+        (doc(1), Verdict::Mixed),
+        (doc(2), Verdict::Mixed),
+        (doc(5), Verdict::Mixed),
+        (doc(6), Verdict::AtSnapshot),
+    ]
+    .into();
+    let current: BTreeMap<DocId, TreeItem> = [
+        (doc(1), item("", false)),
+        (doc(2), item("", true)),
+        (doc(3), item(doc(2).as_str(), false)),
+        (doc(5), item("", false)),
+    ]
+    .into();
+    let merged: BTreeMap<DocId, TreeItem> = [
+        (doc(1), item(doc(4).as_str(), false)),
+        (doc(5), item("", false)),
+    ]
+    .into();
+    let run = |forks: &[(DocId, DocId)]| {
+        let (planned, skipped) = finish(&Finish {
+            rules: rules(),
+            verdicts: &verdicts,
+            merge: &merge,
+            tablet: &tablet,
+            local: &BTreeMap::new(),
+            current: &current,
+            merged: &merged,
+            forks,
+            json: &blobs.0,
+        })
+        .unwrap();
+        let planned: Vec<DocId> = planned.into_iter().map(|entry| entry.doc).collect();
+        (planned, skipped)
+    };
+    assert_eq!(run(&[]), (vec![doc(5)], [doc(1), doc(2)].into()));
+    // A fork partner of a skipped document is skipped with it.
+    assert_eq!(
+        run(&[(doc(1), doc(5))]),
+        (Vec::new(), [doc(1), doc(2), doc(5)].into())
+    );
+}

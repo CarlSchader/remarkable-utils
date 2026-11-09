@@ -876,6 +876,11 @@ fn reference(template: &World) -> Reference {
     assert_eq!(count(OpKind::StartXochitl), 2, "{ops:?}");
     assert_eq!(count(OpKind::StopXochitl), 2, "{ops:?}");
     assert_eq!(report.quarantined.len(), 3, "{report:?}");
+    let again = world.sync(0).unwrap();
+    assert!(
+        again.update == MainUpdate::UpToDate && again.applied.is_empty(),
+        "{again:?}"
+    );
     Reference {
         ops,
         mutations,
@@ -920,6 +925,13 @@ fn recover(world: &World, reference: &Reference, what: &str) {
         }
         Err(error) => panic!("{what}: the next run failed: {error}"),
     }
+    // The recovering run left the tablet in step with origin (it
+    // snapshotted what reconciliation wrote, not the read before it).
+    let quiet = world.sync(0).unwrap();
+    assert!(
+        quiet.update == MainUpdate::UpToDate && quiet.applied.is_empty(),
+        "{what}: the run after the recovery was not quiet: {quiet:?}"
+    );
     assert_eq!(
         settle(world),
         reference.conflicts,
@@ -1615,4 +1627,816 @@ fn a_folder_trashed_on_origin_spares_a_notebook_written_in_during_the_sync() {
     assert_eq!(notes["parent"], lib.folder.as_str());
     let folder = world.device(1).metadata(&lib.folder).unwrap();
     assert_eq!(folder["parent"], "");
+}
+
+// ---- regressions found in review ------------------------------------------------
+
+/// A run staged everything (complete sentinel) for a merge bringing B's
+/// rename of the notes, then died at its apply (nothing moved). The user
+/// then inks the notes on A. B's rename must still arrive: the notes'
+/// base must not become the merge while their files are at the snapshot.
+#[test]
+fn an_edit_after_a_staged_but_unapplied_run_keeps_the_other_change() {
+    let (base, lib) = two_tablets();
+    base.rename(1, &lib.notes, "Notes (B)");
+    base.sync(1).unwrap();
+    let apply = op_index(&base, 0, OpKind::Apply, 1, |w| {
+        w.sync(0).unwrap();
+    });
+    let world = base.duplicate();
+    world.tablet(0).inject(Fault::DisconnectAtOp(apply));
+    assert!(world.sync(0).is_err());
+    world.tablet(0).reconnect();
+    world.tablet(0).fire_watchdog();
+    let page = world.pages(0, &lib.notes)[0].clone();
+    world.ink(0, &lib.notes, &page);
+    world.sync(0).unwrap();
+    world.converge();
+    assert_eq!(
+        world.device(0).metadata(&lib.notes).unwrap()["visibleName"],
+        "Notes (B)"
+    );
+    assert!(world.conflicts().is_empty(), "{:?}", world.conflicts());
+}
+
+/// After a reattach that leaves an orphan origin has (files without a
+/// `.metadata`, left alone), a sync with no changes pushes nothing: the
+/// orphan keeps its previous base and does not count against "already
+/// agrees with origin".
+#[test]
+fn an_orphan_origin_has_does_not_push_on_every_sync() {
+    let (world, lib) = two_tablets();
+    let page = world.pages(0, &lib.sketch)[0].clone();
+    world.ink(0, &lib.sketch, &page);
+    world.lose_metadata(0, &lib.sketch);
+    std::fs::remove_dir_all(world.device(0).tablet.state_dir()).unwrap();
+    world.reattach(0).unwrap();
+    let first = world.sync(0).unwrap();
+    let second = world.sync(0).unwrap();
+    let third = world.sync(1).unwrap();
+    let fourth = world.sync(0).unwrap();
+    assert!(
+        second.update == MainUpdate::UpToDate && fourth.update == MainUpdate::UpToDate,
+        "{:?} / {:?} / {:?} / {:?}",
+        first.update,
+        second.update,
+        third.update,
+        fourth.update
+    );
+}
+
+/// The shared-cloud-library clone of B (base inference, a fork), crashed
+/// at every operation and recovered.
+fn clone_template() -> World {
+    let world = World::new(2);
+    let lib = Library::create(&world, 0);
+    let a = world.device(0).docs();
+    a.iter().for_each(|(doc, files)| {
+        files.iter().for_each(|(file, bytes)| {
+            world
+                .device(1)
+                .tablet
+                .write_file(&file.xochitl_path(doc), bytes)
+                .unwrap();
+        });
+    });
+    world.read(1, &lib.notes);
+    let page = world.pages(1, &lib.diary)[0].clone();
+    world.ink(1, &lib.diary, &page);
+    let own = world.create(1, Kind::Notebook { pages: 1 }, "B only", "");
+    let _ = own;
+    world.clone_tablet(0).unwrap();
+    // A moves on meanwhile.
+    world.rename(0, &lib.paper, "Paper (A)");
+    world.sync(0).unwrap();
+    world
+}
+
+fn recover_clone(world: &World, what: &str) {
+    let tablet = world.tablet(1);
+    tablet.reconnect();
+    let armed = tablet.watchdog_armed().is_some();
+    assert!(
+        tablet.is_running() || armed,
+        "{what}: xochitl down, no watchdog"
+    );
+    if armed {
+        tablet.fire_watchdog();
+    }
+    assert!(tablet.is_running(), "{what}: xochitl did not come back");
+    let attached = world.device(1).state().is_some();
+    let run = |break_lock: bool| -> libremarkable_utils::error::Result<()> {
+        let options = HubOptions {
+            break_lock,
+            ..world.options.clone()
+        };
+        let hub = world.hub_with(1, options);
+        if attached {
+            hub.sync(world.tablet(1)).map(|_| ())
+        } else {
+            let name = libremarkable_utils::hub::model::DeviceName::new("Tablet B").unwrap();
+            hub.clone_tablet(world.tablet(1), &world.origin, Some(name), false)
+                .map(|_| ())
+        }
+    };
+    match run(false) {
+        Ok(()) => {}
+        Err(error) if is_locked(&error) => {
+            assert!(!armed, "{what}: a lock with a fired watchdog must be stale");
+            run(true).unwrap_or_else(|e| panic!("{what}: after --break-lock: {e}"));
+        }
+        Err(error) => panic!("{what}: recovery failed (attached={attached}): {error}"),
+    }
+}
+
+#[test]
+fn crash_at_every_op_of_a_clone() {
+    let template = clone_template();
+    let probe = template.duplicate();
+    let before = probe.tablet(1).ops().len();
+    probe.clone_tablet(1).unwrap();
+    let ops = probe.tablet(1).ops()[before..].to_vec();
+    let mutations = ops.iter().filter(|op| op.is_mutating()).count();
+    probe.converge();
+    let reference = probe.conflicts();
+    assert_eq!(reference.len(), 1, "{reference:?}");
+    (1..=ops.len()).for_each(|k| {
+        let world = template.duplicate();
+        world.tablet(1).inject(Fault::DisconnectAtOp(k));
+        let result = world.clone_tablet(1);
+        world::no_contract_violation(&result);
+        let what = format!("clone: disconnect at op {k} ({:?})", ops[k - 1]);
+        recover_clone(&world, &what);
+        world.converge();
+        assert_eq!(world.conflicts(), reference, "{what}");
+    });
+    (1..=mutations).for_each(|m| {
+        let world = template.duplicate();
+        world.tablet(1).inject(Fault::LoseAck(m));
+        let result = world.clone_tablet(1);
+        world::no_contract_violation(&result);
+        let what = format!("clone: lost ack of mutation {m}");
+        recover_clone(&world, &what);
+        world.converge();
+        assert_eq!(world.conflicts(), reference, "{what}");
+    });
+}
+
+/// B deletes an empty folder; while A's sync has the UI up, A's user
+/// writes a new notebook into that folder. Applying the deletion would
+/// orphan the notebook on the live tablet: step 14 must skip it.
+#[test]
+fn a_folder_deleted_on_origin_that_gained_a_child_during_the_sync_is_kept() {
+    let (base, lib) = two_tablets();
+    let boxf = base.create(0, Kind::Folder, "Box", "");
+    base.converge();
+    base.delete(1, &boxf);
+    base.sync(1).unwrap();
+    let stage = op_index(&base, 0, OpKind::Stage, 1, |w| {
+        w.sync(0).unwrap();
+    });
+    let world = base.duplicate();
+    let child = world::uuid(9_999);
+    let page = world::page_id(9_998);
+    world.inks.lock().unwrap().expect("box-ink", &child);
+    let template = world
+        .device(0)
+        .tablet
+        .read_file(&format!("{}.content", lib.sketch))
+        .unwrap();
+    let mut content: serde_json::Value = serde_json::from_slice(&template).unwrap();
+    content["cPages"]["pages"] = serde_json::json!([{
+        "id": page,
+        "idx": { "timestamp": "1:2", "value": "ba" },
+        "template": { "timestamp": "1:3", "value": "Blank" },
+    }]);
+    content["pageCount"] = serde_json::json!(1);
+    let metadata = world::metadata("In the box", boxf.as_str(), "DocumentType");
+    let child_c = child.clone();
+    world.tablet(0).inject(Fault::EditBefore(
+        stage + 1,
+        Box::new(move |dir: &Path| {
+            std::fs::write(
+                dir.join(format!("{child_c}.metadata")),
+                serde_json::to_vec_pretty(&metadata).unwrap(),
+            )
+            .unwrap();
+            std::fs::write(
+                dir.join(format!("{child_c}.content")),
+                serde_json::to_vec_pretty(&content).unwrap(),
+            )
+            .unwrap();
+            std::fs::create_dir_all(dir.join(child_c.as_str())).unwrap();
+            std::fs::write(
+                dir.join(format!("{child_c}/{page}.rm")),
+                b"reMarkable .lines file, version=6          \nstroke box-ink\n",
+            )
+            .unwrap();
+        }),
+    ));
+    let report = world.sync(0).unwrap();
+    assert!(report.skipped.contains(&boxf), "{report:?}");
+    assert!(
+        world.device(0).metadata(&boxf).is_some(),
+        "the folder holding the new notebook was deleted under it"
+    );
+    world.converge();
+}
+
+/// The crash matrix again, but after every crash A's user writes in a
+/// document only A changed (and in B's new notebook, if A has it yet)
+/// before the next run: a base that is too old forks A's own change, a
+/// base that is too new reverts B's.
+#[test]
+fn crash_before_every_operation_then_edit() {
+    let template = crash_template();
+    let probe = template.duplicate();
+    let before = probe.tablet(0).ops().len();
+    probe.sync(0).unwrap();
+    let ops = probe.tablet(0).ops()[before..].to_vec();
+    let edit = |world: &World| {
+        let device = world.device(0);
+        let sketch = device
+            .names()
+            .into_iter()
+            .find(|(_, name)| name == "Sketch")
+            .map(|(doc, _)| doc)
+            .expect("the sketch");
+        let page = world.pages(0, &sketch)[0].clone();
+        world.ink(0, &sketch, &page);
+        device
+            .names()
+            .into_iter()
+            .filter(|(_, name)| name == "From B")
+            .for_each(|(doc, _)| {
+                let page = world.pages(0, &doc)[0].clone();
+                world.ink(0, &doc, &page);
+            });
+    };
+    // Clean: sync, edit, settle.
+    edit(&probe);
+    let reference = settle(&probe);
+    (1..=ops.len()).for_each(|k| {
+        let world = template.duplicate();
+        world.tablet(0).inject(Fault::DisconnectAtOp(k));
+        let _ = world.sync(0);
+        let tablet = world.tablet(0);
+        tablet.reconnect();
+        let armed = tablet.watchdog_armed().is_some();
+        if armed {
+            tablet.fire_watchdog();
+        }
+        edit(&world);
+        let what = format!("disconnect at op {k} ({:?}), then an edit", ops[k - 1]);
+        match world.sync(0) {
+            Ok(_) => {}
+            Err(error) if is_locked(&error) => {
+                world
+                    .sync_with(
+                        0,
+                        HubOptions {
+                            break_lock: true,
+                            ..world.options.clone()
+                        },
+                    )
+                    .unwrap_or_else(|e| panic!("{what}: {e}"));
+            }
+            Err(error) => panic!("{what}: {error}"),
+        }
+        assert_eq!(settle(&world), reference, "{what}");
+    });
+}
+
+/// A run that fails while the connection still works brings xochitl back
+/// itself (the error path), without waiting for the watchdog.
+#[test]
+fn a_failed_run_restarts_xochitl_itself() {
+    let template = crash_template();
+    let clean = template.duplicate();
+    let before = clean.tablet(0).ops().len();
+    clean.sync(0).unwrap();
+    let ops = clean.tablet(0).ops()[before..].to_vec();
+    let failures: Vec<String> = (1..=ops.len())
+        .filter_map(|k| {
+            let world = template.duplicate();
+            world.tablet(0).inject(Fault::FailOp(k));
+            let result = world.sync(0);
+            (result.is_err() && !world.tablet(0).is_running())
+                .then(|| format!("failure of op {k} ({:?})", ops[k - 1]))
+        })
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "xochitl left to the watchdog: {failures:#?}"
+    );
+}
+
+/// A's apply of merge M is killed half-way; then origin is rewound to
+/// just before M (an admin reset). A's journal names a merge origin no
+/// longer has, but its staging sentinel proves M had landed: dropping the
+/// journal as "never landed" reads the half-applied files as A's edits.
+#[test]
+fn a_rewind_after_the_journaled_merge_landed() {
+    let template = crash_template();
+    let repo = template.git.open(Path::new(&template.origin)).unwrap();
+    let before = repo.rev_parse("refs/heads/main").unwrap().unwrap();
+    let (kill, finished) = kill_leaving_a_half_applied_document(&template);
+    let world = crashed_by(&template, Fault::KillApplyAfter(kill));
+    let repo = world.git.open(Path::new(&world.origin)).unwrap();
+    let after = repo.rev_parse("refs/heads/main").unwrap().unwrap();
+    assert_ne!(before, after);
+    repo.update_ref("refs/heads/main", &before, None).unwrap();
+    // Without the staging evidence: Ok, `reconciled.dropped == true`, and
+    // the half-applied notes fork a second time.
+    let result = world.sync(0);
+    assert!(
+        matches!(&result, Err(error) if is_cycle(error, |e| matches!(e, CycleError::OriginRewound { .. }))),
+        "half-applied {finished:?}; after the rewind: {:?}",
+        result
+            .as_ref()
+            .map(|r| (&r.update, &r.reconciled, &r.forks))
+            .map_err(|e| e.to_string())
+    );
+}
+
+// ---- base inference, device refs, pins ----------------------------------------------
+
+/// Copy tablet 0's documents onto tablet 1 (one cloud library, two
+/// tablets).
+fn share(world: &World) {
+    world.device(0).docs().iter().for_each(|(doc, files)| {
+        files.iter().for_each(|(file, bytes)| {
+            world
+                .device(1)
+                .tablet
+                .write_file(&file.xochitl_path(doc), bytes)
+                .unwrap();
+        });
+    });
+}
+
+/// Base inference matches with the merge's own rules: B merely opened
+/// the PDF (a first-open materialisation), so its clone fast-forwards it
+/// to A's inked version instead of forking.
+#[test]
+fn a_shared_library_clone_of_an_opened_pdf_does_not_fork() {
+    let world = World::new(2);
+    let paper = world.create(0, Kind::Pdf, "Paper", "");
+    share(&world);
+    world.open_pdf(1, &paper, 3);
+    world.clone_tablet(0).unwrap();
+    world.open_pdf(0, &paper, 3);
+    let page = world.pages(0, &paper)[0].clone();
+    world.ink(0, &paper, &page);
+    world.sync(0).unwrap();
+    let report = world.clone_tablet(1).unwrap();
+    assert!(report.inferred.contains_key(&paper), "{report:?}");
+    world.converge();
+    assert!(world.conflicts().is_empty(), "{:?}", world.conflicts());
+}
+
+#[test]
+fn reattach_after_opening_a_pdf_does_not_fork() {
+    let world = World::new(2);
+    let paper = world.create(0, Kind::Pdf, "Paper", "");
+    world.clone_tablet(0).unwrap();
+    world.clone_tablet(1).unwrap();
+    world.converge();
+    world.open_pdf(1, &paper, 3);
+    std::fs::remove_dir_all(world.device(1).tablet.state_dir()).unwrap();
+    world.open_pdf(0, &paper, 3);
+    let page = world.pages(0, &paper)[0].clone();
+    world.ink(0, &paper, &page);
+    world.sync(0).unwrap();
+    world.reattach(1).unwrap();
+    world.converge();
+    assert!(world.conflicts().is_empty(), "{:?}", world.conflicts());
+}
+
+/// Two tablets with two notebooks each, in step.
+fn two_notebooks() -> (
+    World,
+    libremarkable_utils::hub::model::DocId,
+    libremarkable_utils::hub::model::DocId,
+) {
+    let world = World::new(2);
+    let notes = world.create(0, Kind::Notebook { pages: 1 }, "Notes", "");
+    let other = world.create(0, Kind::Notebook { pages: 1 }, "Other", "");
+    world.clone_tablet(0).unwrap();
+    world.clone_tablet(1).unwrap();
+    world.converge();
+    (world, notes, other)
+}
+
+fn origin_main(world: &World) -> libremarkable_utils::git::Oid {
+    world
+        .git
+        .open(Path::new(&world.origin))
+        .unwrap()
+        .rev_parse("refs/heads/main")
+        .unwrap()
+        .unwrap()
+}
+
+/// Origin inked the notes after A's version: inference finds A's version
+/// further back and the reattach fast-forwards (without inference, the
+/// empty base forks it).
+#[test]
+fn reattach_after_origin_inked_does_not_fork() {
+    let (world, notes, _) = two_notebooks();
+    let page = world.pages(1, &notes)[0].clone();
+    world.ink(1, &notes, &page);
+    world.sync(1).unwrap();
+    std::fs::remove_dir_all(world.device(0).tablet.state_dir()).unwrap();
+    let report = world.reattach(0).unwrap();
+    assert!(report.forks.is_empty(), "{report:?}");
+    assert_ne!(report.inferred.get(&notes), Some(&report.base));
+    world.converge();
+    assert!(world.conflicts().is_empty());
+}
+
+/// Origin deleted a document after A's version: it stays deleted (without
+/// inference, the reattached tablet brings it back).
+#[test]
+fn reattach_after_origin_deleted_keeps_it_deleted() {
+    let (world, _, other) = two_notebooks();
+    world.delete(1, &other);
+    world.sync(1).unwrap();
+    std::fs::remove_dir_all(world.device(0).tablet.state_dir()).unwrap();
+    world.reattach(0).unwrap();
+    world.converge();
+    assert!(!world.origin_docs().contains_key(&other));
+}
+
+/// Of the commits holding the tablet's version, the newest is the base.
+#[test]
+fn inference_takes_the_newest_matching_commit() {
+    let (world, notes, other) = two_notebooks();
+    let page = world.pages(1, &other)[0].clone();
+    world.ink(1, &other, &page);
+    world.sync(1).unwrap();
+    let main = origin_main(&world);
+    std::fs::remove_dir_all(world.device(0).tablet.state_dir()).unwrap();
+    let report = world.reattach(0).unwrap();
+    assert_eq!(report.inferred.get(&notes), Some(&main), "{report:?}");
+}
+
+/// The device-ref push is a compare-and-swap that could rewind: every
+/// snapshot takes the ref's head as a parent, so earlier backups stay on
+/// it.
+#[test]
+fn the_device_ref_keeps_every_snapshot() {
+    let (world, notes, _) = two_notebooks();
+    let page = world.pages(0, &notes)[0].clone();
+    world.ink(0, &notes, &page);
+    let first = world.backup(0).unwrap().snapshot;
+    world.ink(0, &notes, &page);
+    world.backup(0).unwrap();
+    world.sync(0).unwrap();
+    let repo = world.git.open(Path::new(&world.origin)).unwrap();
+    let id = world.device(0).state().unwrap().device_id;
+    let head = repo
+        .rev_parse(&format!("refs/rmu/devices/{id}"))
+        .unwrap()
+        .unwrap();
+    assert!(repo.is_ancestor(&first, &head).unwrap());
+}
+
+/// A base override origin's `main` does not contain stops the run like a
+/// rewound default base does.
+#[test]
+fn a_rewind_is_detected_through_a_base_override() {
+    let (world, notes, _) = two_notebooks();
+    let page = world.pages(0, &notes)[0].clone();
+    world.ink(0, &notes, &page);
+    // A snapshot only the device ref holds: no ancestor of `main`.
+    let snapshot = world.backup(0).unwrap().snapshot;
+    let device = world.device(0);
+    let mut state = device.state().unwrap();
+    state.base_overrides.insert(notes.clone(), Some(snapshot));
+    device.set_state(&state);
+    let main = origin_main(&world);
+    let result = world.sync(0);
+    assert!(
+        matches!(&result, Err(e) if is_cycle(e, |e| matches!(e, CycleError::OriginRewound { .. }))),
+        "{result:?}"
+    );
+    assert_eq!(origin_main(&world), main);
+    world.check_idle(0);
+}
+
+/// `.rmu/hub.json` changing on origin mid-run (the snapshot was
+/// classified under the old rules) stops the run before it pushes.
+#[test]
+fn the_repo_config_is_pinned_for_the_run() {
+    let (base, notes, _) = two_notebooks();
+    let page = base.pages(0, &notes)[0].clone();
+    base.ink(0, &notes, &page);
+    let stop = op_index(&base, 0, OpKind::StopXochitl, 1, |w| {
+        w.sync(0).unwrap();
+    });
+    let world = base.duplicate();
+    let (git, origin) = (world.git.clone(), world.origin.clone());
+    let repo_id = world.device(0).state().unwrap().repo_id;
+    let mut upgraded = libremarkable_utils::hub::model::RepoConfig::new(repo_id);
+    upgraded
+        .extra
+        .insert("upgradedBy".to_string(), serde_json::json!("another tool"));
+    let upgraded = upgraded.to_json().into_bytes();
+    world.tablet(0).inject(Fault::EditBefore(
+        stop,
+        Box::new(move |_: &Path| {
+            world::commit_repo_config(&git, &origin, &upgraded);
+        }),
+    ));
+    let result = world.sync(0);
+    assert!(
+        matches!(&result, Err(e) if is_cycle(e, |e| matches!(e, CycleError::RepoConfigChanged))),
+        "{result:?}"
+    );
+    // Only the upgrade landed on `main`.
+    let repo = world.git.open(Path::new(&world.origin)).unwrap();
+    let main = origin_main(&world);
+    let commit = repo.cat_file().unwrap().read(&main).unwrap().unwrap().1;
+    assert!(String::from_utf8_lossy(&commit).contains("edit .rmu/hub.json"));
+    world.check_idle(0);
+}
+
+#[test]
+fn a_tablet_with_changes_on_an_unmoved_origin_fast_forwards() {
+    let (world, notes, _) = two_notebooks();
+    let page = world.pages(0, &notes)[0].clone();
+    world.ink(0, &notes, &page);
+    let report = world.sync(0).unwrap();
+    assert_eq!(
+        report.update,
+        MainUpdate::FastForward(report.snapshot.clone()),
+        "{report:?}"
+    );
+    assert_eq!(origin_main(&world), report.snapshot);
+}
+
+#[test]
+fn a_pull_only_sync_pushes_no_merge_commit() {
+    let (world, notes, _) = two_notebooks();
+    let page = world.pages(1, &notes)[0].clone();
+    world.ink(1, &notes, &page);
+    world.sync(1).unwrap();
+    let main = origin_main(&world);
+    let report = world.sync(0).unwrap();
+    assert_eq!(report.update, MainUpdate::Pulled, "{report:?}");
+    assert_eq!(report.base, main);
+    assert_eq!(report.applied, vec![notes.clone()]);
+    assert_eq!(origin_main(&world), main);
+    let again = world.sync(0).unwrap();
+    assert_eq!(again.update, MainUpdate::UpToDate, "{again:?}");
+    world.check();
+}
+
+#[test]
+fn a_push_losing_every_attempt_stops_the_run() {
+    let (base, lib) = two_tablets();
+    let page = base.pages(0, &lib.notes)[1].clone();
+    base.ink(0, &lib.notes, &page);
+    base.rename(1, &lib.archive, "Attic");
+    let journal = op_index(&base, 0, OpKind::WriteState, 2, |w| {
+        w.sync(0).unwrap();
+    });
+    let world = base.duplicate();
+    world.tablet(0).inject(Fault::EditBefore(
+        journal,
+        other_computer(&world, 1, None, |hub, tablet, _| {
+            hub.sync(tablet).unwrap();
+        }),
+    ));
+    let result = world.sync_with(
+        0,
+        HubOptions {
+            push_attempts: 1,
+            ..world.options.clone()
+        },
+    );
+    assert!(
+        matches!(&result, Err(e) if is_cycle(e, |e| matches!(e, CycleError::PushRetriesExhausted(1)))),
+        "{result:?}"
+    );
+    // The journaled merge never landed: the next run drops it.
+    let report = world.sync(0).unwrap();
+    assert!(
+        report.reconciled.as_ref().is_some_and(|r| r.dropped),
+        "{report:?}"
+    );
+    world.converge();
+}
+
+/// The merge forks the notes; B's user writes in them while the sync has
+/// the UI up. The notes are skipped, and their conflict copy (a fork
+/// partner, known from the merge's trailers) with them.
+#[test]
+fn a_skipped_original_skips_its_conflict_copy() {
+    let (base, lib) = same_page_conflict();
+    let page = base.pages(1, &lib.notes)[1].clone();
+    let stage = op_index(&base, 1, OpKind::Stage, 1, |w| {
+        w.sync(1).unwrap();
+    });
+    let world = base.duplicate();
+    world.inks.lock().unwrap().expect("window-ink", &lib.notes);
+    let page_path = format!("{}/{page}.rm", lib.notes);
+    world.tablet(1).inject(Fault::EditBefore(
+        stage + 1,
+        Box::new(move |dir: &Path| {
+            let path = dir.join(&page_path);
+            let mut bytes = std::fs::read(&path).unwrap();
+            bytes.extend_from_slice(b"stroke window-ink\n");
+            std::fs::write(&path, bytes).unwrap();
+        }),
+    ));
+    let report = world.sync(1).unwrap();
+    assert_eq!(report.forks.len(), 1, "{report:?}");
+    let copy = report.forks[0].copy.clone();
+    assert!(
+        report.skipped.contains(&lib.notes) && report.skipped.contains(&copy),
+        "{report:?}"
+    );
+    world.converge();
+}
+
+#[test]
+fn reattach_refuses_a_pending_journal_of_the_same_repository() {
+    let template = crash_template();
+    let (kill, _) = kill_leaving_a_half_applied_document(&template);
+    let world = crashed_by(&template, Fault::KillApplyAfter(kill));
+    assert!(world.device(0).state().unwrap().journal.is_some());
+    let result = world.reattach(0);
+    assert!(
+        matches!(&result, Err(e) if is_cycle(e, |e| matches!(e, CycleError::JournalPending))),
+        "{result:?}"
+    );
+    world.check_idle(0);
+    // Once `sync` has reconciled it, the reattach goes ahead.
+    world.sync(0).unwrap();
+    world.reattach(0).unwrap();
+    world.check_idle(0);
+}
+
+#[test]
+fn errors_before_the_tablet_is_touched() {
+    let (world, _, _) = two_notebooks();
+    // Another run on this computer holds the cache.
+    let state = world.device(0).state().unwrap();
+    let lock = std::fs::File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(
+            world
+                .device(0)
+                .cache
+                .join(format!("{}.lock", state.repo_id)),
+        )
+        .unwrap();
+    lock.try_lock().unwrap();
+    let result = world.sync(0);
+    assert!(
+        matches!(&result, Err(e) if is_cycle(e, |e| matches!(e, CycleError::CacheBusy(_)))),
+        "{result:?}"
+    );
+    drop(lock);
+    world.check_idle(0);
+    // The state changed between the first read and the lock.
+    let lock_op = op_index(&world, 0, OpKind::AcquireLock, 1, |w| {
+        w.sync(0).unwrap();
+    });
+    let changed = world.duplicate();
+    let state_file = changed.device(0).tablet.paths().state_file();
+    changed.tablet(0).inject(Fault::EditBefore(
+        lock_op,
+        Box::new(move |_: &Path| {
+            let mut state = libremarkable_utils::hub::model::TabletState::parse(
+                &std::fs::read(&state_file).unwrap(),
+            )
+            .unwrap();
+            state.origin = "/elsewhere/origin.git".to_string();
+            std::fs::write(&state_file, state.to_json()).unwrap();
+        }),
+    ));
+    let result = changed.sync(0);
+    assert!(
+        matches!(&result, Err(e) if is_cycle(e, |e| matches!(e, CycleError::StateChanged))),
+        "{result:?}"
+    );
+    // An origin that was never initialised.
+    let empty = world.root.join("empty.git");
+    world
+        .git
+        .init_bare(&empty, libremarkable_utils::git::ObjectFormat::Sha1)
+        .unwrap();
+    let fresh = World::new(1);
+    fresh.create(0, Kind::Notebook { pages: 1 }, "Notes", "");
+    let result = fresh
+        .hub(0)
+        .clone_tablet(fresh.tablet(0), empty.to_str().unwrap(), None, false);
+    assert!(
+        matches!(&result, Err(e) if is_cycle(e, |e| matches!(e, CycleError::NotInitialised { .. }))),
+        "{result:?}"
+    );
+    // A `.rmu/hub.json` this rmu cannot read.
+    world::commit_repo_config(&fresh.git, &fresh.origin, b"not json");
+    let result = fresh.clone_tablet(0);
+    assert!(
+        matches!(&result, Err(e) if is_cycle(e, |e| matches!(e, CycleError::InvalidRepoConfig(_)))),
+        "{result:?}"
+    );
+    // An origin emptied (replaced by an empty repository).
+    std::fs::remove_dir_all(&world.origin).unwrap();
+    world
+        .git
+        .init_bare(
+            Path::new(&world.origin),
+            libremarkable_utils::git::ObjectFormat::Sha1,
+        )
+        .unwrap();
+    let result = world.sync(0);
+    assert!(
+        matches!(&result, Err(e) if is_cycle(e, |e| matches!(e, CycleError::OriginEmpty { .. }))),
+        "{result:?}"
+    );
+    world.check_idle(0);
+}
+
+/// A backup crashed at every operation (and with every mutation's reply
+/// lost): xochitl comes back, and the next backup leaves the device ref
+/// at the tree a clean backup gives.
+#[test]
+fn crash_at_every_op_of_a_backup() {
+    let (template, notes, _) = two_notebooks();
+    let page = template.pages(0, &notes)[0].clone();
+    template.ink(0, &notes, &page);
+    let clean = template.duplicate();
+    let before = clean.tablet(0).ops().len();
+    let reference = clean.backup(0).unwrap();
+    let ops = clean.tablet(0).ops()[before..].to_vec();
+    let mutations = ops.iter().filter(|op| op.is_mutating()).count();
+    let tree = |world: &World, commit: &libremarkable_utils::git::Oid| {
+        world
+            .git
+            .open(Path::new(&world.origin))
+            .unwrap()
+            .rev_parse(&format!("{commit}^{{tree}}"))
+            .unwrap()
+            .unwrap()
+    };
+    let expected = tree(&clean, &reference.snapshot);
+    let faults = (1..=ops.len())
+        .map(|k| {
+            (
+                Fault::DisconnectAtOp(k),
+                format!("disconnect at op {k} ({:?})", ops[k - 1]),
+            )
+        })
+        .chain((1..=mutations).map(|m| (Fault::LoseAck(m), format!("lost ack of mutation {m}"))));
+    faults.for_each(|(fault, what)| {
+        let world = template.duplicate();
+        world.tablet(0).inject(fault);
+        let result = world.backup(0);
+        world::no_contract_violation(&result);
+        let tablet = world.tablet(0);
+        tablet.reconnect();
+        let armed = tablet.watchdog_armed().is_some();
+        assert!(
+            tablet.is_running() || armed,
+            "{what}: xochitl down, no watchdog"
+        );
+        if armed {
+            tablet.fire_watchdog();
+        }
+        assert!(tablet.is_running(), "{what}: xochitl did not come back");
+        let report = match world.backup(0) {
+            Ok(report) => report,
+            Err(error) if is_locked(&error) => {
+                assert!(!armed, "{what}: a lock with a fired watchdog must be stale");
+                world
+                    .hub_with(
+                        0,
+                        HubOptions {
+                            break_lock: true,
+                            ..world.options.clone()
+                        },
+                    )
+                    .backup(world.tablet(0))
+                    .unwrap_or_else(|e| panic!("{what}: after --break-lock: {e}"))
+            }
+            Err(error) => panic!("{what}: the next backup failed: {error}"),
+        };
+        assert_eq!(tree(&world, &report.snapshot), expected, "{what}");
+        let id = world.device(0).state().unwrap().device_id;
+        let head = world
+            .git
+            .open(Path::new(&world.origin))
+            .unwrap()
+            .rev_parse(&format!("refs/rmu/devices/{id}"))
+            .unwrap();
+        assert_eq!(head, Some(report.snapshot), "{what}");
+        world.check_idle(0);
+    });
 }

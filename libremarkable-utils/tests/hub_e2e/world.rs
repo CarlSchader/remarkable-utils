@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use libremarkable_utils::error::{Error, Result};
-use libremarkable_utils::git::{Git, ObjectKind};
+use libremarkable_utils::git::{CommitMeta, Expected, FileMode, Git, ObjectKind, Oid, Signature};
 use libremarkable_utils::hub::cycle::{
     BackupReport, CycleError, DryRunReport, Hub, HubOptions, MainUpdate, StatusReport, SyncReport,
 };
@@ -123,6 +123,12 @@ impl Device {
         fs::read(self.tablet.paths().state_file())
             .ok()
             .map(|bytes| TabletState::parse(&bytes).unwrap())
+    }
+
+    /// Overwrite the tablet's hub state (what a damaged or hand-edited
+    /// state would hold).
+    pub fn set_state(&self, state: &TabletState) {
+        fs::write(self.tablet.paths().state_file(), state.to_json()).unwrap();
     }
 
     fn file(&self, path: &str) -> Option<Vec<u8>> {
@@ -809,6 +815,46 @@ fn idx(position: usize) -> String {
         (b'a' + (position / 26) as u8) as char,
         (b'a' + (position % 26) as u8) as char
     )
+}
+
+/// Commit `.rmu/hub.json` = `bytes` on top of origin's `main`, every
+/// other file kept: an upgrade (or damage) by another tool. Returns the
+/// new `main`.
+pub fn commit_repo_config(git: &Git, origin: &str, bytes: &[u8]) -> Oid {
+    let repo = git.open(Path::new(origin)).unwrap();
+    let main = repo.rev_parse("refs/heads/main").unwrap().unwrap();
+    let mut writer = repo.commit_writer(&NoProgress, None).unwrap();
+    repo.ls_tree_recursive(main.as_str())
+        .unwrap()
+        .iter()
+        .filter(|entry| entry.kind == ObjectKind::Blob)
+        .filter(|entry| entry.path != model::REPO_CONFIG_PATH.as_bytes())
+        .for_each(|entry| {
+            let mode = FileMode::from_bits(entry.mode).unwrap();
+            writer
+                .add_existing(entry.path.clone(), mode, &entry.oid)
+                .unwrap();
+        });
+    writer
+        .add_bytes(model::REPO_CONFIG_PATH, FileMode::Regular, bytes)
+        .unwrap();
+    let admin = Signature {
+        name: "Admin".to_string(),
+        email: "admin@example.invalid".to_string(),
+        time: 1_800_000_000,
+        offset_minutes: 0,
+    };
+    let commit = writer
+        .commit(&CommitMeta {
+            parents: vec![main.clone()],
+            author: admin.clone(),
+            committer: admin,
+            message: "edit .rmu/hub.json\n".to_string(),
+        })
+        .unwrap();
+    repo.update_ref("refs/heads/main", &commit, Some(&Expected::At(main)))
+        .unwrap();
+    commit
 }
 
 pub fn metadata(name: &str, parent: &str, type_: &str) -> Value {
