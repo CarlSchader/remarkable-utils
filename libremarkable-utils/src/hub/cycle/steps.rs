@@ -196,7 +196,7 @@ impl Hub<'_> {
                 orphans: snapshot.orphans.iter().cloned().collect(),
                 read: read_summary(&p.read),
                 took_over: p.took_over,
-                warnings: Vec::new(),
+                warnings: self.maintain(&p.origin),
             })
         })?;
         report.warnings.extend(warnings);
@@ -305,6 +305,21 @@ impl Hub<'_> {
         })?;
         report.warnings.extend(warnings);
         Ok(report)
+    }
+
+    /// `git maintenance run --auto` on the cache, once the tablet is back
+    /// up (the user's thresholds decide whether anything happens); a
+    /// failure is only a warning.
+    fn maintain(&self, origin: &OriginCtx) -> Vec<String> {
+        self.progress.step("Maintaining the local cache");
+        origin
+            .cache
+            .repo
+            .maintenance_auto()
+            .err()
+            .map(|error| format!("cache maintenance failed: {error}"))
+            .into_iter()
+            .collect()
     }
 
     /// A best-effort read while xochitl runs and before the lock (reads
@@ -544,6 +559,7 @@ impl Hub<'_> {
             // rests on until the state is written, and a crash before that
             // must find these documents finished too.
             let sizes = self.stage(s, store, &finish, Some(&journal.merge))?;
+            s.arm()?;
             s.tablet.apply(s.lock(), &apply_plan(&finish, &sizes)?)?;
         }
         let kept: Vec<DocId> = verdicts
@@ -654,6 +670,7 @@ impl Hub<'_> {
                     .into_iter()
                     .map(XochitlPath::new)
                     .collect::<std::result::Result<Vec<_>, _>>()?;
+            s.arm()?;
             s.tablet.stage(s.lock(), &sentinel, &mut |_, sink| {
                 sink(0, &mut std::io::empty())
             })?;
@@ -1043,9 +1060,12 @@ impl Hub<'_> {
         let protect: BTreeSet<DocId> = snapshot.quarantined.keys().cloned().collect();
         let tablet = tablet_versions(&p.read);
         let local = p.read.local_json();
-        let applied = {
+        let (applied, left_alone) = {
             let json = Overlay::read(&p.read, &p.origin.store);
-            let planned = plan::plan(&plan::PlanInput {
+            let plan::PlanOutput {
+                planned,
+                left_alone,
+            } = plan::plan(&plan::PlanInput {
                 rules: p.origin.rules,
                 merged: &pushed.merged,
                 tablet: &tablet,
@@ -1053,7 +1073,7 @@ impl Hub<'_> {
                 local: &local,
                 json: &json,
             })?;
-            if planned.is_empty() {
+            let applied = if planned.is_empty() {
                 Applied::default()
             } else {
                 self.apply_planned(
@@ -1070,7 +1090,8 @@ impl Hub<'_> {
                         protect: &protect,
                     },
                 )?
-            }
+            };
+            (applied, left_alone)
         };
         // 15. Record.
         self.progress.step("Recording the sync on the tablet");
@@ -1083,6 +1104,7 @@ impl Hub<'_> {
             .chain(
                 protect
                     .iter()
+                    .chain(&left_alone)
                     .map(|doc| (doc.clone(), previous.base_for(doc).cloned())),
             )
             .collect();
@@ -1108,6 +1130,7 @@ impl Hub<'_> {
             self.progress.step("Starting xochitl");
             s.start()?;
         }
+        warnings.extend(self.maintain(&p.origin));
         Ok(SyncReport {
             update: pushed.update,
             snapshot: snapshot_commit.clone(),

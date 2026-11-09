@@ -544,7 +544,7 @@ fn a_concurrent_pusher_makes_the_push_retry() {
     let world = base.duplicate();
     world.tablet(0).inject(Fault::EditBefore(
         journal,
-        other_computer(&world, 1, |hub, tablet, _| {
+        other_computer(&world, 1, None, |hub, tablet, _| {
             let report = hub.sync(tablet).unwrap();
             assert_ne!(report.update, MainUpdate::UpToDate);
         }),
@@ -559,10 +559,12 @@ fn a_concurrent_pusher_makes_the_push_retry() {
 }
 
 /// An edit (for `Fault::EditBefore`) that runs `run` on tablet `i` from
-/// its own computer: another rmu acting while this one is mid-run.
+/// its computer (or from the one whose cache is `cache`): another rmu
+/// acting while this one is mid-run.
 fn other_computer(
     world: &World,
     i: usize,
+    cache: Option<std::path::PathBuf>,
     run: impl FnOnce(
         &libremarkable_utils::hub::cycle::Hub<'static>,
         &dyn libremarkable_utils::hub::device::Tablet,
@@ -577,7 +579,7 @@ fn other_computer(
     );
     let (tablet, cache) = (
         Arc::clone(&world.device(i).tablet),
-        world.device(i).cache.clone(),
+        cache.unwrap_or_else(|| world.device(i).cache.clone()),
     );
     Box::new(move |_| {
         static PROGRESS: libremarkable_utils::progress::NoProgress =
@@ -760,16 +762,17 @@ fn status_and_dry_run_change_nothing() {
 
 /// The crash scenario: B's changes are on origin (a rename, a new
 /// notebook, a deletion, ink on a page A also inks, ink in a notebook A
-/// holds quarantined, the deletion of another A holds quarantined), A
+/// holds quarantined, the deletion of two others A holds quarantined), A
 /// has its own (that ink, an inserted page, a rename, a new folder with a
-/// move, a trashed document, a corrupt `.metadata`, a lost `.metadata`
-/// with new ink). A's sync therefore reads, merges with a fork, pushes,
+/// move, a trashed document, a corrupt `.metadata`, two lost `.metadata`,
+/// one after new ink, one after a rename). A's sync therefore reads, merges with a fork, pushes,
 /// stages, applies writes and deletions, leaves two quarantined
 /// documents alone, and records. [`settle`] repairs them at the end.
 fn crash_template() -> World {
     let (world, lib) = two_tablets();
     let ledger = world.create(0, Kind::Notebook { pages: 1 }, "Ledger", "");
     let scratch = world.create(0, Kind::Notebook { pages: 1 }, "Scratch", "");
+    let spare = world.create(0, Kind::Notebook { pages: 1 }, "Spare", "");
     world.sync(0).unwrap();
     world.sync(1).unwrap();
     let page = world.pages(0, &lib.notes)[0].clone();
@@ -784,6 +787,7 @@ fn crash_template() -> World {
     world.ink(1, &lib.notes, &page);
     world.insert_page(1, &ledger);
     world.delete(1, &scratch);
+    world.delete(1, &spare);
     world.sync(1).unwrap();
     world.ink(0, &lib.notes, &page);
     world.insert_page(0, &lib.sketch);
@@ -795,6 +799,11 @@ fn crash_template() -> World {
     let scratch_page = world.pages(0, &scratch)[0].clone();
     world.ink(0, &scratch, &scratch_page);
     world.lose_metadata(0, &scratch);
+    // Renamed, then its `.metadata` lost: every file left is exactly the
+    // snapshot's, so it looks like a deletion interrupted after
+    // `.metadata`. No run planned it; it must never be deleted.
+    world.rename(0, &spare, "Spare (A)");
+    world.lose_metadata(0, &spare);
     world
 }
 
@@ -806,6 +815,22 @@ fn settle(world: &World) -> Vec<(libremarkable_utils::hub::model::DocId, String)
     world.converge();
     world.repair(0);
     world.converge();
+    // The renamed spare notebook beats B's deletion with its pages: the
+    // ink oracle cannot tell (B deleted that ink deliberately), so look.
+    let origin = world.origin_docs();
+    let spare = world
+        .device(0)
+        .names()
+        .into_iter()
+        .find(|(_, name)| name == "Spare (A)")
+        .map(|(doc, _)| doc)
+        .expect("the spare notebook is on the tablet");
+    assert!(
+        origin[&spare]
+            .keys()
+            .any(|file| matches!(file, libremarkable_utils::hub::model::DocFile::Page(_))),
+        "the spare notebook lost its pages"
+    );
     world.conflicts()
 }
 
@@ -829,7 +854,7 @@ fn reference(template: &World) -> Reference {
     let count = |kind: OpKind| ops.iter().filter(|op| **op == kind).count();
     assert_eq!(count(OpKind::StartXochitl), 2, "{ops:?}");
     assert_eq!(count(OpKind::StopXochitl), 2, "{ops:?}");
-    assert_eq!(report.quarantined.len(), 2, "{report:?}");
+    assert_eq!(report.quarantined.len(), 3, "{report:?}");
     Reference {
         ops,
         mutations,
@@ -1112,15 +1137,18 @@ fn an_edit_after_a_crashed_reconciliation_is_not_a_conflict() {
     assert!(world.sync(0).is_err());
     world.tablet(0).reconnect();
     world.tablet(0).fire_watchdog();
-    finished.iter().for_each(|doc| {
-        if let Some(page) = world
-            .device(0)
-            .content(doc)
-            .and_then(|content| world::pages_of(&content).first().cloned())
-        {
+    let inked = finished
+        .iter()
+        .filter_map(|doc| {
+            let page = world
+                .device(0)
+                .content(doc)
+                .and_then(|content| world::pages_of(&content).first().cloned())?;
             world.ink(0, doc, &page);
-        }
-    });
+            Some(doc)
+        })
+        .count();
+    assert!(inked > 0, "nothing to write in among {finished:?}");
     world.sync(0).unwrap();
     assert_eq!(settle(&world), reference.conflicts);
 }
@@ -1134,6 +1162,84 @@ fn crashed_by(template: &World, fault: Fault) -> World {
     crashed.tablet(0).reconnect();
     crashed.tablet(0).fire_watchdog();
     crashed
+}
+
+/// A pre-read cut inside a file ends the `fast-import` it streamed into;
+/// it must only shrink the pre-read, never fail the run.
+#[test]
+fn a_pre_read_cut_inside_a_file_only_shrinks_it() {
+    let template = crash_template();
+    let reference = reference(&template);
+    (0..3).for_each(|k| {
+        let world = template.duplicate();
+        // The next download is the pre-read's (a copied world's stats are
+        // all new).
+        world.tablet(0).inject(Fault::CutDownloadInFile(k));
+        world
+            .sync(0)
+            .unwrap_or_else(|e| panic!("pre-read cut inside file {}: {e}", k + 1));
+        assert_eq!(settle(&world), reference.conflicts);
+    });
+}
+
+/// Another computer syncs the same tablet between this run's first fetch
+/// and its lock: the newer base and device ref it records must not read
+/// as a rewound origin or a foreign device ref.
+#[test]
+fn a_run_that_held_the_lock_first_is_seen_by_fetching_again() {
+    let (base, lib) = two_tablets();
+    let page = base.pages(0, &lib.notes)[0].clone();
+    base.ink(0, &lib.notes, &page);
+    base.rename(1, &lib.paper, "Paper (B)");
+    base.sync(1).unwrap();
+    let lock = op_index(&base, 0, OpKind::AcquireLock, 1, |w| {
+        w.sync(0).unwrap();
+    });
+    let world = base.duplicate();
+    let elsewhere = world.root.join("computer-x").join("cache");
+    world.tablet(0).inject(Fault::EditBefore(
+        lock,
+        other_computer(&world, 0, Some(elsewhere), |hub, tablet, _| {
+            assert!(matches!(
+                hub.sync(tablet).unwrap().update,
+                MainUpdate::Merge(_)
+            ));
+        }),
+    ));
+    let report = world.sync(0).unwrap();
+    assert_eq!(report.update, MainUpdate::UpToDate, "{report:?}");
+    world.converge();
+}
+
+/// A document that lost its `.metadata` after new ink, on a tablet that
+/// reattaches (so it is in no base): its files are not rmu's leftovers
+/// and are never overwritten by origin's version.
+#[test]
+fn reattach_never_overwrites_a_document_that_lost_its_metadata() {
+    let (world, lib) = two_tablets();
+    let page = world.pages(0, &lib.sketch)[0].clone();
+    world.ink(0, &lib.sketch, &page);
+    let marker = world
+        .inks
+        .lock()
+        .unwrap()
+        .expected
+        .keys()
+        .last()
+        .cloned()
+        .unwrap();
+    world.lose_metadata(0, &lib.sketch);
+    std::fs::remove_dir_all(world.device(0).tablet.state_dir()).unwrap();
+    let report = world.reattach(0).unwrap();
+    assert!(report.orphans.contains(&lib.sketch), "{report:?}");
+    let rm = format!("{}/{page}.rm", lib.sketch);
+    let kept = String::from_utf8(world.device(0).tablet.read_file(&rm).unwrap()).unwrap();
+    assert!(kept.contains(&marker), "the tablet's ink was overwritten");
+    // Repaired, it is new on both sides with different ink: a conflict
+    // copy, ink kept.
+    world.repair(0);
+    world.converge();
+    assert_eq!(world.conflicts().len(), 1);
 }
 
 #[test]
@@ -1383,7 +1489,7 @@ fn concurrent_first_clones_into_an_empty_origin() {
     let world = base.duplicate();
     world.tablet(0).inject(Fault::EditBefore(
         journal,
-        other_computer(&world, 1, |hub, tablet, origin| {
+        other_computer(&world, 1, None, |hub, tablet, origin| {
             hub.clone_tablet(tablet, origin, None, false).unwrap();
         }),
     ));

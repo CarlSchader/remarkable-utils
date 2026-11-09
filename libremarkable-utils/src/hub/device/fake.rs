@@ -107,6 +107,10 @@ pub enum Fault {
     /// The next download delivers `k` files, then fails as a lost
     /// connection.
     FailDownloadAfter(usize),
+    /// The next download delivers `k` files, then loses the connection
+    /// halfway through the next one: its reader fails after part of the
+    /// file (what a cut tar stream looks like to the caller).
+    CutDownloadInFile(usize),
     /// During the next apply, the watchdog fires right after the `k`th
     /// move (the guard before the next document must then stop it).
     FireWatchdogAfterMoves(usize),
@@ -166,6 +170,7 @@ struct FakeState {
     pending: Vec<Pending>,
     kill_apply_after: Option<usize>,
     fail_download_after: Option<usize>,
+    cut_download_in: Option<usize>,
     fire_after_moves: Option<usize>,
     disconnected: bool,
 }
@@ -187,6 +192,10 @@ impl FakeState {
             }
             Fault::FailDownloadAfter(k) => {
                 self.fail_download_after = Some(k);
+                return;
+            }
+            Fault::CutDownloadInFile(k) => {
+                self.cut_download_in = Some(k);
                 return;
             }
             Fault::FireWatchdogAfterMoves(k) => {
@@ -333,6 +342,7 @@ impl FakeTabletBuilder {
             pending: Vec::new(),
             kill_apply_after: None,
             fail_download_after: None,
+            cut_download_in: None,
             fire_after_moves: None,
             disconnected: false,
             armed_since_start: false,
@@ -403,6 +413,18 @@ fn remove_if_present(path: &Path) -> io::Result<()> {
         Ok(_) => fs::remove_file(path),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
+    }
+}
+
+/// A reader whose connection is gone.
+struct FailingReader;
+
+impl Read for FailingReader {
+    fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+        Err(io::Error::new(
+            io::ErrorKind::ConnectionReset,
+            "fake tablet: connection lost mid-file",
+        ))
     }
 }
 
@@ -1054,10 +1076,22 @@ impl Tablet for FakeTablet {
         transfer_paths(files)?;
         self.op(OpKind::Download, || {
             let fail_after = self.state().fail_download_after.take();
+            let cut_in = self.state().cut_download_in.take();
             files.iter().enumerate().try_for_each(|(delivered, file)| {
                 if fail_after == Some(delivered) {
                     return Err(transport_error(format!(
                         "connection lost after {delivered} file(s)"
+                    )));
+                }
+                if cut_in == Some(delivered) {
+                    let path = self.data(file.as_str());
+                    let size = fs::symlink_metadata(&path)?.len();
+                    let half = fs::File::open(&path)?.take(size / 2);
+                    let mut cut = half.chain(FailingReader);
+                    visit(file, size, &mut cut)?;
+                    return Err(transport_error(format!(
+                        "connection lost inside file {}",
+                        delivered + 1
                     )));
                 }
                 let path = self.data(file.as_str());

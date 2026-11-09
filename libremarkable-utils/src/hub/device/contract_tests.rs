@@ -755,6 +755,33 @@ fn fake_fails_a_download_part_way() {
 }
 
 #[test]
+fn fake_cuts_a_download_inside_a_file() {
+    let h = FakeHarness::with(|b| {
+        b.file("a", "1")
+            .file("b", "0123456789")
+            .fault(Fault::CutDownloadInFile(1))
+    });
+    let t = &h.tablet;
+    let mut seen = Vec::new();
+    let result = t.download(&[path("a"), path("b")], &mut |file, size, reader| {
+        let mut data = Vec::new();
+        let read = reader.read_to_end(&mut data);
+        seen.push((file.to_string(), size, data, read.is_ok()));
+        read.map(drop).map_err(Into::into)
+    });
+    assert!(result.is_err());
+    // The cut file announced its size, then delivered only part of it.
+    assert_eq!(
+        seen,
+        vec![
+            ("a".to_string(), 1, b"1".to_vec(), true),
+            ("b".to_string(), 10, b"01234".to_vec(), false),
+        ]
+    );
+    assert_eq!(download_all(t, &[path("a"), path("b")]).unwrap().len(), 2);
+}
+
+#[test]
 fn fake_loses_acknowledgements_after_the_effect() {
     let h = FakeHarness::with(|b| b.fault(Fault::LoseAck(1)));
     let t = &h.tablet;

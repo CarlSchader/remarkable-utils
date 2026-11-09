@@ -353,7 +353,13 @@ while implementing it, beyond the steps above:
   device's own `sizeInBytes` do not ping-pong between tablets); other
   files when their blob or mode differs. Files the tablet has and the
   merge lacks are removed, leftovers without a `.metadata` included once
-  the document arrives. Staged JSON carries the view state read at step
+  the document arrives — but files without a `.metadata` are touched
+  only when every one already equals the merge's (what rmu's own
+  interrupted write leaves); anything else may be the user's document
+  that lost its `.metadata` (one in no base, after `--reattach`, say):
+  it is left alone, reported as an orphan, and keeps its previous base,
+  so a later repair is never read as the tablet undoing the merge.
+  Staged JSON carries the view state read at step
   5; files re-read at step 14 with other view state are re-staged with
   the fresh overlay while stopped. Written bytes that are not a blob rmu
   has (overlaid JSON) are left out of the manifest and read again next
@@ -1021,15 +1027,17 @@ clocks and per-model translation.
   tablet), every ink stroke ever drawn and not deliberately deleted is on
   origin and on every tablet, xochitl runs, no lock or journal is left;
   scenarios that are refused check that the tablet is untouched, running
-  and unlocked. The crash scenario includes two documents the crashing
-  tablet holds quarantined (one origin changed, one origin deleted),
-  repaired at the end so their ink is checked too. The crash matrix
+  and unlocked. The crash scenario includes three documents the crashing
+  tablet holds quarantined (one origin changed, two origin deleted, one
+  of which looks exactly like an interrupted deletion), repaired at the
+  end so their ink is checked too. The crash matrix
   copies one prepared world per fault and injects, in turn, a
   disconnection before every operation and after every mutation, a lost
   reply to every mutation, a failure of every operation, an apply killed
   after every move, the watchdog firing after every move, a cut of the
   stopped read after every file, and a disconnection at every operation
-  of a run that reconciles an earlier crash; after each, xochitl must be
+  of a run that reconciles an earlier crash (plus a pre-read cut inside
+  a file); after each, xochitl must be
   up or have an armed watchdog, and the next run (with `--break-lock`
   only where the crash left a lock nothing makes stale) must end with
   exactly the clean run's conflict copies. A lost push acknowledgement

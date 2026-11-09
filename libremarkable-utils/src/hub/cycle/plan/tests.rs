@@ -251,6 +251,45 @@ fn plans_write_only_what_differs_and_keep_the_tablets_view_state() {
 }
 
 #[test]
+fn files_without_metadata_are_overwritten_only_if_they_are_rmus_leftovers() {
+    let mut blobs = Blobs::default();
+    let target = notebook(&mut blobs, "A", "", &[(1, 10), (2, 20)]);
+    let merged = RepoTree {
+        docs: [(doc(1), target)].into(),
+        extra: BTreeMap::new(),
+    };
+    let local = BTreeMap::new();
+    let planned = |leftovers: DocVersion| {
+        let tablet: BTreeMap<DocId, DocVersion> = [(doc(1), leftovers)].into();
+        plan(&PlanInput {
+            rules: rules(),
+            merged: &merged,
+            tablet: &tablet,
+            protect: &BTreeSet::new(),
+            local: &local,
+            json: &blobs.0,
+        })
+        .unwrap()
+    };
+    // An interrupted write of this very version: finished.
+    let output = planned(version(vec![(page(1), oid(10))]));
+    assert_eq!(output.planned.len(), 1);
+    assert!(output.left_alone.is_empty());
+    // Ink of its own (a page origin lacks, or another page blob): a
+    // document that lost its `.metadata`, never overwritten.
+    [
+        version(vec![(page(1), oid(11))]),
+        version(vec![(page(3), oid(30))]),
+    ]
+    .into_iter()
+    .for_each(|leftovers| {
+        let output = planned(leftovers);
+        assert!(output.planned.is_empty());
+        assert_eq!(output.left_alone, [doc(1)].into());
+    });
+}
+
+#[test]
 fn plan_skips_protected_documents() {
     let mut blobs = Blobs::default();
     let a = notebook(&mut blobs, "A", "", &[(1, 1)]);
@@ -270,6 +309,7 @@ fn plan_skips_protected_documents() {
             json: &blobs.0,
         })
         .unwrap()
+        .planned
     };
     let all = input(&BTreeSet::new());
     assert_eq!(
@@ -433,19 +473,56 @@ fn moving_a_touched_document_into_the_trash_is_skipped() {
         (doc(1), item("", true)),
         (doc(2), item(doc(1).as_str(), false)),
         (doc(3), item("", false)),
+        (doc(4), item("", true)),
     ]
     .into();
-    let planned: BTreeMap<DocId, Option<TreeItem>> = [
-        (doc(1), Some(item("trash", true))),
-        (doc(3), Some(item("trash", false))),
+    // Origin trashed folder 1 and document 3, and moved folder 4 under 1.
+    let merged: BTreeMap<DocId, TreeItem> = [
+        (doc(1), item("trash", true)),
+        (doc(3), item("trash", false)),
+        (doc(4), item(doc(1).as_str(), true)),
     ]
     .into();
+    let planned = vec![write(1), write(3), write(4)];
+    let blobs = Blobs::default();
+    let check = |touched: BTreeSet<DocId>| {
+        skipped(&Checks {
+            rules: rules(),
+            planned: &planned,
+            before: &BTreeMap::new(),
+            files_now: &BTreeMap::new(),
+            moved: &BTreeMap::new(),
+            sha256: &HashMap::new(),
+            json: &blobs.0,
+            current: &current,
+            merged: &merged,
+            touched: &touched,
+            partners: &Partners::new(),
+        })
+        .unwrap()
+    };
     // The user wrote in 2, inside folder 1, after the snapshot.
-    assert_eq!(
-        trash_skips(&current, &planned, &[doc(2)].into(), &Partners::new()),
-        [doc(1)].into()
-    );
-    assert!(trash_skips(&current, &planned, &BTreeSet::new(), &Partners::new()).is_empty());
+    assert_eq!(check([doc(2)].into()), [doc(1)].into());
+    assert!(check(BTreeSet::new()).is_empty());
+    // Written in inside folder 4: moving 4 under the trashed 1 would take
+    // it along too, and so would trashing 1.
+    let mut nested = current.clone();
+    nested.insert(doc(5), item(doc(4).as_str(), false));
+    let skipped_nested = skipped(&Checks {
+        rules: rules(),
+        planned: &planned,
+        before: &BTreeMap::new(),
+        files_now: &BTreeMap::new(),
+        moved: &BTreeMap::new(),
+        sha256: &HashMap::new(),
+        json: &blobs.0,
+        current: &nested,
+        merged: &merged,
+        touched: &[doc(5)].into(),
+        partners: &Partners::new(),
+    })
+    .unwrap();
+    assert!(skipped_nested.contains(&doc(4)), "{skipped_nested:?}");
 }
 
 #[test]

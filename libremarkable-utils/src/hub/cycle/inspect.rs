@@ -254,7 +254,8 @@ impl Hub<'_> {
             protect: &protect,
             local: &read.local_json(),
             json: store,
-        })?;
+        })?
+        .planned;
         let status = StatusReport {
             repo_id: state.repo_id.clone(),
             device_id: state.device_id.clone(),

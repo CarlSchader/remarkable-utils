@@ -247,9 +247,44 @@ pub(super) struct PlanInput<'a> {
     pub json: &'a dyn JsonBlobs,
 }
 
-/// Every document whose tablet files must change to match the merge,
-/// in document order.
-pub(super) fn plan(input: &PlanInput) -> Result<Vec<Planned>> {
+/// Whether the tablet's files of a document without a `.metadata` may be
+/// overwritten: only when every one is already the target's (what rmu's
+/// own interrupted write leaves). Anything else may be the user's
+/// document that lost its `.metadata`; it is left alone (and reported as
+/// an orphan by validation) rather than overwritten.
+fn leftovers_are_ours(
+    rules: &MirrorRules,
+    target: Option<&DocVersion>,
+    current: &DocVersion,
+    json: &dyn JsonBlobs,
+) -> Result<bool> {
+    let Some(target) = present_files(target) else {
+        return Ok(true);
+    };
+    current.files.iter().try_fold(true, |ours, (file, entry)| {
+        Ok(ours
+            && match target.get(file) {
+                Some(wanted) => entries_equivalent(rules, file, wanted, entry, json)?,
+                None => false,
+            })
+    })
+}
+
+/// What [`plan`] decided.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct PlanOutput {
+    /// Every document whose tablet files must change, in document order.
+    pub planned: Vec<Planned>,
+    /// Documents the merge would change but whose files without a
+    /// `.metadata` are not rmu's leftovers: left alone, they keep their
+    /// previous base (as quarantined ones do), so a later repair never
+    /// reads the merge as the tablet's own change.
+    pub left_alone: BTreeSet<DocId>,
+}
+
+/// Plan the apply. Protected documents, and files without a `.metadata`
+/// that are not rmu's own leftovers, are never touched.
+pub(super) fn plan(input: &PlanInput) -> Result<PlanOutput> {
     let empty = LocalJson::new();
     let ids: BTreeSet<&DocId> = input
         .merged
@@ -259,18 +294,35 @@ pub(super) fn plan(input: &PlanInput) -> Result<Vec<Planned>> {
         .filter(|doc| !input.protect.contains(*doc))
         .collect();
     ids.into_iter()
-        .map(|doc| {
-            plan_doc(
+        .try_fold(PlanOutput::default(), |mut output, doc| {
+            let current = input.tablet.get(doc);
+            let Some(planned) = plan_doc(
                 input.rules,
                 doc,
                 input.merged.docs.get(doc),
-                input.tablet.get(doc),
+                current,
                 input.local.get(doc).unwrap_or(&empty),
                 input.json,
-            )
+            )?
+            else {
+                return Ok(output);
+            };
+            let ours = match current {
+                Some(current) if !current.is_present() => leftovers_are_ours(
+                    input.rules,
+                    input.merged.docs.get(doc),
+                    current,
+                    input.json,
+                )?,
+                _ => true,
+            };
+            if ours {
+                output.planned.push(planned);
+            } else {
+                output.left_alone.insert(doc.clone());
+            }
+            Ok(output)
         })
-        .filter_map(Result::transpose)
-        .collect()
 }
 
 /// Number of ancestors of `id` in `items` (bounded, so a cycle ends).
@@ -497,30 +549,23 @@ pub(super) fn tree_skips(
     })
 }
 
-/// Planned changes that would carry a document the user touched since
-/// the snapshot (`touched`) into the trash, e.g. a folder origin trashed
-/// while the user wrote in a notebook inside it: that notebook would
-/// land in the trash on a side whose own tree then has it there, and
-/// the edit could no longer pull it out. Those changes are skipped (with
-/// fork partners) until no touched document newly lands in the trash.
-pub(super) fn trash_skips(
-    current: &BTreeMap<DocId, TreeItem>,
-    planned: &BTreeMap<DocId, Option<TreeItem>>,
-    touched: &BTreeSet<DocId>,
-    partners: &Partners,
-) -> BTreeSet<DocId> {
-    skip_until_settled(planned, partners, |skipped| {
-        let projected = project(current, planned, skipped);
-        let blamed: BTreeSet<DocId> = touched
-            .iter()
-            .filter(|doc| {
-                projected.contains_key(*doc) && on_trash(&projected, doc) && !on_trash(current, doc)
-            })
-            .flat_map(|doc| chain(&projected, doc))
-            .filter(|doc| planned.contains_key(doc) && !skipped.contains(doc))
-            .collect();
-        (!blamed.is_empty()).then_some(blamed)
-    })
+/// Touched documents (changed by the user since the snapshot) that the
+/// projected tree puts in the trash although they are not there now, and
+/// everything above them: e.g. a folder origin trashed while the user
+/// wrote in a notebook inside it. That notebook would land in the trash
+/// on a side whose own tree then has it there, and the edit could no
+/// longer pull it out; the changes doing it are skipped instead.
+fn trash_blame<'a>(
+    current: &'a BTreeMap<DocId, TreeItem>,
+    projected: &'a BTreeMap<DocId, TreeItem>,
+    touched: &'a BTreeSet<DocId>,
+) -> impl Iterator<Item = DocId> + 'a {
+    touched
+        .iter()
+        .filter(|doc| {
+            projected.contains_key(*doc) && on_trash(projected, doc) && !on_trash(current, doc)
+        })
+        .flat_map(|doc| chain(projected, doc))
 }
 
 // ---- reconciliation ---------------------------------------------------------------
@@ -792,9 +837,9 @@ pub(super) struct Checks<'a> {
 }
 
 /// The documents not to apply: those whose files changed since the read
-/// ([`verified`]), changes that would carry a touched document into the
-/// trash ([`trash_skips`]), changes that would break the live tree
-/// ([`tree_skips`]), each with its fork partners.
+/// ([`verified`]), then, to a fixpoint, changes that would carry a
+/// touched document into the trash ([`trash_blame`]) or break the live
+/// tree (as [`tree_skips`] judges), each with its fork partners.
 pub(super) fn skipped(checks: &Checks) -> Result<BTreeSet<DocId>> {
     let (no_files, no_set, no_moves) = (BTreeMap::new(), BTreeSet::new(), BTreeMap::new());
     let changed = checks
@@ -827,27 +872,26 @@ pub(super) fn skipped(checks: &Checks) -> Result<BTreeSet<DocId>> {
             })
             .collect()
     };
-    let skipped = with_partners(changed, checks.partners);
-    let skipped: BTreeSet<DocId> = skipped
-        .iter()
-        .cloned()
-        .chain(trash_skips(
-            checks.current,
-            &items(&skipped),
-            checks.touched,
-            checks.partners,
-        ))
-        .collect();
-    let skipped: BTreeSet<DocId> = skipped
-        .iter()
-        .cloned()
-        .chain(tree_skips(
-            checks.current,
-            &items(&skipped),
-            checks.partners,
-        ))
-        .collect();
-    Ok(with_partners(skipped, checks.partners))
+    let changed = with_partners(changed, checks.partners);
+    // One fixpoint for both checks: a change skipped by one can make
+    // another fail the other.
+    let planned: BTreeMap<DocId, Option<TreeItem>> = items(&changed);
+    let baseline: BTreeSet<TreeViolation> = tree_violations(checks.current).into_iter().collect();
+    let settled = skip_until_settled(&planned, checks.partners, |skipped| {
+        let projected = project(checks.current, &planned, skipped);
+        let blamed: BTreeSet<DocId> = tree_violations(&projected)
+            .iter()
+            .filter(|violation| !baseline.contains(*violation))
+            .flat_map(involved)
+            .chain(trash_blame(checks.current, &projected, checks.touched))
+            .filter(|doc| planned.contains_key(doc) && !skipped.contains(doc))
+            .collect();
+        (!blamed.is_empty()).then_some(blamed)
+    });
+    Ok(with_partners(
+        changed.union(&settled).cloned().collect(),
+        checks.partners,
+    ))
 }
 
 /// The writes of `plan` whose content differs from what was staged
