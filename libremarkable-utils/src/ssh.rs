@@ -137,6 +137,12 @@ impl SshSession {
         })
     }
 
+    /// Run this executable instead of `ssh` (tests with a mock transport).
+    #[cfg(test)]
+    pub(crate) fn set_ssh_exe(&mut self, exe: PathBuf) {
+        self.ssh_exe = Some(exe);
+    }
+
     /// The ssh destination (`host` or `user@host`).
     pub fn target(&self) -> String {
         self.opts.destination.clone()
@@ -316,6 +322,155 @@ impl SshSession {
             progress,
         )
     }
+
+    /// Run a shell script on the device by piping it to `sh -s`, so its
+    /// size is not bounded by the remote command line (one argv string,
+    /// 128 KiB on Linux). The script must not read stdin. Returns the
+    /// output whatever the exit status; callers interpret it. A failure
+    /// to send the script is an error only if the remote exited zero
+    /// (otherwise its status and stderr say more).
+    pub fn run_script(&self, script: &str) -> Result<Output> {
+        let mut child = StreamingChild::spawn(&mut self.command("sh -s"), true)?;
+        let sent = {
+            let mut stdin = child.child.stdin.take().expect("stdin was piped");
+            stdin.write_all(script.as_bytes())
+        };
+        // stdin is closed, so the remote shell sees EOF and SSH ends.
+        let output = child.wait_for_output()?;
+        match sent {
+            Err(error) if output.status.success() => Err(error.into()),
+            _ => Ok(output),
+        }
+    }
+
+    /// Run a remote command with stdin produced incrementally by `write`
+    /// (e.g. a tar stream built on the fly); non-zero exit is an error.
+    /// An error from `write` other than a broken pipe kills the command.
+    pub fn run_checked_with_writer<T>(
+        &self,
+        remote_cmd: &str,
+        write: impl FnOnce(&mut dyn Write) -> Result<T>,
+    ) -> Result<T> {
+        let (value, output) = self.run_with_stdin_writer(remote_cmd, write)?;
+        checked(output)?;
+        Ok(value)
+    }
+
+    fn run_with_stdin_writer<T>(
+        &self,
+        remote_cmd: &str,
+        write: impl FnOnce(&mut dyn Write) -> Result<T>,
+    ) -> Result<(T, Output)> {
+        let mut child = StreamingChild::spawn(&mut self.command(remote_cmd), true)?;
+        let written = {
+            let mut stdin = child.child.stdin.take().expect("stdin was piped");
+            write(&mut stdin)
+        };
+        match written {
+            // The remote stopped reading; its exit status may say why.
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::BrokenPipe => {
+                checked(child.wait_for_output()?)?;
+                Err(error.into())
+            }
+            // `Drop` kills SSH.
+            Err(error) => Err(error),
+            Ok(value) => Ok((value, child.wait_for_output()?)),
+        }
+    }
+
+    /// Run a remote command with `input` on its stdin (fed from a thread)
+    /// and hand its stdout to the caller as a stream, so large outputs
+    /// (tar archives) are never buffered whole. Finish with
+    /// [`RemoteStream::finish`]; dropping the stream kills the command.
+    pub fn stream_stdout<'p>(
+        &self,
+        remote_cmd: &str,
+        input: Vec<u8>,
+        progress: &'p dyn Progress,
+    ) -> Result<RemoteStream<'p>> {
+        let mut child = StreamingChild::spawn_io(&mut self.command(remote_cmd), true, false)?;
+        let stdout = child.child.stdout.take().expect("stdout was piped");
+        let mut stdin = child.child.stdin.take().expect("stdin was piped");
+        let feeder = thread::Builder::new().spawn(move || stdin.write_all(&input))?;
+        Ok(RemoteStream {
+            child,
+            stdout,
+            feeder: Some(feeder),
+            eof: false,
+            transferred: 0,
+            progress,
+        })
+    }
+}
+
+/// How much more output [`RemoteStream::finish`] reads after a local
+/// error, looking for the end of the remote's output (a tar archive's
+/// trailing padding is at most 10 KiB).
+const STREAM_ERROR_DRAIN: u64 = 64 * 1024;
+
+/// The stdout of a remote command, readable as it arrives (see
+/// [`SshSession::stream_stdout`]).
+pub struct RemoteStream<'p> {
+    child: StreamingChild,
+    stdout: std::process::ChildStdout,
+    feeder: Option<JoinHandle<std::io::Result<()>>>,
+    eof: bool,
+    transferred: u64,
+    progress: &'p dyn Progress,
+}
+
+impl Read for RemoteStream<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.stdout.read(buf)?;
+        if n == 0 {
+            self.eof = true;
+        } else {
+            self.transferred += n as u64;
+            self.progress.bytes(self.transferred, None);
+        }
+        Ok(n)
+    }
+}
+
+impl RemoteStream<'_> {
+    /// Settle the command given the caller's result of consuming the
+    /// stream. On success the rest of stdout is drained and the exit
+    /// status checked. On a local error, up to [`STREAM_ERROR_DRAIN`]
+    /// more bytes are read: if the remote's output ends within them (a
+    /// truncated archive, a missing file noticed at the end), its failure
+    /// wins, since it explains the local one; otherwise the local error
+    /// is returned and the command killed.
+    pub fn finish<T>(mut self, local: Result<T>) -> Result<T> {
+        match local {
+            Ok(value) => {
+                let drained = std::io::copy(&mut self, &mut std::io::sink());
+                let output = self.child.wait_for_output()?;
+                let fed = join_feeder(self.feeder.take());
+                checked(output)?;
+                drained?;
+                fed?;
+                self.progress.bytes_done();
+                Ok(value)
+            }
+            Err(error) => {
+                let mut rest = (&mut self).take(STREAM_ERROR_DRAIN);
+                // A read error here only means the remote side is gone.
+                let _ = std::io::copy(&mut rest, &mut std::io::sink());
+                if self.eof {
+                    checked(self.child.wait_for_output()?)?;
+                }
+                Err(error)
+            }
+        }
+    }
+}
+
+fn join_feeder(feeder: Option<JoinHandle<std::io::Result<()>>>) -> std::io::Result<()> {
+    feeder.map_or(Ok(()), |feeder| {
+        feeder
+            .join()
+            .map_err(|_| std::io::Error::other("SSH input writer panicked"))?
+    })
 }
 
 /// An exclusively created sibling, removed on every unsuccessful exit path.
@@ -453,6 +608,15 @@ struct StreamingChild {
 
 impl StreamingChild {
     fn spawn(command: &mut Command, with_stdin: bool) -> std::io::Result<Self> {
+        Self::spawn_io(command, with_stdin, with_stdin)
+    }
+
+    /// `drain_stdout = false` leaves stdout to the caller (downloads).
+    fn spawn_io(
+        command: &mut Command,
+        with_stdin: bool,
+        drain_stdout: bool,
+    ) -> std::io::Result<Self> {
         let cancellation = DrainCancellation::new()?;
         let child = command
             .stdin(if with_stdin {
@@ -475,7 +639,7 @@ impl StreamingChild {
             stream.child.stderr.take().expect("stderr was piped"),
             &stream.cancellation,
         )?);
-        if with_stdin {
+        if drain_stdout {
             stream.stdout = Some(drain_pipe(
                 stream.child.stdout.take().expect("stdout was piped"),
                 &stream.cancellation,

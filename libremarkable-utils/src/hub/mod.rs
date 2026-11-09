@@ -10,14 +10,16 @@
 //!   repository and tablet state formats, normalisation, document
 //!   grouping, snapshot validation, carry-forward.
 //! - [`merge`] — pure three-way merge, deletion guard, forks.
-//! - [`device`] — tablet I/O behind a trait (lock, watchdog, stat
-//!   pass, staged apply).
+//! - [`device`] — tablet I/O behind the [`device::Tablet`] trait (lock,
+//!   watchdog, stat pass, streaming download, staged apply), over SSH
+//!   or a fault-injecting fake.
 //!
 //! Errors: pure functions that fail only on their own terms return
-//! their module's error ([`model::ModelError`], [`merge::MergeError`]);
-//! functions that call caller-supplied readers return [`crate::Result`],
-//! and their own failures are variants of [`crate::Error`]
-//! (`HubModel`, `HubMerge`). Hub errors never wrap [`crate::Error`].
+//! their module's error ([`model::ModelError`], [`merge::MergeError`],
+//! [`device::DeviceError`]). Functions that do I/O or call
+//! caller-supplied readers return [`crate::Result`]; their own failures
+//! are the variants `HubModel`, `HubMerge` and `HubDevice` of
+//! [`crate::Error`]. Hub errors never wrap [`crate::Error`].
 
 pub mod device;
 pub mod merge;
