@@ -130,8 +130,9 @@ pub fn item_kind(metadata: &Value) -> Option<ItemKind> {
     }
 }
 
-/// xochitl stores timestamps sometimes as strings, sometimes as numbers.
-fn lenient_i64(value: Option<&Value>) -> i64 {
+/// xochitl stores timestamps sometimes as strings, sometimes as numbers;
+/// `0` when absent or unparsable.
+pub fn lenient_i64(value: Option<&Value>) -> i64 {
     match value {
         Some(Value::Number(n)) => n.as_i64().unwrap_or(0),
         Some(Value::String(s)) => s.parse().unwrap_or(0),

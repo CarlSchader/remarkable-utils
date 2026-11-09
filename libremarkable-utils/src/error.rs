@@ -148,6 +148,14 @@ pub enum Error {
     #[error(transparent)]
     HubModel(#[from] crate::hub::model::ModelError),
 
+    /// `rmu hub` merge-engine error.
+    #[error(transparent)]
+    HubMerge(#[from] crate::hub::merge::MergeError),
+
+    /// A string that is not a git object id ([`crate::git::Oid`]).
+    #[error("invalid object id {0:?}: expected 40 or 64 lowercase hex digits")]
+    InvalidObjectId(String),
+
     /// `rmu hub` device-layer error (lock, watchdog, transfers, apply).
     #[error(transparent)]
     HubDevice(#[from] crate::hub::device::DeviceError),

@@ -351,7 +351,14 @@ configurable), or whenever the snapshot is empty and the base is not.
 Consent is recorded in the merge commit's trailer. Deletions that origin
 has already accepted (they are in theirs, not introduced by this merge)
 are applied to other tablets without asking again, so one deliberate
-clean-up does not require `--allow-deletions` on every tablet.
+clean-up does not require `--allow-deletions` on every tablet — but
+only deletions whose consent is recorded in a trailer. The sync cycle
+collects those from the commits since the base and passes them to the
+merge; anything else already deleted in origin still counts. Folders
+count as documents. The percentage is of origin's library for
+deletions from origin and of the tablet's for deletions from the
+tablet. With `--allow-deletions`, the trailer lists this merge's
+deletions from origin.
 
 ### Stage and apply (steps 12–14)
 
@@ -526,10 +533,15 @@ documents that another tablet changed or deleted in the meantime.
 
 Further:
 
-- **Deterministic forks**: a fork's UUID is UUIDv5 over (original
-  document UUID, tree id of the forked version normalised without view
-  state and derived fields). Recomputing a merge recreates the identical fork, which merges
-  as an identical add — never a duplicate.
+- **Deterministic forks**: a fork's UUID is UUIDv5 (fixed rmu
+  namespace) over the original document UUID and a canonical text of
+  the forked version's fork class: its `.content` normalised without
+  view-state, derived and set fields (keys sorted, pages sorted by id),
+  plus the path, mode and blob id of every other file except
+  `.metadata`. The merge is pure and has no git tree ids, so this text
+  stands in for the tree id. Recomputing a merge recreates the identical
+  fork, which merges as an identical add — never a duplicate; a fork
+  whose UUID already exists in the merged tree is not created again.
 - **Identical changes** on both sides merge to one.
 - **Device ref bookkeeping**: `device_ref` is written to the tablet
   state immediately after each device-ref push (in `sync` and `backup`).
@@ -574,7 +586,15 @@ document. JSON is compared parsed, never as bytes.
   file.
 - **Fork class**: every mirrored file except `metadata`, view-state and
   derived fields — page list and other `.content` fields, `.rm` files,
-  `pagedata`, highlights, page metadata, templates, payloads.
+  `pagedata`, highlights, page metadata, templates, payloads, and paths
+  carried forward that the active rules do not cover. `tags` and
+  `pageTags` are not fork class: they merge as sets (below). The order
+  of the `cPages.pages` array carries no meaning (`idx` orders pages),
+  so a reordered array with unchanged `idx` values is no change.
+- A fork-class change wins **whole**: the merged document takes every
+  fork-class file, derived fields included, from the one side that
+  changed it. EPUB units (below) therefore move together without a
+  special case.
 
 ### Per document
 
@@ -586,7 +606,7 @@ document. JSON is compared parsed, never as bytes.
 | New on both (same UUID), identical | Taken once |
 | New on both, different | Treated as "changed on both" against an empty base |
 | Deleted on one side, unchanged on the other | Deleted |
-| Deleted on one side, changed on the other | **Kept** (changed version), note |
+| Deleted on one side, changed on the other | **Kept** (changed version), note. Moving it to the trash alone does not count: trashed on one tablet and emptied from the trash on the other is a deletion |
 | Deleted on both | Deleted |
 | Changed on both, differently | Per-file rules below |
 
@@ -597,50 +617,124 @@ reMarkable cloud account, and the case after lost tablet state.
 
 - **`metadata`** — three-way merge per field. Concurrent different
   values for one field (renamed differently on two tablets) take
-  origin's value, with a note. Unknown fields are preserved.
-  `lastModified` becomes the maximum of both.
+  origin's value, with a note (none for view-state fields, which only
+  the overlay on apply cares about). Unknown fields are preserved.
+  `lastModified` becomes the maximum of both, compared leniently as a
+  number or a numeric string; the later side's value is kept as written.
 - **Fork class** — phase 1: if fork-class content changed on both sides
   differently, the document **forks**. Origin keeps the UUID; the
   tablet's version becomes a new document (deterministic UUID, above)
   named `<name> (conflict <device-name> <yyyy-mm-dd>)` in the same
-  folder, with a short id suffix if that name is taken. Phase 2 replaces
-  most forks with a page-level merge.
+  folder, with a short id suffix if that name is taken (`<name>
+  (conflict <device-name> <yyyy-mm-dd> <first 8 hex digits of the copy
+  UUID>)`). The original keeps origin's fork class and the per-field
+  metadata merge; the copy has the tablet's fork class and metadata,
+  renamed. Copies are placed after the tree rules, next to wherever the
+  original ended up, and named in UUID order, so the result is
+  deterministic. Phase 2 replaces most forks with a page-level merge.
 - **Units**: an EPUB's generated `payload.pdf` and the `.content` layout
   fields (`fontName`, `margins`, `lineHeight`, `textScale`,
   `textAlignment`, `orientation`) are fork class and move together with
   the ink positioned on them.
-- **`tags`, `pageTags`** — merge as sets.
-- **Unknown `.content` format** (unrecognised `formatVersion`, `.rm`
-  header, or structure) — opaque: changed on both differently forks.
+- **`tags`, `pageTags`** — merge as sets, three-way: a value survives
+  when both sides have it or one side added it; a removal on one side
+  wins unless the other side added it. A missing field is an empty set,
+  and an empty result is written only where the winning `.content`
+  already had the field (rmu's skeleton has no `tags`; xochitl adds
+  `tags: []` on first open).
+- **Unknown `.content` format** (unrecognised `formatVersion` or
+  structure on ours' or theirs' side; an old format in the base does not
+  count, so documents both tablets migrated identically after a
+  firmware update are an identical change) — opaque: the enumerated
+  view-state and derived paths are still stripped (reading never
+  counts), but the rest is compared as it is: no set merge, no page
+  sorting, no materialisation rule; changed on both differently forks.
+  `.rm` header versions are not gated in phase 1: `.rm` files are
+  compared as whole blobs, so their format cannot make a phase-1 merge
+  wrong. Phase 2 gates them before merging pages.
+- **First-open materialisation**: a `.content` counts as unchanged
+  when its page list is a trivial materialisation of the reference's
+  empty one (`"pages": []`): one entry per PDF page, keys only `id`,
+  `idx`, `redir` and the per-page view state, `redir` equal to the
+  page's position in `idx` order, a page count equal to
+  `cPages.original` when that is set, and no `.rm` files. The reference
+  is the base's `.content`; for "new on both" it is an empty page list,
+  so two tablets that each opened the same imported PDF agree.
+  When both sides materialised, origin's page ids win, even if the tablet
+  also changed the metadata (the fork class then comes from origin).
+- **Unparsable JSON** stops the run: the `.metadata` of every present
+  merged document (the tree rules parse them all) and any `.content` the
+  merge reads. Snapshots are validated, so it can only come from a
+  damaged commit.
 
 ### Tree-level rules, after per-document merging
 
-Applied in this order:
+Applied in rounds, in this order, until a round changes nothing:
 
-1. **Trash vs edit**: edits beat deletion, including soft deletion. If
-   one side moved a document — or any of its ancestor folders — to the
-   trash (`parent: "trash"`) and the other side changed the document's
-   fork-class content, the nearest trashed item on its path (the
-   document, or the trashed folder) is restored to its pre-trash parent,
-   with a note.
+1. **Trash vs edit**: edits beat deletion, including soft deletion. A
+   document whose fork-class content a side changed must not end up on
+   a trash path in the merged tree — unless that side's **own** tree has
+   the document on a trash path (it trashed the document or an ancestor
+   itself). A metadata-only change (a rename) is not an edit here.
+   While such a document sits on a trash path, the nearest trashed item
+   on that path (the document, or a trashed folder) goes back to its
+   pre-trash parent: the one the editing side gives it, or the base's if
+   that side lacks the item; then the walk continues upward, since that
+   parent may be in the trash too. If the trashed item cannot go back
+   (the editing side trashed it too; neither the editing side nor the
+   base has a parent for it; or that parent is gone from the merged
+   tree, is not a folder, or lies below the item, so restoring it would
+   create an orphan or a cycle), the item just below it on the path
+   moves out instead: to the editing side's
+   parent, the base's, or the root, whichever is first off every trash
+   path. Each move gets a note. So a folder both sides trashed stays in
+   the trash, and the edited document comes out of it.
 2. **Orphans**: a present item whose parent is missing gets its whole
-   ancestor chain resurrected from the newest version in history; with
-   no such version it is moved to the root, with a note. A resurrected
+   ancestor chain resurrected: each parent from origin's or the base's
+   own version when one of them has it present outside the trash (the
+   tablet may have deleted a folder origin still has), else from the
+   newest version in origin's history; with no such version the item is
+   moved to the root, with a note. A resurrected
    folder that was in the trash comes back to its last non-trash
-   location.
-3. **Cycles**: while the folder tree has a cycle, a folder on the cycle
-   that the tablet moved takes origin's parent instead, with a note.
-   This terminates because origin's tree is acyclic. A resurrected folder
-   that is still on a cycle is moved to the root.
+   location (root if it has none). An item whose parent exists but is
+   not a folder also moves to the root.
+3. **Cycles**: while the folder tree has a cycle, one folder on it
+   moves, with a note. In order of preference: a folder that was
+   restored from the trash or resurrected goes to the root; a folder
+   whose parent differs from origin's (one the tablet moved) takes
+   origin's parent, if that is the root or a present folder; a folder
+   origin lacks goes to the root; failing all that, the smallest UUID
+   goes to the root. This terminates: each step either sends a folder
+   to the root, which ends every walk, or gives a folder origin's parent,
+   after which the second preference never picks it again, so there are
+   at most two steps per folder. A cycle without any candidate would
+   consist of origin's own edges, which an acyclic origin cannot have.
+
+Rule 1 runs again in each round because rules 2 and 3 can put an edited
+document back in the trash (a resurrected folder inside a trashed one,
+a cycle broken by taking origin's parent under a trashed folder). Rule 1
+only moves items to the root or to a present folder not below them, so
+it creates neither orphans nor cycles: two changing rounds suffice, and
+every rule has a proven step bound. Exceeding a bound, or ending with a
+broken tree, is an error, and nothing is pushed.
+
+The same checks (orphans, parents that are not folders, cycles) are a
+pure function over item metadata (`hub::merge::tree_violations`), which
+step 14 runs against the live tablet.
+
+Paths outside document subtrees (`.rmu/*`, hand-committed files) are
+taken from origin: snapshots carry them forward from base and sync never
+changes them.
 
 Trash is ordinary metadata; emptying the trash is deletion.
 
 ### Per-document format gating
 
 Instead of blocking mixed firmware wholesale, each document is merged
-only if both sides' formats are known to this rmu (`formatVersion`,
-`.rm` header version, recognised structure); otherwise it is treated as
-opaque. Commit trailers record each device's firmware. A firmware update
+only if both sides' formats are known to this rmu (`formatVersion` and
+recognised structure of ours' and theirs' `.content`; the `.rm` header
+version from phase 2 on, see "Unknown `.content` format"); otherwise it
+is treated as opaque. Commit trailers record each device's firmware. A firmware update
 that migrates every `.content` makes the next sync touch the whole
 library: sync all tablets before updating any of them.
 
@@ -717,7 +811,8 @@ When fork-class content changed on both sides:
 ## View state
 
 View state is **device-local**: it never counts as a change, never forks,
-never resurrects a deleted document, and on apply each tablet keeps its
+never resurrects a deleted document (also for an unknown `.content`
+format: the enumerated view-state paths are stripped from it too), and on apply each tablet keeps its
 own values for existing documents (re-read while xochitl is stopped). Documents new to a tablet get the
 values stored in origin, minus model-specific zoom fields (the
 `customZoom*` fields; the survey saw `1404`×`1872` page sizes on a
@@ -942,19 +1037,19 @@ does with a merged `cPages.uuids`, needs a second tablet (question 7).
 
 To be handled in the implementation PRs named:
 
-- Merge engine: the deletion-guard exemption applies only to deletions
-  that carry recorded consent in a trailer, not to every deletion already
-  in origin (one pushed by hand has none). Prove the cycle rule
-  terminates when a folder restored from the trash sits on a cycle (send
-  it to the root).
+- Merge engine (done in phase 1): the deletion-guard exemption applies
+  only to deletions that carry recorded consent in a trailer, not to
+  every deletion already in origin (one pushed by hand has none). Prove
+  the cycle rule terminates when a folder restored from the trash sits
+  on a cycle (send it to the root).
 - Sync cycle: reconciliation that finishes an interrupted apply uses the
   same verify and tree checks as step 14. `backup` skips reconciliation,
   since reconciliation can write files. The journal is flushed to disk
   (`sync`) on the tablet before each push. The metadata re-read in step
   14 includes newly created files. Quarantined documents are never
   deleted, not only never overwritten.
-- Merge engine (from the device survey): **first-open
-  materialisation**. A `.content` whose base has `"pages": []` and
+- Merge engine (from the device survey; done in phase 1, see "Changed
+  on both, differently"): **first-open materialisation**. A `.content` whose base has `"pages": []` and
   whose new page list is trivial — one entry per PDF page, `redir` equal
   to its position, no inserted, deleted or templated pages, no `.rm`
   files — counts as unchanged (only view state and derived fields

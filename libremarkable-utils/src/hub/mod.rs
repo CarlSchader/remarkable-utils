@@ -13,6 +13,13 @@
 //! - [`device`] — tablet I/O behind the [`device::Tablet`] trait (lock,
 //!   watchdog, stat pass, streaming download, staged apply), over SSH
 //!   or a fault-injecting fake.
+//!
+//! Errors: pure functions that fail only on their own terms return
+//! their module's error ([`model::ModelError`], [`merge::MergeError`],
+//! [`device::DeviceError`]). Functions that do I/O or call
+//! caller-supplied readers return [`crate::Result`]; their own failures
+//! are the variants `HubModel`, `HubMerge` and `HubDevice` of
+//! [`crate::Error`]. Hub errors never wrap [`crate::Error`].
 
 pub mod device;
 pub mod merge;
