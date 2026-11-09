@@ -10,8 +10,9 @@
 //!   repository and tablet state formats, normalisation, document
 //!   grouping, snapshot validation, carry-forward.
 //! - [`merge`] — pure three-way merge, deletion guard, forks.
-//! - [`device`] — tablet I/O behind a trait (lock, watchdog, stat
-//!   pass, staged apply).
+//! - [`device`] — tablet I/O behind the [`device::Tablet`] trait (lock,
+//!   watchdog, stat pass, streaming download, staged apply), over SSH
+//!   or a fault-injecting fake.
 
 pub mod device;
 pub mod merge;
