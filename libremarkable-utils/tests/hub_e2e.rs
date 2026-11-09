@@ -2746,3 +2746,37 @@ fn a_pull_only_sync_crashed_at_every_step_recovers() {
         );
     });
 }
+
+/// Every report serialises (for the CLI's `--json`), with tagged enums.
+#[test]
+fn reports_serialise_to_json() {
+    let (world, lib) = same_page_conflict();
+    let status = serde_json::to_value(world.status(1).unwrap()).unwrap();
+    assert_eq!(status["lock"]["state"], "free");
+    assert!(status["read"]["downloaded"]["files"].is_u64(), "{status}");
+    let dry = serde_json::to_value(world.dry_run(1).unwrap()).unwrap();
+    assert_eq!(dry["would_push"], true);
+    let report = world.sync(1).unwrap();
+    let json = serde_json::to_value(&report).unwrap();
+    assert_eq!(json["update"]["kind"], "merge", "{json}");
+    assert_eq!(json["update"]["commit"], report.base.as_str());
+    assert_eq!(json["forks"][0]["original"], lib.notes.as_str());
+    assert!(
+        json["notes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|note| note["kind"] == "forked" && note["doc"] == lib.notes.as_str()),
+        "{json}"
+    );
+    let quiet = serde_json::to_value(world.sync(1).unwrap()).unwrap();
+    assert_eq!(quiet["update"], serde_json::json!({ "kind": "up_to_date" }));
+    let backup = serde_json::to_value(world.backup(0).unwrap()).unwrap();
+    assert!(backup["snapshot"].is_string(), "{backup}");
+    let warning = serde_json::to_value(Warning::MixedModel {
+        seen: "a".to_string(),
+        model: "b".to_string(),
+    })
+    .unwrap();
+    assert_eq!(warning["kind"], "mixed_model");
+}
