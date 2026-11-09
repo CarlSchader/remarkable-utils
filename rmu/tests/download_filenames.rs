@@ -4,30 +4,23 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde_json::json;
+use test_support::Scratch;
 
 const FIRST: &str = "00000000-0000-4000-8000-000000000001";
 const SECOND: &str = "00000000-0000-4000-8000-000000000002";
-static NEXT: AtomicUsize = AtomicUsize::new(0);
 
-struct Fixture(PathBuf);
+struct Fixture(Scratch);
 
 impl Fixture {
     fn new() -> Self {
-        let root = std::env::temp_dir().join(format!(
-            "rmu-download-names-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir(&root).unwrap();
-        let fixture = Self(root);
-        for dir in ["bin", "device", "out", "state"] {
+        let fixture = Self(Scratch::new("download-names"));
+        for dir in ["device", "out", "state"] {
             fs::create_dir(fixture.path(dir)).unwrap();
         }
-        test_support::write_script(
-            &fixture.path("bin/ssh"),
+        fixture.0.mock_command(
+            "ssh",
             r#"for arg do command=$arg; done
 case "$command" in
     cat\ *|*'tar -cf -'*)
@@ -62,11 +55,9 @@ exec sh -c "$command"
     }
 
     fn download(&self, target: &str, output: Option<&Path>, bundle: bool, fail: bool) -> Output {
-        let current_path = std::env::var_os("PATH").unwrap_or_default();
-        let paths = std::iter::once(self.path("bin")).chain(std::env::split_paths(&current_path));
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_rmu"));
         cmd.current_dir(self.path("out"))
-            .env("PATH", std::env::join_paths(paths).unwrap())
+            .env("PATH", self.0.mock_path())
             .env("XDG_STATE_HOME", self.path("state"))
             .env("MOCK_TRANSFERS", self.path("transfers"))
             .env("MOCK_FAIL_TRANSFERS", if fail { "1" } else { "0" })
@@ -99,12 +90,6 @@ exec sh -c "$command"
             !self.path("transfers").exists(),
             "started a document transfer"
         );
-    }
-}
-
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        fs::remove_dir_all(&self.0).unwrap();
     }
 }
 
@@ -207,11 +192,7 @@ fn normal_downloads_and_explicit_user_paths_still_work() {
             let chosen = PathBuf::from(format!("../chosen.{ext}"));
             let result =
                 fixture.download(FIRST, explicit.then_some(chosen.as_path()), bundle, false);
-            assert!(
-                result.status.success(),
-                "{}",
-                String::from_utf8_lossy(&result.stderr)
-            );
+            test_support::assert_success(&result);
             let path = if explicit {
                 fixture.path(&format!("chosen.{ext}"))
             } else {

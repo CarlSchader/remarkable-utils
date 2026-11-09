@@ -3,10 +3,10 @@
 use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use libremarkable_utils::client::Client;
 use libremarkable_utils::ssh::{SshOptions, SshSession};
+use test_support::Scratch;
 
 const MOCK_SSH: &str = r#"[ "$#" -eq 3 ] && [ "$1" = -- ] && [ "$2" = mock-device ] || exit 99
 case "$3" in
@@ -113,14 +113,6 @@ impl Fixture {
     }
 }
 
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        if self.root.exists() {
-            fs::remove_dir_all(&self.root).unwrap();
-        }
-    }
-}
-
 // Re-execute only this test with a private PATH: no process-global environment
 // mutation, cross-test races, SSH connection, or production transport changes.
 fn with_mock_ssh(name: &str, test: impl FnOnce(&Fixture)) {
@@ -128,26 +120,20 @@ fn with_mock_ssh(name: &str, test: impl FnOnce(&Fixture)) {
         test(&Fixture { root: root.into() });
         return;
     }
-    let root = std::env::temp_dir().join(format!("rmu-listing-{}", uuid::Uuid::new_v4()));
-    let fixture = Fixture { root };
+    // The scratch directory belongs to this (parent) process, which
+    // removes it once the child has finished.
+    let scratch = Scratch::new("listing");
+    let fixture = Fixture {
+        root: scratch.path().to_path_buf(),
+    };
     fs::create_dir_all(fixture.data()).unwrap();
-    let bin = fixture.root.join("bin");
-    fs::create_dir(&bin).unwrap();
-    test_support::write_script(&bin.join("ssh"), MOCK_SSH);
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    let paths = std::iter::once(bin).chain(std::env::split_paths(&path));
-    let output = Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", name, "--nocapture"])
-        .env("RMU_LISTING_TEST_ROOT", &fixture.root)
-        .env("PATH", std::env::join_paths(paths).unwrap())
+    scratch.mock_command("ssh", MOCK_SSH);
+    let output = test_support::rerun_test(name)
+        .env("RMU_LISTING_TEST_ROOT", scratch.path())
+        .env("PATH", scratch.mock_path())
         .output()
         .unwrap();
-    assert!(
-        output.status.success(),
-        "mock listing test failed:\n{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    test_support::assert_success(&output);
 }
 
 fn check_stat_failure(fixture: &Fixture, mode: &str) {

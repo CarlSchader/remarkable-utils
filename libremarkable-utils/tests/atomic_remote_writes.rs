@@ -6,39 +6,21 @@
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use libremarkable_utils::client::Client;
 use libremarkable_utils::progress::{NoProgress, Progress};
 use libremarkable_utils::ssh::{SshOptions, SshSession};
+use test_support::Scratch;
 
 const UUID: &str = "11111111-1111-4111-8111-111111111111";
 const METADATA: &[u8] = br#"{"type":"DocumentType","visibleName":"Original","parent":"","lastModified":"1","unknown":{"keep":true}}"#;
 const ORIGINAL: &[u8] = b"original synthetic PDF bytes";
 
-struct Sandbox(PathBuf);
-
-impl Sandbox {
-    fn new() -> Self {
-        let path = std::env::temp_dir().join(format!("rmu-atomic-{}", uuid::Uuid::new_v4()));
-        fs::create_dir(&path).unwrap();
-        Self(path)
-    }
-}
-
-impl Drop for Sandbox {
-    fn drop(&mut self) {
-        fs::remove_dir_all(&self.0).unwrap();
-    }
-}
-
 #[test]
 fn mock_remote_write_scenarios() {
-    let sandbox = Sandbox::new();
-    let bin = sandbox.0.join("bin");
-    fs::create_dir(&bin).unwrap();
-    test_support::write_script(
-        &bin.join("ssh"),
+    let sandbox = Scratch::new("atomic");
+    sandbox.mock_command(
+        "ssh",
         r#"for cmd do :; done
 case "$cmd" in
     *'cat >'*) ;;
@@ -79,10 +61,7 @@ case "$RMU_TEST_MODE" in
 esac
 "#,
     );
-    let path = std::env::join_paths(
-        std::iter::once(bin).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
-    )
-    .unwrap();
+    let path = sandbox.mock_path();
     [
         "truncated",
         "cat-failure",
@@ -93,10 +72,9 @@ esac
     ]
     .into_iter()
     .for_each(|mode| {
-        let root = sandbox.0.join(format!("{mode} 'quoted $directory"));
+        let root = sandbox.join(format!("{mode} 'quoted $directory"));
         fs::create_dir(&root).unwrap();
-        let output = Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "mock_remote_write_child", "--nocapture"])
+        let output = test_support::rerun_test("mock_remote_write_child")
             .env("PATH", &path)
             .env("RMU_TEST_ROOT", &root)
             .env("RMU_TEST_MODE", mode)

@@ -2,36 +2,29 @@
 //! tablets. The SSH stand-in rejects every destination except the fixtures.
 #![cfg(unix)]
 
-use std::fs::{self, File, FileTimes};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, UNIX_EPOCH};
 
 use serde_json::{Value, json};
+use test_support::{Scratch, assert_success};
 
 const ROOT: &str = "00000000-0000-4000-8000-000000000001";
 const OTHER: &str = "00000000-0000-4000-8000-000000000002";
 const DOC: &str = "00000000-0000-4000-8000-000000000003";
 const ORIGINAL: &[u8] = b"synthetic original PDF";
-static NEXT: AtomicUsize = AtomicUsize::new(0);
 
-struct Fixture(PathBuf);
+struct Fixture(Scratch);
 
 impl Fixture {
     fn new() -> Self {
-        let root = std::env::temp_dir().join(format!(
-            "rmu-sync-cache-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir(&root).unwrap();
-        let fixture = Self(root);
-        for dir in ["bin", "a/device", "b/device", "local", "state"] {
+        let fixture = Self(Scratch::new("sync-cache"));
+        for dir in ["a/device", "b/device", "local", "state"] {
             fs::create_dir_all(fixture.0.join(dir)).unwrap();
         }
-        test_support::write_script(
-            &fixture.0.join("bin/ssh"),
+        fixture.0.mock_command(
+            "ssh",
             r#"[ "$#" = 3 ] && [ "$1" = -- ] || exit 90
 case "$2" in
     root@a.invalid) cd "$MOCK_ROOT/a" || exit 91;;
@@ -61,14 +54,7 @@ exec sh -c "$3"
     fn put_metadata(&self, side: &str, uuid: &str, metadata: &Value) {
         let path = self.file(side, uuid, "metadata");
         fs::write(&path, serde_json::to_vec_pretty(metadata).unwrap()).unwrap();
-        File::options()
-            .write(true)
-            .open(path)
-            .unwrap()
-            .set_times(
-                FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(1_700_000_000)),
-            )
-            .unwrap();
+        test_support::set_modified(&path, UNIX_EPOCH + Duration::from_secs(1_700_000_000));
     }
 
     fn folder(&self, side: &str, uuid: &str, name: &str) {
@@ -96,25 +82,18 @@ exec sh -c "$3"
     }
 
     fn command(&self) -> Command {
-        let path = std::env::var_os("PATH").unwrap_or_default();
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_rmu"));
-        cmd.env(
-            "PATH",
-            std::env::join_paths(
-                std::iter::once(self.0.join("bin")).chain(std::env::split_paths(&path)),
-            )
-            .unwrap(),
-        )
-        .env("XDG_STATE_HOME", self.0.join("state"))
-        .env("MOCK_ROOT", &self.0)
-        .env("MOCK_FAIL_LISTING", "")
-        .args([
-            "--no-multiplex",
-            "--no-restart",
-            "--quiet",
-            "--xochitl-dir",
-            "device",
-        ]);
+        cmd.env("PATH", self.0.mock_path())
+            .env("XDG_STATE_HOME", self.0.join("state"))
+            .env("MOCK_ROOT", self.0.path())
+            .env("MOCK_FAIL_LISTING", "")
+            .args([
+                "--no-multiplex",
+                "--no-restart",
+                "--quiet",
+                "--xochitl-dir",
+                "device",
+            ]);
         cmd
     }
 
@@ -130,7 +109,8 @@ exec sh -c "$3"
 
     fn prime_cache(&self, side: &str) {
         assert_success(
-            self.command()
+            &self
+                .command()
                 .args([
                     "--host",
                     &format!("{side}.invalid"),
@@ -178,12 +158,7 @@ exec sh -c "$3"
         let mut metadata = self.metadata(side, uuid);
         metadata[field] = json!(value);
         fs::write(&path, serde_json::to_vec_pretty(&metadata).unwrap()).unwrap();
-        File::options()
-            .write(true)
-            .open(&path)
-            .unwrap()
-            .set_times(FileTimes::new().set_modified(before.modified().unwrap()))
-            .unwrap();
+        test_support::set_modified(&path, before.modified().unwrap());
         let after = fs::metadata(path).unwrap();
         assert_eq!(after.len(), before.len());
         assert_eq!(after.modified().unwrap(), before.modified().unwrap());
@@ -200,20 +175,6 @@ exec sh -c "$3"
         assert_eq!(fs::read(self.file(side, uuid, "pdf")).unwrap(), ORIGINAL);
         assert!(self.file(side, uuid, "content").exists());
     }
-}
-
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        fs::remove_dir_all(&self.0).unwrap();
-    }
-}
-
-fn assert_success(output: Output) {
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
 }
 
 fn local_path(fixture: &Fixture) -> String {
@@ -238,7 +199,7 @@ fn filesystem_sync_does_not_mutate_renamed_roots_or_moved_children() {
             let local = local_path(&fixture);
             fs::write(fixture.0.join("local/keep.pdf"), ORIGINAL).unwrap();
             let dst = format!("root@b.invalid:{}", if by_uuid { ROOT } else { "/AAAA" });
-            assert_success(fixture.sync(&local, &dst, false, ""));
+            assert_success(&fixture.sync(&local, &dst, false, ""));
             fixture.assert_archive("sync-");
             let child = fixture.child("b");
             fixture.prime_cache("b");
@@ -252,7 +213,7 @@ fn filesystem_sync_does_not_mutate_renamed_roots_or_moved_children() {
             let metadata = fixture.metadata("b", &child);
             remove_or_replace_local(&fixture.0.join("local/keep.pdf"), delete);
             for _ in 0..2 {
-                assert_success(fixture.sync(&local, &dst, delete, ""));
+                assert_success(&fixture.sync(&local, &dst, delete, ""));
                 fixture.assert_preserved("b", &child, &metadata);
             }
             if !by_uuid {
@@ -273,7 +234,7 @@ fn tablet_sync_does_not_mutate_renamed_roots_or_moved_children() {
             fixture.folder("b", OTHER, "Elsewhere");
             let src = "root@a.invalid:/Source";
             let dst = format!("root@b.invalid:{}", if by_uuid { ROOT } else { "/AAAA" });
-            assert_success(fixture.sync(src, &dst, false, ""));
+            assert_success(&fixture.sync(src, &dst, false, ""));
             fixture.assert_archive("sync-pair-");
             let child = fixture.child("b");
             fixture.prime_cache("b");
@@ -292,7 +253,7 @@ fn tablet_sync_does_not_mutate_renamed_roots_or_moved_children() {
                 fs::write(fixture.file("a", DOC, "pdf"), b"synthetic replacement").unwrap();
             }
             for _ in 0..2 {
-                assert_success(fixture.sync(src, &dst, delete, ""));
+                assert_success(&fixture.sync(src, &dst, delete, ""));
                 fixture.assert_preserved("b", &child, &metadata);
             }
             if !by_uuid {
@@ -314,7 +275,7 @@ fn renamed_read_only_sources_abort_before_propagating_deletions() {
             local_path(&fixture)
         };
         let src = "root@a.invalid:/AAAA";
-        assert_success(fixture.sync(src, &dst, false, ""));
+        assert_success(&fixture.sync(src, &dst, false, ""));
         fixture.assert_archive(if tablet_destination {
             "sync-pair-"
         } else {
@@ -366,7 +327,7 @@ fn dry_run_uses_authoritative_roots_without_creating_renamed_targets() {
             local_path(&fixture)
         };
         let dst = "root@b.invalid:/AAAA";
-        assert_success(fixture.sync(&src, dst, false, ""));
+        assert_success(&fixture.sync(&src, dst, false, ""));
         fixture.prime_cache("b");
         fixture.same_stamp_change("b", ROOT, "visibleName", "BBBB");
         let files = || tree(&fixture.0.join("b/device"));
@@ -386,7 +347,7 @@ fn dry_run_uses_authoritative_roots_without_creating_renamed_targets() {
                 .output()
                 .unwrap();
             assert!(String::from_utf8_lossy(&output.stdout).contains("mkdir root"));
-            assert_success(output);
+            assert_success(&output);
             assert_eq!(files(), before);
         }
     }
@@ -405,7 +366,7 @@ fn failed_authoritative_sync_listing_never_uses_warm_cache() {
             local_path(&fixture)
         };
         let dst = "root@b.invalid:/Target";
-        assert_success(fixture.sync(&src, dst, false, ""));
+        assert_success(&fixture.sync(&src, dst, false, ""));
         let child = fixture.child("b");
         let metadata = fixture.metadata("b", &child);
         fixture.prime_cache("b");
