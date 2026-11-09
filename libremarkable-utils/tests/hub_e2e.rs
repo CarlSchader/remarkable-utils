@@ -2440,3 +2440,229 @@ fn crash_at_every_op_of_a_backup() {
         world.check_idle(0);
     });
 }
+
+// ---- remote, detach, init, cache hygiene ---------------------------------------------
+
+/// A hub on tablet `i`'s computer that uses the origin stored on the
+/// tablet (no `--origin`).
+fn hub_without_origin(world: &World, i: usize) -> libremarkable_utils::hub::cycle::Hub<'static> {
+    static PROGRESS: libremarkable_utils::progress::NoProgress =
+        libremarkable_utils::progress::NoProgress;
+    libremarkable_utils::hub::cycle::Hub::new(
+        world.git.clone(),
+        world.device(i).cache.clone(),
+        libremarkable_utils::hub::device::LockRequest::for_this_process("test-host"),
+        &PROGRESS,
+    )
+    .with_options(world.options.clone())
+}
+
+#[test]
+fn remote_shows_and_set_url_changes_the_stored_origin() {
+    let (world, notes, _) = two_notebooks();
+    let hub = hub_without_origin(&world, 0);
+    let shown = hub.remote(world.tablet(0)).unwrap();
+    assert_eq!(shown.origin, world.origin);
+    assert_eq!(shown.effective, world.origin);
+    assert_eq!(shown.device_name.as_str(), "Tablet A");
+    let elsewhere = "/elsewhere/origin.git".to_string();
+    let overridden = world.hub(0).remote(world.tablet(0)).unwrap();
+    assert_eq!(overridden.effective, world.origin);
+    // Origin moved: point the tablet at its new place, then sync.
+    let moved = world.root.join("moved.git");
+    std::fs::rename(&world.origin, &moved).unwrap();
+    let moved = moved.to_str().unwrap().to_string();
+    let report = hub.set_remote_url(world.tablet(0), &moved).unwrap();
+    assert_eq!(report.previous, world.origin);
+    assert_eq!(report.remote.origin, moved);
+    assert_eq!(world.device(0).state().unwrap().origin, moved);
+    world.check_idle(0);
+    let page = world.pages(0, &notes)[0].clone();
+    world.ink(0, &notes, &page);
+    assert_ne!(
+        hub.sync(world.tablet(0)).unwrap().update,
+        MainUpdate::UpToDate
+    );
+    // Refused: another repository, an origin without `main`, a missing
+    // one, credentials in the URL. The stored URL stays.
+    let other = World::new(1);
+    let refused = |url: &str, expected: fn(&CycleError) -> bool| {
+        let result = hub.set_remote_url(world.tablet(0), url);
+        assert!(
+            matches!(&result, Err(e) if is_cycle(e, expected)),
+            "{url}: {result:?}"
+        );
+        assert_eq!(world.device(0).state().unwrap().origin, moved);
+        world.check_idle(0);
+    };
+    refused(&other.origin, |e| {
+        matches!(e, CycleError::RepoMismatch { .. })
+    });
+    let empty = world.root.join("empty.git");
+    world
+        .git
+        .init_bare(&empty, libremarkable_utils::git::ObjectFormat::Sha1)
+        .unwrap();
+    refused(empty.to_str().unwrap(), |e| {
+        matches!(e, CycleError::OriginEmpty { .. })
+    });
+    refused("https://user:secret@example.invalid/x.git", |e| {
+        matches!(e, CycleError::CredentialsInUrl)
+    });
+    assert!(hub.set_remote_url(world.tablet(0), &elsewhere).is_err());
+    assert_eq!(world.device(0).state().unwrap().origin, moved);
+    // Not attached.
+    let detached = World::new(1);
+    assert!(matches!(
+        hub_without_origin(&detached, 0).remote(detached.tablet(0)),
+        Err(e) if is_cycle(&e, |e| matches!(e, CycleError::NotAttached))
+    ));
+}
+
+#[test]
+fn detach_forgets_the_hub_state_and_can_prune_the_device_ref() {
+    let (world, notes, _) = two_notebooks();
+    let page = world.pages(0, &notes)[0].clone();
+    world.ink(0, &notes, &page);
+    world.sync(0).unwrap();
+    let state = world.device(0).state().unwrap();
+    let device_ref = format!("refs/rmu/devices/{}", state.device_id);
+    let repo = world.git.open(Path::new(&world.origin)).unwrap();
+    assert!(repo.rev_parse(&device_ref).unwrap().is_some());
+    let docs = world.device(0).docs();
+    let report = world.hub(0).detach(world.tablet(0), true).unwrap();
+    assert_eq!(report.pruned.as_deref(), Some(device_ref.as_str()));
+    assert_eq!(report.repo_id, state.repo_id);
+    assert!(report.warnings.is_empty(), "{report:?}");
+    assert!(world.device(0).state().is_none());
+    assert_eq!(world.device(0).docs(), docs);
+    assert_eq!(repo.rev_parse(&device_ref).unwrap(), None);
+    world.check_idle(0);
+    assert!(matches!(
+        world.hub(0).detach(world.tablet(0), false),
+        Err(e) if is_cycle(&e, |e| matches!(e, CycleError::NotAttached))
+    ));
+    // Attached again: a new device id, and nothing forks.
+    let report = world.clone_tablet(0).unwrap();
+    assert!(report.forks.is_empty(), "{report:?}");
+    assert_ne!(world.device(0).state().unwrap().device_id, state.device_id);
+    world.converge();
+    assert!(world.conflicts().is_empty());
+}
+
+#[test]
+fn detach_discards_a_pending_journal_with_a_warning() {
+    let template = crash_template();
+    let (kill, _) = kill_leaving_a_half_applied_document(&template);
+    let world = crashed_by(&template, Fault::KillApplyAfter(kill));
+    let tablet = world.tablet(0);
+    tablet.reconnect();
+    if tablet.watchdog_armed().is_some() {
+        tablet.fire_watchdog();
+    }
+    let state = world.device(0).state().unwrap();
+    assert!(state.journal.is_some());
+    let report = world.hub(0).detach(tablet, false).unwrap();
+    assert_eq!(report.pruned, None);
+    assert_eq!(report.warnings, vec![Warning::JournalDiscarded]);
+    assert!(world.device(0).state().is_none());
+    let repo = world.git.open(Path::new(&world.origin)).unwrap();
+    assert!(
+        repo.rev_parse(&format!("refs/rmu/devices/{}", state.device_id))
+            .unwrap()
+            .is_some()
+    );
+    world.check_idle(0);
+}
+
+/// Records progress calls.
+#[derive(Default)]
+struct Recorder(std::sync::Mutex<Vec<String>>);
+
+impl libremarkable_utils::progress::Progress for Recorder {
+    fn step(&self, message: &str) {
+        self.0.lock().unwrap().push(message.to_string());
+    }
+    fn bytes(&self, _: u64, _: Option<u64>) {}
+    fn bytes_done(&self) {}
+    fn finished(&self) {
+        self.0.lock().unwrap().push("finished".to_string());
+    }
+}
+
+#[test]
+fn init_creates_a_local_origin_and_cleans_up_after_a_failure() {
+    let world = World::new(1);
+    let recorder: &'static Recorder = Box::leak(Box::default());
+    let cache = world.root.join("init-cache");
+    let hub = |cache: std::path::PathBuf| {
+        libremarkable_utils::hub::cycle::Hub::new(
+            world.git.clone(),
+            cache,
+            libremarkable_utils::hub::device::LockRequest::for_this_process("test-host"),
+            recorder,
+        )
+    };
+    let entries = |dir: &Path| -> std::collections::BTreeSet<String> {
+        std::fs::read_dir(dir)
+            .map(|read| {
+                read.map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    // A new local path becomes a bare repository with `main`.
+    let fresh = world.root.join("fresh.git");
+    let report = hub(cache.clone()).init(fresh.to_str().unwrap()).unwrap();
+    let repo = world.git.open(&fresh).unwrap();
+    assert_eq!(
+        repo.rev_parse("refs/heads/main").unwrap(),
+        Some(report.commit)
+    );
+    assert_eq!(
+        recorder.0.lock().unwrap().last().map(String::as_str),
+        Some("finished")
+    );
+    // Already initialised: refused, and the cache it set up is gone.
+    let before = entries(&cache);
+    recorder.0.lock().unwrap().clear();
+    let result = hub(cache.clone()).init(fresh.to_str().unwrap());
+    assert!(
+        matches!(&result, Err(e) if is_cycle(e, |e| matches!(e, CycleError::AlreadyInitialised { .. }))),
+        "{result:?}"
+    );
+    assert_eq!(entries(&cache), before);
+    assert_eq!(
+        *recorder.0.lock().unwrap(),
+        vec!["Initialising origin".to_string(), "finished".to_string()]
+    );
+    // A failure after creating a new local path removes it again.
+    let blocked = world.root.join("not-a-directory");
+    std::fs::write(&blocked, b"").unwrap();
+    let doomed = world.root.join("doomed.git");
+    assert!(hub(blocked).init(doomed.to_str().unwrap()).is_err());
+    assert!(!doomed.exists());
+}
+
+/// A clone killed mid-fetch leaves its temporary repository; the next
+/// clone on that computer removes it, but not one a running clone holds.
+#[test]
+fn stale_incoming_repositories_are_swept() {
+    let world = World::new(1);
+    world.create(0, Kind::Notebook { pages: 1 }, "Notes", "");
+    let cache = world.device(0).cache.clone();
+    std::fs::create_dir_all(cache.join("incoming-dead.git/objects")).unwrap();
+    std::fs::create_dir_all(cache.join("incoming-live.git/objects")).unwrap();
+    let live = std::fs::File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(cache.join("incoming-live.lock"))
+        .unwrap();
+    live.try_lock().unwrap();
+    world.clone_tablet(0).unwrap();
+    assert!(!cache.join("incoming-dead.git").exists());
+    assert!(cache.join("incoming-live.git").exists());
+    drop(live);
+    world.check();
+}

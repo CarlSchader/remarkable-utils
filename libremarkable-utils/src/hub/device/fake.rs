@@ -57,6 +57,7 @@ pub enum OpKind {
     Sha256,
     ReadState,
     WriteState,
+    RemoveState,
     Stage,
     ClearStaging,
     Apply,
@@ -74,6 +75,7 @@ impl OpKind {
                 | OpKind::StopXochitl
                 | OpKind::StartXochitl
                 | OpKind::WriteState
+                | OpKind::RemoveState
                 | OpKind::Stage
                 | OpKind::ClearStaging
                 | OpKind::Apply
@@ -1174,6 +1176,15 @@ impl Tablet for FakeTablet {
                 Path::new(&self.paths.state_file()),
                 state.to_json().as_bytes(),
             )?)
+        })
+    }
+
+    fn remove_state(&self, lock: &HeldLock) -> Result<()> {
+        self.guarded(OpKind::RemoveState, lock, || {
+            match fs::remove_file(self.paths.state_file()) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                other => Ok(other?),
+            }
         })
     }
 

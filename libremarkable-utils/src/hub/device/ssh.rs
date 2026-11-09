@@ -470,6 +470,11 @@ impl Tablet for SshTablet {
         )
     }
 
+    fn remove_state(&self, lock: &HeldLock) -> Result<()> {
+        self.script(&scripts::remove_state_script(&self.paths, lock.run()))?;
+        Ok(())
+    }
+
     fn stage(
         &self,
         lock: &HeldLock,

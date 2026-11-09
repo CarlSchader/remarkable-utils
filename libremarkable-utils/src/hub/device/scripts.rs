@@ -949,6 +949,15 @@ pub(super) fn stage_command(paths: &TabletPaths, run: &str, staging: &str) -> St
     )
 }
 
+/// Delete the hub state file under the guard, then flush.
+pub(super) fn remove_state_script(paths: &TabletPaths, run: &str) -> String {
+    guarded(
+        paths,
+        run,
+        &format!("rm -f -- {} || exit 1\nsync", q(&paths.state_file())),
+    )
+}
+
 pub(super) fn clear_staging_script(paths: &TabletPaths, run: &str) -> String {
     guarded(
         paths,
@@ -1606,6 +1615,9 @@ mod tests {
         assert!(receive < length && length < synced && synced < lock && lock < sync);
         assert_quoted(&write_state_command(&hostile(), RUN, 1), &hostile());
         assert_quoted(&read_state_script(&hostile()), &hostile());
+        let script = remove_state_script(&TabletPaths::default(), RUN);
+        assert!(position(&script, "rmu_guard\nrm -f -- ") < script.rfind("\nsync").unwrap());
+        assert_quoted(&remove_state_script(&hostile(), RUN), &hostile());
     }
 
     #[test]

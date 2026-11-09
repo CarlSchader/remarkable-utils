@@ -1,5 +1,6 @@
 //! The `rmu hub` operations behind the CLI: `init`, `clone` (with
-//! `--reattach`), `sync`, `backup`, `status` and `--dry-run`, composing
+//! `--reattach`), `sync`, `backup`, `status`, `--dry-run`, `remote` and
+//! `detach`, composing
 //! the local git cache ([`crate::git`]), the data model, the merge engine
 //! and a [`Tablet`] (see "The sync cycle" in `docs/hub-design.md`).
 //!
@@ -27,20 +28,24 @@
 //!    device ref with a lease, record `device_ref` on the tablet;
 //! 8. fetch, identity and ancestry checks;
 //! 9. merge, deletion guard;
-//! 10. journal, written durably before each push attempt;
+//! 10. journal, written durably before each push attempt (and before the
+//!     apply of a pull-only run, which pushes nothing);
 //! 11. push `main` (fast-forward only), back to 8 on rejection, a bounded
-//!     number of times;
+//!     number of times; nothing when the tablet already matches origin or
+//!     has no changes of its own;
 //! 12. stage (in batches, re-arming the watchdog);
 //! 13. stop (watchdog armed);
 //! 14. re-read, verify, live-tablet tree checks, apply;
 //! 15. record;
-//! 16. start, disarm, release.
+//! 16. start, disarm, release; then `git maintenance run --auto` on the
+//!     cache, still under its `flock`.
 //!
 //! Every error path brings xochitl back (`reset-failed` + `start`) when
 //! this run may have stopped it, then releases the lock; if the
 //! connection is gone, the watchdog brings it back. The library never
 //! prints: progress goes to a [`Progress`], results come back as reports.
 
+mod admin;
 mod inspect;
 mod message;
 mod plan;
@@ -472,6 +477,16 @@ pub struct RemoteReport {
     pub origin: String,
     /// The URL this invocation uses ([`HubOptions::origin`] if set).
     pub effective: String,
+}
+
+/// What `remote set-url` changed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SetUrlReport {
+    /// The URL the tablet stored before.
+    pub previous: String,
+    pub remote: RemoteReport,
+    pub took_over: Option<TakeOver>,
+    pub warnings: Vec<Warning>,
 }
 
 /// What `detach` did.
@@ -1297,6 +1312,28 @@ mod tests {
         assert_eq!(civil_date(1_794_182_400), "2026-11-09");
         assert_eq!(civil_date(1_794_268_799), "2026-11-09");
         assert_eq!(civil_date(-86_400), "1969-12-31");
+    }
+
+    #[test]
+    fn local_paths_follow_gits_rule() {
+        [
+            "/srv/git/library.git",
+            "library.git",
+            "./a:b",
+            "../x/y.git",
+            "dir/with:colon",
+        ]
+        .iter()
+        .for_each(|origin| assert!(is_local_path(origin), "{origin}"));
+        [
+            "ssh://git@example.invalid/library.git",
+            "file:///srv/git/library.git",
+            "git@example.invalid:library.git",
+            "host:library.git",
+            "host:dir/library.git",
+        ]
+        .iter()
+        .for_each(|origin| assert!(!is_local_path(origin), "{origin}"));
     }
 
     #[test]

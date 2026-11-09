@@ -192,6 +192,7 @@ fn lock_lifecycle(h: &dyn Harness) {
     assert!(lock_lost(t.check_guard(&second)));
     assert!(lock_lost(t.arm_watchdog(&second, WATCHDOG)));
     assert!(lock_lost(t.write_state(&second, &hub_state())));
+    assert!(lock_lost(t.remove_state(&second)));
     assert!(lock_lost(t.start_xochitl(&second)));
     t.check_guard(&broken).unwrap();
     t.release_lock(&broken).unwrap();
@@ -351,6 +352,10 @@ fn state_round_trip(h: &dyn Harness) {
     state.quarantine.insert(doc(DOC));
     t.write_state(&lock, &state).unwrap();
     assert_eq!(t.read_state().unwrap(), Some(state));
+    t.remove_state(&lock).unwrap();
+    assert_eq!(t.read_state().unwrap(), None);
+    // Absent already: fine.
+    t.remove_state(&lock).unwrap();
     t.release_lock(&lock).unwrap();
 }
 
