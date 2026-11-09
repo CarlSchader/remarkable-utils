@@ -30,6 +30,7 @@ flake-utils.lib.eachDefaultSystem (
     checks = {
       pre-commit = preCommitCheck;
       clippy = self.packages.${system}.clippy-check;
+      workspace-tests = self.packages.${system}.workspace-tests;
     };
   }
 )

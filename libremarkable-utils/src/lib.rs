@@ -11,6 +11,9 @@
 //! - [`bundle`] — `.rmdoc` bundle creation (tar-from-device → zip).
 //! - [`ssh`] — subprocess transport around the system `ssh` binary
 //!   (multiplexed, optional password auth via a self-askpass helper).
+//! - [`git`] — plumbing over the system `git` binary for bare
+//!   repositories: remote transport, typed push rejection, tree
+//!   listing, batched blob reads, and commits via `fast-import`.
 //! - [`xochitl`] — on-device file formats and pure tree logic
 //!   (path/UUID resolution, rendering, conflict and cycle checks).
 //! - [`client`] — high-level operations: list, mkdir, upload,
@@ -30,6 +33,7 @@
 pub mod bundle;
 pub mod client;
 pub mod error;
+pub mod git;
 pub mod hub;
 pub mod progress;
 pub mod ssh;

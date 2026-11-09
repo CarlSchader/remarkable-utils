@@ -32,9 +32,9 @@ This repository is **open source** (dual-licensed MIT OR Apache-2.0):
 |-------------------------|--------------------------------------------------------|
 | `flake.nix`             | Flake entry point — melds modules from `nix/` via `flake-utils.lib.meld` |
 | `nix/default.nix`       | Melds `checks.nix`, `formatter.nix`, `rust-packages.nix`, `shells.nix` |
-| `nix/rust-packages.nix` | crane-based Rust builds, toolchain, vendor dir, clippy check |
-| `nix/checks.nix`        | `nix flake check` targets (pre-commit hooks, clippy)   |
-| `nix/shells.nix`        | Dev shell (rust toolchain, treefmt, openssh, hooks)    |
+| `nix/rust-packages.nix` | crane-based Rust builds, toolchain, vendor dir, clippy check, workspace tests (hermetic git env); `rmu` wrapped with git/ssh as PATH fallbacks |
+| `nix/checks.nix`        | `nix flake check` targets (pre-commit hooks, clippy, workspace tests) |
+| `nix/shells.nix`        | Dev shell (rust toolchain, treefmt, openssh, git, hooks) |
 | `nix/formatter.nix`     | treefmt wrapper (`nix fmt`)                            |
 | `nix/lib/treefmt.nix`   | Formatter config: rustfmt, alejandra, statix, deadnix  |
 | `nix/lib/git-hooks.nix` | Pre-commit hooks: treefmt + clippy (offline vendored)  |
@@ -55,6 +55,19 @@ This repository is **open source** (dual-licensed MIT OR Apache-2.0):
   auth re-executes the current binary as an `SSH_ASKPASS` helper
   (`maybe_run_askpass` must be called first thing in `main`); the
   password travels via environment, never argv.
+- `git.rs` — plumbing over the system `git` binary for `rmu hub`
+  (`docs/hub-design.md`): bare repositories only, explicit `--git-dir`,
+  argv (never shell strings), and an explicit environment (`gc.auto=0`,
+  hooks disabled, `GIT_TERMINAL_PROMPT=0` when non-interactive; the
+  user's own config and credential helpers otherwise apply). Commits
+  go through `fast-import` with identity always passed explicitly and
+  blobs streamed; losing to a concurrent writer (non-fast-forward, stale
+  lease, the remote's own compare-and-swap) is the typed `PushRejected`,
+  and pushes take commit ids and full `refs/...` names, never refspecs.
+  Requires git >= 2.30. Output parsers are pure and unit-tested; tests
+  against temp repos must stay hermetic (`GIT_CONFIG_GLOBAL=/dev/null`,
+  `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_COUNT=0`, `GIT_DEFAULT_HASH=sha1`,
+  temp `HOME`).
 - `xochitl.rs` — on-device file formats and **pure** tree logic (path/UUID
   resolution, glob matching/expansion, ambiguity rejection,
   conflict/cycle checks, rendering). Keep this module I/O-free so it
@@ -131,7 +144,8 @@ cargo build --workspace            # build everything
 cargo test --workspace             # run tests
 cargo clippy --all-features --all-targets -- -D warnings  # mandatory lint
 nix fmt                            # format (rustfmt + Nix formatters)
-nix flake check                    # full check: pre-commit hooks + clippy
+nix flake check                    # full check: pre-commit hooks + clippy + workspace tests
+nix build .#workspace-tests        # just the sandboxed workspace test suite
 nix build .#rmu                    # build the CLI via crane
 ```
 
