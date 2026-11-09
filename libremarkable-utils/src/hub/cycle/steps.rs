@@ -1449,3 +1449,42 @@ fn mixed_model_warning(store: &Store, main: &Oid, info: &DeviceInfo) -> Result<O
         _ => None,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hub::device::{StatEntry, StatListing};
+
+    #[test]
+    fn pending_files_come_from_the_run_that_staged_the_merge_completely() {
+        let merge: Oid = format!("{:040x}", 7).parse().unwrap();
+        let other: Oid = format!("{:040x}", 8).parse().unwrap();
+        let entry = |path: &str| StatEntry {
+            path: path.to_string(),
+            mode: 0o100_644,
+            stat: StatSignature {
+                size: 0,
+                mtime_ns: 1,
+                ctime_ns: 1,
+                inode: 1,
+            },
+        };
+        let listing = StatListing {
+            entries: vec![
+                entry(&format!("run1/{STAGED_SENTINEL}{merge}")),
+                entry("run1/a.metadata"),
+                entry("run1/b/p.rm"),
+                entry(&format!("run2/{STAGED_SENTINEL}{other}")),
+                entry("run2/c.metadata"),
+                entry("run3/d.metadata"),
+            ],
+            unlisted: 0,
+        };
+        assert_eq!(
+            pending_for(&listing, &merge),
+            Some(["a.metadata".to_string(), "b/p.rm".to_string()].into())
+        );
+        let none: Oid = format!("{:040x}", 9).parse().unwrap();
+        assert_eq!(pending_for(&listing, &none), None);
+    }
+}

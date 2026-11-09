@@ -986,3 +986,70 @@ impl<'a> Hub<'a> {
         Ok(InitReport { config, commit })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn civil_dates() {
+        assert_eq!(civil_date(0), "1970-01-01");
+        assert_eq!(civil_date(951_782_400), "2000-02-29");
+        assert_eq!(civil_date(1_794_182_400), "2026-11-09");
+        assert_eq!(civil_date(1_794_268_799), "2026-11-09");
+        assert_eq!(civil_date(-86_400), "1969-12-31");
+    }
+
+    #[test]
+    fn urls_with_passwords_are_refused() {
+        [
+            "ssh://git@example.invalid/library.git",
+            "git@example.invalid:library.git",
+            "/srv/git/library.git",
+            "https://example.invalid/a@b:c",
+            "https://token@example.invalid/x.git",
+        ]
+        .iter()
+        .for_each(|url| assert!(check_url(url).is_ok(), "{url}"));
+        [
+            "https://user:secret@example.invalid/x.git",
+            "ssh://user:pw@example.invalid/x",
+        ]
+        .iter()
+        .for_each(|url| {
+            assert!(
+                matches!(
+                    check_url(url),
+                    Err(Error::HubCycle(CycleError::CredentialsInUrl))
+                ),
+                "{url}"
+            )
+        });
+    }
+
+    #[test]
+    fn default_names_come_from_the_model_and_id() {
+        let id = DeviceId::new("0f0e0d0c-0000-4000-8000-00000000c001").unwrap();
+        let info = |model: Option<&str>| DeviceInfo {
+            model: model.map(str::to_string),
+            firmware: None,
+        };
+        assert_eq!(
+            default_name(&info(Some("reMarkable Paper Pro")), &id).as_str(),
+            "reMarkable Paper Pro 0f0e"
+        );
+        assert_eq!(default_name(&info(None), &id).as_str(), "reMarkable 0f0e");
+        assert_eq!(
+            default_name(&info(Some("<\n>")), &id).as_str(),
+            "reMarkable 0f0e"
+        );
+        let long = "m".repeat(200);
+        assert!(
+            default_name(&info(Some(&long)), &id)
+                .as_str()
+                .chars()
+                .count()
+                <= 64
+        );
+    }
+}

@@ -1152,3 +1152,148 @@ fn interleaving(seed: u64) {
 fn interleaved_edits_and_syncs_across_three_tablets() {
     [1, 7, 42, 1234, 99_991].into_iter().for_each(interleaving);
 }
+
+// ---- more guards and races -------------------------------------------------------
+
+#[test]
+fn concurrent_first_clones_into_an_empty_origin() {
+    // Both tablets clone at once; B's clone lands while A's is between
+    // its journal and its push. A loses the race, falls back to merging
+    // with what B pushed, and nothing is duplicated.
+    let world = World::new(2);
+    let mine = world.create(0, Kind::Notebook { pages: 1 }, "A's notes", "");
+    let theirs = world.create(1, Kind::Notebook { pages: 1 }, "B's notes", "");
+    let journal = op_index(&world, 0, OpKind::WriteState, 3, |w| {
+        w.clone_tablet(0).unwrap();
+    });
+    let (git, origin, options) = (
+        world.git.clone(),
+        world.origin.clone(),
+        world.options.clone(),
+    );
+    let (other, cache) = (
+        Arc::clone(&world.device(1).tablet),
+        world.device(1).cache.clone(),
+    );
+    world.tablet(0).inject(Fault::EditBefore(
+        journal,
+        Box::new(move |_| {
+            static PROGRESS: libremarkable_utils::progress::NoProgress =
+                libremarkable_utils::progress::NoProgress;
+            libremarkable_utils::hub::cycle::Hub::new(
+                git,
+                cache,
+                libremarkable_utils::hub::device::LockRequest::for_this_process("other-host"),
+                &PROGRESS,
+            )
+            .with_options(HubOptions {
+                origin: Some(origin.clone()),
+                ..options
+            })
+            .clone_tablet(&*other, &origin, None, false)
+            .unwrap();
+        }),
+    ));
+    let report = world.clone_tablet(0).unwrap();
+    assert_eq!(report.push_attempts, 2, "{report:?}");
+    world.converge();
+    let origin = world.origin_docs();
+    assert!(origin.contains_key(&mine) && origin.contains_key(&theirs));
+    assert!(world.conflicts().is_empty());
+}
+
+#[test]
+fn a_second_model_attaching_is_warned_about() {
+    let world = World::new(2);
+    world.create(0, Kind::Notebook { pages: 1 }, "Notes", "");
+    world.clone_tablet(0).unwrap();
+    let other = libremarkable_utils::hub::device::FakeTablet::builder(&world.device(1).dir)
+        .device_info("reMarkable Other", "3.30.0")
+        .build()
+        .unwrap();
+    let report = world
+        .hub(1)
+        .clone_tablet(&other, &world.origin, None, false)
+        .unwrap();
+    assert_eq!(report.warnings.len(), 1, "{report:?}");
+    assert!(report.warnings[0].contains("reMarkable Other"));
+    // The same model again: no warning.
+    let world = World::new(2);
+    world.create(0, Kind::Notebook { pages: 1 }, "Notes", "");
+    world.clone_tablet(0).unwrap();
+    assert!(world.clone_tablet(1).unwrap().warnings.is_empty());
+}
+
+#[test]
+fn a_device_ref_that_does_not_continue_the_tablets_stops_the_sync() {
+    let (world, lib) = two_tablets();
+    let page = world.pages(0, &lib.notes)[0].clone();
+    world.ink(0, &lib.notes, &page);
+    // Someone rewrites A's device ref on origin to an unrelated history.
+    let state = world.device(0).state().unwrap();
+    let reference = format!("refs/rmu/devices/{}", state.device_id);
+    let repo = world.git.open(Path::new(&world.origin)).unwrap();
+    let main = repo.rev_parse("refs/heads/main").unwrap().unwrap();
+    let first = repo
+        .rev_list(&["refs/heads/main"], true)
+        .unwrap()
+        .last()
+        .cloned()
+        .unwrap();
+    assert_ne!(Some(&first), state.device_ref.as_ref());
+    repo.update_ref(&reference, &first, None).unwrap();
+    let error = world.sync(0).unwrap_err();
+    assert!(
+        is_cycle(&error, |e| matches!(
+            e,
+            CycleError::DeviceRefConflict { .. }
+        )),
+        "{error}"
+    );
+    assert_eq!(repo.rev_parse("refs/heads/main").unwrap(), Some(main));
+    assert!(world.tablet(0).is_running());
+}
+
+#[test]
+fn a_folder_trashed_on_origin_spares_a_notebook_written_in_during_the_sync() {
+    let (world, lib) = two_tablets();
+    // B trashes the folder holding the notes; while A's sync has the UI
+    // up, the user writes in those notes on A.
+    world.trash(1, &lib.folder);
+    world.sync(1).unwrap();
+    let page = world.pages(0, &lib.notes)[0].clone();
+    let stage = op_index(&world, 0, OpKind::Stage, 1, |w| {
+        w.sync(0).unwrap();
+    });
+    world
+        .inks
+        .lock()
+        .unwrap()
+        .expected
+        .insert("late-ink".to_string());
+    let path = format!("{}/{page}.rm", lib.notes);
+    world.tablet(0).inject(Fault::EditBefore(
+        stage + 1,
+        Box::new(move |dir: &Path| {
+            let file = dir.join(&path);
+            let mut bytes = std::fs::read(&file).unwrap();
+            bytes.extend_from_slice(b"stroke late-ink\n");
+            std::fs::write(&file, bytes).unwrap();
+        }),
+    ));
+    let report = world.sync(0).unwrap();
+    // Moving the folder into the trash would take the edited notes along.
+    assert!(report.skipped.contains(&lib.folder), "{report:?}");
+    assert_ne!(
+        world.device(0).metadata(&lib.folder).unwrap()["parent"],
+        "trash"
+    );
+    world.converge();
+    // The edit pulls the folder holding the notes back out of the trash
+    // everywhere ("an edit pulls a document, or its trashed ancestor
+    // folder, out of the trash").
+    let notes = world.device(1).metadata(&lib.notes).unwrap();
+    assert_eq!(notes["parent"], lib.folder.as_str());
+    let folder = world.device(1).metadata(&lib.folder).unwrap();
+    assert_eq!(folder["parent"], "");
+}
