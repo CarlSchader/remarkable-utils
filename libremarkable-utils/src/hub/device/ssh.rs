@@ -8,7 +8,10 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::lock::{self, AcquireProbe, HeldLock, LockRequest, LockState};
-use super::scripts::{self, EXIT_BUSY, EXIT_LOCK_CHANGED, EXIT_LOCK_LOST, EXIT_WATCHDOG_FIRED};
+use super::scripts::{
+    self, EXIT_BUSY, EXIT_LOCK_CHANGED, EXIT_LOCK_LOST, EXIT_NOT_ARMED, EXIT_REBOOTED,
+    EXIT_WATCHDOG_FIRED, EXIT_XOCHITL_RUNNING, EXIT_XOCHITL_STOPPED,
+};
 use super::{
     ApplyPlan, ApplyReport, DeviceError, DeviceInfo, DownloadVisitor, ExactReader, StageContent,
     StatListing, Tablet, TabletPaths, timeout_secs, transfer_paths,
@@ -85,6 +88,10 @@ fn guard_error(status: Option<i32>) -> Option<DeviceError> {
         Some(EXIT_WATCHDOG_FIRED) => Some(DeviceError::WatchdogFired),
         Some(EXIT_LOCK_LOST) => Some(DeviceError::LockLost),
         Some(EXIT_BUSY) => Some(DeviceError::Busy),
+        Some(EXIT_REBOOTED) => Some(DeviceError::Rebooted),
+        Some(EXIT_XOCHITL_STOPPED) => Some(DeviceError::XochitlStopped),
+        Some(EXIT_XOCHITL_RUNNING) => Some(DeviceError::XochitlRunning),
+        Some(EXIT_NOT_ARMED) => Some(DeviceError::WatchdogNotArmed),
         _ => None,
     }
 }
@@ -344,7 +351,7 @@ impl Tablet for SshTablet {
             // the script never ran) before failing. The time printed
             // before the start is lost then, and a later one would not be
             // conservative: report the earliest possible.
-            self.script(&scripts::owned(&self.paths, lock.run(), "true"))?;
+            self.script(&scripts::start_allowed_script(&self.paths, lock.run()))?;
             if self.xochitl_active()? {
                 return Ok(0);
             }
@@ -406,7 +413,7 @@ impl Tablet for SshTablet {
                 &*self.progress,
             )?;
             let result = read_tar(&mut stream, files, visit);
-            stream.finish(result)
+            stream.finish(result).map_err(download_error)
         })
     }
 
@@ -484,48 +491,73 @@ impl Tablet for SshTablet {
 
     fn apply(&self, lock: &HeldLock, plan: &ApplyPlan) -> Result<ApplyReport> {
         let steps = plan.steps()?;
-        let written = plan.written();
+        let staged = plan.staged();
         self.step(&format!("Applying {} document(s)", plan.docs.len()), || {
             let output = self.session.run_script(&scripts::apply_script(
                 &self.paths,
                 lock.run(),
                 &self.paths.staging_dir(lock),
                 &steps,
-                &written,
+                &staged,
             ))?;
-            if let Some(error) = guard_error(output.status.code()) {
-                return Err(error.into());
-            }
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let parsed = scripts::parse_apply_output(&stdout);
-            match (output.status.success(), parsed) {
-                (true, Ok(parsed)) if parsed.complete && parsed.written.len() == written.len() => {
-                    Ok(ApplyReport {
-                        applied: parsed.applied,
-                        written: parsed.written,
-                        recorded_at_ns: parsed.recorded_at_ns.ok_or_else(|| {
-                            DeviceError::Output {
-                                operation: "apply",
-                                detail: "no device time".to_string(),
-                            }
-                        })?,
-                    })
-                }
-                (success, _) => Err(DeviceError::ApplyIncomplete {
-                    applied: scripts::applied_documents(&stdout),
-                    reason: if success {
-                        "incomplete output".to_string()
-                    } else {
-                        format!(
-                            "exit {:?}: {}",
-                            output.status.code(),
-                            String::from_utf8_lossy(&output.stderr).trim()
-                        )
-                    },
-                }
-                .into()),
-            }
+            apply_report(&output, staged.len())
         })
+    }
+}
+
+/// A download's remote failure (tar's own exit status, e.g. for a file
+/// it could not read, which GNU tar pads with zeros) is a download
+/// error, as in the fake; ssh's own failure (255) stays a transport
+/// error.
+fn download_error(error: Error) -> Error {
+    match error {
+        Error::Remote { status, stderr } if status != 255 => {
+            DeviceError::Download(format!("tar exited with status {status}: {stderr}")).into()
+        }
+        other => other,
+    }
+}
+
+/// Interpret the apply script's outcome: complete output with one stat
+/// per written file, or the guard's typed error, or
+/// [`DeviceError::ApplyIncomplete`] with the documents reported done.
+fn apply_report(output: &Output, written: usize) -> Result<ApplyReport> {
+    if let Some(error) = guard_error(output.status.code()) {
+        return Err(error.into());
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let incomplete = |reason: String| -> Error {
+        DeviceError::ApplyIncomplete {
+            applied: scripts::applied_documents(&stdout),
+            reason,
+        }
+        .into()
+    };
+    if !output.status.success() {
+        return Err(incomplete(format!(
+            "exit {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    match scripts::parse_apply_output(&stdout) {
+        Ok(parsed) if parsed.complete && parsed.written.len() == written => {
+            let recorded_at_ns = parsed.recorded_at_ns.ok_or_else(|| DeviceError::Output {
+                operation: "apply",
+                detail: "no device time".to_string(),
+            })?;
+            Ok(ApplyReport {
+                applied: parsed.applied,
+                written: parsed.written,
+                recorded_at_ns,
+            })
+        }
+        Ok(parsed) if parsed.complete => Err(incomplete(format!(
+            "{} stat line(s) for {written} written file(s)",
+            parsed.written.len()
+        ))),
+        Ok(_) => Err(incomplete("incomplete output".to_string())),
+        Err(error) => Err(incomplete(error.to_string())),
     }
 }
 
@@ -709,5 +741,152 @@ mod tests {
             })),
             Err(Error::Remote { status: 1, .. })
         ));
+    }
+
+    #[cfg(unix)]
+    fn output(code: i32, stdout: &str, stderr: &str) -> Output {
+        use std::os::unix::process::ExitStatusExt;
+        Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_reports_are_checked() {
+        const DOC: &str = "aaaaaaaa-0000-4000-8000-000000000001";
+        let stat = format!(
+            "81a4 2 1790000001 2026-09-21 12:13:21.1 +0000 1790000001 2026-09-21 12:13:21.1 +0000 2 {DOC}.metadata\n"
+        );
+        let complete = format!("rmu-done {DOC}\nrmu-time 1790000000\n{stat}rmu-complete\n");
+        let report = apply_report(&output(0, &complete, ""), 1).unwrap();
+        assert_eq!(report.applied.len(), 1);
+        assert_eq!(report.written.len(), 1);
+        let incomplete = |result: Result<ApplyReport>, docs: usize| matches!(result, Err(Error::HubDevice(DeviceError::ApplyIncomplete { applied, .. })) if applied.len() == docs);
+        // One stat line short of the files written.
+        assert!(incomplete(apply_report(&output(0, &complete, ""), 2), 1));
+        // No completion line, a failed exit, unparsable output.
+        assert!(incomplete(
+            apply_report(&output(0, &format!("rmu-done {DOC}\n"), ""), 0),
+            1
+        ));
+        assert!(incomplete(
+            apply_report(&output(1, &format!("rmu-done {DOC}\n"), "mv: x"), 0),
+            1
+        ));
+        assert!(incomplete(
+            apply_report(&output(0, "garbage\nrmu-complete\n", ""), 0),
+            0
+        ));
+        // The guard's statuses keep their types.
+        [
+            (EXIT_WATCHDOG_FIRED, "WatchdogFired"),
+            (EXIT_LOCK_LOST, "LockLost"),
+            (EXIT_REBOOTED, "Rebooted"),
+            (EXIT_XOCHITL_RUNNING, "XochitlRunning"),
+            (EXIT_BUSY, "Busy"),
+        ]
+        .into_iter()
+        .for_each(|(code, name)| {
+            let error = apply_report(&output(code, "", ""), 0).unwrap_err();
+            assert!(format!("{error:?}").contains(name), "{error:?}");
+        });
+    }
+
+    /// A tablet whose `ssh` consumes its stdin, prints `archive` and exits
+    /// with `status` (and `stderr`).
+    #[cfg(unix)]
+    fn mock_download(
+        scratch: &crate::hub::device::harness::Scratch,
+        archive: &[u8],
+        status: i32,
+        stderr: &str,
+    ) -> SshTablet {
+        let file = scratch.0.join("archive.tar");
+        std::fs::write(&file, archive).unwrap();
+        let ssh = scratch.0.join("ssh");
+        test_support::write_script(
+            &ssh,
+            &format!(
+                "cat >/dev/null\ncat {}\nprintf '%s' {} >&2\nexit {status}\n",
+                crate::ssh::shell_quote(&file.to_string_lossy()),
+                crate::ssh::shell_quote(stderr),
+            ),
+        );
+        let mut session = SshSession::new(crate::ssh::SshOptions {
+            destination: "mock.invalid".into(),
+            multiplex: false,
+            ..crate::ssh::SshOptions::default()
+        })
+        .unwrap();
+        session.set_ssh_exe(ssh);
+        SshTablet::new(session)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn downloads_fail_on_the_remote_status_even_with_a_complete_archive() {
+        use crate::hub::device::harness::Scratch;
+        let archive = tar_of(&[("./a", b"one"), ("./b", b"two")]);
+        let files = [path("a"), path("b")];
+        let download = |tablet: &SshTablet| {
+            let mut seen = Vec::new();
+            tablet
+                .download(&files, &mut |file, _, reader| {
+                    let mut data = Vec::new();
+                    reader.read_to_end(&mut data)?;
+                    seen.push((file.to_string(), data));
+                    Ok(())
+                })
+                .map(|()| seen)
+        };
+        let scratch = Scratch::new("tar-ok");
+        assert_eq!(
+            download(&mock_download(&scratch, &archive, 0, ""))
+                .unwrap()
+                .len(),
+            2
+        );
+        // GNU tar pads a file it could not read with zeros up to the
+        // declared size: only the exit status tells.
+        let scratch = Scratch::new("tar-status");
+        let failed = download(&mock_download(
+            &scratch,
+            &archive,
+            1,
+            "tar: b: Permission denied",
+        ));
+        assert!(
+            matches!(&failed, Err(Error::HubDevice(DeviceError::Download(detail))) if detail.contains("Permission denied")),
+            "{failed:?}"
+        );
+        // A truncated archive from a failing tar: the remote error wins.
+        let scratch = Scratch::new("tar-truncated");
+        let truncated = tar_of(&[("./a", &[7; 4000]), ("./b", b"two")]);
+        let failed = download(&mock_download(
+            &scratch,
+            &truncated[..2048],
+            2,
+            "tar: short read",
+        ));
+        assert!(
+            matches!(&failed, Err(Error::HubDevice(DeviceError::Download(detail))) if detail.contains("short read")),
+            "{failed:?}"
+        );
+        // ssh's own failure stays a transport error.
+        let scratch = Scratch::new("tar-ssh");
+        assert!(matches!(
+            download(&mock_download(&scratch, b"", 255, "connection refused")),
+            Err(Error::Remote { status: 255, .. })
+        ));
+        // A local error with the remote still sending is the local error.
+        let scratch = Scratch::new("tar-local");
+        let big = tar_of(&[("./a", &[1; 200_000]), ("./b", b"two")]);
+        let local = mock_download(&scratch, &big, 0, "").download(&files, &mut |_, _, _| {
+            Err(Error::InvalidName("local".into()))
+        });
+        assert!(matches!(local, Err(Error::InvalidName(_))), "{local:?}");
     }
 }

@@ -26,7 +26,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
-use super::apply::ApplyStep;
+use super::apply::{ApplyStep, StagedPath};
 use super::lock::{self, AcquireProbe, HeldLock, LockRequest, LockState};
 use super::{
     ApplyPlan, ApplyReport, DeviceError, DeviceInfo, DownloadVisitor, ExactReader, StageContent,
@@ -97,6 +97,18 @@ pub enum Fault {
     /// The `n`th mutating operation takes effect, then the connection is
     /// gone as with [`Fault::DisconnectAt`].
     DisconnectAfter(usize),
+    /// The `n`th operation of any kind (reads included) fails without
+    /// effect.
+    FailOp(usize),
+    /// The `n`th operation of any kind fails without effect, and every
+    /// operation after it until [`FakeTablet::reconnect`].
+    DisconnectAtOp(usize),
+    /// The next download delivers `k` files, then fails as a lost
+    /// connection.
+    FailDownloadAfter(usize),
+    /// During the next apply, the watchdog fires right after the `k`th
+    /// move (the guard before the next document must then stop it).
+    FireWatchdogAfterMoves(usize),
     /// The next apply stops after `k` moves (renames, removals, document
     /// deletions), without the final `sync`, as if the connection died:
     /// at the first step after the `k`th move, so a document whose last
@@ -118,15 +130,33 @@ enum MutationFault {
     DisconnectAfter,
 }
 
+/// What happens to an operation of any kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpFault {
+    Fail,
+    Disconnect,
+}
+
 enum Pending {
     Mutation(usize, MutationFault),
+    Op(usize, OpFault),
     EditBefore(usize, Edit),
+}
+
+/// The armed watchdog: its timeout and the run that armed it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Watchdog {
+    timeout: Duration,
+    run: String,
 }
 
 struct FakeState {
     running: bool,
     boot_id: String,
-    watchdog: Option<Duration>,
+    watchdog: Option<Watchdog>,
+    /// Armed since xochitl last started: what a stop requires (a timer
+    /// armed before an earlier start may have fired or expired since).
+    armed_since_start: bool,
     cloud_paired: bool,
     info: DeviceInfo,
     ops: usize,
@@ -134,6 +164,8 @@ struct FakeState {
     log: Vec<OpKind>,
     pending: Vec<Pending>,
     kill_apply_after: Option<usize>,
+    fail_download_after: Option<usize>,
+    fire_after_moves: Option<usize>,
     disconnected: bool,
 }
 
@@ -146,8 +178,18 @@ impl FakeState {
             Fault::LoseAck(n) => mutation(n, MutationFault::LoseAck),
             Fault::DisconnectAt(n) => mutation(n, MutationFault::DisconnectAt),
             Fault::DisconnectAfter(n) => mutation(n, MutationFault::DisconnectAfter),
+            Fault::FailOp(n) => Pending::Op(self.ops + n, OpFault::Fail),
+            Fault::DisconnectAtOp(n) => Pending::Op(self.ops + n, OpFault::Disconnect),
             Fault::KillApplyAfter(k) => {
                 self.kill_apply_after = Some(k);
+                return;
+            }
+            Fault::FailDownloadAfter(k) => {
+                self.fail_download_after = Some(k);
+                return;
+            }
+            Fault::FireWatchdogAfterMoves(k) => {
+                self.fire_after_moves = Some(k);
                 return;
             }
             Fault::EditBefore(n, edit) => Pending::EditBefore(self.ops + n, edit),
@@ -172,9 +214,21 @@ impl FakeState {
         due.into_iter()
             .filter_map(|pending| match pending {
                 Pending::EditBefore(_, edit) => Some(edit),
-                Pending::Mutation(..) => None,
+                Pending::Mutation(..) | Pending::Op(..) => None,
             })
             .collect()
+    }
+
+    /// Take the fault planned for operation `op`, if any.
+    fn op_fault(&mut self, op: usize) -> Option<OpFault> {
+        let position = self
+            .pending
+            .iter()
+            .position(|pending| matches!(pending, Pending::Op(at, _) if *at == op))?;
+        match self.pending.remove(position) {
+            Pending::Op(_, fault) => Some(fault),
+            Pending::Mutation(..) | Pending::EditBefore(..) => None,
+        }
     }
 
     /// Take the fault planned for mutation `n`, if any.
@@ -185,7 +239,7 @@ impl FakeState {
             .position(|pending| matches!(pending, Pending::Mutation(at, _) if *at == n))?;
         match self.pending.remove(position) {
             Pending::Mutation(_, fault) => Some(fault),
-            Pending::EditBefore(..) => None,
+            Pending::Op(..) | Pending::EditBefore(..) => None,
         }
     }
 }
@@ -277,7 +331,10 @@ impl FakeTabletBuilder {
             log: Vec::new(),
             pending: Vec::new(),
             kill_apply_after: None,
+            fail_download_after: None,
+            fire_after_moves: None,
             disconnected: false,
+            armed_since_start: false,
         };
         self.faults
             .into_iter()
@@ -315,6 +372,28 @@ fn write_atomic(path: &Path, data: &[u8]) -> io::Result<()> {
     let temp = path.with_file_name(format!(".rmu-fake-{}", uuid::Uuid::new_v4().simple()));
     fs::write(&temp, data)?;
     fs::rename(&temp, path)
+}
+
+#[cfg(unix)]
+fn same_filesystem(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    matches!((fs::metadata(a), fs::metadata(b)), (Ok(a), Ok(b)) if a.dev() == b.dev())
+}
+
+#[cfg(not(unix))]
+fn same_filesystem(a: &Path, b: &Path) -> bool {
+    a.exists() && b.exists()
+}
+
+#[cfg(unix)]
+fn set_executable(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+}
+
+#[cfg(not(unix))]
+fn set_executable(_path: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 fn remove_if_present(path: &Path) -> io::Result<()> {
@@ -396,7 +475,7 @@ fn walk(root: &Path, dir: &Path, listing: &mut StatListing) -> io::Result<()> {
     entries.sort_by_key(|entry| entry.file_name());
     entries.iter().try_for_each(|entry| {
         let path = entry.path();
-        if entry.file_name().to_string_lossy().contains('\n') {
+        if entry.file_name().to_string_lossy().contains(['\n', '\r']) {
             listing.unlisted += 1;
             return Ok(());
         }
@@ -497,20 +576,25 @@ impl FakeTablet {
         state.watchdog = None;
     }
 
-    /// Fire the armed watchdog now: leave the marker, start xochitl.
-    /// Returns whether one was armed.
-    pub fn fire_watchdog(&self) -> Result<bool> {
+    /// Fire the armed watchdog now: try to leave the marker, and start
+    /// xochitl even if that fails (e.g. the state dir is gone). Returns
+    /// whether one was armed.
+    pub fn fire_watchdog(&self) -> bool {
         let mut state = self.state();
         if state.watchdog.take().is_none() {
-            return Ok(false);
+            return false;
         }
-        fs::write(self.paths.watchdog_marker(), b"")?;
+        let _ = fs::write(self.paths.watchdog_marker(), b"");
         state.running = true;
-        Ok(true)
+        true
     }
 
+    /// The armed watchdog's timeout.
     pub fn watchdog_armed(&self) -> Option<Duration> {
-        self.state().watchdog
+        self.state()
+            .watchdog
+            .as_ref()
+            .map(|watchdog| watchdog.timeout)
     }
 
     pub fn inject(&self, fault: Fault) {
@@ -547,6 +631,13 @@ impl FakeTablet {
             let edits = state.due_edits(op);
             let outcome = if state.disconnected {
                 Err(transport_error("disconnected".to_string()))
+            } else if let Some(fault) = state.op_fault(op) {
+                if fault == OpFault::Disconnect {
+                    state.disconnected = true;
+                }
+                Err(transport_error(format!(
+                    "injected failure of operation {op}"
+                )))
             } else if kind.is_mutating() {
                 state.mutations += 1;
                 let n = state.mutations;
@@ -591,7 +682,7 @@ impl FakeTablet {
         if self.is_disconnected() {
             return Err(error);
         }
-        self.owns(lock)?;
+        self.may_start(lock)?;
         if self.is_running() {
             Ok(0)
         } else {
@@ -615,7 +706,23 @@ impl FakeTablet {
         if Path::new(&self.paths.watchdog_marker()).exists() {
             return Err(DeviceError::WatchdogFired.into());
         }
-        self.owns(lock)
+        self.owns(lock)?;
+        let owner = fs::read_to_string(self.paths.lock_owner()).unwrap_or_default();
+        let boot = format!("boot_id={}", self.boot_id());
+        if owner.lines().any(|line| line == boot) {
+            Ok(())
+        } else {
+            Err(DeviceError::Rebooted.into())
+        }
+    }
+
+    /// Starting xochitl is refused only by another run's lock.
+    fn may_start(&self, lock: &HeldLock) -> Result<()> {
+        if Path::new(&self.paths.lock_dir()).is_dir() {
+            self.owns(lock)
+        } else {
+            Ok(())
+        }
     }
 
     fn owns(&self, lock: &HeldLock) -> Result<()> {
@@ -680,6 +787,35 @@ impl FakeTablet {
         }
     }
 
+    /// The checks before an apply changes anything, as the real script
+    /// makes them: staging on the data dir's filesystem, every staged
+    /// file a regular file of its planned size; then executables get
+    /// their mode.
+    fn check_staged(&self, lock: &HeldLock, staged: &[StagedPath]) -> Result<()> {
+        let staging = PathBuf::from(self.paths.staging_dir(lock));
+        if !same_filesystem(&staging, &self.xochitl) {
+            return Err(incomplete(
+                &[],
+                "rmu: staging is not on the data filesystem".to_string(),
+            ));
+        }
+        staged.iter().try_for_each(|file| {
+            let path = staging.join(&file.path);
+            let ok = fs::symlink_metadata(&path)
+                .is_ok_and(|meta| meta.is_file() && meta.len() == file.size);
+            if !ok {
+                return Err(incomplete(
+                    &[],
+                    format!("rmu: not staged as planned: {}", file.path),
+                ));
+            }
+            if file.executable {
+                set_executable(&path)?;
+            }
+            Ok(())
+        })
+    }
+
     /// Run the steps; `Err` carries the documents finished so far.
     fn run_apply(
         &self,
@@ -688,13 +824,11 @@ impl FakeTablet {
         steps: &[ApplyStep],
         kill_after: Option<usize>,
     ) -> Result<ApplyReport> {
-        let written_paths = plan.written();
-        if let Some(missing) = written_paths
-            .iter()
-            .find(|path| !self.staged(lock, path).is_file())
-        {
-            return Err(incomplete(&[], format!("rmu: not staged: {missing}")));
+        let staged = plan.staged();
+        if !staged.is_empty() {
+            self.check_staged(lock, &staged)?;
         }
+        let fire_after = self.state().fire_after_moves.take();
         let (applied, _) =
             steps
                 .iter()
@@ -709,21 +843,27 @@ impl FakeTablet {
                     match self.apply_step(lock, step) {
                         Ok(()) => {}
                         Err(Error::HubDevice(
-                            guard @ (DeviceError::WatchdogFired | DeviceError::LockLost),
+                            guard @ (DeviceError::WatchdogFired
+                            | DeviceError::LockLost
+                            | DeviceError::Rebooted),
                         )) => return Err(guard.into()),
                         Err(error) => return Err(incomplete(&applied, error.to_string())),
                     }
                     if let ApplyStep::Done(doc) = step {
                         applied.push(doc.clone());
                     }
-                    Ok((applied, moves + usize::from(step.is_mutation())))
+                    let moves = moves + usize::from(step.is_mutation());
+                    if step.is_mutation() && fire_after == Some(moves) {
+                        self.fire_watchdog();
+                    }
+                    Ok((applied, moves))
                 })?;
-        let written = written_paths
+        let written = staged
             .iter()
-            .map(|path| {
-                let (mode, stat) = signature(&fs::symlink_metadata(self.data(path))?);
+            .map(|file| {
+                let (mode, stat) = signature(&fs::symlink_metadata(self.data(&file.path))?);
                 Ok(StatEntry {
-                    path: path.clone(),
+                    path: file.path.clone(),
                     mode,
                     stat,
                 })
@@ -802,14 +942,34 @@ impl Tablet for FakeTablet {
 
     fn arm_watchdog(&self, lock: &HeldLock, timeout: Duration) -> Result<()> {
         self.guarded(OpKind::ArmWatchdog, lock, || {
-            self.state().watchdog = Some(timeout);
+            let mut state = self.state();
+            state.watchdog = Some(Watchdog {
+                timeout,
+                run: lock.run().to_string(),
+            });
+            state.armed_since_start = true;
             Ok(())
         })
     }
 
+    /// A disarm while xochitl is stopped is a contract violation (the
+    /// real tablet refuses it); another run's watchdog is left alone.
     fn disarm_watchdog(&self, lock: &HeldLock) -> Result<()> {
         self.guarded(OpKind::DisarmWatchdog, lock, || {
-            self.state().watchdog = None;
+            let mut state = self.state();
+            if !state.running {
+                return Err(DeviceError::ContractViolation(
+                    "watchdog disarmed while xochitl is stopped".to_string(),
+                )
+                .into());
+            }
+            if state
+                .watchdog
+                .as_ref()
+                .is_some_and(|watchdog| watchdog.run == lock.run())
+            {
+                state.watchdog = None;
+            }
             Ok(())
         })
     }
@@ -817,9 +977,14 @@ impl Tablet for FakeTablet {
     fn stop_xochitl(&self, lock: &HeldLock) -> Result<()> {
         self.guarded(OpKind::StopXochitl, lock, || {
             let mut state = self.state();
-            if state.watchdog.is_none() {
+            let armed = state
+                .watchdog
+                .as_ref()
+                .is_some_and(|watchdog| watchdog.run == lock.run());
+            if !armed || !state.armed_since_start {
                 return Err(DeviceError::ContractViolation(
-                    "xochitl stopped without an armed watchdog".to_string(),
+                    "xochitl stopped without a watchdog armed by this run since the last start"
+                        .to_string(),
                 )
                 .into());
             }
@@ -833,9 +998,12 @@ impl Tablet for FakeTablet {
     fn start_xochitl(&self, lock: &HeldLock) -> Result<i64> {
         match self.begin(OpKind::StartXochitl) {
             Ok(ack) => {
-                self.owns(lock)?;
+                self.may_start(lock)?;
                 let time = now_ns();
-                self.state().running = true;
+                let mut state = self.state();
+                state.running = true;
+                state.armed_since_start = false;
+                drop(state);
                 match ack {
                     Ack::Report => Ok(time),
                     Ack::Lose(n) => self.start_reply_lost(lock, Self::lost(n)),
@@ -872,7 +1040,13 @@ impl Tablet for FakeTablet {
         }
         transfer_paths(files)?;
         self.op(OpKind::Download, || {
-            files.iter().try_for_each(|file| {
+            let fail_after = self.state().fail_download_after.take();
+            files.iter().enumerate().try_for_each(|(delivered, file)| {
+                if fail_after == Some(delivered) {
+                    return Err(transport_error(format!(
+                        "connection lost after {delivered} file(s)"
+                    )));
+                }
                 let path = self.data(file.as_str());
                 let meta = fs::symlink_metadata(&path)
                     .map_err(|_| Error::from(DeviceError::Download(format!("missing {file}"))))?;

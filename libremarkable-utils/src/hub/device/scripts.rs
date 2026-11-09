@@ -21,7 +21,7 @@
 //! and the watchdog never takes it, so a stuck script cannot keep
 //! xochitl down.
 
-use super::apply::ApplyStep;
+use super::apply::{ApplyStep, StagedPath};
 use super::lock::{AcquireProbe, LockRequest, LockState, owner_fields, parse_owner, run_line};
 use super::{DeviceError, StatEntry, StatListing, TabletPaths, WATCHDOG_UNIT};
 use crate::hub::model::{DocId, StatSignature};
@@ -35,6 +35,15 @@ pub(super) const EXIT_LOCK_LOST: i32 = 76;
 pub(super) const EXIT_LOCK_CHANGED: i32 = 77;
 /// Exit status of a script that could not get the guard `flock` in time.
 pub(super) const EXIT_BUSY: i32 = 78;
+/// Exit status of a disarm refused because xochitl is stopped.
+pub(super) const EXIT_XOCHITL_STOPPED: i32 = 79;
+/// Exit status of a guarded script on a tablet that rebooted since the
+/// lock was taken.
+pub(super) const EXIT_REBOOTED: i32 = 80;
+/// Exit status of an apply refused because xochitl is running.
+pub(super) const EXIT_XOCHITL_RUNNING: i32 = 81;
+/// Exit status of a stop refused for want of this run's watchdog.
+pub(super) const EXIT_NOT_ARMED: i32 = 82;
 
 /// Seconds a script waits for the guard `flock`: long enough for any
 /// legitimate holder (an apply, `systemctl stop xochitl`), bounded so a
@@ -91,13 +100,18 @@ fn take_flock(paths: &TabletPaths) -> String {
     )
 }
 
-/// Defines the guard functions:
+/// Defines the shell functions guarded scripts use:
 ///
 /// - `rmu_lock` takes the `flock` (see [`take_flock`]). A missing state
 ///   dir means the lock is gone: [`EXIT_LOCK_LOST`].
 /// - `rmu_owned` exits [`EXIT_LOCK_LOST`] unless the lock names `run`.
 /// - `rmu_guard` exits [`EXIT_WATCHDOG_FIRED`] if the watchdog marker
-///   exists, then checks `rmu_owned`.
+///   exists, checks `rmu_owned`, then exits [`EXIT_REBOOTED`] unless the
+///   record carries the current boot id (a reboot took the run's
+///   watchdog and may have started xochitl again).
+/// - `rmu_pid_ok` accepts a recorded sleeper process group only if it is
+///   a number greater than 1 (a pid file saying `1` must never signal
+///   every process).
 pub(super) fn guard_fns(paths: &TabletPaths, run: &str) -> String {
     format!(
         "rmu_lock() {{\n\
@@ -109,14 +123,22 @@ pub(super) fn guard_fns(paths: &TabletPaths, run: &str) -> String {
          rmu_guard() {{\n\
          if [ -e {marker} ]; then echo 'rmu: the hub watchdog fired' >&2; exit {fired}; fi\n\
          rmu_owned\n\
+         read -r rmu_boot < {boot_id} || exit 1\n\
+         grep -qxF \"boot_id=$rmu_boot\" {owner} 2>/dev/null || {{ echo 'rmu: the tablet rebooted since this run took its lock' >&2; exit {rebooted}; }}\n\
+         }}\n\
+         rmu_pid_ok() {{\n\
+         case \"$1\" in ''|*[!0-9]*) return 1 ;; esac\n\
+         [ \"$1\" -gt 1 ]\n\
          }}\n",
         state = q(&paths.state_dir),
         take_flock = take_flock(paths),
         line = q(&run_line(run)),
         owner = q(&paths.lock_owner()),
         marker = q(&paths.watchdog_marker()),
+        boot_id = q(&paths.boot_id),
         fired = EXIT_WATCHDOG_FIRED,
         lost = EXIT_LOCK_LOST,
+        rebooted = EXIT_REBOOTED,
     )
 }
 
@@ -135,12 +157,6 @@ pub(super) fn guarded(paths: &TabletPaths, run: &str, body: &str) -> String {
     main_with(paths, run, "rmu_guard", body)
 }
 
-/// Lock ownership only, under the `flock`, then `body`: for starting
-/// xochitl, which must still work after the watchdog fired.
-pub(super) fn owned(paths: &TabletPaths, run: &str, body: &str) -> String {
-    main_with(paths, run, "rmu_owned", body)
-}
-
 /// Variables and the `flock` shared by the lock scripts.
 fn lock_prelude(paths: &TabletPaths) -> String {
     format!(
@@ -157,11 +173,12 @@ fn lock_prelude(paths: &TabletPaths) -> String {
     )
 }
 
-/// Write the owner record (inside the lock directory, atomically) and
-/// clear a leftover watchdog marker.
+/// Write the owner record (inside the lock directory, atomically and
+/// durably: a power cut must not leave an empty record) and clear a
+/// leftover watchdog marker.
 fn write_owner(request: &LockRequest) -> String {
     format!(
-        "{{ printf '%s' {fields}; printf 'boot_id=%s\\n' \"$boot\"; }} > \"$o.tmp\" && mv -f -- \"$o.tmp\" \"$o\"",
+        "{{ printf '%s' {fields}; printf 'boot_id=%s\\n' \"$boot\"; }} > \"$o.tmp\" && sync && mv -f -- \"$o.tmp\" \"$o\" && sync",
         fields = q(&owner_fields(request)),
     )
 }
@@ -312,12 +329,20 @@ pub(super) fn parse_bool(operation: &'static str, output: &str) -> Result<bool, 
 }
 
 // ---- watchdog --------------------------------------------------------------
+//
+// State files: `watchdog.unit` holds `<unit> <run>` for the systemd
+// watchdog, `watchdog.pid` holds `<process group> <boot id> <run>` for
+// the sleep fallback, and `watchdog.token` the token the current sleeper
+// must find (or `disarmed`). Recording the arming run keeps one run's
+// disarm from stopping another run's watchdog.
 
-/// What the watchdog does when it fires: leave the marker first (so a
-/// live run stops before xochitl is back), then reset-failed + start.
+/// What the watchdog does when it fires: try to leave the marker (so a
+/// live run stops before xochitl is back), then reset-failed + start,
+/// whether or not the marker could be written (`true`, not the special
+/// builtin `:`, so a failed redirection cannot end the shell).
 pub(super) fn fire_command(paths: &TabletPaths) -> String {
     format!(
-        ": > {}; systemctl reset-failed xochitl.service; systemctl start xochitl.service",
+        "true > {} 2>/dev/null; systemctl reset-failed xochitl.service; systemctl start xochitl.service",
         q(&paths.watchdog_marker())
     )
 }
@@ -346,27 +371,44 @@ fn stop_recorded_unit(variable: &str) -> String {
     )
 }
 
-/// Kill the sleeper recorded in `oldp`/`oldb` if it is from this boot
-/// (after a reboot the number may belong to an unrelated process).
-const KILL_OLD_SLEEPER: &str = "if [ -n \"$oldp\" ] && [ \"$oldb\" = \"$boot\" ]; then kill -TERM -- \"-$oldp\" 2>/dev/null; fi\n";
+/// Kill the sleeper recorded in `oldp`/`oldb` if its process group is
+/// valid and from this boot (after a reboot the number may belong to an
+/// unrelated process). No `--`: BusyBox `ash`'s `kill` builtin rejects
+/// it, and `rmu_pid_ok` makes `-<group>` unambiguous.
+const KILL_OLD_SLEEPER: &str = "if rmu_pid_ok \"$oldp\" && [ \"$oldb\" = \"$boot\" ]; then kill -TERM \"-$oldp\" 2>/dev/null; fi\n";
 
+/// Read the recorded watchdogs: `old`/`oldr` (unit, run) and
+/// `oldp`/`oldb`/`oldpr` (process group, boot id, run).
 fn read_old_watchdog(paths: &TabletPaths) -> String {
     format!(
-        "old=; [ -f {unit} ] && read -r old < {unit}\n\
-         oldp=; oldb=; [ -f {pid} ] && read -r oldp oldb < {pid}\n",
+        "old=; oldr=; [ -f {unit} ] && read -r old oldr < {unit}\n\
+         oldp=; oldb=; oldpr=; [ -f {pid} ] && read -r oldp oldb oldpr < {pid}\n",
         unit = q(&paths.watchdog_unit()),
         pid = q(&paths.watchdog_pid()),
     )
 }
 
 /// The fallback without `systemd-run`: a detached `sleep` in its own
-/// session. It fires only if the token file still holds `token`; arming
-/// replaces the token and disarming removes it before killing the
-/// recorded process group, so a sleeper that survived a missed `kill`
-/// never fires. It must not inherit the guard `flock` (fd 9).
-pub(super) fn sleep_watchdog_command(paths: &TabletPaths, secs: u64, token: &str) -> String {
+/// session. When it wakes it fires unless the token file holds another
+/// token (a later arming) or `disarmed`; a missing token file (the state
+/// dir was lost) still fires, since it may be all that brings xochitl
+/// back. Disarming writes `disarmed` before killing the recorded process
+/// group, so a sleeper that survived a missed `kill` never fires. It must
+/// not inherit the guard `flock` (fd 9). Arming fails unless the new
+/// sleeper is alive, and only then is the old one killed.
+///
+/// Limitation: on systems whose sshd puts each session in its own
+/// systemd unit and kills its whole cgroup on disconnect, the sleeper
+/// dies with the session despite `setsid`. The systemd timer has no such
+/// problem and is used wherever `systemd-run` exists (every known model).
+pub(super) fn sleep_watchdog_command(
+    paths: &TabletPaths,
+    secs: u64,
+    token: &str,
+    run: &str,
+) -> String {
     let body = format!(
-        "sleep {secs}; read -r t < {tokens} 2>/dev/null && [ \"$t\" = {token} ] || exit 0; rm -f -- {tokens} {pid}; {fire}",
+        "sleep {secs}; t=; [ -f {tokens} ] && read -r t < {tokens}; [ -z \"$t\" ] || [ \"$t\" = {token} ] || exit 0; rm -f -- {tokens} {pid} 2>/dev/null; {fire}",
         tokens = q(&paths.watchdog_token()),
         token = q(token),
         pid = q(&paths.watchdog_pid()),
@@ -376,18 +418,21 @@ pub(super) fn sleep_watchdog_command(paths: &TabletPaths, secs: u64, token: &str
         "command -v setsid >/dev/null 2>&1 || {{ echo 'rmu: neither systemd-run nor setsid is available for the watchdog' >&2; exit 1; }}\n\
          printf '%s\\n' {token} > {tokens} || exit 1\n\
          setsid sh -c {body} </dev/null >/dev/null 2>&1 9>&- &\n\
-         printf '%s %s\\n' \"$!\" \"$boot\" > {pid} || exit 1\n",
+         p=$!\n\
+         kill -0 \"$p\" 2>/dev/null || {{ echo 'rmu: the watchdog sleeper did not start' >&2; exit 1; }}\n\
+         printf '%s %s %s\\n' \"$p\" \"$boot\" {run} > {pid} || exit 1\n",
         token = q(token),
         tokens = q(&paths.watchdog_token()),
         body = q(&body),
+        run = q(run),
         pid = q(&paths.watchdog_pid()),
     )
 }
 
 /// Arm (or re-arm) the watchdog: guard, arm the new one (the systemd
-/// timer if `systemd-run` exists, else the sleep fallback), and only then
-/// remove the previous one, so a failed arming leaves the old watchdog
-/// in place.
+/// timer if `systemd-run` exists, else the sleep fallback), record it
+/// with this run, and only then remove the previous one (any run's), so
+/// a failed arming leaves the old watchdog in place.
 pub(super) fn arm_script(paths: &TabletPaths, run: &str, secs: u64, token: &str) -> String {
     let unit = watchdog_unit_name(token);
     guarded(
@@ -397,8 +442,8 @@ pub(super) fn arm_script(paths: &TabletPaths, run: &str, secs: u64, token: &str)
             "read -r boot < {boot_id} || exit 1\n\
              {read_old}if command -v systemd-run >/dev/null 2>&1; then\n\
              {systemd} || exit 1\n\
-             printf '%s\\n' {unit} > {unit_file} || exit 1\n\
-             rm -f -- {tokens} {pid}\n\
+             printf '%s %s\\n' {unit} {run} > {unit_file} || exit 1\n\
+             printf 'disarmed\\n' > {tokens}; rm -f -- {pid}\n\
              else\n\
              {sleep}rm -f -- {unit_file}\n\
              fi\n\
@@ -407,28 +452,38 @@ pub(super) fn arm_script(paths: &TabletPaths, run: &str, secs: u64, token: &str)
             read_old = read_old_watchdog(paths),
             systemd = systemd_watchdog_command(paths, secs, &unit),
             unit = q(&unit),
+            run = q(run),
             unit_file = q(&paths.watchdog_unit()),
             tokens = q(&paths.watchdog_token()),
             pid = q(&paths.watchdog_pid()),
-            sleep = sleep_watchdog_command(paths, secs, token),
+            sleep = sleep_watchdog_command(paths, secs, token, run),
             stop_old = stop_recorded_unit("old"),
             kill_old = KILL_OLD_SLEEPER,
         ),
     )
 }
 
-/// Remove the armed watchdog, of either kind. The token goes first, so a
-/// sleeper cannot fire after.
+/// Remove the watchdog this run armed, of either kind; another run's is
+/// left alone. Refused ([`EXIT_XOCHITL_STOPPED`]) while xochitl is
+/// stopped. A sleeper's token becomes `disarmed` before the kill.
 pub(super) fn disarm_script(paths: &TabletPaths, run: &str) -> String {
     guarded(
         paths,
         run,
         &format!(
-            "read -r boot < {boot_id} || exit 1\n\
-             {read_old}rm -f -- {tokens} {unit_file} {pid}\n\
-             {stop_old}{kill_old}true",
+            "systemctl is-active --quiet xochitl.service || {{ echo 'rmu: refusing to disarm the watchdog while xochitl is stopped' >&2; exit {stopped}; }}\n\
+             read -r boot < {boot_id} || exit 1\n\
+             {read_old}if [ -n \"$old\" ] && [ \"$oldr\" = {run} ]; then\n\
+             rm -f -- {unit_file}\n\
+             {stop_old}fi\n\
+             if [ -n \"$oldp\" ] && [ \"$oldpr\" = {run} ]; then\n\
+             printf 'disarmed\\n' > {tokens}; rm -f -- {pid}\n\
+             {kill_old}fi\n\
+             true",
+            stopped = EXIT_XOCHITL_STOPPED,
             boot_id = q(&paths.boot_id),
             read_old = read_old_watchdog(paths),
+            run = q(run),
             tokens = q(&paths.watchdog_token()),
             unit_file = q(&paths.watchdog_unit()),
             pid = q(&paths.watchdog_pid()),
@@ -440,20 +495,63 @@ pub(super) fn disarm_script(paths: &TabletPaths, run: &str) -> String {
 
 // ---- xochitl and guard checks -----------------------------------------------
 
+/// Stop xochitl, refused ([`EXIT_NOT_ARMED`]) unless a watchdog armed by
+/// this run is pending: its systemd timer is active, or its sleeper's
+/// process group (from this boot) is alive.
 pub(super) fn stop_script(paths: &TabletPaths, run: &str) -> String {
-    guarded(paths, run, "systemctl stop xochitl.service")
-}
-
-/// Prints the device time (unix seconds), then reset-failed + start.
-/// Checks only lock ownership: bringing xochitl back is always allowed
-/// to the lock holder, also after the watchdog fired.
-pub(super) fn start_script(paths: &TabletPaths, run: &str) -> String {
-    owned(
+    guarded(
         paths,
         run,
-        "date +%s\n\
+        &format!(
+            "read -r boot < {boot_id} || exit 1\n\
+             u=; ur=; [ -f {unit_file} ] && read -r u ur < {unit_file}\n\
+             p=; pb=; pr=; [ -f {pid} ] && read -r p pb pr < {pid}\n\
+             if {{ [ -n \"$u\" ] && [ \"$ur\" = {run} ] && systemctl is-active --quiet \"$u.timer\"; }} \\\n\
+             || {{ [ \"$pr\" = {run} ] && [ \"$pb\" = \"$boot\" ] && rmu_pid_ok \"$p\" && kill -0 \"-$p\" 2>/dev/null; }}; then :\n\
+             else echo 'rmu: refusing to stop xochitl without a watchdog armed by this run' >&2; exit {not_armed}; fi\n\
+             systemctl stop xochitl.service",
+            boot_id = q(&paths.boot_id),
+            unit_file = q(&paths.watchdog_unit()),
+            pid = q(&paths.watchdog_pid()),
+            run = q(run),
+            not_armed = EXIT_NOT_ARMED,
+        ),
+    )
+}
+
+/// Whether xochitl may be started: if the state dir exists, under the
+/// `flock`, the lock must be ours or free (only another run's lock
+/// refuses). A lost state dir (or a fired watchdog) never blocks it.
+fn start_check(paths: &TabletPaths) -> String {
+    format!(
+        "if [ -d {state} ]; then rmu_lock; [ ! -d {lock} ] || rmu_owned; fi",
+        state = q(&paths.state_dir),
+        lock = q(&paths.lock_dir()),
+    )
+}
+
+/// Prints the device time (unix seconds), then reset-failed + start
+/// (see [`start_check`]).
+pub(super) fn start_script(paths: &TabletPaths, run: &str) -> String {
+    format!(
+        "{fns}rmu_main() {{\n\
+         {check}\n\
+         date +%s\n\
          systemctl reset-failed xochitl.service 2>/dev/null\n\
-         systemctl start xochitl.service",
+         systemctl start xochitl.service\n\
+         }}\n\
+         rmu_main </dev/null\n",
+        fns = guard_fns(paths, run),
+        check = start_check(paths),
+    )
+}
+
+/// Only the check of [`start_script`] (after a lost reply).
+pub(super) fn start_allowed_script(paths: &TabletPaths, run: &str) -> String {
+    format!(
+        "{fns}rmu_main() {{\n{check}\n}}\nrmu_main </dev/null\n",
+        fns = guard_fns(paths, run),
+        check = start_check(paths),
     )
 }
 
@@ -483,16 +581,19 @@ pub(super) fn cloud_paired_script(paths: &TabletPaths) -> String {
 // ---- stat pass ---------------------------------------------------------------
 
 /// Stat every non-directory entry of the data dir in one `find`. Names
-/// with a newline cannot be listed line by line; they are pruned and
-/// counted (`skip` lines). Any diagnostic from `find`/`stat` fails the
-/// pass: a partial listing must never read as deleted files.
+/// with a newline or a carriage return cannot be listed line by line
+/// (a trailing `\r` would vanish in line splitting and alias another
+/// name); they are pruned and counted (`skip` lines). Any diagnostic from
+/// `find`/`stat` fails the pass: a partial listing must never read as
+/// deleted files.
 pub(super) fn stat_script(paths: &TabletPaths) -> String {
     format!(
         "rmu_stat() {{\n\
          cd {dir} || exit 9\n\
          err=$(mktemp) || exit 1\n\
          nl='\n'\n\
-         find . -name \"*$nl*\" -prune -exec printf 'skip\\n' \\; -o ! -type d -exec stat -c {format} -- {{}} + 2>\"$err\"\n\
+         cr=$(printf '\\r')\n\
+         find . \\( -name \"*$nl*\" -o -name \"*$cr*\" \\) -prune -exec printf 'skip\\n' \\; -o ! -type d -exec stat -c {format} -- {{}} + 2>\"$err\"\n\
          status=$?\n\
          if [ \"$status\" -ne 0 ] || [ -s \"$err\" ]; then cat \"$err\" >&2; rm -f \"$err\"; exit 1; fi\n\
          rm -f \"$err\"\n\
@@ -570,6 +671,14 @@ fn parse_stat_lines<'a>(
         })
         .collect::<Result<Vec<_>, _>>()?;
     entries.sort_by(|a, b| a.path.cmp(&b.path));
+    // Every name is listed once: a repeat means the output is not what
+    // it seems (e.g. two names that differ only where a line split cut).
+    if let Some(pair) = entries.windows(2).find(|pair| pair[0].path == pair[1].path) {
+        return Err(output_error(
+            operation,
+            format!("{} listed twice", pair[0].path),
+        ));
+    }
     Ok(entries)
 }
 
@@ -624,7 +733,7 @@ pub(super) fn read_files_script<'a>(
          n=$(wc -c < \"$f\") || exit 1\n\
          n=$((n))\n\
          printf 'present %s\\n' \"$n\"\n\
-         head -c \"$n\" -- \"$f\" || exit 1\n\
+         head -c \"$n\" -- \"./$f\" || exit 1\n\
          {not_regular}\
          else\n\
          printf 'absent\\n'\n\
@@ -692,7 +801,7 @@ pub(super) fn sha256_script(paths: &TabletPaths, files: &[&str]) -> String {
             format!(
                 "set --\n\
                  for f in {list}; do\n\
-                 if [ -f \"$f\" ] && [ ! -L \"$f\" ]; then set -- \"$@\" \"$f\"\n\
+                 if [ -f \"$f\" ] && [ ! -L \"$f\" ]; then set -- \"$@\" \"./$f\"\n\
                  {not_regular}\
                  else printf 'absent %s\\n' \"$f\"; fi\n\
                  done\n\
@@ -732,7 +841,11 @@ pub(super) fn parse_sha256<'a>(
                             .bytes()
                             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) =>
                 {
-                    Ok((name, Some(hash.to_string())))
+                    // Names are passed as `./<name>` (so `-` is not stdin).
+                    Ok((
+                        name.strip_prefix("./").unwrap_or(name),
+                        Some(hash.to_string()),
+                    ))
                 }
                 _ => Err(error(format!("unexpected line {line:?}"))),
             }
@@ -783,8 +896,9 @@ pub(super) fn parse_state_output(output: &[u8]) -> Result<Option<&[u8]>, DeviceE
 }
 
 /// Receive `size` bytes on stdin into a private sibling of the state
-/// file, verify the length, then, under the guard, rename it into place
-/// and `sync` (atomic and durable). The guard is also checked before the
+/// file, verify the length, `sync` (so the rename cannot outlive the
+/// data), then, under the guard, rename it into place and `sync` again
+/// (atomic and durable). The guard is also checked before the
 /// transfer, to fail fast.
 pub(super) fn write_state_command(paths: &TabletPaths, run: &str, size: usize) -> String {
     format!(
@@ -794,6 +908,7 @@ pub(super) fn write_state_command(paths: &TabletPaths, run: &str, size: usize) -
          trap 'exit 1' HUP INT TERM\n\
          cat > \"$tmp\" || exit 1\n\
          [ \"$(wc -c < \"$tmp\")\" -eq {size} ] || {{ echo 'rmu: incomplete state upload' >&2; exit 1; }}\n\
+         sync\n\
          rmu_lock\n\
          rmu_guard\n\
          mv -f -- \"$tmp\" {file} || exit 1\n\
@@ -842,33 +957,56 @@ fn render_step(step: &ApplyStep) -> String {
     }
 }
 
-/// The apply, under the guard `flock`: check that every staged file is
-/// there before changing anything, `sync` (so no rename can outlive its
-/// file's data in a power cut), the steps in order, `sync` again, the
-/// device time, and a stat of every written file; `rmu-complete` last.
+/// The apply, under the guard `flock`, refused ([`EXIT_XOCHITL_RUNNING`])
+/// while xochitl runs. Before changing anything: staging must be on the
+/// data dir's filesystem (BusyBox `mv` would silently copy across
+/// filesystems, which is not atomic), every staged file must be a
+/// regular file of its planned size (a partial upload is never applied),
+/// executables get their mode, and `sync` (so no rename can outlive its
+/// file's data in a power cut). Then the steps in order, `sync` again,
+/// the device time, and a stat of every written file; `rmu-complete`
+/// last.
 pub(super) fn apply_script(
     paths: &TabletPaths,
     run: &str,
     staging: &str,
     steps: &[ApplyStep],
-    written: &[String],
+    staged: &[StagedPath],
 ) -> String {
-    let stats = written
+    let stats = staged
         .chunks(ARGS_PER_CALL)
         .map(|batch| {
             format!(
                 "stat -c {} -- {} || exit 1\n",
                 q(STAT_FORMAT),
-                quoted_list(batch.iter().map(String::as_str))
+                quoted_list(batch.iter().map(|file| file.path.as_str()))
             )
         })
         .collect::<String>();
-    let staged = if written.is_empty() {
+    let checks = staged
+        .iter()
+        .map(|file| {
+            format!(
+                "rmu_staged {} {}{}\n",
+                q(&file.path),
+                file.size,
+                if file.executable {
+                    format!(" && chmod 755 -- \"$S\"/{} || exit 1", q(&file.path))
+                } else {
+                    String::new()
+                }
+            )
+        })
+        .collect::<String>();
+    let staged = if staged.is_empty() {
         String::new()
     } else {
         format!(
-            "for f in {}; do [ -f \"$S/$f\" ] || {{ printf 'rmu: not staged: %s\\n' \"$f\" >&2; exit 1; }}; done\n",
-            quoted_list(written.iter().map(String::as_str))
+            "[ \"$(stat -c %d -- \"$S\")\" = \"$(stat -c %d -- .)\" ] || {{ echo 'rmu: staging is not on the data filesystem' >&2; exit 1; }}\n\
+             rmu_staged() {{\n\
+             [ -f \"$S/$1\" ] && [ ! -L \"$S/$1\" ] && [ \"$(wc -c < \"$S/$1\")\" -eq \"$2\" ] || {{ printf 'rmu: not staged as planned: %s\\n' \"$1\" >&2; exit 1; }}\n\
+             }}\n\
+             {checks}"
         )
     };
     let body = steps
@@ -879,6 +1017,7 @@ pub(super) fn apply_script(
         "{fns}rmu_apply() {{\n\
          rmu_lock\n\
          rmu_guard\n\
+         if systemctl is-active --quiet xochitl.service; then echo 'rmu: refusing to apply while xochitl is running' >&2; exit {running}; fi\n\
          cd {dir} || exit 9\n\
          S={staging}\n\
          {staged}sync\n\
@@ -888,6 +1027,7 @@ pub(super) fn apply_script(
          }}\n\
          rmu_apply </dev/null\n",
         fns = guard_fns(paths, run),
+        running = EXIT_XOCHITL_RUNNING,
         dir = q(&paths.xochitl_dir),
         staging = q(staging),
     )
@@ -946,7 +1086,7 @@ pub(super) fn applied_documents(output: &str) -> Vec<DocId> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hub::device::apply::{ApplyPlan, DocApply};
+    use crate::hub::device::apply::{ApplyPlan, DocApply, StagedFile};
     use crate::hub::model::{DocFile, PageId};
 
     const RUN: &str = "0123456789abcdef0123456789abcdef";
@@ -1036,18 +1176,19 @@ mod tests {
             "grep -qxF 'run={RUN}' /home/root/.local/share/rmu/lock/owner 2>/dev/null || {{ echo 'rmu: the hub lock is not held by this run' >&2; exit 76; }}"
         )));
         assert!(fns.contains(
-            "if [ -e /home/root/.local/share/rmu/watchdog-fired ]; then echo 'rmu: the hub watchdog fired' >&2; exit 75; fi\nrmu_owned\n"
+            "if [ -e /home/root/.local/share/rmu/watchdog-fired ]; then echo 'rmu: the hub watchdog fired' >&2; exit 75; fi\nrmu_owned\n\
+             read -r rmu_boot < /proc/sys/kernel/random/boot_id || exit 1\n\
+             grep -qxF \"boot_id=$rmu_boot\" /home/root/.local/share/rmu/lock/owner 2>/dev/null || { echo 'rmu: the tablet rebooted since this run took its lock' >&2; exit 80; }\n"
         ));
+        // A recorded pid must be a number above 1 before it is signalled.
+        assert!(fns.contains("case \"$1\" in ''|*[!0-9]*) return 1 ;; esac\n[ \"$1\" -gt 1 ]\n"));
         // Wrapped in a function: nothing runs, the flock above all, before
         // the whole script has arrived.
         assert!(
             guarded(&paths, RUN, "body")
                 .ends_with("rmu_main() {\nrmu_lock\nrmu_guard\nbody\n}\nrmu_main </dev/null\n")
         );
-        assert!(
-            owned(&paths, RUN, "body")
-                .ends_with("rmu_main() {\nrmu_lock\nrmu_owned\nbody\n}\nrmu_main </dev/null\n")
-        );
+
         assert_quoted(&guarded(&hostile(), RUN, "true"), &hostile());
     }
 
@@ -1144,7 +1285,7 @@ mod tests {
         assert_eq!(
             systemd_watchdog_command(&paths, 300, "rmu-hub-watchdog-tok"),
             "systemd-run --quiet --collect --unit=rmu-hub-watchdog-tok --on-active=300s /bin/sh -c \
-             ': > /home/root/.local/share/rmu/watchdog-fired; systemctl reset-failed xochitl.service; systemctl start xochitl.service'"
+             'true > /home/root/.local/share/rmu/watchdog-fired 2>/dev/null; systemctl reset-failed xochitl.service; systemctl start xochitl.service'"
         );
     }
 
@@ -1152,14 +1293,19 @@ mod tests {
     fn watchdog_sleep_variant() {
         let paths = TabletPaths::default();
         assert_eq!(
-            sleep_watchdog_command(&paths, 90, "tok"),
-            "command -v setsid >/dev/null 2>&1 || { echo 'rmu: neither systemd-run nor setsid is available for the watchdog' >&2; exit 1; }\n\
-             printf '%s\\n' tok > /home/root/.local/share/rmu/watchdog.token || exit 1\n\
-             setsid sh -c 'sleep 90; read -r t < /home/root/.local/share/rmu/watchdog.token 2>/dev/null \
-             && [ \"$t\" = tok ] || exit 0; rm -f -- /home/root/.local/share/rmu/watchdog.token \
-             /home/root/.local/share/rmu/watchdog.pid; : > /home/root/.local/share/rmu/watchdog-fired; \
-             systemctl reset-failed xochitl.service; systemctl start xochitl.service' </dev/null >/dev/null 2>&1 9>&- &\n\
-             printf '%s %s\\n' \"$!\" \"$boot\" > /home/root/.local/share/rmu/watchdog.pid || exit 1\n"
+            sleep_watchdog_command(&paths, 90, "tok", RUN),
+            format!(
+                "command -v setsid >/dev/null 2>&1 || {{ echo 'rmu: neither systemd-run nor setsid is available for the watchdog' >&2; exit 1; }}\n\
+                 printf '%s\\n' tok > /home/root/.local/share/rmu/watchdog.token || exit 1\n\
+                 setsid sh -c 'sleep 90; t=; [ -f /home/root/.local/share/rmu/watchdog.token ] \
+                 && read -r t < /home/root/.local/share/rmu/watchdog.token; [ -z \"$t\" ] || [ \"$t\" = tok ] || exit 0; \
+                 rm -f -- /home/root/.local/share/rmu/watchdog.token /home/root/.local/share/rmu/watchdog.pid 2>/dev/null; \
+                 true > /home/root/.local/share/rmu/watchdog-fired 2>/dev/null; \
+                 systemctl reset-failed xochitl.service; systemctl start xochitl.service' </dev/null >/dev/null 2>&1 9>&- &\n\
+                 p=$!\n\
+                 kill -0 \"$p\" 2>/dev/null || {{ echo 'rmu: the watchdog sleeper did not start' >&2; exit 1; }}\n\
+                 printf '%s %s %s\\n' \"$p\" \"$boot\" {RUN} > /home/root/.local/share/rmu/watchdog.pid || exit 1\n"
+            )
         );
     }
 
@@ -1170,7 +1316,7 @@ mod tests {
         let guard = position(&arm, "rmu_main() {\nrmu_lock\nrmu_guard\n");
         let read_old = position(
             &arm,
-            "old=; [ -f /home/root/.local/share/rmu/watchdog.unit ] && read -r old <",
+            "old=; oldr=; [ -f /home/root/.local/share/rmu/watchdog.unit ] && read -r old oldr <",
         );
         let systemd = position(
             &arm,
@@ -1178,19 +1324,37 @@ mod tests {
         );
         let sleep = position(&arm, "setsid sh -c");
         let stop_old = position(&arm, "systemctl stop \"$old.timer\"");
-        let kill_old = position(&arm, "kill -TERM -- \"-$oldp\"");
+        let kill_old = position(&arm, "kill -TERM \"-$oldp\"");
         assert!(guard < read_old && read_old < systemd && systemd < sleep);
         assert!(sleep < stop_old && stop_old < kill_old);
         assert!(arm.contains("if command -v systemd-run >/dev/null 2>&1; then"));
-        // The old sleeper is only killed if it is from this boot.
-        assert!(arm.contains("[ \"$oldb\" = \"$boot\" ]"));
-        // Disarm: guard, token gone before any kill.
+        // Arming records this run with the watchdog.
+        assert!(arm.contains(&format!(
+            "printf '%s %s\\n' rmu-hub-watchdog-tok {RUN} > /home/root/.local/share/rmu/watchdog.unit"
+        )));
+        // The old sleeper is only killed if its group is valid and from
+        // this boot, and only once the new sleeper is alive.
+        assert!(arm.contains("if rmu_pid_ok \"$oldp\" && [ \"$oldb\" = \"$boot\" ]"));
+        assert!(position(&arm, "kill -0 \"$p\"") < kill_old);
+        // Disarm: refused while xochitl is stopped, only this run's
+        // watchdog, token marked before any kill.
         let disarm = disarm_script(&paths, RUN);
-        assert!(disarm.contains("rmu_main() {\nrmu_lock\nrmu_guard\n"));
+        let guard = position(&disarm, "rmu_main() {\nrmu_lock\nrmu_guard\n");
+        let active = position(
+            &disarm,
+            "systemctl is-active --quiet xochitl.service || { echo 'rmu: refusing to disarm the watchdog while xochitl is stopped' >&2; exit 79; }",
+        );
+        assert!(guard < active);
+        assert!(disarm.contains(&format!(
+            "if [ -n \"$old\" ] && [ \"$oldr\" = {RUN} ]; then"
+        )));
+        assert!(disarm.contains(&format!(
+            "if [ -n \"$oldp\" ] && [ \"$oldpr\" = {RUN} ]; then"
+        )));
         assert!(
             position(
                 &disarm,
-                "rm -f -- /home/root/.local/share/rmu/watchdog.token"
+                "printf 'disarmed\\n' > /home/root/.local/share/rmu/watchdog.token"
             ) < position(&disarm, "kill -TERM")
         );
         // Nested quoting (the fire command inside `sh -c`) is exercised by
@@ -1201,16 +1365,30 @@ mod tests {
     #[test]
     fn start_checks_ownership_and_resets_failed_state_first() {
         let script = start_script(&TabletPaths::default(), RUN);
-        let owned = position(&script, "rmu_main() {\nrmu_lock\nrmu_owned\n");
+        // Refused only by another run's lock; a lost state dir or a fired
+        // watchdog never blocks it.
+        let owned = position(
+            &script,
+            "rmu_main() {\nif [ -d /home/root/.local/share/rmu ]; then rmu_lock; \
+             [ ! -d /home/root/.local/share/rmu/lock ] || rmu_owned; fi\n",
+        );
         let date = position(&script, "date +%s");
         let reset = position(&script, "systemctl reset-failed xochitl.service");
         let start = position(&script, "systemctl start xochitl.service");
         assert!(owned < date && date < reset && reset < start);
         assert!(!script.contains("rmu_lock\nrmu_guard\n"));
+        let stop = stop_script(&TabletPaths::default(), RUN);
+        assert!(stop.contains("rmu_main() {\nrmu_lock\nrmu_guard\n"));
+        // Only with this run's pending watchdog, of either kind.
         assert!(
-            stop_script(&TabletPaths::default(), RUN)
-                .contains("rmu_lock\nrmu_guard\nsystemctl stop xochitl.service\n}\n")
+            position(&stop, "systemctl is-active --quiet \"$u.timer\"")
+                < position(&stop, "systemctl stop xochitl.service")
         );
+        assert!(stop.contains(&format!(
+            "[ \"$pr\" = {RUN} ] && [ \"$pb\" = \"$boot\" ] && rmu_pid_ok \"$p\" && kill -0 \"-$p\""
+        )));
+        assert!(stop.contains("exit 82; fi\nsystemctl stop xochitl.service\n}\n"));
+        assert!(start_allowed_script(&TabletPaths::default(), RUN).contains("rmu_owned; fi\n}\n"));
         assert_eq!(
             parse_device_time("t", "1790000000\n").unwrap(),
             1_790_000_000 * NANOS_PER_SEC
@@ -1316,6 +1494,14 @@ mod tests {
         );
         assert!(parse_stat_output("garbage\n").is_err());
         assert_eq!(parse_stat_output("").unwrap(), StatListing::default());
+        // A name listed twice (e.g. `x` and a `x\r` that line splitting
+        // cut) means the listing is not what it seems.
+        let line = "81a4 1 1790000001 2026-09-21 12:13:21.1 +0000 1790000001 2026-09-21 12:13:21.1 +0000 2 ./x";
+        assert!(parse_stat_output(&format!("{line}\n{line}\r\n")).is_err());
+        // Names with a newline or a carriage return are pruned.
+        let script = stat_script(&TabletPaths::default());
+        assert!(script.contains("cr=$(printf '\\r')\n"));
+        assert!(script.contains("find . \\( -name \"*$nl*\" -o -name \"*$cr*\" \\) -prune"));
         let script = stat_script(&hostile());
         assert_quoted(&script, &hostile());
         assert!(script.contains(&format!("stat -c {}", shell_quote(STAT_FORMAT))));
@@ -1352,7 +1538,7 @@ mod tests {
         let script = read_files_script(&hostile(), ["it's.metadata", "$(x).content"]);
         assert!(script.contains("for f in 'it'\\''s.metadata' '$(x).content'; do"));
         // Exactly the announced bytes, even if the file grew meanwhile.
-        assert!(script.contains("head -c \"$n\" -- \"$f\""));
+        assert!(script.contains("head -c \"$n\" -- \"./$f\""));
         assert_quoted(&script, &hostile());
     }
 
@@ -1390,9 +1576,10 @@ mod tests {
         let script = write_state_command(&TabletPaths::default(), RUN, 42);
         let receive = position(&script, "cat > \"$tmp\"");
         let length = position(&script, "-eq 42 ]");
+        let synced = position(&script, "\nsync\nrmu_lock\n");
         let lock = position(&script, "rmu_lock\nrmu_guard\nmv -f -- \"$tmp\"");
-        let sync = position(&script, "\nsync\n");
-        assert!(receive < length && length < lock && lock < sync);
+        let sync = script.rfind("\nsync\n").unwrap();
+        assert!(receive < length && length < synced && synced < lock && lock < sync);
         assert_quoted(&write_state_command(&hostile(), RUN, 1), &hostile());
         assert_quoted(&read_state_script(&hostile()), &hostile());
     }
@@ -1412,7 +1599,15 @@ mod tests {
             docs: vec![
                 DocApply::Write {
                     doc: DocId::new(DOC).unwrap(),
-                    write: vec![DocFile::Metadata, page, DocFile::Content],
+                    write: vec![
+                        StagedFile::regular(DocFile::Metadata, 12),
+                        StagedFile::regular(page, 3),
+                        StagedFile {
+                            file: DocFile::Content,
+                            size: 7,
+                            mode: crate::git::FileMode::Executable,
+                        },
+                    ],
                     remove: vec![],
                 },
                 DocApply::Delete {
@@ -1426,7 +1621,7 @@ mod tests {
             RUN,
             "/st/run",
             &plan.steps().unwrap(),
-            &plan.written(),
+            &plan.staged(),
         );
         let body = script.split_once("rmu_apply() {\n").unwrap().1;
         let lines: Vec<&str> = body.lines().collect();
@@ -1435,11 +1630,18 @@ mod tests {
             vec![
                 "rmu_lock",
                 "rmu_guard",
+                "if systemctl is-active --quiet xochitl.service; then echo 'rmu: refusing to apply while xochitl is running' >&2; exit 81; fi",
                 "cd /home/root/.local/share/remarkable/xochitl || exit 9",
                 "S=/st/run",
+                "[ \"$(stat -c %d -- \"$S\")\" = \"$(stat -c %d -- .)\" ] || { echo 'rmu: staging is not on the data filesystem' >&2; exit 1; }",
+                "rmu_staged() {",
+                "[ -f \"$S/$1\" ] && [ ! -L \"$S/$1\" ] && [ \"$(wc -c < \"$S/$1\")\" -eq \"$2\" ] || { printf 'rmu: not staged as planned: %s\\n' \"$1\" >&2; exit 1; }",
+                "}",
                 &format!(
-                    "for f in {DOC}.content {DOC}.metadata {DOC}/p1.rm; do [ -f \"$S/$f\" ] || {{ printf 'rmu: not staged: %s\\n' \"$f\" >&2; exit 1; }}; done"
+                    "rmu_staged {DOC}.content 7 && chmod 755 -- \"$S\"/{DOC}.content || exit 1"
                 ),
+                &format!("rmu_staged {DOC}.metadata 12"),
+                &format!("rmu_staged {DOC}/p1.rm 3"),
                 "sync",
                 "rmu_guard",
                 &format!("mkdir -p -- {DOC} || exit 1"),
@@ -1470,7 +1672,7 @@ mod tests {
         let plan = ApplyPlan {
             docs: vec![DocApply::Write {
                 doc: DocId::new(DOC).unwrap(),
-                write: vec![DocFile::Metadata],
+                write: vec![StagedFile::regular(DocFile::Metadata, 2)],
                 remove: vec![],
             }],
         };
@@ -1481,7 +1683,7 @@ mod tests {
             RUN,
             &staging,
             &plan.steps().unwrap(),
-            &plan.written(),
+            &plan.staged(),
         );
         assert_quoted_with(&script, &paths, &[&staging]);
         assert!(script.contains(&format!("S={}\n", shell_quote(&staging))));
@@ -1496,7 +1698,7 @@ mod tests {
             RUN,
             &staging,
             &deletion.steps().unwrap(),
-            &deletion.written(),
+            &deletion.staged(),
         );
         assert!(!script.contains("stat -c"));
         assert!(!script.contains("not staged"));

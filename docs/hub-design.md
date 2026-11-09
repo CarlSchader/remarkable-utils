@@ -361,7 +361,9 @@ clean-up does not require `--allow-deletions` on every tablet.
   stages into `staging/<run-id>/`, keeping xochitl-relative paths, as one
   streamed tar; staged files are `touch`ed after extraction, so applied
   files carry device-clock nanosecond mtimes (never kept out of the
-  manifest as racy).
+  manifest as racy). Staged files are mode 0644; the apply plan carries
+  each file's size and mode (regular or executable), and executables
+  get their mode before the move.
 - While stopped, rmu re-reads every `.metadata` and `.content` whose
   stat moved since the snapshot.
 - **Verify**: a document is applied only if its tablet files still match
@@ -376,18 +378,26 @@ clean-up does not require `--allow-deletions` on every tablet.
   merge's tree checks against it — no parent cycles, no folder deleted
   that has gained children, no orphans. Documents that would violate them
   are skipped with a base override.
-- Staged files are moved into place in one batch script. Within a
-  document: pages and payload, then `.content`, then `.metadata`. Each
-  move is a `rename` (`mv -T`). Mirrored files the merge dropped from a
+- Staged files are moved into place in one batch script, refused while
+  xochitl runs. Within a document: pages and payload, then `.content`,
+  then `.metadata`. Each move is a `rename` (`mv -T`), because the
+  script first checks, by device number, that staging is on the data
+  dir's filesystem (BusyBox `mv` silently falls back to a non-atomic
+  copy across filesystems). Mirrored files the merge dropped from a
   document that stays (a deleted page) are removed in the same phase as
   their kind.
 - A document deletion removes the whole `<uuid>`/`<uuid>.*` set,
   including thumbnails and `.local`, `.metadata` first (an interrupted
   deletion leaves invisible orphans, never a half document). Otherwise
   apply never deletes files outside the mirror.
-- The script first checks that every staged file is there (nothing
-  changes otherwise) and runs `sync`, so no rename can outlive its
-  file's data in a power cut. It prints each finished document, then,
+- The script first checks that every staged file is a regular file of
+  its planned size (a partial upload, which BusyBox `tar -x` can leave
+  with exit status 0, is never applied; nothing changes otherwise) and
+  runs `sync`, so no rename can outlive its file's data in a power cut.
+  A guard failure part-way (watchdog fired, lock lost, reboot) is
+  reported as such and may follow documents already applied;
+  reconciliation, not the error, decides what each document's files
+  are. It prints each finished document, then,
   after a final `sync`, the device time and a stat of every written file
   (for the manifest), all in the same invocation.
 - View-state fields of existing documents are overlaid with the values
@@ -419,9 +429,11 @@ clean-up does not require `--allow-deletions` on every tablet.
 - **Guard.** That check (the *guard*) also requires the lock to still
   name this run: the owner record holds a random run id, and every
   mutating device command first tests, in the same invocation, that the
-  marker is absent and the run id is still there. Taking the lock (fresh
-  or over a stale one) therefore clears the marker: the old run is still
-  stopped, because the lock is no longer its own. Lock operations and
+  marker is absent, the run id is still there, and the record carries
+  the current boot id (after a reboot the run's watchdog is gone and
+  xochitl may be running again, so the run must end). Taking the lock
+  (fresh or over a stale one) therefore clears the marker: the old run
+  is still stopped, because the lock is no longer its own. Lock operations and
   guarded commands hold an exclusive `flock` (BusyBox) on a file in
   `/home/root/.local/share/rmu/` from the guard check to their last
   change, so a takeover can never fall between a run's guard and its
@@ -429,9 +441,11 @@ clean-up does not require `--allow-deletions` on every tablet.
   Only bounded local work runs under it, and only once the whole script
   has arrived; waiters give up after 180 s ("tablet busy"). Staging (a
   network transfer into the run's own directory) checks the guard
-  without it, and the watchdog never takes it. The apply script repeats the guard before
-  every document. Starting xochitl checks only that the lock is still
-  ours: bringing the UI back stays allowed after the watchdog fired.
+  without it, and the watchdog never takes it. The apply script repeats
+  the guard before every document. Exceptions: releasing the lock checks
+  only that it is ours, and starting xochitl is refused only by another
+  run's lock: bringing the UI back stays allowed after the watchdog
+  fired, after a reboot, and when the state directory is gone.
 - **Device-layer details.** The owner record is `key=value` lines
   (`run`, `host`, `pid`, `started`, `boot_id`; unknown keys ignored).
   The run id belongs to the process, so a retry after a lost
@@ -442,18 +456,30 @@ clean-up does not require `--allow-deletions` on every tablet.
   record as inspected, so two runs taking over at once cannot both win
   and even a corrupt record can be broken with `--break-lock`. A lock
   directory left without a record (power cut while acquiring) needs
-  `--break-lock`. The marker is written before xochitl is started. The
-  systemd watchdog is `systemd-run --quiet --collect
-  --unit=rmu-hub-watchdog-<token> --on-active=<n>s /bin/sh -c '<marker;
-  reset-failed; start>'`, with a fresh unit per arming: re-arming arms
-  the new timer first and only then stops the old one, so a failed
-  re-arm leaves the old watchdog in place. Taking over a lock does not
-  disarm the previous owner's watchdog, which may be what brings
-  xochitl back. The `sleep` fallback runs in its own session (`setsid`)
-  and fires only if a token file still holds the token written when it
-  was armed; disarming removes the token before killing the process
-  group, which is recorded with the boot id so that a number from before
-  a reboot is never signalled. The pairing check runs the survey's test
+  `--break-lock`. When the watchdog fires it tries to write the marker
+  first, then runs `reset-failed` and `start` whether or not the marker
+  could be written (`true > marker`, not the special builtin `:`, whose
+  failed redirection would end the shell): a lost state directory or a
+  read-only `/home` must not keep xochitl down. The systemd watchdog is
+  `systemd-run --quiet --collect --unit=rmu-hub-watchdog-<token>
+  --on-active=<n>s /bin/sh -c '<marker; reset-failed; start>'`, with a
+  fresh unit per arming: re-arming arms the new timer first and only
+  then stops the old one, so a failed re-arm leaves the old watchdog in
+  place. The armed watchdog is recorded with the run that armed it.
+  Stopping xochitl requires a pending watchdog armed by this run.
+  Disarming is refused while xochitl is stopped (the watchdog is what
+  brings it back) and only ever removes this run's own watchdog, so a
+  run that took a lock over cannot disarm the previous owner's. The
+  `sleep` fallback runs in its own session (`setsid`); when it wakes it
+  fires unless its token file holds another token (a later arming) or
+  `disarmed`. A missing token file (lost state dir) still fires.
+  Arming fails unless the new sleeper is alive, and only then kills the
+  old one. Disarming marks the token before killing the process group,
+  which is recorded with the boot id and signalled only if it is a
+  number above 1 from this boot. Limitation: where sshd kills each
+  session's whole cgroup on disconnect, the sleeper dies with the
+  session despite `setsid`; the systemd timer, used wherever
+  `systemd-run` exists (every known model), has no such problem. The pairing check runs the survey's test
   as `t=$(sed …) || fail; printf '%s\n' "$t" | grep -qvE …`, so a
   configuration that cannot be read fails rather than reading as
   unpaired. Device scripts are piped to `sh -s` and file lists to
@@ -938,8 +964,9 @@ To be handled in the implementation PRs named:
   with deterministic page ids (UUIDv5 over document UUID and page index)
   so documents added through the hub never hit the case. Phase 2 matches
   pages by `redir` when both sides materialised from an empty base.
-- Sync cycle, step 2: the pairing guard runs the one-liner from survey
-  question 1 and refuses on `true`.
+- Sync cycle, step 2: the pairing guard runs the survey's check (in the
+  device layer's fail-closed form, which errors when the configuration
+  cannot be read) and refuses on `true`.
 - Device layer (done): skip the `tar` call when there is nothing to
   download (BusyBox `tar` fails on an empty file list); stat signatures
   use `%y`/`%z` for nanosecond times. When recording the manifest, leave out

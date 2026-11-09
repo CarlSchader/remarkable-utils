@@ -36,6 +36,10 @@ mod ssh;
 
 #[cfg(test)]
 mod contract_tests;
+/// Test harnesses (the fake, and the real [`SshTablet`] over a local mock
+/// transport), shared with the end-to-end tests of the sync cycle.
+#[cfg(test)]
+pub(crate) mod harness;
 
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -46,7 +50,7 @@ use thiserror::Error;
 use crate::error::Result;
 use crate::hub::model::{DocId, StatSignature, TabletState, XochitlPath};
 
-pub use apply::{ApplyPlan, ApplyStep, DocApply};
+pub use apply::{ApplyPlan, ApplyStep, DocApply, StagedFile, StagedPath};
 pub use fake::{Edit, FakeTablet, FakeTabletBuilder, Fault, OpKind};
 pub use lock::{HeldLock, LockDecision, LockOwner, LockRequest, LockState, StaleReason};
 pub use ssh::SshTablet;
@@ -173,6 +177,24 @@ pub enum DeviceError {
     #[error("the watchdog on the tablet fired and restarted xochitl; stopping this run")]
     WatchdogFired,
 
+    /// The tablet rebooted since this run took the lock: its watchdog is
+    /// gone and xochitl may be running again, so this run must end.
+    #[error("the tablet rebooted since this run took its lock; this run must end")]
+    Rebooted,
+
+    /// Refused: disarming the watchdog while xochitl is stopped would
+    /// leave nothing to bring it back.
+    #[error("refusing to disarm the watchdog while xochitl is stopped")]
+    XochitlStopped,
+
+    /// Refused: applying while xochitl runs would race its own writes.
+    #[error("refusing to apply while xochitl is running")]
+    XochitlRunning,
+
+    /// Refused: stopping xochitl needs a watchdog armed by this run.
+    #[error("refusing to stop xochitl without a watchdog armed by this run")]
+    WatchdogNotArmed,
+
     /// A device command printed something rmu cannot interpret.
     #[error("unexpected output from the tablet ({operation}): {detail}")]
     Output {
@@ -247,9 +269,10 @@ impl StatEntry {
 pub struct StatListing {
     /// Sorted by path.
     pub entries: Vec<StatEntry>,
-    /// Entries whose name contains a newline: they cannot be listed line
-    /// by line, and no mirrored file can have such a name, so they are
-    /// only counted (and reported as unrecognised files).
+    /// Entries whose name contains a newline or a carriage return: they
+    /// cannot be listed line by line, and no mirrored file can have such
+    /// a name, so they are only counted (and reported as unrecognised
+    /// files).
     pub unlisted: usize,
 }
 
@@ -308,23 +331,32 @@ pub trait Tablet {
     /// Whether the watchdog marker is present.
     fn watchdog_fired(&self) -> Result<bool>;
 
-    /// Arm, or re-arm, the watchdog: after `timeout` it leaves the marker,
-    /// then runs `systemctl reset-failed xochitl.service; systemctl start
-    /// xochitl.service`. Replaces any watchdog armed before, but only once
-    /// the new one is armed.
+    /// Arm, or re-arm, the watchdog: after `timeout` it tries to leave
+    /// the marker, then runs `systemctl reset-failed xochitl.service;
+    /// systemctl start xochitl.service` whether or not the marker could
+    /// be written. Replaces any watchdog armed before (by any run), but
+    /// only once the new one is armed. The watchdog records the run that
+    /// armed it.
     fn arm_watchdog(&self, lock: &HeldLock, timeout: Duration) -> Result<()>;
 
+    /// Disarm the watchdog this run armed; a watchdog armed by another
+    /// run (before a takeover) is left alone. Refused while xochitl is
+    /// stopped ([`DeviceError::XochitlStopped`]): the watchdog is what
+    /// brings it back.
     fn disarm_watchdog(&self, lock: &HeldLock) -> Result<()>;
 
-    /// `systemctl stop xochitl.service`. Arm the watchdog first.
+    /// `systemctl stop xochitl.service`. Refused unless a watchdog armed
+    /// by this run is pending ([`DeviceError::WatchdogNotArmed`]).
     fn stop_xochitl(&self, lock: &HeldLock) -> Result<()>;
 
     /// `systemctl reset-failed xochitl.service`, then `start`. Returns the
     /// device time just before the start, in ns: the racy-entry reference
     /// for the stats taken before it (an earlier reference only drops
     /// more entries, so it is conservative; `0` if the reply was lost
-    /// but xochitl is up). Checks only that the lock is ours: bringing
-    /// xochitl back is allowed after the watchdog fired.
+    /// but xochitl is up). Allowed while the lock is ours or free (also
+    /// after the watchdog fired, or after the state dir was lost): only
+    /// another run's lock refuses it. Bringing the UI back is never
+    /// otherwise refused.
     fn start_xochitl(&self, lock: &HeldLock) -> Result<i64>;
 
     fn xochitl_active(&self) -> Result<bool>;
@@ -361,7 +393,8 @@ pub trait Tablet {
     fn write_state(&self, lock: &HeldLock, state: &TabletState) -> Result<()>;
 
     /// Upload files into this run's staging directory (adding to what
-    /// is already staged), in one transfer.
+    /// is already staged), in one transfer. Staged files are mode 0644;
+    /// [`ApplyPlan`] carries each file's mode, set before it is moved.
     fn stage(
         &self,
         lock: &HeldLock,
@@ -372,12 +405,22 @@ pub trait Tablet {
     /// Remove every run's staging directory.
     fn clear_staging(&self, lock: &HeldLock) -> Result<()>;
 
-    /// Execute an apply plan (see [`ApplyPlan`]) with xochitl stopped:
-    /// per document, in plan order, the guard check, then pages and
-    /// payload, `.content`, `.metadata`; document deletions remove the
-    /// whole `<uuid>`/`<uuid>.*` set (`.metadata` first). Each move is an
-    /// atomic rename from staging. Ends with a device `sync` and a stat
-    /// of every written file.
+    /// Execute an apply plan (see [`ApplyPlan`]) with xochitl stopped
+    /// (refused while it runs: [`DeviceError::XochitlRunning`]). Before
+    /// any change: staging must be on the data dir's filesystem, every
+    /// staged file must have its planned size (then gets its planned
+    /// mode), and a device `sync`. Then per document, in plan order: the
+    /// guard check, pages and payload, `.content`, `.metadata`; document
+    /// deletions remove the whole `<uuid>`/`<uuid>.*` set (`.metadata`
+    /// first). Each move is an atomic rename from staging. Ends with a
+    /// device `sync` and a stat of every written file.
+    ///
+    /// A guard failure part-way ([`DeviceError::WatchdogFired`],
+    /// [`DeviceError::LockLost`], [`DeviceError::Rebooted`]) is returned
+    /// as such and may follow documents already applied; any other
+    /// failure is [`DeviceError::ApplyIncomplete`], whose `applied` is a
+    /// lower bound. Either way the run ends and reconciliation, not the
+    /// error, decides what each document's files are.
     fn apply(&self, lock: &HeldLock, plan: &ApplyPlan) -> Result<ApplyReport>;
 }
 
@@ -389,7 +432,7 @@ fn timeout_secs(timeout: Duration) -> u64 {
 /// Paths in transfer lists are one per line and appear verbatim in
 /// `sha256sum` output, so control characters (newlines) and backslashes
 /// (which GNU `sha256sum` escapes) are refused. No mirrored path has
-/// either.
+/// either. (A name like `-` is safe: scripts pass names as `./<name>`.)
 fn transferable(path: &XochitlPath) -> std::result::Result<&str, DeviceError> {
     let text = path.as_str();
     if text.chars().any(|c| c.is_control() || c == '\\') {

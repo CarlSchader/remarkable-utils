@@ -6,6 +6,7 @@
 use std::collections::BTreeSet;
 
 use super::DeviceError;
+use crate::git::FileMode;
 use crate::hub::model::{DocFile, DocId};
 
 /// What to change on the tablet, per document, in order. Files to write
@@ -16,6 +17,36 @@ pub struct ApplyPlan {
     pub docs: Vec<DocApply>,
 }
 
+/// A file to move into place, as it must have been staged: the apply
+/// checks the staged size before changing anything (a short or partial
+/// upload is never applied) and gives the file its mode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagedFile {
+    pub file: DocFile,
+    pub size: u64,
+    /// [`FileMode::Regular`] or [`FileMode::Executable`].
+    pub mode: FileMode,
+}
+
+impl StagedFile {
+    /// A regular (0644) file of `size` bytes.
+    pub fn regular(file: DocFile, size: u64) -> Self {
+        Self {
+            file,
+            size,
+            mode: FileMode::Regular,
+        }
+    }
+}
+
+/// One staged file of a plan, by xochitl-relative path.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct StagedPath {
+    pub path: String,
+    pub size: u64,
+    pub executable: bool,
+}
+
 /// One document's change.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DocApply {
@@ -24,7 +55,7 @@ pub enum DocApply {
     /// the document: use [`DocApply::Delete`].
     Write {
         doc: DocId,
-        write: Vec<DocFile>,
+        write: Vec<StagedFile>,
         remove: Vec<DocFile>,
     },
     /// Delete the whole `<uuid>`/`<uuid>.*` set, including files outside
@@ -95,27 +126,35 @@ fn invalid(doc: &DocId, detail: &str) -> DeviceError {
 
 fn unique<'a>(
     doc: &DocId,
-    files: &'a [DocFile],
+    files: impl IntoIterator<Item = &'a DocFile>,
     what: &str,
 ) -> Result<BTreeSet<&'a DocFile>, DeviceError> {
-    files.iter().try_fold(BTreeSet::new(), |mut set, file| {
-        if set.insert(file) {
-            Ok(set)
-        } else {
-            Err(invalid(
-                doc,
-                &format!("{} listed twice to {what}", file.repo_name()),
-            ))
-        }
-    })
+    files
+        .into_iter()
+        .try_fold(BTreeSet::new(), |mut set, file| {
+            if set.insert(file) {
+                Ok(set)
+            } else {
+                Err(invalid(
+                    doc,
+                    &format!("{} listed twice to {what}", file.repo_name()),
+                ))
+            }
+        })
 }
 
 fn write_steps(
     doc: &DocId,
-    write: &[DocFile],
+    write: &[StagedFile],
     remove: &[DocFile],
 ) -> Result<Vec<ApplyStep>, DeviceError> {
-    let writes = unique(doc, write, "write")?;
+    if let Some(odd) = write.iter().find(|staged| !staged.mode.is_file()) {
+        return Err(invalid(
+            doc,
+            &format!("{} has mode {:o}", odd.file.repo_name(), odd.mode.bits()),
+        ));
+    }
+    let writes = unique(doc, write.iter().map(|staged| &staged.file), "write")?;
     let removes = unique(doc, remove, "remove")?;
     if writes.is_empty() && removes.is_empty() {
         return Err(invalid(doc, "nothing to write or remove"));
@@ -192,18 +231,32 @@ impl ApplyPlan {
             .map(|(_, steps)| steps)
     }
 
-    /// Every file the plan writes (xochitl-relative), sorted.
-    pub fn written(&self) -> Vec<String> {
+    /// Every file the plan writes, with its staged size and mode, sorted
+    /// by path.
+    pub fn staged(&self) -> Vec<StagedPath> {
         self.docs
             .iter()
             .flat_map(|entry| match entry {
-                DocApply::Write { doc, write, .. } => {
-                    write.iter().map(|file| file.xochitl_path(doc)).collect()
-                }
+                DocApply::Write { doc, write, .. } => write
+                    .iter()
+                    .map(|staged| StagedPath {
+                        path: staged.file.xochitl_path(doc),
+                        size: staged.size,
+                        executable: staged.mode == FileMode::Executable,
+                    })
+                    .collect(),
                 DocApply::Delete { .. } => Vec::new(),
             })
             .collect::<BTreeSet<_>>()
             .into_iter()
+            .collect()
+    }
+
+    /// Every file the plan writes (xochitl-relative), sorted.
+    pub fn written(&self) -> Vec<String> {
+        self.staged()
+            .into_iter()
+            .map(|staged| staged.path)
             .collect()
     }
 }
@@ -224,19 +277,26 @@ mod tests {
         DocFile::Page(PageId::new(id).unwrap())
     }
 
+    fn staged(files: Vec<DocFile>) -> Vec<StagedFile> {
+        files
+            .into_iter()
+            .map(|file| StagedFile::regular(file, 1))
+            .collect()
+    }
+
     #[test]
     fn writes_go_pages_and_payload_then_content_then_metadata() {
         let plan = ApplyPlan {
             docs: vec![DocApply::Write {
                 doc: doc(A),
-                write: vec![
+                write: staged(vec![
                     DocFile::Metadata,
                     DocFile::Content,
                     page("p2"),
                     DocFile::PayloadPdf,
                     DocFile::Highlights(PageId::new("p1").unwrap()),
                     page("p1"),
-                ],
+                ]),
                 remove: vec![page("gone"), DocFile::Pagedata],
             }],
         };
@@ -280,7 +340,7 @@ mod tests {
                 DocApply::Delete { doc: doc(B) },
                 DocApply::Write {
                     doc: doc(A),
-                    write: vec![DocFile::Metadata],
+                    write: staged(vec![DocFile::Metadata]),
                     remove: vec![DocFile::Content],
                 },
             ],
@@ -314,7 +374,7 @@ mod tests {
         let write = |write: Vec<DocFile>, remove: Vec<DocFile>| ApplyPlan {
             docs: vec![DocApply::Write {
                 doc: doc(A),
-                write,
+                write: staged(write),
                 remove,
             }],
         };
@@ -331,5 +391,50 @@ mod tests {
             ],
         }));
         assert_eq!(ApplyPlan::default().steps().unwrap(), vec![]);
+        let symlink = ApplyPlan {
+            docs: vec![DocApply::Write {
+                doc: doc(A),
+                write: vec![StagedFile {
+                    file: DocFile::Metadata,
+                    size: 1,
+                    mode: FileMode::Symlink,
+                }],
+                remove: vec![],
+            }],
+        };
+        assert!(refused(symlink));
+    }
+
+    #[test]
+    fn staged_files_carry_size_and_mode() {
+        let plan = ApplyPlan {
+            docs: vec![DocApply::Write {
+                doc: doc(A),
+                write: vec![
+                    StagedFile::regular(DocFile::Metadata, 12),
+                    StagedFile {
+                        file: DocFile::PayloadPdf,
+                        size: 3,
+                        mode: FileMode::Executable,
+                    },
+                ],
+                remove: vec![],
+            }],
+        };
+        assert_eq!(
+            plan.staged(),
+            vec![
+                StagedPath {
+                    path: format!("{A}.metadata"),
+                    size: 12,
+                    executable: false
+                },
+                StagedPath {
+                    path: format!("{A}.pdf"),
+                    size: 3,
+                    executable: true
+                },
+            ]
+        );
     }
 }

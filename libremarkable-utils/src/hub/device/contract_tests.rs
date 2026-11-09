@@ -1,57 +1,27 @@
-//! Contract scenarios, written against the [`Tablet`] trait and a small
-//! [`Harness`] for what only the environment can do (the user editing a
-//! file, the watchdog firing, a reboot). They run against the fake and,
-//! on Linux, against the real [`SshTablet`] with a mock `ssh` that runs
-//! the generated scripts locally on scratch directories with hostile
-//! names, with a curated `PATH` and stub `systemctl`/`systemd-run` (so
-//! nothing ever reaches the host's systemd): once with the host's GNU
-//! tools and, when `RMU_TEST_BUSYBOX` names a BusyBox binary (the nix
-//! checks set it), once with BusyBox applets and `ash`, as on a tablet.
-//! A real tablet could get a harness too; the test suite never uses one.
+//! Contract scenarios, written against the [`Tablet`] trait and the
+//! small [`Harness`] (see `harness`). They run against the fake and, on
+//! Linux, against the real [`SshTablet`] through a mock `ssh`: once with
+//! the host's GNU tools and, when `RMU_TEST_BUSYBOX` names a BusyBox
+//! binary (the dev shell and the nix checks set it), once with BusyBox
+//! applets and `ash`, as on a tablet. A real tablet could get a harness
+//! too; the test suite never uses one.
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::path::Path;
+use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 
+use super::harness::{FakeHarness, Harness, running_as_root};
 use super::*;
 use crate::error::Error;
+use crate::git::FileMode;
 use crate::hub::model::{DeviceId, DeviceName, DocFile, PageId, RepoId};
 
 const DOC: &str = "aaaaaaaa-0000-4000-8000-000000000001";
 const OTHER: &str = "bbbbbbbb-0000-4000-8000-000000000002";
 const WATCHDOG: Duration = Duration::from_secs(600);
-
-/// What a scenario needs besides the trait.
-trait Harness {
-    fn tablet(&self) -> &dyn Tablet;
-    /// Write a file in the data dir behind rmu's back.
-    fn put(&self, path: &str, contents: &[u8]);
-    fn get(&self, path: &str) -> Option<Vec<u8>>;
-    /// Make the armed watchdog fire now.
-    fn fire_watchdog(&self);
-    fn reboot(&self);
-    /// Remove rmu's state directory (lock, state file, staging).
-    fn wipe_state(&self);
-}
-
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn new(name: &str) -> Self {
-        let path = std::env::temp_dir().join(format!("rmu-device-{name}-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&path).unwrap();
-        Self(path)
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
 
 fn path(text: &str) -> XochitlPath {
     XochitlPath::new(text).unwrap()
@@ -77,8 +47,21 @@ fn watchdog_fired<T>(result: Result<T>) -> bool {
     device_error(&result, |e| matches!(e, DeviceError::WatchdogFired))
 }
 
+fn rebooted<T>(result: Result<T>) -> bool {
+    device_error(&result, |e| matches!(e, DeviceError::Rebooted))
+}
+
 fn locked<T>(result: Result<T>) -> bool {
     device_error(&result, |e| matches!(e, DeviceError::Locked(_)))
+}
+
+/// Refused by the real tablet with `real`, by the fake as a contract
+/// violation.
+fn refused<T>(result: Result<T>, real: fn(&DeviceError) -> bool) -> bool {
+    matches!(
+        &result,
+        Err(Error::HubDevice(DeviceError::ContractViolation(_)))
+    ) || device_error(&result, real)
 }
 
 fn sha256_hex(data: &[u8]) -> String {
@@ -115,37 +98,62 @@ fn hub_state() -> TabletState {
     )
 }
 
-fn document_files() -> BTreeMap<String, Vec<u8>> {
-    [
+/// A page id long enough that its path needs tar's long-name entries.
+fn long_page() -> PageId {
+    PageId::new("L".repeat(120)).unwrap()
+}
+
+/// The fabricated document: each file and its contents.
+fn document() -> Vec<(DocFile, Vec<u8>)> {
+    vec![
         (
-            format!("{DOC}.metadata"),
+            DocFile::Metadata,
             br#"{"type":"DocumentType","visibleName":"Fabricated"}"#.to_vec(),
         ),
         (
-            format!("{DOC}.content"),
+            DocFile::Content,
             br#"{"fileType":"notebook","formatVersion":2}"#.to_vec(),
         ),
         (
-            format!("{DOC}/p1.rm"),
+            DocFile::Page(PageId::new("p1").unwrap()),
             b"reMarkable .lines file, version=6 \x00\x01\xff".to_vec(),
         ),
-        (format!("{DOC}.highlights/p1.json"), b"{}".to_vec()),
+        (DocFile::Page(long_page()), b"long page".to_vec()),
+        (
+            DocFile::Highlights(PageId::new("p1").unwrap()),
+            b"{}".to_vec(),
+        ),
     ]
-    .into_iter()
-    .collect()
+}
+
+fn document_files() -> BTreeMap<String, Vec<u8>> {
+    document()
+        .into_iter()
+        .map(|(file, data)| (file.xochitl_path(&doc(DOC)), data))
+        .collect()
+}
+
+fn write_of(id: &str, files: Vec<(DocFile, Vec<u8>)>, remove: Vec<DocFile>) -> DocApply {
+    DocApply::Write {
+        doc: doc(id),
+        write: files
+            .into_iter()
+            .map(|(file, data)| StagedFile::regular(file, data.len() as u64))
+            .collect(),
+        remove,
+    }
 }
 
 fn full_write() -> DocApply {
-    DocApply::Write {
-        doc: doc(DOC),
-        write: vec![
-            DocFile::Metadata,
-            DocFile::Content,
-            DocFile::Page(PageId::new("p1").unwrap()),
-            DocFile::Highlights(PageId::new("p1").unwrap()),
-        ],
-        remove: vec![],
-    }
+    write_of(DOC, document(), vec![])
+}
+
+fn metadata_only(id: &str) -> (DocApply, BTreeMap<String, Vec<u8>>) {
+    let data = b"{}".to_vec();
+    (
+        write_of(id, vec![(DocFile::Metadata, data.clone())], vec![]),
+        [(format!("{id}.metadata"), data)].into(),
+    )
 }
 
 // ---- scenarios ---------------------------------------------------------------
@@ -169,7 +177,9 @@ fn lock_lifecycle(h: &dyn Harness) {
     assert!(lock_lost(t.check_guard(&first)));
     assert!(lock_lost(t.release_lock(&first)));
     assert!(lock_lost(t.stop_xochitl(&first)));
-    assert!(lock_lost(t.start_xochitl(&first)));
+    assert!(lock_lost(stage(t, &first, &document_files())));
+    // Starting xochitl needs only that no other run holds the lock.
+    t.start_xochitl(&first).unwrap();
 
     let second = t.acquire_lock(&request(), false).unwrap();
     let broken = t.acquire_lock(&request(), true).unwrap();
@@ -182,6 +192,7 @@ fn lock_lifecycle(h: &dyn Harness) {
     assert!(lock_lost(t.check_guard(&second)));
     assert!(lock_lost(t.arm_watchdog(&second, WATCHDOG)));
     assert!(lock_lost(t.write_state(&second, &hub_state())));
+    assert!(lock_lost(t.start_xochitl(&second)));
     t.check_guard(&broken).unwrap();
     t.release_lock(&broken).unwrap();
 }
@@ -200,6 +211,29 @@ fn reboot_frees_the_lock(h: &dyn Harness) {
     t.release_lock(&new).unwrap();
 }
 
+fn reboot_ends_the_run(h: &dyn Harness) {
+    let t = h.tablet();
+    let lock = t.acquire_lock(&request(), false).unwrap();
+    t.arm_watchdog(&lock, WATCHDOG).unwrap();
+    t.stop_xochitl(&lock).unwrap();
+    let (plan, files) = metadata_only(DOC);
+    stage(t, &lock, &files).unwrap();
+    h.reboot();
+    // The watchdog died with the boot and xochitl may be running again:
+    // every guarded operation now ends the run.
+    assert!(rebooted(t.check_guard(&lock)));
+    assert!(rebooted(t.stop_xochitl(&lock)));
+    assert!(rebooted(t.arm_watchdog(&lock, WATCHDOG)));
+    assert!(rebooted(t.write_state(&lock, &hub_state())));
+    assert!(rebooted(stage(t, &lock, &files)));
+    assert!(rebooted(t.apply(&lock, &ApplyPlan { docs: vec![plan] })));
+    assert_eq!(h.get(&format!("{DOC}.metadata")), None);
+    // Bringing xochitl back and releasing stay possible.
+    t.start_xochitl(&lock).unwrap();
+    assert!(t.xochitl_active().unwrap());
+    t.release_lock(&lock).unwrap();
+}
+
 fn fired_watchdog_ends_the_run(h: &dyn Harness) {
     let t = h.tablet();
     let lock = t.acquire_lock(&request(), false).unwrap();
@@ -214,6 +248,7 @@ fn fired_watchdog_ends_the_run(h: &dyn Harness) {
     assert!(watchdog_fired(t.stop_xochitl(&lock)));
     assert!(watchdog_fired(t.write_state(&lock, &hub_state())));
     assert!(watchdog_fired(t.arm_watchdog(&lock, WATCHDOG)));
+    assert!(watchdog_fired(stage(t, &lock, &document_files())));
     // Bringing xochitl back stays allowed to the lock holder.
     t.start_xochitl(&lock).unwrap();
     // A fired watchdog makes the lock stale; taking it clears the marker,
@@ -230,15 +265,68 @@ fn fired_watchdog_ends_the_run(h: &dyn Harness) {
     t.release_lock(&next).unwrap();
 }
 
+fn watchdog_fires_without_the_state_dir(h: &dyn Harness) {
+    let t = h.tablet();
+    let lock = t.acquire_lock(&request(), false).unwrap();
+    t.arm_watchdog(&lock, WATCHDOG).unwrap();
+    t.stop_xochitl(&lock).unwrap();
+    // The state dir goes (or /home turns read-only): the marker cannot be
+    // written, and the watchdog must still bring xochitl back.
+    h.wipe_state();
+    h.fire_watchdog();
+    assert!(t.xochitl_active().unwrap());
+    assert!(lock_lost(t.check_guard(&lock)));
+    assert!(lock_lost(t.arm_watchdog(&lock, WATCHDOG)));
+    assert!(lock_lost(t.write_state(&lock, &hub_state())));
+    assert!(lock_lost(t.release_lock(&lock)));
+    // With no lock left, starting xochitl is allowed.
+    t.start_xochitl(&lock).unwrap();
+    assert_eq!(t.lock_state().unwrap(), LockState::Free);
+    // A new run starts from scratch.
+    let next = t.acquire_lock(&request(), false).unwrap();
+    t.release_lock(&next).unwrap();
+}
+
+fn takeover_keeps_the_previous_watchdog(h: &dyn Harness) {
+    let t = h.tablet();
+    let old = t.acquire_lock(&request(), false).unwrap();
+    t.arm_watchdog(&old, WATCHDOG).unwrap();
+    t.stop_xochitl(&old).unwrap();
+    let new = t.acquire_lock(&request(), true).unwrap();
+    // The new owner can neither disarm while xochitl is stopped nor stop
+    // the old owner's watchdog: it is what brings xochitl back.
+    assert!(refused(t.disarm_watchdog(&new), |e| matches!(
+        e,
+        DeviceError::XochitlStopped
+    )));
+    t.start_xochitl(&new).unwrap();
+    t.stop_xochitl(&new).unwrap_err();
+    t.disarm_watchdog(&new).unwrap();
+    // The old run's watchdog is still armed and fires.
+    h.fire_watchdog();
+    assert!(t.xochitl_active().unwrap());
+}
+
 fn xochitl_stop_and_start(h: &dyn Harness) {
     let t = h.tablet();
     let lock = t.acquire_lock(&request(), false).unwrap();
+    assert!(t.xochitl_active().unwrap());
+    // No stop without this run's watchdog.
+    assert!(refused(t.stop_xochitl(&lock), |e| matches!(
+        e,
+        DeviceError::WatchdogNotArmed
+    )));
     assert!(t.xochitl_active().unwrap());
     t.arm_watchdog(&lock, WATCHDOG).unwrap();
     // Re-arming replaces the watchdog.
     t.arm_watchdog(&lock, WATCHDOG).unwrap();
     t.stop_xochitl(&lock).unwrap();
     assert!(!t.xochitl_active().unwrap());
+    // No disarm while xochitl is stopped.
+    assert!(refused(t.disarm_watchdog(&lock), |e| matches!(
+        e,
+        DeviceError::XochitlStopped
+    )));
     let started = t.start_xochitl(&lock).unwrap();
     assert!(
         started > 1_600_000_000 * 1_000_000_000,
@@ -275,19 +363,17 @@ fn stage_apply_read_and_delete(h: &dyn Harness) {
     h.put(&format!("{DOC}.thumbnails/p1.png"), b"png");
     h.put(&format!("{DOC}.pagedata"), b"stale");
     h.put(&format!("{OTHER}.metadata"), b"{}");
-    let write = DocApply::Write {
-        doc: doc(DOC),
-        write: vec![
-            DocFile::Metadata,
-            DocFile::Content,
-            DocFile::Page(PageId::new("p1").unwrap()),
-            DocFile::Highlights(PageId::new("p1").unwrap()),
-        ],
-        remove: vec![DocFile::Pagedata],
-    };
+    let write = write_of(DOC, document(), vec![DocFile::Pagedata]);
+    let plan = ApplyPlan { docs: vec![write] };
+    // No apply while xochitl runs.
+    assert!(refused(t.apply(&lock, &plan), |e| matches!(
+        e,
+        DeviceError::XochitlRunning
+    )));
+    assert_eq!(h.get(&format!("{DOC}.metadata")), None);
     t.arm_watchdog(&lock, WATCHDOG).unwrap();
     t.stop_xochitl(&lock).unwrap();
-    let report = t.apply(&lock, &ApplyPlan { docs: vec![write] }).unwrap();
+    let report = t.apply(&lock, &plan).unwrap();
     t.start_xochitl(&lock).unwrap();
     assert_eq!(report.applied, vec![doc(DOC)]);
     files
@@ -304,7 +390,7 @@ fn stage_apply_read_and_delete(h: &dyn Harness) {
             .find(|entry| entry.path == written.path)
             .unwrap_or_else(|| panic!("{} not listed", written.path));
         assert_eq!(listed, written);
-        assert!(listed.is_regular());
+        assert!(listed.is_regular() && !listed.is_executable());
         assert_eq!(listed.stat.size, files[&written.path].len() as u64);
         // Staged files were touched: device-clock nanosecond mtimes.
         assert!(listed.stat.mtime_ns > report.recorded_at_ns - 600 * 1_000_000_000);
@@ -323,8 +409,7 @@ fn stage_apply_read_and_delete(h: &dyn Harness) {
     assert!(download_all(t, &[]).unwrap().is_empty());
     let missing = download_all(t, &[path(&format!("{DOC}.missing"))]);
     assert!(
-        device_error(&missing, |e| matches!(e, DeviceError::Download(_)))
-            || matches!(missing, Err(Error::Remote { .. })),
+        device_error(&missing, |e| matches!(e, DeviceError::Download(_))),
         "{missing:?}"
     );
     assert!(device_error(
@@ -375,32 +460,56 @@ fn stage_apply_read_and_delete(h: &dyn Harness) {
     t.release_lock(&lock).unwrap();
 }
 
+fn apply_sets_planned_modes(h: &dyn Harness) {
+    let t = h.tablet();
+    let lock = t.acquire_lock(&request(), false).unwrap();
+    let data = b"payload".to_vec();
+    let files: BTreeMap<String, Vec<u8>> = [(format!("{DOC}.pdf"), data.clone())].into();
+    stage(t, &lock, &files).unwrap();
+    let plan = ApplyPlan {
+        docs: vec![DocApply::Write {
+            doc: doc(DOC),
+            write: vec![StagedFile {
+                file: DocFile::PayloadPdf,
+                size: data.len() as u64,
+                mode: FileMode::Executable,
+            }],
+            remove: vec![],
+        }],
+    };
+    t.arm_watchdog(&lock, WATCHDOG).unwrap();
+    t.stop_xochitl(&lock).unwrap();
+    let report = t.apply(&lock, &plan).unwrap();
+    assert!(report.written[0].is_executable());
+    t.start_xochitl(&lock).unwrap();
+}
+
 fn apply_refuses_unstaged_files_before_any_change(h: &dyn Harness) {
     let t = h.tablet();
     let lock = t.acquire_lock(&request(), false).unwrap();
-    // Only the first document is staged: nothing at all may change.
-    let first: BTreeMap<String, Vec<u8>> = [(format!("{OTHER}.metadata"), b"{}".to_vec())].into();
-    stage(t, &lock, &first).unwrap();
+    let (first, staged) = metadata_only(OTHER);
+    stage(t, &lock, &staged).unwrap();
     t.arm_watchdog(&lock, WATCHDOG).unwrap();
     t.stop_xochitl(&lock).unwrap();
-    let plan = ApplyPlan {
-        docs: vec![
-            DocApply::Write {
-                doc: doc(OTHER),
-                write: vec![DocFile::Metadata],
-                remove: vec![],
-            },
-            full_write(),
-        ],
-    };
-    let result = t.apply(&lock, &plan);
-    assert!(
+    let incomplete_before_any_change = |result: &Result<ApplyReport>| {
         matches!(
-            &result,
+            result,
             Err(Error::HubDevice(DeviceError::ApplyIncomplete { applied, .. })) if applied.is_empty()
-        ),
-        "{result:?}"
+        )
+    };
+    // Only the first document is staged: nothing at all may change.
+    let result = t.apply(
+        &lock,
+        &ApplyPlan {
+            docs: vec![first.clone(), full_write()],
+        },
     );
+    assert!(incomplete_before_any_change(&result), "{result:?}");
+    assert_eq!(h.get(&format!("{OTHER}.metadata")), None);
+    // A staged file of the wrong size (a partial upload) neither.
+    let short = write_of(OTHER, vec![(DocFile::Metadata, b"{}...".to_vec())], vec![]);
+    let result = t.apply(&lock, &ApplyPlan { docs: vec![short] });
+    assert!(incomplete_before_any_change(&result), "{result:?}");
     assert_eq!(h.get(&format!("{OTHER}.metadata")), None);
     t.start_xochitl(&lock).unwrap();
 }
@@ -421,21 +530,6 @@ fn apply_stops_when_the_watchdog_fired(h: &dyn Harness) {
     assert_eq!(h.get(&format!("{DOC}.metadata")), None);
 }
 
-fn lost_state_dir_reads_as_lost_lock(h: &dyn Harness) {
-    let t = h.tablet();
-    let lock = t.acquire_lock(&request(), false).unwrap();
-    h.wipe_state();
-    assert!(lock_lost(t.check_guard(&lock)));
-    assert!(lock_lost(t.arm_watchdog(&lock, WATCHDOG)));
-    assert!(lock_lost(t.start_xochitl(&lock)));
-    assert!(lock_lost(t.write_state(&lock, &hub_state())));
-    assert!(lock_lost(t.release_lock(&lock)));
-    assert_eq!(t.lock_state().unwrap(), LockState::Free);
-    // A new run starts from scratch.
-    let next = t.acquire_lock(&request(), false).unwrap();
-    t.release_lock(&next).unwrap();
-}
-
 fn stat_pass_lists_odd_names(h: &dyn Harness) {
     let names = [
         " lead",
@@ -444,11 +538,14 @@ fn stat_pass_lists_odd_names(h: &dyn Harness) {
         "it's",
         "$(x)",
         "-dash",
+        "-",
         "uni\u{e9}",
     ];
     names.iter().for_each(|name| h.put(name, name.as_bytes()));
     h.put("dir/with\nnewline", b"x");
     h.put("new\nline", b"x");
+    h.put("carriage\rreturn", b"x");
+    h.put(&format!("{DOC}.metadata\r"), b"x");
     let listing = h.tablet().stat_all().unwrap();
     let mut expected: Vec<&str> = names.to_vec();
     expected.sort_unstable();
@@ -460,12 +557,12 @@ fn stat_pass_lists_odd_names(h: &dyn Harness) {
             .collect::<Vec<_>>(),
         expected
     );
-    assert_eq!(listing.unlisted, 2);
+    assert_eq!(listing.unlisted, 4);
     listing.entries.iter().for_each(|entry| {
         assert_eq!(entry.stat.size, entry.path.len() as u64);
         assert!(entry.stat.mtime_ns > 0 && entry.stat.ctime_ns > 0);
     });
-    // The same odd names transfer.
+    // The same odd names transfer, `-` included (never read as stdin).
     let list: Vec<XochitlPath> = names.iter().map(|n| path(n)).collect();
     let got = download_all(h.tablet(), &list).unwrap();
     names
@@ -481,15 +578,62 @@ fn stat_pass_lists_odd_names(h: &dyn Harness) {
         .for_each(|name| assert_eq!(read[&path(name)].as_deref(), Some(name.as_bytes())));
 }
 
+fn symlinks_are_never_read_as_files(h: &dyn Harness) {
+    let t = h.tablet();
+    h.put("target", b"secret");
+    h.put_symlink(&format!("{DOC}.metadata"), "target");
+    let link = path(&format!("{DOC}.metadata"));
+    let listing = t.stat_all().unwrap();
+    let entry = listing
+        .entries
+        .iter()
+        .find(|entry| entry.path == link.as_str())
+        .unwrap();
+    assert!(!entry.is_regular());
+    assert!(t.read_files(std::slice::from_ref(&link)).is_err());
+    assert!(t.sha256(std::slice::from_ref(&link)).is_err());
+    assert!(download_all(t, std::slice::from_ref(&link)).is_err());
+}
+
+fn unreadable_entries_fail_the_stat_pass(h: &dyn Harness) {
+    if running_as_root() {
+        eprintln!("running as root; skipping the unreadable-entry scenario");
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        h.put("visible", b"x");
+        h.put(&format!("{DOC}/p1.rm"), b"ink");
+        let dir = h.data_dir().join(DOC);
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o000)).unwrap();
+        let result = h.tablet().stat_all();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        // A partial listing would read as deleted pages: it must fail.
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(h.tablet().stat_all().unwrap().entries.len(), 2);
+    }
+}
+
 type Scenario = fn(&dyn Harness);
 
 const SCENARIOS: &[(&str, Scenario)] = &[
     ("lock_lifecycle", lock_lifecycle),
     ("reboot_frees_the_lock", reboot_frees_the_lock),
+    ("reboot_ends_the_run", reboot_ends_the_run),
     ("fired_watchdog_ends_the_run", fired_watchdog_ends_the_run),
+    (
+        "watchdog_fires_without_the_state_dir",
+        watchdog_fires_without_the_state_dir,
+    ),
+    (
+        "takeover_keeps_the_previous_watchdog",
+        takeover_keeps_the_previous_watchdog,
+    ),
     ("xochitl_stop_and_start", xochitl_stop_and_start),
     ("state_round_trip", state_round_trip),
     ("stage_apply_read_and_delete", stage_apply_read_and_delete),
+    ("apply_sets_planned_modes", apply_sets_planned_modes),
     (
         "apply_refuses_unstaged_files_before_any_change",
         apply_refuses_unstaged_files_before_any_change,
@@ -498,60 +642,18 @@ const SCENARIOS: &[(&str, Scenario)] = &[
         "apply_stops_when_the_watchdog_fired",
         apply_stops_when_the_watchdog_fired,
     ),
-    (
-        "lost_state_dir_reads_as_lost_lock",
-        lost_state_dir_reads_as_lost_lock,
-    ),
     ("stat_pass_lists_odd_names", stat_pass_lists_odd_names),
+    (
+        "symlinks_are_never_read_as_files",
+        symlinks_are_never_read_as_files,
+    ),
+    (
+        "unreadable_entries_fail_the_stat_pass",
+        unreadable_entries_fail_the_stat_pass,
+    ),
 ];
 
 // ---- the fake ------------------------------------------------------------------
-
-struct FakeHarness {
-    tablet: FakeTablet,
-    _scratch: Scratch,
-}
-
-impl FakeHarness {
-    fn new() -> Self {
-        Self::with(|builder| builder)
-    }
-
-    fn with(configure: impl FnOnce(FakeTabletBuilder) -> FakeTabletBuilder) -> Self {
-        let scratch = Scratch::new("fake");
-        let tablet = configure(FakeTablet::builder(&scratch.0)).build().unwrap();
-        Self {
-            tablet,
-            _scratch: scratch,
-        }
-    }
-}
-
-impl Harness for FakeHarness {
-    fn tablet(&self) -> &dyn Tablet {
-        &self.tablet
-    }
-
-    fn put(&self, path: &str, contents: &[u8]) {
-        self.tablet.write_file(path, contents).unwrap();
-    }
-
-    fn get(&self, path: &str) -> Option<Vec<u8>> {
-        self.tablet.read_file(path)
-    }
-
-    fn fire_watchdog(&self) {
-        assert!(self.tablet.fire_watchdog().unwrap(), "no watchdog armed");
-    }
-
-    fn reboot(&self) {
-        self.tablet.reboot();
-    }
-
-    fn wipe_state(&self) {
-        fs::remove_dir_all(self.tablet.state_dir()).unwrap();
-    }
-}
 
 #[test]
 fn fake_honours_the_contract() {
@@ -580,6 +682,46 @@ fn fake_fails_a_mutation_without_effect() {
     assert_eq!(t.read_state().unwrap(), None);
     t.write_state(&lock, &hub_state()).unwrap();
     assert_eq!(t.mutations(), 5);
+}
+
+#[test]
+fn fake_fails_reads_too() {
+    let h = FakeHarness::with(|b| b.file(format!("{DOC}.metadata"), "{}"));
+    let t = &h.tablet;
+    let file = path(&format!("{DOC}.metadata"));
+    // FailOp counts every operation, reads included.
+    t.inject(Fault::FailOp(1));
+    assert!(transport(&t.stat_all()));
+    t.stat_all().unwrap();
+    t.inject(Fault::FailOp(2));
+    t.read_state().unwrap();
+    assert!(transport(&t.sha256(std::slice::from_ref(&file))));
+    t.inject(Fault::FailOp(1));
+    assert!(transport(&t.read_files(std::slice::from_ref(&file))));
+    // DisconnectAtOp: that and every later operation fail.
+    t.inject(Fault::DisconnectAtOp(1));
+    assert!(transport(&t.read_state()));
+    assert!(transport(&t.stat_all()));
+    t.reconnect();
+    t.stat_all().unwrap();
+}
+
+#[test]
+fn fake_fails_a_download_part_way() {
+    let h = FakeHarness::with(|b| {
+        b.file("a", "1")
+            .file("b", "2")
+            .fault(Fault::FailDownloadAfter(1))
+    });
+    let t = &h.tablet;
+    let mut seen = Vec::new();
+    let result = t.download(&[path("a"), path("b")], &mut |file, _, _| {
+        seen.push(file.to_string());
+        Ok(())
+    });
+    assert!(transport(&result));
+    assert_eq!(seen, vec!["a"]);
+    assert_eq!(download_all(t, &[path("a"), path("b")]).unwrap().len(), 2);
 }
 
 #[test]
@@ -614,7 +756,7 @@ fn fake_disconnects_like_a_dead_rmu() {
     assert!(!t.is_running());
     assert_eq!(t.watchdog_armed(), Some(WATCHDOG));
     // The watchdog brings xochitl back; the next run takes the lock over.
-    assert!(t.fire_watchdog().unwrap());
+    assert!(t.fire_watchdog());
     t.reconnect();
     assert!(t.is_running());
     let next = t.acquire_lock(&request(), false).unwrap();
@@ -643,6 +785,7 @@ fn fake_handles_a_lost_start_reply_like_a_real_tablet() {
     t.inject(Fault::FailMutation(1));
     assert_eq!(t.start_xochitl(&lock).unwrap(), 0);
     // The start never ran and xochitl is down: an error.
+    t.arm_watchdog(&lock, WATCHDOG).unwrap();
     t.stop_xochitl(&lock).unwrap();
     t.inject(Fault::FailMutation(1));
     assert!(device_error(&t.start_xochitl(&lock), |e| matches!(
@@ -683,18 +826,11 @@ fn fake_kills_an_apply_after_k_moves() {
     stage(t, &lock, &files).unwrap();
     t.arm_watchdog(&lock, WATCHDOG).unwrap();
     t.stop_xochitl(&lock).unwrap();
-    t.inject(Fault::KillApplyAfter(2));
+    // Five moves: two pages, highlights, content, metadata.
     let plan = ApplyPlan {
-        docs: vec![DocApply::Write {
-            doc: doc(DOC),
-            write: vec![
-                DocFile::Metadata,
-                DocFile::Content,
-                DocFile::Page(PageId::new("p1").unwrap()),
-            ],
-            remove: vec![],
-        }],
+        docs: vec![full_write()],
     };
+    t.inject(Fault::KillApplyAfter(4));
     let result = t.apply(&lock, &plan);
     assert!(matches!(
         result,
@@ -706,7 +842,7 @@ fn fake_kills_an_apply_after_k_moves() {
     assert_eq!(h.get(&format!("{DOC}.metadata")), None);
     // Killed right after a document's last move: applied but unreported.
     stage(t, &lock, &files).unwrap();
-    t.inject(Fault::KillApplyAfter(3));
+    t.inject(Fault::KillApplyAfter(5));
     let result = t.apply(&lock, &plan);
     assert!(matches!(
         result,
@@ -717,6 +853,68 @@ fn fake_kills_an_apply_after_k_moves() {
     stage(t, &lock, &files).unwrap();
     let report = t.apply(&lock, &plan).unwrap();
     assert_eq!(report.applied, vec![doc(DOC)]);
+}
+
+#[test]
+fn fake_deletes_metadata_before_the_rest_of_the_set() {
+    let h = FakeHarness::with(|b| {
+        b.file(format!("{DOC}.metadata"), "{}")
+            .file(format!("{DOC}.content"), "{}")
+            .file(format!("{DOC}/p1.rm"), "ink")
+    });
+    let t = &h.tablet;
+    let lock = t.acquire_lock(&request(), false).unwrap();
+    t.arm_watchdog(&lock, WATCHDOG).unwrap();
+    t.stop_xochitl(&lock).unwrap();
+    t.inject(Fault::KillApplyAfter(1));
+    let plan = ApplyPlan {
+        docs: vec![DocApply::Delete { doc: doc(DOC) }],
+    };
+    assert!(t.apply(&lock, &plan).is_err());
+    // An interrupted deletion leaves invisible orphans, not half a document.
+    assert_eq!(h.get(&format!("{DOC}.metadata")), None);
+    assert!(h.get(&format!("{DOC}.content")).is_some());
+    assert!(h.get(&format!("{DOC}/p1.rm")).is_some());
+}
+
+#[test]
+fn fake_watchdog_firing_mid_apply_stops_at_the_next_document() {
+    let h = FakeHarness::new();
+    let t = &h.tablet;
+    let lock = t.acquire_lock(&request(), false).unwrap();
+    let (first, mut files) = metadata_only(OTHER);
+    files.extend(document_files());
+    stage(t, &lock, &files).unwrap();
+    t.arm_watchdog(&lock, WATCHDOG).unwrap();
+    t.stop_xochitl(&lock).unwrap();
+    t.inject(Fault::FireWatchdogAfterMoves(1));
+    let result = t.apply(
+        &lock,
+        &ApplyPlan {
+            docs: vec![first, full_write()],
+        },
+    );
+    assert!(watchdog_fired(result));
+    assert!(h.get(&format!("{OTHER}.metadata")).is_some());
+    assert_eq!(h.get(&format!("{DOC}.content")), None);
+    assert!(t.is_running());
+}
+
+#[test]
+fn fake_watchdog_armed_before_a_start_does_not_cover_a_later_stop() {
+    let h = FakeHarness::new();
+    let t = &h.tablet;
+    let lock = t.acquire_lock(&request(), false).unwrap();
+    t.arm_watchdog(&lock, WATCHDOG).unwrap();
+    t.stop_xochitl(&lock).unwrap();
+    t.start_xochitl(&lock).unwrap();
+    // Step 13 must re-arm: the step-3 timer may have fired or expired.
+    assert!(device_error(&t.stop_xochitl(&lock), |e| matches!(
+        e,
+        DeviceError::ContractViolation(_)
+    )));
+    t.arm_watchdog(&lock, WATCHDOG).unwrap();
+    t.stop_xochitl(&lock).unwrap();
 }
 
 #[test]
@@ -763,6 +961,7 @@ fn fake_checks_the_callers_side_of_the_contract() {
     assert!(violation(t.apply(&lock, &plan).map(drop)));
     t.arm_watchdog(&lock, WATCHDOG).unwrap();
     t.stop_xochitl(&lock).unwrap();
+    assert!(violation(t.disarm_watchdog(&lock)));
     t.apply(&lock, &plan).unwrap();
     assert_eq!(
         t.ops(),
@@ -772,6 +971,7 @@ fn fake_checks_the_callers_side_of_the_contract() {
             OpKind::Apply,
             OpKind::ArmWatchdog,
             OpKind::StopXochitl,
+            OpKind::DisarmWatchdog,
             OpKind::Apply,
         ]
     );
@@ -796,477 +996,255 @@ fn fake_builder_seeds_files_state_and_device() {
     t.reboot();
     assert_ne!(t.boot_id(), boot);
     assert!(t.is_running());
-    assert!(!t.fire_watchdog().unwrap(), "nothing armed after a reboot");
+    assert!(!t.fire_watchdog(), "nothing armed after a reboot");
 }
 
 // ---- the real implementation over a local mock transport ------------------------
 
 #[cfg(target_os = "linux")]
-mod local_ssh {
+mod ssh_tablet {
+    use super::super::harness::local_ssh::{SshHarness, Tools, busybox};
     use super::*;
-    use crate::ssh::{SshOptions, SshSession, shell_quote};
-    use std::process::Command;
 
-    /// Tools the scripts may run; everything else is absent from `PATH`.
-    const TOOLS: &[&str] = &[
-        "sh",
-        "cat",
-        "mkdir",
-        "mv",
-        "rm",
-        "stat",
-        "find",
-        "tar",
-        "sha256sum",
-        "grep",
-        "date",
-        "wc",
-        "sync",
-        "touch",
-        "sleep",
-        "sed",
-        "mktemp",
-        "printf",
-        "chmod",
-        "chown",
-        "head",
-        "flock",
-        "setsid",
-        "kill",
-        "true",
-        "false",
-        "uname",
-        "df",
-    ];
-
-    fn which(tool: &str) -> Option<PathBuf> {
-        std::env::var_os("PATH")
-            .iter()
-            .flat_map(std::env::split_paths)
-            .map(|dir| dir.join(tool))
-            .find(|candidate| candidate.is_file())
-    }
-
-    /// Where the tools come from.
-    #[derive(Clone, Copy)]
-    pub(super) enum Tools<'a> {
-        /// The host's (GNU) tools.
-        Host,
-        /// BusyBox applets, `sh` included.
-        BusyBox(&'a Path),
-    }
-
-    /// The BusyBox binary from `RMU_TEST_BUSYBOX`, if set.
-    pub(super) fn busybox() -> Option<PathBuf> {
-        std::env::var_os("RMU_TEST_BUSYBOX").map(PathBuf::from)
-    }
-
-    pub(super) struct SshHarness {
-        tablet: SshTablet,
-        root: PathBuf,
-        bin: PathBuf,
-        sys: PathBuf,
-        boot_file: PathBuf,
-        _scratch: Scratch,
-    }
-
-    impl SshHarness {
-        /// `systemd_run`: install the `systemd-run` stub (else the sleep
-        /// fallback runs).
-        pub(super) fn new(tools: Tools<'_>, systemd_run: bool) -> Self {
-            let scratch = Scratch::new("ssh");
-            // Hostile directory names: quotes, spaces, `$()`, a newline.
-            let root = scratch.0.join("it's a $(dir) `x`");
-            let xochitl = root.join("xochitl data");
-            let state = root.join("state;dir&\nnext");
-            let bin = scratch.0.join("bin");
-            let sys = scratch.0.join("sys");
-            [&xochitl, &state, &bin, &sys]
-                .iter()
-                .for_each(|dir| fs::create_dir_all(dir).unwrap());
-            match tools {
-                Tools::Host => TOOLS.iter().for_each(|tool| {
-                    if let Some(found) = which(tool) {
-                        std::os::unix::fs::symlink(found, bin.join(tool)).unwrap();
-                    }
-                }),
-                Tools::BusyBox(busybox) => {
-                    let output = Command::new(busybox).arg("--list").output().unwrap();
-                    let applets = String::from_utf8(output.stdout).unwrap();
-                    TOOLS
-                        .iter()
-                        .filter(|tool| applets.lines().any(|applet| applet == **tool))
-                        .for_each(|tool| {
-                            std::os::unix::fs::symlink(busybox, bin.join(tool)).unwrap();
-                        });
-                }
-            }
-            let q = |p: &Path| shell_quote(&p.to_string_lossy());
-            test_support::write_script(
-                &bin.join("systemctl"),
-                &format!(
-                    "printf '%s\\n' \"$*\" >> {log}\n\
-                     case \"$*\" in\n\
-                     'stop xochitl.service') rm -f {running} ;;\n\
-                     'start xochitl.service') : > {running} ;;\n\
-                     'is-active xochitl.service') if [ -e {running} ]; then echo active; else echo inactive; exit 3; fi ;;\n\
-                     'stop '*'.timer') u=${{2%.timer}}; rm -f {sys}/watchdog-\"$u\" ;;\n\
-                     esac\n\
-                     exit 0\n",
-                    log = q(&sys.join("systemctl.log")),
-                    running = q(&sys.join("running")),
-                    sys = q(&sys),
-                ),
-            );
-            if systemd_run {
-                test_support::write_script(
-                    &bin.join("systemd-run"),
-                    &format!(
-                        "printf '%s\\n' \"$*\" >> {log}\n\
-                         unit=\n\
-                         while [ $# -gt 0 ]; do case \"$1\" in --unit=*) unit=${{1#--unit=}}; shift ;; --*) shift ;; *) break ;; esac; done\n\
-                         for a do printf '%s\\0' \"$a\"; done > {sys}/watchdog-\"$unit\"\n",
-                        log = q(&sys.join("systemd-run.log")),
-                        sys = q(&sys),
-                    ),
-                );
-            }
-            fs::write(sys.join("running"), b"").unwrap();
-            let boot_file = root.join("boot id");
-            fs::write(&boot_file, format!("{}\n", uuid::Uuid::new_v4())).unwrap();
-            let conf = root.join("xochitl.conf");
-            fs::write(&conf, "[General]\ndevicetoken=@Invalid()\n").unwrap();
-            let ssh = scratch.0.join("ssh");
-            test_support::write_script(
-                &ssh,
-                &format!(
-                    "for cmd do :; done\nPATH={bin}; export PATH\nexec sh -c \"$cmd\"\n",
-                    bin = q(&bin)
-                ),
-            );
-            let mut session = SshSession::new(SshOptions {
-                destination: "mock.invalid".into(),
-                multiplex: false,
-                ..SshOptions::default()
-            })
-            .unwrap();
-            session.set_ssh_exe(ssh);
-            let paths = TabletPaths {
-                xochitl_dir: xochitl.to_string_lossy().into_owned(),
-                state_dir: state.to_string_lossy().into_owned(),
-                xochitl_conf: conf.to_string_lossy().into_owned(),
-                boot_id: boot_file.to_string_lossy().into_owned(),
-            };
-            Self {
-                tablet: SshTablet::new(session).with_paths(paths),
-                root,
-                bin,
-                sys,
-                boot_file,
-                _scratch: scratch,
-            }
-        }
-
-        fn data(&self, path: &str) -> PathBuf {
-            Path::new(&self.tablet.paths().xochitl_dir).join(path)
-        }
-
-        pub(super) fn systemctl_log(&self) -> String {
-            fs::read_to_string(self.sys.join("systemctl.log")).unwrap_or_default()
-        }
-
-        pub(super) fn systemd_run_log(&self) -> String {
-            fs::read_to_string(self.sys.join("systemd-run.log")).unwrap_or_default()
-        }
-
-        /// Watchdogs the `systemd-run` stub has armed and not stopped.
-        pub(super) fn armed_units(&self) -> Vec<PathBuf> {
-            let mut units: Vec<PathBuf> = fs::read_dir(&self.sys)
-                .unwrap()
-                .map(|entry| entry.unwrap().path())
-                .filter(|path| {
-                    path.file_name()
-                        .unwrap()
-                        .to_string_lossy()
-                        .starts_with("watchdog-")
-                })
-                .collect();
-            units.sort();
-            units
-        }
-
-        pub(super) fn running(&self) -> bool {
-            self.sys.join("running").exists()
-        }
-
-        pub(super) fn conf(&self) -> PathBuf {
-            self.root.join("xochitl.conf")
-        }
-
-        pub(super) fn ssh_tablet(&self) -> &SshTablet {
-            &self.tablet
-        }
-
-        pub(super) fn has_tool(&self, tool: &str) -> bool {
-            self.bin.join(tool).exists()
+    /// Run `check` with the host's tools and, if available, BusyBox.
+    fn on_both(systemd_run: bool, check: impl Fn(&SshHarness)) {
+        check(&SshHarness::new(Tools::Host, systemd_run));
+        match busybox() {
+            Some(busybox) => check(&SshHarness::new(Tools::BusyBox(&busybox), systemd_run)),
+            None => eprintln!("RMU_TEST_BUSYBOX is not set; skipping the BusyBox run"),
         }
     }
 
-    impl Harness for SshHarness {
-        fn tablet(&self) -> &dyn Tablet {
-            &self.tablet
-        }
-
-        fn put(&self, path: &str, contents: &[u8]) {
-            let target = self.data(path);
-            fs::create_dir_all(target.parent().unwrap()).unwrap();
-            fs::write(target, contents).unwrap();
-        }
-
-        fn get(&self, path: &str) -> Option<Vec<u8>> {
-            fs::read(self.data(path)).ok()
-        }
-
-        /// Run the command of the one armed `systemd-run` watchdog.
-        fn fire_watchdog(&self) {
-            let units = self.armed_units();
-            assert_eq!(units.len(), 1, "armed watchdogs: {units:?}");
-            let recorded = fs::read(&units[0]).unwrap();
-            fs::remove_file(&units[0]).unwrap();
-            let args: Vec<String> = recorded
-                .split(|&b| b == 0)
-                .filter(|arg| !arg.is_empty())
-                .map(|arg| String::from_utf8(arg.to_vec()).unwrap())
-                .collect();
-            let status = Command::new(&args[0])
-                .args(&args[1..])
-                .env("PATH", &self.bin)
-                .status()
-                .unwrap();
-            assert!(status.success());
-        }
-
-        fn reboot(&self) {
-            fs::write(&self.boot_file, format!("{}\n", uuid::Uuid::new_v4())).unwrap();
-        }
-
-        fn wipe_state(&self) {
-            fs::remove_dir_all(&self.tablet.paths().state_dir).unwrap();
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn run_ssh_contract(tools: local_ssh::Tools<'_>, label: &str) {
-    SCENARIOS.iter().for_each(|(name, scenario)| {
-        eprintln!("{label}: {name}");
-        let harness = local_ssh::SshHarness::new(tools, true);
-        scenario(&harness);
-        let log = harness.systemctl_log();
-        if *name == "xochitl_stop_and_start" {
-            // The scripts really reached the stubs, and re-arming left
-            // exactly one watchdog until the disarm.
-            assert!(log.contains("stop xochitl.service\n"), "{log}");
-            assert!(log.contains("start xochitl.service\n"), "{log}");
-            let armed = harness.systemd_run_log();
-            assert_eq!(armed.matches("--on-active=600s").count(), 2, "{armed}");
-            assert!(
-                harness.armed_units().is_empty(),
-                "{:?}",
-                harness.armed_units()
-            );
-        }
-        // Every start was preceded by reset-failed.
-        let lines: Vec<&str> = log.lines().collect();
-        lines
-            .iter()
-            .enumerate()
-            .filter(|(_, line)| **line == "start xochitl.service")
-            .for_each(|(at, _)| {
+    fn run_contract(tools: Tools<'_>, label: &str) {
+        SCENARIOS.iter().for_each(|(name, scenario)| {
+            eprintln!("{label}: {name}");
+            let harness = SshHarness::new(tools, true);
+            scenario(&harness);
+            let log = harness.systemctl_log();
+            if *name == "xochitl_stop_and_start" {
+                // The scripts really reached the stubs, and re-arming left
+                // exactly one watchdog until the disarm.
+                assert!(log.contains("stop xochitl.service\n"), "{log}");
+                assert!(log.contains("start xochitl.service\n"), "{log}");
+                let armed = harness.systemd_run_log();
+                assert_eq!(armed.matches("--on-active=600s").count(), 2, "{armed}");
                 assert!(
-                    at > 0 && lines[at - 1] == "reset-failed xochitl.service",
-                    "{log}"
+                    harness.armed_units().is_empty(),
+                    "{:?}",
+                    harness.armed_units()
                 );
-            });
-    });
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn ssh_tablet_honours_the_contract() {
-    run_ssh_contract(local_ssh::Tools::Host, "ssh");
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn ssh_tablet_honours_the_contract_on_busybox() {
-    let Some(busybox) = local_ssh::busybox() else {
-        eprintln!("RMU_TEST_BUSYBOX is not set; skipping the BusyBox contract run");
-        return;
-    };
-    run_ssh_contract(local_ssh::Tools::BusyBox(&busybox), "busybox");
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn ssh_tablet_rearms_before_removing_the_old_watchdog() {
-    let harness = local_ssh::SshHarness::new(local_ssh::Tools::Host, true);
-    let t = harness.ssh_tablet();
-    let lock = t.acquire_lock(&request(), false).unwrap();
-    t.arm_watchdog(&lock, WATCHDOG).unwrap();
-    let first = harness.armed_units();
-    assert_eq!(first.len(), 1);
-    t.arm_watchdog(&lock, WATCHDOG).unwrap();
-    let second = harness.armed_units();
-    assert_eq!(second.len(), 1);
-    assert_ne!(first, second, "each arming uses a fresh unit");
-    let log = harness.systemctl_log();
-    let file = first[0].file_name().unwrap().to_string_lossy().into_owned();
-    let unit = file.strip_prefix("watchdog-").unwrap();
-    assert!(log.contains(&format!("stop {unit}.timer\n")), "{log}");
-    t.disarm_watchdog(&lock).unwrap();
-    assert!(harness.armed_units().is_empty());
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn ssh_tablet_detects_cloud_pairing_and_fails_closed() {
-    check_cloud_pairing(&local_ssh::SshHarness::new(local_ssh::Tools::Host, true));
-    if let Some(busybox) = local_ssh::busybox() {
-        check_cloud_pairing(&local_ssh::SshHarness::new(
-            local_ssh::Tools::BusyBox(&busybox),
-            true,
-        ));
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn check_cloud_pairing(harness: &local_ssh::SshHarness) {
-    let t = harness.ssh_tablet();
-    [
-        ("devicetoken=@Invalid()\n", false),
-        ("devicetoken=\n", false),
-        ("devicetoken=@ByteArray()\n", false),
-        ("devicetoken=\"\"\n", false),
-        ("other=1\n", false),
-        ("devicetoken=@ByteArray(fabricated-token)\n", true),
-    ]
-    .into_iter()
-    .for_each(|(conf, paired)| {
-        fs::write(harness.conf(), format!("[General]\n{conf}")).unwrap();
-        assert_eq!(t.cloud_paired().unwrap(), paired, "{conf}");
-    });
-    fs::remove_file(harness.conf()).unwrap();
-    assert!(matches!(
-        t.cloud_paired(),
-        Err(Error::Remote { status: 1, .. })
-    ));
-}
-
-#[cfg(target_os = "linux")]
-fn check_sleep_watchdog(harness: &local_ssh::SshHarness) {
-    let t = harness.ssh_tablet();
-    let paths = t.paths().clone();
-    let lock = t.acquire_lock(&request(), false).unwrap();
-    let alive = |pid: &str| {
-        std::process::Command::new("sh")
-            .args(["-c", "kill -0 -- \"-$1\" 2>/dev/null", "sh", pid])
-            .status()
-            .unwrap()
-            .success()
-    };
-    let gone = |pid: &str| {
-        (0..50).any(|_| {
-            let alive = alive(pid);
-            if alive {
-                std::thread::sleep(Duration::from_millis(100));
             }
-            !alive
-        })
-    };
-    let pid = || {
-        fs::read_to_string(paths.watchdog_pid())
-            .unwrap()
-            .split(' ')
-            .next()
-            .unwrap()
-            .to_string()
-    };
-    // Re-arming replaces the sleeper; disarm kills it and removes its
-    // token before it fires.
-    t.arm_watchdog(&lock, Duration::from_secs(60)).unwrap();
-    let first = pid();
-    t.arm_watchdog(&lock, Duration::from_secs(60)).unwrap();
-    let second = pid();
-    assert_ne!(first, second);
-    assert!(gone(&first), "the replaced sleeper survived");
-    assert!(Path::new(&paths.watchdog_token()).exists());
-    t.disarm_watchdog(&lock).unwrap();
-    assert!(!Path::new(&paths.watchdog_pid()).exists());
-    assert!(!Path::new(&paths.watchdog_token()).exists());
-    assert!(gone(&second), "the sleeper survived the disarm");
-
-    // Armed for a second, with xochitl stopped: it fires.
-    t.arm_watchdog(&lock, Duration::from_secs(1)).unwrap();
-    t.stop_xochitl(&lock).unwrap();
-    assert!(!harness.running());
-    let fired = (0..150).any(|_| {
-        std::thread::sleep(Duration::from_millis(100));
-        harness.running() && t.watchdog_fired().unwrap()
-    });
-    assert!(fired, "the sleep watchdog did not fire");
-    assert!(watchdog_fired(t.check_guard(&lock)));
-    let log = harness.systemctl_log();
-    assert!(
-        log.ends_with("reset-failed xochitl.service\nstart xochitl.service\n"),
-        "{log}"
-    );
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn ssh_tablet_sleep_watchdog_fires_and_disarms() {
-    let harness = local_ssh::SshHarness::new(local_ssh::Tools::Host, false);
-    if !harness.has_tool("setsid") || !harness.has_tool("flock") {
-        eprintln!("setsid or flock not available; skipping the sleep-watchdog test");
-        return;
+            // Every start was preceded by reset-failed.
+            let lines: Vec<&str> = log.lines().collect();
+            lines
+                .iter()
+                .enumerate()
+                .filter(|(_, line)| **line == "start xochitl.service")
+                .for_each(|(at, _)| {
+                    assert!(
+                        at > 0 && lines[at - 1] == "reset-failed xochitl.service",
+                        "{log}"
+                    );
+                });
+        });
     }
-    check_sleep_watchdog(&harness);
-}
 
-#[cfg(target_os = "linux")]
-#[test]
-fn ssh_tablet_sleep_watchdog_on_busybox() {
-    let Some(busybox) = local_ssh::busybox() else {
-        eprintln!("RMU_TEST_BUSYBOX is not set; skipping the BusyBox sleep-watchdog test");
-        return;
-    };
-    check_sleep_watchdog(&local_ssh::SshHarness::new(
-        local_ssh::Tools::BusyBox(&busybox),
-        false,
-    ));
-}
+    #[test]
+    fn honours_the_contract() {
+        run_contract(Tools::Host, "ssh");
+    }
 
-#[cfg(target_os = "linux")]
-#[test]
-fn ssh_tablet_takeover_is_a_compare_and_swap() {
-    // The takeover replaces the record only if its checksum is still the
-    // one inspected: a record that changed meanwhile is never overwritten.
-    let harness = local_ssh::SshHarness::new(local_ssh::Tools::Host, true);
-    let t = harness.ssh_tablet();
-    let paths = t.paths().clone();
-    let held = t.acquire_lock(&request(), false).unwrap();
-    let stale = "0".repeat(64);
-    let output = t
-        .session_for_tests()
-        .run_script(&scripts::takeover_script(&paths, &request(), &stale))
-        .unwrap();
-    assert_eq!(output.status.code(), Some(scripts::EXIT_LOCK_CHANGED));
-    t.check_guard(&held).unwrap();
-    // Even a corrupt record can be broken: the version is its checksum.
-    fs::write(paths.lock_owner(), b"\0\xff garbage").unwrap();
-    assert!(locked(t.acquire_lock(&request(), false)));
-    let broken = t.acquire_lock(&request(), true).unwrap();
-    assert_eq!(broken.took_over(), Some((None, StaleReason::Broken)));
-    t.check_guard(&broken).unwrap();
+    #[test]
+    fn honours_the_contract_on_busybox() {
+        let Some(busybox) = busybox() else {
+            eprintln!("RMU_TEST_BUSYBOX is not set; skipping the BusyBox contract run");
+            return;
+        };
+        run_contract(Tools::BusyBox(&busybox), "busybox");
+    }
+
+    #[test]
+    fn rearms_before_removing_the_old_watchdog() {
+        let harness = SshHarness::new(Tools::Host, true);
+        let t = harness.ssh_tablet();
+        let lock = t.acquire_lock(&request(), false).unwrap();
+        t.arm_watchdog(&lock, WATCHDOG).unwrap();
+        let first = harness.armed_units();
+        assert_eq!(first.len(), 1);
+        t.arm_watchdog(&lock, WATCHDOG).unwrap();
+        let second = harness.armed_units();
+        assert_eq!(second.len(), 1);
+        assert_ne!(first, second, "each arming uses a fresh unit");
+        let log = harness.systemctl_log();
+        let file = first[0].file_name().unwrap().to_string_lossy().into_owned();
+        let unit = file.strip_prefix("watchdog-").unwrap();
+        assert!(log.contains(&format!("stop {unit}.timer\n")), "{log}");
+        t.disarm_watchdog(&lock).unwrap();
+        assert!(harness.armed_units().is_empty());
+    }
+
+    #[test]
+    fn detects_cloud_pairing_and_fails_closed() {
+        on_both(true, |harness| {
+            let t = harness.ssh_tablet();
+            [
+                ("devicetoken=@Invalid()\n", false),
+                ("devicetoken=\n", false),
+                ("devicetoken=@ByteArray()\n", false),
+                ("devicetoken=\"\"\n", false),
+                ("other=1\n", false),
+                ("devicetoken=@ByteArray(fabricated-token)\n", true),
+            ]
+            .into_iter()
+            .for_each(|(conf, paired)| {
+                fs::write(harness.conf(), format!("[General]\n{conf}")).unwrap();
+                assert_eq!(t.cloud_paired().unwrap(), paired, "{conf}");
+            });
+            fs::remove_file(harness.conf()).unwrap();
+            assert!(matches!(
+                t.cloud_paired(),
+                Err(Error::Remote { status: 1, .. })
+            ));
+        });
+    }
+
+    fn check_sleep_watchdog(harness: &SshHarness) {
+        if !harness.has_tool("setsid") || !harness.has_tool("flock") {
+            eprintln!("setsid or flock not available; skipping the sleep-watchdog test");
+            return;
+        }
+        let t = harness.ssh_tablet();
+        let paths = t.paths().clone();
+        let lock = t.acquire_lock(&request(), false).unwrap();
+        let alive = |pid: &str| {
+            std::process::Command::new("sh")
+                .args(["-c", "kill -0 -- \"-$1\" 2>/dev/null", "sh", pid])
+                .status()
+                .unwrap()
+                .success()
+        };
+        let gone = |pid: &str| {
+            (0..50).any(|_| {
+                let alive = alive(pid);
+                if alive {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                !alive
+            })
+        };
+        let record = || fs::read_to_string(paths.watchdog_pid()).unwrap();
+        let pid = || record().split(' ').next().unwrap().to_string();
+        // Re-arming replaces the sleeper; the record names this run; the
+        // disarm kills it and marks the token before it could fire.
+        t.arm_watchdog(&lock, Duration::from_secs(60)).unwrap();
+        let first = pid();
+        assert!(record().trim_end().ends_with(lock.run()), "{}", record());
+        t.arm_watchdog(&lock, Duration::from_secs(60)).unwrap();
+        let second = pid();
+        assert_ne!(first, second);
+        assert!(gone(&first), "the replaced sleeper survived");
+        t.disarm_watchdog(&lock).unwrap();
+        assert!(!Path::new(&paths.watchdog_pid()).exists());
+        assert_eq!(
+            fs::read_to_string(paths.watchdog_token()).unwrap(),
+            "disarmed\n"
+        );
+        assert!(gone(&second), "the sleeper survived the disarm");
+
+        // A pid file naming an invalid group is never signalled.
+        fs::write(paths.watchdog_pid(), format!("1 x {}\n", lock.run())).unwrap();
+        t.arm_watchdog(&lock, Duration::from_secs(60)).unwrap();
+        let third = pid();
+        t.disarm_watchdog(&lock).unwrap();
+        assert!(gone(&third));
+
+        // Armed briefly, with xochitl stopped, and the state dir wiped
+        // (token gone): it still fires.
+        t.arm_watchdog(&lock, Duration::from_secs(3)).unwrap();
+        t.stop_xochitl(&lock).unwrap();
+        assert!(!harness.running());
+        fs::remove_dir_all(&paths.state_dir).unwrap();
+        let fired = (0..200).any(|_| {
+            std::thread::sleep(Duration::from_millis(100));
+            harness.running()
+        });
+        assert!(fired, "the sleep watchdog did not fire");
+        let log = harness.systemctl_log();
+        assert!(
+            log.ends_with("reset-failed xochitl.service\nstart xochitl.service\n"),
+            "{log}"
+        );
+    }
+
+    #[test]
+    fn sleep_watchdog_fires_and_disarms() {
+        on_both(false, check_sleep_watchdog);
+    }
+
+    #[test]
+    fn takeover_is_a_compare_and_swap() {
+        // The takeover replaces the record only if its checksum is still
+        // the one inspected: a record that changed meanwhile is never
+        // overwritten.
+        let harness = SshHarness::new(Tools::Host, true);
+        let t = harness.ssh_tablet();
+        let paths = t.paths().clone();
+        let held = t.acquire_lock(&request(), false).unwrap();
+        let stale = "0".repeat(64);
+        let output = t
+            .session_for_tests()
+            .run_script(&scripts::takeover_script(&paths, &request(), &stale))
+            .unwrap();
+        assert_eq!(output.status.code(), Some(scripts::EXIT_LOCK_CHANGED));
+        t.check_guard(&held).unwrap();
+        // Even a corrupt record can be broken: the version is its checksum.
+        fs::write(paths.lock_owner(), b"\0\xff garbage").unwrap();
+        assert!(locked(t.acquire_lock(&request(), false)));
+        let broken = t.acquire_lock(&request(), true).unwrap();
+        assert_eq!(broken.took_over(), Some((None, StaleReason::Broken)));
+        t.check_guard(&broken).unwrap();
+    }
+
+    #[test]
+    fn guard_flock_serialises_and_the_state_write_rechecks_the_guard() {
+        on_both(true, |harness| {
+            let t = harness.ssh_tablet();
+            let lock = t.acquire_lock(&request(), false).unwrap();
+            let marker = crate::ssh::shell_quote(&t.paths().watchdog_marker());
+            // Another holder of the guard flock leaves the marker while
+            // the state write waits for the flock after its upload.
+            let mut holder = harness.hold_guard_flock(&format!("sleep 1; : > {marker}; sleep 1"));
+            let started = Instant::now();
+            let result = t.write_state(&lock, &hub_state());
+            let waited = started.elapsed();
+            holder.wait().unwrap();
+            assert!(watchdog_fired(result));
+            assert!(waited >= Duration::from_millis(1500), "{waited:?}");
+            assert_eq!(t.read_state().unwrap(), None);
+        });
+    }
+
+    #[test]
+    fn apply_checks_the_guard_before_every_document() {
+        on_both(true, |harness| {
+            let t = harness.ssh_tablet();
+            let lock = t.acquire_lock(&request(), false).unwrap();
+            let (first, mut files) = metadata_only(OTHER);
+            files.extend(document_files());
+            stage(t, &lock, &files).unwrap();
+            t.arm_watchdog(&lock, WATCHDOG).unwrap();
+            t.stop_xochitl(&lock).unwrap();
+            // The watchdog "fires" right after the first move.
+            harness.marker_after_next_move();
+            let result = t.apply(
+                &lock,
+                &ApplyPlan {
+                    docs: vec![first, full_write()],
+                },
+            );
+            assert!(watchdog_fired(result));
+            assert!(harness.get(&format!("{OTHER}.metadata")).is_some());
+            assert_eq!(harness.get(&format!("{DOC}.content")), None);
+        });
+    }
 }
