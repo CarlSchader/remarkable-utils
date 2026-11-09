@@ -269,13 +269,13 @@ fn stderr(output: &Output) -> String {
 }
 
 #[test]
-fn init_clone_status_sync_backup_over_ssh() {
+fn every_command_over_ssh() {
     tool_sets()
         .iter()
-        .for_each(|busybox| init_clone_status_sync_backup(busybox.as_deref()));
+        .for_each(|busybox| every_command(busybox.as_deref()));
 }
 
-fn init_clone_status_sync_backup(busybox: Option<&Path>) {
+fn every_command(busybox: Option<&Path>) {
     let world = World::new(busybox);
     let origin = world.origin();
     let first = world.put_pdf(1, "Paper one");
@@ -354,10 +354,44 @@ fn init_clone_status_sync_backup(busybox: Option<&Path>) {
     let value = world.json(&["backup"]);
     assert_eq!(value["command"], "backup");
     let value = world.json(&["status"]);
-    assert_eq!(value["changes"], json!([]));
+    assert_eq!(value["changes"], json!({}));
     assert_eq!(value["device_name"], "Tablet A");
+
+    // Remote and detach: the attachment only, documents untouched.
+    let output = world.rmu(&["remote"]);
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        format!("{origin}\n")
+    );
+    let moved = world.scratch.join("moved.git").display().to_string();
+    assert!(
+        Command::new("cp")
+            .args(["-R", &origin, &moved])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let value = world.json(&["remote", "set-url", &moved]);
+    assert_eq!(value["previous"], origin.as_str());
+    assert_eq!(value["remote"]["origin"], moved.as_str());
+    world.json(&["sync"]);
+    let value = world.json(&["detach", "--prune-ref"]);
+    assert!(
+        value["pruned"].as_str().unwrap().contains("rmu/devices/"),
+        "{value}"
+    );
+    assert!(
+        !world
+            .device()
+            .join("home/root/.local/share/rmu/hub.json")
+            .exists()
+    );
+    let output = world.rmu(&["status"]);
+    assert_eq!(code(&output), 1);
     assert!(world.running());
     assert!(world.xochitl().join(format!("{first}.pdf")).exists());
+    assert!(world.xochitl().join(format!("{second}.pdf")).exists());
 }
 
 #[test]

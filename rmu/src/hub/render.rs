@@ -11,8 +11,8 @@ use indicatif::HumanBytes;
 use libremarkable_utils::Error;
 use libremarkable_utils::git::Oid;
 use libremarkable_utils::hub::cycle::{
-    BackupReport, CycleError, DocChange, DryRunReport, MainUpdate, ReadSummary, Reconciled,
-    StatusReport, SyncReport,
+    BackupReport, CycleError, DetachReport, DocChange, DryRunReport, MainUpdate, ReadSummary,
+    Reconciled, RemoteReport, SetUrlReport, StatusReport, SyncReport, TakeOver, Warning,
 };
 use libremarkable_utils::hub::device::{LockOwner, LockState, StaleReason};
 use libremarkable_utils::hub::merge::{DeletionGuard, Fork, Note, NoteKind, Summary};
@@ -59,7 +59,9 @@ fn shown<'a>(docs: impl IntoIterator<Item = &'a DocId>) -> impl Iterator<Item = 
 /// The documents whose names the human summary shows.
 pub fn named_docs(report: &Report) -> Vec<DocId> {
     let docs: Vec<&DocId> = match report {
-        Report::Init { .. } => Vec::new(),
+        Report::Init { .. } | Report::Remote(_) | Report::SetUrl(_) | Report::Detach(_) => {
+            Vec::new()
+        }
         Report::Clone(report) | Report::Sync(report) => {
             shown(report.forks.iter().map(|f| &f.original))
                 .chain(shown(&report.skipped))
@@ -106,6 +108,9 @@ pub fn human(report: &Report, names: &Names) -> Vec<String> {
         Report::DryRun(report) => dry_run(report, names),
         Report::Backup(report) => backup(report, names),
         Report::Status(report) => status(report, names),
+        Report::Remote(report) => remote(report),
+        Report::SetUrl(report) => set_url(report),
+        Report::Detach(report) => detach(report),
     }
 }
 
@@ -124,15 +129,20 @@ pub fn plain(report: &Report) -> Vec<String> {
             .map(|doc| format!("write {doc}"))
             .chain(report.deletes.iter().map(|doc| format!("delete {doc}")))
             .collect(),
+        Report::Remote(report) => vec![report.origin.clone()],
+        Report::SetUrl(report) => vec![report.remote.origin.clone()],
+        Report::Detach(report) => report.pruned.iter().cloned().collect(),
     }
 }
 
 /// Warnings, for stderr when the result is JSON.
 pub fn warnings(report: &Report) -> Vec<String> {
-    let warnings: &[String] = match report {
+    let warnings: &[Warning] = match report {
         Report::Clone(report) | Report::Sync(report) => &report.warnings,
         Report::Backup(report) => &report.warnings,
-        _ => &[],
+        Report::SetUrl(report) => &report.warnings,
+        Report::Detach(report) => &report.warnings,
+        Report::Init { .. } | Report::DryRun(_) | Report::Status(_) | Report::Remote(_) => &[],
     };
     warnings
         .iter()
@@ -169,11 +179,10 @@ fn docs(count: usize) -> String {
 }
 
 fn read_line(read: &ReadSummary) -> String {
-    let (files, bytes) = read.downloaded;
     let mut line = format!(
         "Read {} ({}) from the tablet",
-        plural(files, "file", "files"),
-        HumanBytes(bytes)
+        plural(read.downloaded.files, "file", "files"),
+        HumanBytes(read.downloaded.bytes)
     );
     if read.unmirrored > 0 {
         line.push_str(&format!(
@@ -355,8 +364,12 @@ fn owner_text(owner: &Option<LockOwner>) -> String {
         .map_or_else(|| "unknown owner".to_string(), ToString::to_string)
 }
 
-fn took_over(lines: &mut Vec<String>, took_over: &Option<(Option<LockOwner>, StaleReason)>) {
-    if let Some((owner, reason)) = took_over {
+fn took_over(lines: &mut Vec<String>, took_over: &Option<TakeOver>) {
+    if let Some(TakeOver {
+        previous: owner,
+        reason,
+    }) = took_over
+    {
         let why = match reason {
             StaleReason::BootChanged => "the tablet rebooted since it was taken",
             StaleReason::WatchdogFired => "its watchdog had fired",
@@ -392,7 +405,7 @@ fn reconciled(lines: &mut Vec<String>, reconciled: &Option<Reconciled>, names: &
     );
 }
 
-fn warning_lines(lines: &mut Vec<String>, warnings: &[String]) {
+fn warning_lines(lines: &mut Vec<String>, warnings: &[Warning]) {
     lines.extend(warnings.iter().map(|warning| format!("warning: {warning}")));
 }
 
@@ -403,6 +416,9 @@ fn sync(report: &SyncReport, names: &Names, verb: &str) -> Vec<String> {
     };
     let mut lines = vec![match &report.update {
         MainUpdate::UpToDate => format!("{verb}: already in sync with origin; nothing pushed"),
+        MainUpdate::Pulled => {
+            format!("{verb}: took origin's changes; the tablet had none of its own to push")
+        }
         MainUpdate::FastForward(commit) => format!(
             "{verb}: pushed the tablet's changes to origin ({}){attempts}",
             short(commit)
@@ -423,6 +439,12 @@ fn sync(report: &SyncReport, names: &Names, verb: &str) -> Vec<String> {
         n => format!("Updated {} on the tablet", docs(n)),
     });
     lines.push(read_line(&report.read));
+    if !report.inferred.is_empty() {
+        lines.push(format!(
+            "{} matched a version in origin's history and took it as their base",
+            docs(report.inferred.len())
+        ));
+    }
     lines.extend(summary_line(&report.summary));
     lines.push(format!(
         "Deletions: {} from origin, {} from the tablet",
@@ -564,6 +586,45 @@ fn dry_run(report: &DryRunReport, names: &Names) -> Vec<String> {
         false => "It would not push anything to origin".to_string(),
     });
     lines.push("(dry run: nothing was changed; read while xochitl runs: best effort)".into());
+    lines
+}
+
+fn remote(report: &RemoteReport) -> Vec<String> {
+    let mut lines = vec![
+        format!("Tablet \"{}\" ({})", report.device_name, report.device_id),
+        format!("Repository {}", report.repo_id),
+        format!("Origin {}", report.origin),
+    ];
+    if report.effective != report.origin {
+        lines.push(format!("This run uses {} (--origin)", report.effective));
+    }
+    lines
+}
+
+fn set_url(report: &SetUrlReport) -> Vec<String> {
+    let mut lines = vec![format!(
+        "Origin of \"{}\" changed from {} to {}",
+        report.remote.device_name, report.previous, report.remote.origin
+    )];
+    took_over(&mut lines, &report.took_over);
+    warning_lines(&mut lines, &report.warnings);
+    lines
+}
+
+fn detach(report: &DetachReport) -> Vec<String> {
+    let mut lines = vec![format!(
+        "Detached the tablet from repository {}; its documents are untouched",
+        report.repo_id
+    )];
+    lines.extend(
+        report
+            .pruned
+            .iter()
+            .map(|reference| format!("Deleted its device ref {reference} from origin")),
+    );
+    lines.push("`rmu hub clone <origin>` attaches it again".to_string());
+    took_over(&mut lines, &report.took_over);
+    warning_lines(&mut lines, &report.warnings);
     lines
 }
 

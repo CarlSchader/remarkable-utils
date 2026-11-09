@@ -26,8 +26,8 @@ use clap::{Args, Subcommand};
 use libremarkable_utils::Error;
 use libremarkable_utils::git::Git;
 use libremarkable_utils::hub::cycle::{
-    self, BackupReport, CycleError, DryRunReport, Hub, HubOptions, InitReport, StatusReport,
-    SyncReport,
+    self, BackupReport, CycleError, DetachReport, DryRunReport, Hub, HubOptions, InitReport,
+    RemoteReport, SetUrlReport, StatusReport, SyncReport,
 };
 use libremarkable_utils::hub::device::{DeviceError, LockRequest, SshTablet, Tablet, TabletPaths};
 use libremarkable_utils::hub::model::{DeviceName, DocId, XochitlPath};
@@ -51,6 +51,7 @@ Exit status:
      attaches the tablet to it deliberately), or it was emptied (`rmu hub
      init` it again first)
   6  the tablet is paired with the reMarkable cloud (unpair it first)
+  7  an interrupted sync must be finished first: run `rmu hub sync`
 
 Output: stdout carries the result only: a summary on a terminal, JSON
 with --json, otherwise plain ids (the summary then goes to stderr).
@@ -128,9 +129,41 @@ pub enum HubCommand {
         #[command(flatten)]
         origin: OriginArg,
     },
+    /// Show the origin URL stored on the tablet, or change it
+    #[command(after_help = AFTER_HELP, args_conflicts_with_subcommands = true)]
+    Remote {
+        #[command(subcommand)]
+        action: Option<RemoteAction>,
+        #[command(flatten)]
+        origin: OriginArg,
+    },
+    /// Forget the hub state on the tablet; its documents are untouched
+    #[command(after_help = AFTER_HELP)]
+    Detach {
+        /// Also delete the tablet's device ref (its backups) from origin
+        #[arg(long)]
+        prune_ref: bool,
+        #[command(flatten)]
+        run: RunArgs,
+        #[command(flatten)]
+        origin: OriginArg,
+    },
 }
 
-/// Flags of the commands that lock the tablet and stop xochitl.
+#[derive(Subcommand, Debug)]
+pub enum RemoteAction {
+    /// Store another origin URL on the tablet (it must hold the tablet's
+    /// repository, with every commit the tablet has synced)
+    #[command(after_help = AFTER_HELP)]
+    SetUrl {
+        /// The new local path or git URL
+        url: String,
+        #[command(flatten)]
+        run: RunArgs,
+    },
+}
+
+/// Flags of the commands that lock the tablet (and may stop xochitl).
 #[derive(Args, Debug, Clone, PartialEq, Eq)]
 pub struct RunArgs {
     /// Take over the tablet's hub lock even if it does not look stale;
@@ -185,6 +218,9 @@ pub enum Report {
     DryRun(DryRunReport),
     Backup(BackupReport),
     Status(StatusReport),
+    Remote(RemoteReport),
+    SetUrl(SetUrlReport),
+    Detach(DetachReport),
 }
 
 /// Why a command failed, as an exit status (see [`AFTER_HELP`]).
@@ -195,6 +231,7 @@ pub enum Failure {
     LockHeld,
     OriginMismatch,
     CloudPaired,
+    JournalPending,
 }
 
 impl Failure {
@@ -211,6 +248,7 @@ impl Failure {
                 | CycleError::DeviceRefConflict { .. },
             ) => Self::OriginMismatch,
             Error::HubCycle(CycleError::CloudPaired) => Self::CloudPaired,
+            Error::HubCycle(CycleError::JournalPending) => Self::JournalPending,
             _ => Self::Error,
         }
     }
@@ -222,6 +260,7 @@ impl Failure {
             Self::LockHeld => 4,
             Self::OriginMismatch => 5,
             Self::CloudPaired => 6,
+            Self::JournalPending => 7,
         }
     }
 
@@ -233,6 +272,7 @@ impl Failure {
             Self::LockHeld => "lock_held",
             Self::OriginMismatch => "origin_mismatch",
             Self::CloudPaired => "cloud_paired",
+            Self::JournalPending => "journal_pending",
         }
     }
 }
@@ -307,15 +347,28 @@ pub fn options(command: &HubCommand) -> HubOptions {
             run: args,
             origin: url,
         } => run(args, origin(url)),
-        HubCommand::Status { origin: url } => origin(url),
+        HubCommand::Status { origin: url }
+        | HubCommand::Remote {
+            action: None,
+            origin: url,
+        } => origin(url),
+        HubCommand::Remote {
+            action: Some(RemoteAction::SetUrl { run: args, .. }),
+            ..
+        } => run(args, HubOptions::default()),
+        HubCommand::Detach {
+            run: args,
+            origin: url,
+            ..
+        } => run(args, origin(url)),
     }
 }
 
 /// A local origin path made absolute (it is stored on the tablet, and
-/// later runs start elsewhere); URLs and scp-style `host:path` are kept.
-/// The same rule as the library's: anything with a `:` is remote.
+/// later runs start elsewhere); URLs and scp-style `host:path` are kept
+/// ([`cycle::is_local_path`]).
 pub fn absolute_origin(origin: &str) -> String {
-    if origin.contains(':') {
+    if !cycle::is_local_path(origin) {
         return origin.to_string();
     }
     std::path::absolute(origin)
@@ -424,6 +477,16 @@ pub fn execute(
         HubCommand::Sync { .. } => hub.sync(tablet()).map(Report::Sync),
         HubCommand::Backup { .. } => hub.backup(tablet()).map(Report::Backup),
         HubCommand::Status { .. } => hub.status(tablet()).map(Report::Status),
+        HubCommand::Remote { action: None, .. } => hub.remote(tablet()).map(Report::Remote),
+        HubCommand::Remote {
+            action: Some(RemoteAction::SetUrl { url, .. }),
+            ..
+        } => hub
+            .set_remote_url(tablet(), &absolute_origin(url))
+            .map(Report::SetUrl),
+        HubCommand::Detach { prune_ref, .. } => {
+            hub.detach(tablet(), *prune_ref).map(Report::Detach)
+        }
     }
 }
 

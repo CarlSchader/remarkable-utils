@@ -9,8 +9,9 @@ use std::path::{Path, PathBuf};
 use clap::Parser;
 use libremarkable_utils::git::Oid;
 use libremarkable_utils::hub::cycle::{
-    BackupReport, DocChange, DryRunReport, MainUpdate, OpenConflict, ReadSummary, Reconciled,
-    StatusReport, SyncReport,
+    BackupReport, DetachReport, DocChange, Downloaded, DryRunReport, MainUpdate, OpenConflict,
+    ReadSummary, Reconciled, RemoteReport, SetUrlReport, StatusReport, SyncReport, TakeOver,
+    Warning,
 };
 use libremarkable_utils::hub::device::{FakeTablet, LockOwner, LockState, StaleReason};
 use libremarkable_utils::hub::merge::{DeletionGuard, Fork, Note, NoteKind, Side, Summary};
@@ -128,6 +129,31 @@ fn parses_every_subcommand() {
         }
     ));
     assert!(matches!(
+        hub_args(&["remote"]).command,
+        HubCommand::Remote {
+            action: None,
+            origin: OriginArg { origin: None }
+        }
+    ));
+    match hub_args(&["remote", "set-url", "laptop:lib.git", "--break-lock"]).command {
+        HubCommand::Remote {
+            action: Some(RemoteAction::SetUrl { url, run }),
+            ..
+        } => {
+            assert_eq!(url, "laptop:lib.git");
+            assert!(run.break_lock);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(matches!(
+        hub_args(&["detach", "--prune-ref", "--origin", "/x.git"]).command,
+        HubCommand::Detach {
+            prune_ref: true,
+            origin: OriginArg { origin: Some(_) },
+            ..
+        }
+    ));
+    assert!(matches!(
         hub_args(&["status", "--origin", "/x.git"]).command,
         HubCommand::Status {
             origin: OriginArg { origin: Some(_) }
@@ -159,6 +185,14 @@ fn rejects_bad_arguments() {
         ErrorKind::UnknownArgument
     );
     assert_eq!(parse_error(&["init"]), ErrorKind::MissingRequiredArgument);
+    assert_eq!(
+        parse_error(&["remote", "set-url"]),
+        ErrorKind::MissingRequiredArgument
+    );
+    assert_eq!(
+        parse_error(&["remote", "--origin", "/a.git", "set-url", "/b.git"]),
+        ErrorKind::ArgumentConflict
+    );
     assert_eq!(
         parse_error(&[]),
         ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
@@ -259,6 +293,12 @@ fn exit_codes() {
         5
     );
     assert_eq!(code(Error::HubCycle(CycleError::CloudPaired)), 6);
+    assert_eq!(code(Error::HubCycle(CycleError::JournalPending)), 7);
+    assert!(
+        CycleError::JournalPending
+            .to_string()
+            .contains("rmu hub sync")
+    );
     assert_eq!(code(Error::HubCycle(CycleError::NotAttached)), 1);
     assert_eq!(code(Error::HubDevice(DeviceError::Busy)), 4);
     assert_eq!(code(Error::HubDevice(DeviceError::LockContended)), 4);
@@ -300,12 +340,16 @@ fn sync_report() -> SyncReport {
         update: MainUpdate::Merge(oid('c')),
         snapshot: oid('b'),
         base: oid('c'),
+        inferred: BTreeMap::new(),
         applied: vec![doc(1), doc(2), doc(3), doc(21), doc(23)],
         skipped: vec![doc(4), doc(22)],
         quarantined: BTreeMap::from([(doc(5), "unparsable .metadata".to_string())]),
         orphans: vec![doc(6)],
         read: ReadSummary {
-            downloaded: (7, 2048),
+            downloaded: Downloaded {
+                files: 7,
+                bytes: 2048,
+            },
             unmirrored: 3,
         },
         notes: vec![
@@ -341,8 +385,14 @@ fn sync_report() -> SyncReport {
             kept: vec![doc(12)],
         }),
         push_attempts: 2,
-        took_over: Some((Some(owner()), StaleReason::BootChanged)),
-        warnings: vec!["this repository has only seen reMarkable 2 tablets".into()],
+        took_over: Some(TakeOver {
+            previous: Some(owner()),
+            reason: StaleReason::BootChanged,
+        }),
+        warnings: vec![Warning::MixedModel {
+            seen: "reMarkable 2".into(),
+            model: "reMarkable Paper Pro".into(),
+        }],
     }
 }
 
@@ -451,9 +501,11 @@ fn renders_sync_reports() {
     );
 
     assert_eq!(render::plain(&report), vec!["c".repeat(40)]);
-    assert_eq!(
-        render::warnings(&report),
-        vec!["warning: this repository has only seen reMarkable 2 tablets"]
+    let warnings = render::warnings(&report);
+    assert_eq!(warnings.len(), 1);
+    assert!(
+        warnings[0].starts_with("warning: this repository has only seen reMarkable 2 tablets"),
+        "{warnings:?}"
     );
     // Names are looked up only for the listed documents.
     let named = render::named_docs(&report);
@@ -464,9 +516,44 @@ fn renders_sync_reports() {
     );
 }
 
+/// The top-level fields of a JSON object, sorted.
+fn keys(value: &Value) -> Vec<&str> {
+    let mut keys: Vec<&str> = value
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    keys
+}
+
 #[test]
 fn sync_json_is_stable() {
     let value = json::report(&Report::Sync(sync_report()));
+    assert_eq!(
+        keys(&value),
+        vec![
+            "applied",
+            "base",
+            "command",
+            "deletions",
+            "forks",
+            "inferred",
+            "notes",
+            "orphans",
+            "push_attempts",
+            "quarantined",
+            "read",
+            "reconciled",
+            "skipped",
+            "snapshot",
+            "summary",
+            "took_over",
+            "update",
+            "warnings",
+        ]
+    );
     assert_eq!(value["command"], "sync");
     assert_eq!(
         value["update"],
@@ -474,6 +561,7 @@ fn sync_json_is_stable() {
     );
     assert_eq!(value["base"], "c".repeat(40));
     assert_eq!(value["snapshot"], "b".repeat(40));
+    assert_eq!(value["inferred"], json!({}));
     assert_eq!(value["applied"].as_array().unwrap().len(), 5);
     assert_eq!(
         value["skipped"],
@@ -481,21 +569,16 @@ fn sync_json_is_stable() {
     );
     assert_eq!(
         value["quarantined"],
-        json!([{"doc": doc(5).to_string(), "reason": "unparsable .metadata"}])
+        json!({doc(5).to_string(): "unparsable .metadata"})
     );
     assert_eq!(value["orphans"], json!([doc(6).to_string()]));
     assert_eq!(
         value["read"],
-        json!({"downloaded_files": 7, "downloaded_bytes": 2048, "unmirrored_files": 3})
+        json!({"downloaded": {"files": 7, "bytes": 2048}, "unmirrored": 3})
     );
-    assert_eq!(value["notes"][0]["kind"], "kept_over_deletion");
-    assert_eq!(value["notes"][0]["deleted_by"], "origin");
-    assert_eq!(value["notes"][0]["doc"], doc(7).to_string());
-    assert!(
-        value["notes"][0]["message"]
-            .as_str()
-            .unwrap()
-            .contains("kept")
+    assert_eq!(
+        value["notes"][0],
+        json!({"doc": doc(7).to_string(), "kind": "kept_over_deletion", "deleted_by": "theirs"})
     );
     assert_eq!(value["notes"][1]["kind"], "restored_from_trash");
     assert_eq!(value["notes"][1]["parent"], "");
@@ -519,24 +602,24 @@ fn sync_json_is_stable() {
         })
     );
     assert_eq!(value["summary"]["unchanged"], 40);
-    assert_eq!(value["summary"]["changed_on_tablet"], 2);
-    assert_eq!(value["summary"]["changed_on_origin"], 3);
+    assert_eq!(value["summary"]["changed_ours"], 2);
+    assert_eq!(value["summary"]["changed_theirs"], 3);
     assert_eq!(
         value["reconciled"],
         json!({"dropped": false, "finished": [doc(11).to_string()], "kept": [doc(12).to_string()]})
     );
     assert_eq!(value["push_attempts"], 2);
+    assert_eq!(value["took_over"]["reason"], "boot_changed");
+    assert_eq!(value["took_over"]["previous"]["host"], "laptop");
+    assert_eq!(value["took_over"]["previous"]["pid"], 4242);
     assert_eq!(
-        value["took_over"],
-        json!({
-            "reason": "boot_changed",
-            "previous_owner": {"host": "laptop", "pid": 4242, "started_unix": 1_790_000_000},
-        })
+        value["warnings"],
+        json!([{"kind": "mixed_model", "seen": "reMarkable 2", "model": "reMarkable Paper Pro"}])
     );
-    assert_eq!(value["warnings"].as_array().unwrap().len(), 1);
 
     let fast_forward = SyncReport {
         update: MainUpdate::FastForward(oid('d')),
+        inferred: BTreeMap::from([(doc(1), oid('a'))]),
         reconciled: None,
         took_over: None,
         ..sync_report()
@@ -547,16 +630,27 @@ fn sync_json_is_stable() {
         value["update"],
         json!({"kind": "fast_forward", "commit": "d".repeat(40)})
     );
+    assert_eq!(
+        value["inferred"],
+        json!({doc(1).to_string(): "a".repeat(40)})
+    );
     assert_eq!(value["reconciled"], Value::Null);
     assert_eq!(value["took_over"], Value::Null);
-    let up_to_date = SyncReport {
-        update: MainUpdate::UpToDate,
-        ..sync_report()
-    };
-    assert_eq!(
-        json::report(&Report::Sync(up_to_date))["update"],
-        json!({"kind": "up_to_date"})
-    );
+    [
+        (MainUpdate::UpToDate, "up_to_date"),
+        (MainUpdate::Pulled, "pulled"),
+    ]
+    .into_iter()
+    .for_each(|(update, kind)| {
+        let report = SyncReport {
+            update,
+            ..sync_report()
+        };
+        assert_eq!(
+            json::report(&Report::Sync(report))["update"],
+            json!({"kind": kind})
+        );
+    });
 }
 
 #[test]
@@ -596,24 +690,44 @@ fn renders_status_and_dry_run_reports() {
     );
 
     let value = json::report(&report);
+    assert_eq!(
+        keys(&value),
+        vec![
+            "behind",
+            "changes",
+            "command",
+            "device_id",
+            "device_name",
+            "forks",
+            "guard",
+            "journal_pending",
+            "lock",
+            "notes",
+            "open_conflicts",
+            "origin",
+            "orphans",
+            "quarantined",
+            "read",
+            "repo_id",
+            "summary",
+        ]
+    );
     assert_eq!(value["command"], "status");
     assert_eq!(value["device_name"], "Desk tablet");
-    assert_eq!(
-        value["lock"],
-        json!({"held": true, "owner": {"host": "laptop", "pid": 4242, "started_unix": 1_790_000_000}})
-    );
+    assert_eq!(value["lock"]["state"], "held");
+    assert_eq!(value["lock"]["owner"]["host"], "laptop");
     assert_eq!(value["journal_pending"], true);
     assert_eq!(
         value["changes"],
-        json!([
-            {"doc": doc(1).to_string(), "change": "added"},
-            {"doc": doc(2).to_string(), "change": "modified"},
-            {"doc": doc(3).to_string(), "change": "deleted"},
-        ])
+        json!({
+            doc(1).to_string(): "added",
+            doc(2).to_string(): "modified",
+            doc(3).to_string(): "deleted",
+        })
     );
     assert_eq!(value["behind"], 4);
     assert_eq!(value["open_conflicts"][0]["copy"], doc(10).to_string());
-    assert_eq!(value["deletions"]["allowed"], false);
+    assert_eq!(value["guard"]["allowed"], false);
     assert_eq!(value["notes"][0]["kind"], "metadata_conflict");
     assert_eq!(value["notes"][0]["field"], "visibleName");
 
@@ -639,7 +753,7 @@ fn renders_status_and_dry_run_reports() {
     assert!(!human.contains("Would delete"));
     assert_eq!(
         json::report(&Report::Status(clean.clone()))["lock"],
-        json!({"held": false, "owner": null})
+        json!({"state": "free"})
     );
 
     let dry_run = Report::DryRun(DryRunReport {
@@ -666,6 +780,10 @@ fn renders_status_and_dry_run_reports() {
         ]
     );
     let value = json::report(&dry_run);
+    assert_eq!(
+        keys(&value),
+        vec!["command", "deletes", "status", "would_push", "writes"]
+    );
     assert_eq!(value["command"], "sync --dry-run");
     assert_eq!(
         value["writes"],
@@ -673,7 +791,7 @@ fn renders_status_and_dry_run_reports() {
     );
     assert_eq!(value["deletes"], json!([doc(32).to_string()]));
     assert_eq!(value["would_push"], true);
-    assert_eq!(value["behind"], 0, "the status fields are inline");
+    assert_eq!(value["status"]["behind"], 0);
 }
 
 #[test]
@@ -684,10 +802,16 @@ fn renders_backup_and_init_reports() {
         quarantined: BTreeMap::new(),
         orphans: vec![doc(6)],
         read: ReadSummary {
-            downloaded: (1, 10),
+            downloaded: Downloaded {
+                files: 1,
+                bytes: 10,
+            },
             unmirrored: 0,
         },
-        took_over: Some((None, StaleReason::Broken)),
+        took_over: Some(TakeOver {
+            previous: None,
+            reason: StaleReason::Broken,
+        }),
         warnings: Vec::new(),
     };
     let report = Report::Backup(backup.clone());
@@ -702,7 +826,20 @@ fn renders_backup_and_init_reports() {
     assert_eq!(value["pushed"], true);
     assert_eq!(
         value["took_over"],
-        json!({"reason": "broken", "previous_owner": null})
+        json!({"reason": "broken", "previous": null})
+    );
+    assert_eq!(
+        keys(&value),
+        vec![
+            "command",
+            "orphans",
+            "pushed",
+            "quarantined",
+            "read",
+            "snapshot",
+            "took_over",
+            "warnings",
+        ]
     );
     let again = Report::Backup(BackupReport {
         pushed: false,
@@ -726,10 +863,140 @@ fn renders_backup_and_init_reports() {
     assert!(human.contains("rmu hub clone /srv/library.git --name <name>"));
     assert_eq!(render::plain(&init), vec![repo_id.to_string()]);
     let value = json::report(&init);
+    assert_eq!(keys(&value), vec!["command", "commit", "config", "origin"]);
     assert_eq!(value["command"], "init");
-    assert_eq!(value["repo_id"], repo_id.to_string());
+    assert_eq!(value["origin"], "/srv/library.git");
+    assert_eq!(value["config"]["repo_id"], repo_id.to_string());
+    assert_eq!(value["config"]["format"], RepoConfig::FORMAT);
     assert_eq!(value["commit"], "f".repeat(40));
-    assert_eq!(value["format"], RepoConfig::FORMAT);
+}
+
+#[test]
+fn renders_pulled_and_inferred_syncs() {
+    let report = SyncReport {
+        update: MainUpdate::Pulled,
+        inferred: BTreeMap::from([(doc(1), oid('a')), (doc(2), oid('a'))]),
+        ..sync_report()
+    };
+    let human = text(&render::human(&Report::Clone(report), &BTreeMap::new()));
+    assert!(
+        human.starts_with("Cloned: took origin's changes; the tablet had none of its own to push"),
+        "{human}"
+    );
+    assert!(human.contains("2 documents matched a version in origin's history"));
+    let human = text(&render::human(
+        &Report::Sync(sync_report()),
+        &BTreeMap::new(),
+    ));
+    assert!(!human.contains("matched a version"), "{human}");
+}
+
+fn remote_report() -> RemoteReport {
+    RemoteReport {
+        repo_id: RepoId::new("0f0e0d0c-0000-4000-8000-0000000000a1").unwrap(),
+        device_id: DeviceId::new("0f0e0d0c-0000-4000-8000-0000000000c1").unwrap(),
+        device_name: DeviceName::new("Desk tablet").unwrap(),
+        origin: "ssh://git@example.invalid/library.git".into(),
+        effective: "ssh://git@example.invalid/library.git".into(),
+    }
+}
+
+#[test]
+fn renders_remote_set_url_and_detach_reports() {
+    let report = Report::Remote(remote_report());
+    let human = text(&render::human(&report, &BTreeMap::new()));
+    assert!(human.contains("Tablet \"Desk tablet\" (0f0e0d0c-0000-4000-8000-0000000000c1)"));
+    assert!(human.contains("Origin ssh://git@example.invalid/library.git"));
+    assert!(!human.contains("This run uses"));
+    assert_eq!(
+        render::plain(&report),
+        vec!["ssh://git@example.invalid/library.git"]
+    );
+    let value = json::report(&report);
+    assert_eq!(
+        keys(&value),
+        vec![
+            "command",
+            "device_id",
+            "device_name",
+            "effective",
+            "origin",
+            "repo_id"
+        ]
+    );
+    assert_eq!(value["command"], "remote");
+    let overridden = Report::Remote(RemoteReport {
+        effective: "laptop:library.git".into(),
+        ..remote_report()
+    });
+    assert!(
+        text(&render::human(&overridden, &BTreeMap::new()))
+            .contains("This run uses laptop:library.git (--origin)")
+    );
+
+    let set_url = Report::SetUrl(SetUrlReport {
+        previous: "/old/library.git".into(),
+        remote: remote_report(),
+        took_over: None,
+        warnings: vec![Warning::ReleaseFailed {
+            error: "connection lost".into(),
+        }],
+    });
+    let human = text(&render::human(&set_url, &BTreeMap::new()));
+    assert!(human.contains(
+        "Origin of \"Desk tablet\" changed from /old/library.git to ssh://git@example.invalid/library.git"
+    ));
+    assert!(human.contains("warning: could not release the tablet lock: connection lost"));
+    assert_eq!(
+        render::plain(&set_url),
+        vec!["ssh://git@example.invalid/library.git"]
+    );
+    let value = json::report(&set_url);
+    assert_eq!(
+        keys(&value),
+        vec!["command", "previous", "remote", "took_over", "warnings"]
+    );
+    assert_eq!(value["command"], "remote set-url");
+    assert_eq!(value["warnings"][0]["kind"], "release_failed");
+
+    let detach = DetachReport {
+        repo_id: RepoId::new("0f0e0d0c-0000-4000-8000-0000000000a1").unwrap(),
+        device_id: DeviceId::new("0f0e0d0c-0000-4000-8000-0000000000c1").unwrap(),
+        pruned: Some("refs/rmu/devices/0f0e0d0c-0000-4000-8000-0000000000c1".into()),
+        took_over: None,
+        warnings: vec![Warning::JournalDiscarded],
+    };
+    let report = Report::Detach(detach.clone());
+    let human = text(&render::human(&report, &BTreeMap::new()));
+    assert!(human.contains(
+        "Detached the tablet from repository 0f0e0d0c-0000-4000-8000-0000000000a1; its documents are untouched"
+    ));
+    assert!(human.contains("Deleted its device ref refs/rmu/devices/"));
+    assert!(human.contains("warning: the journal of an interrupted sync was discarded"));
+    assert_eq!(
+        render::plain(&report),
+        vec!["refs/rmu/devices/0f0e0d0c-0000-4000-8000-0000000000c1"]
+    );
+    let value = json::report(&report);
+    assert_eq!(
+        keys(&value),
+        vec![
+            "command",
+            "device_id",
+            "pruned",
+            "repo_id",
+            "took_over",
+            "warnings"
+        ]
+    );
+    assert_eq!(value["warnings"], json!([{"kind": "journal_discarded"}]));
+    let kept = Report::Detach(DetachReport {
+        pruned: None,
+        warnings: Vec::new(),
+        ..detach
+    });
+    assert!(render::plain(&kept).is_empty());
+    assert!(!text(&render::human(&kept, &BTreeMap::new())).contains("device ref"));
 }
 
 #[test]
@@ -978,7 +1245,7 @@ fn init_clone_sync_status_backup() {
     let (value, code) = world.json(&b, &["sync", "--dry-run"]);
     assert_eq!(code, 0, "{value}");
     assert_eq!(ids(&value["writes"]), vec![id.to_string()]);
-    assert_eq!(value["behind"], 1);
+    assert_eq!(value["status"]["behind"], 1);
     assert!(
         b.read_file(&format!("{id}.pdf")).is_none(),
         "dry run wrote nothing"
@@ -1017,7 +1284,7 @@ fn init_clone_sync_status_backup() {
     let (value, code) = world.json(&b, &["status"]);
     assert_eq!(code, 0);
     assert_eq!(value["device_name"], "Tablet B");
-    assert_eq!(value["changes"], json!([]));
+    assert_eq!(value["changes"], json!({}));
     assert_eq!(value["behind"], 0);
 }
 
@@ -1050,7 +1317,7 @@ fn the_deletion_guard_exits_3_and_lists_the_documents() {
 
     let (value, code) = world.json(&a, &["sync", "--dry-run"]);
     assert_eq!(code, 0);
-    assert_eq!(value["deletions"]["needs_consent"], true);
+    assert_eq!(value["status"]["guard"]["needs_consent"], true);
 
     let (value, code) = world.json(&a, &["sync", "--allow-deletions"]);
     assert_eq!(code, 0, "{value}");
@@ -1079,7 +1346,7 @@ fn a_held_lock_exits_4() {
 
     let (value, code) = world.json(&a, &["status"]);
     assert_eq!(code, 0, "status reads without the lock");
-    assert_eq!(value["lock"]["held"], true);
+    assert_eq!(value["lock"]["state"], "held");
     assert_eq!(value["lock"]["owner"]["host"], "other-computer");
 
     assert_eq!(world.json(&a, &["sync", "--break-lock"]).1, 0);
@@ -1145,6 +1412,72 @@ fn other_errors_exit_1() {
             .unwrap()
             .contains("rmu hub clone")
     );
+}
+
+#[test]
+fn remote_set_url_and_detach() {
+    let world = World::new();
+    let origin = world.origin();
+    let a = world.tablet("a", |b| with_pdf(b, 1, "Paper"));
+    assert_eq!(world.json(&a, &["init", &origin]).1, 0);
+    assert_eq!(
+        world.json(&a, &["clone", &origin, "--name", "Tablet A"]).1,
+        0
+    );
+
+    let (value, code) = world.json(&a, &["remote"]);
+    assert_eq!(code, 0, "{value}");
+    assert_eq!(value["origin"], origin.as_str());
+    assert_eq!(value["effective"], origin.as_str());
+    assert_eq!(value["device_name"], "Tablet A");
+    let (value, _) = world.json(&a, &["remote", "--origin", "/elsewhere.git"]);
+    assert_eq!(value["origin"], origin.as_str());
+    assert_eq!(value["effective"], "/elsewhere.git");
+
+    // A copy of origin (moved to another path) is accepted.
+    let moved = world.scratch.join("moved.git").display().to_string();
+    let copied = std::process::Command::new("cp")
+        .args(["-R", &origin, &moved])
+        .status()
+        .unwrap();
+    assert!(copied.success());
+    let (stdout, stderr, code) = world.run(&a, &["remote", "set-url", &moved], Output::Plain);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(stdout, format!("{moved}\n"));
+    assert!(
+        stderr.contains(&format!("changed from {origin} to {moved}")),
+        "{stderr}"
+    );
+    assert_eq!(world.json(&a, &["sync"]).1, 0);
+
+    // Another repository is refused before anything is stored.
+    let other = world.scratch.join("other.git").display().to_string();
+    assert_eq!(world.json(&a, &["init", &other]).1, 0);
+    let (value, code) = world.json(&a, &["remote", "set-url", &other]);
+    assert_eq!(code, 5, "{value}");
+    assert_eq!(world.json(&a, &["remote"]).0["origin"], moved.as_str());
+
+    let (value, code) = world.json(&a, &["detach", "--prune-ref"]);
+    assert_eq!(code, 0, "{value}");
+    assert_eq!(value["command"], "detach");
+    assert!(
+        value["pruned"].as_str().unwrap().contains("rmu/devices/"),
+        "{value}"
+    );
+    assert!(
+        a.read_file(&format!("{}.pdf", doc(1))).is_some(),
+        "documents stay"
+    );
+    let (value, code) = world.json(&a, &["status"]);
+    assert_eq!(code, 1);
+    assert!(
+        value["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("not attached")
+    );
+    let (value, code) = world.json(&a, &["clone", &moved]);
+    assert_eq!(code, 0, "{value}");
 }
 
 #[test]

@@ -40,7 +40,7 @@ This repository is **open source** (dual-licensed MIT OR Apache-2.0):
 | `nix/lib/git-hooks.nix` | Pre-commit hooks: treefmt + clippy (offline vendored)  |
 | `libremarkable-utils/`  | Library crate (see module map below)                   |
 | `rmu/`                  | `rmu` CLI binary crate (clap; all config via flags, no config file) |
-| `rmu/src/hub.rs`, `rmu/src/hub/` | `rmu hub` over the library's `Hub`: arguments, `execute` (runs a command on any `&dyn Tablet`), exit statuses (`Failure`), `finish` (output and error details); pure `render.rs` (human summary, plain ids) and `json.rs` (stable `--json` mirrors of the reports: add fields, never rename). Tests: `hub/tests.rs` (fabricated reports; commands against the fake tablet), `rmu/tests/hub_cli.rs` (the real binary over a mock `ssh` that rewrites the tablet's paths into a scratch dir) |
+| `rmu/src/hub.rs`, `rmu/src/hub/` | `rmu hub` over the library's `Hub`: arguments, `execute` (runs a command on any `&dyn Tablet`), exit statuses (`Failure`), `finish` (output and error details); pure `render.rs` (human summary, plain ids) and `json.rs` (`--json`: the library's serialised reports plus `command`, and the error object; tests pin each command's top-level fields). Tests: `hub/tests.rs` (fabricated reports; commands against the fake tablet), `rmu/tests/hub_cli.rs` (the real binary over a mock `ssh` that rewrites the tablet's paths into a scratch dir) |
 | `test-support/`         | Unpublished dev-dependency: helpers shared by tests (`Scratch` temp dirs with mock `bin/` + `PATH`, `write_script`, `rerun_test`, `assert_success`, `set_modified`) |
 | `Cargo.toml`            | Workspace root; shared deps in `[workspace.dependencies]` |
 

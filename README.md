@@ -154,12 +154,18 @@ rmu hub sync                       # back up, merge, push, apply
 rmu hub status                     # changes since the last sync, conflict copies
 rmu hub sync --dry-run             # what a sync would write and delete
 rmu hub backup                     # back up to origin only; nothing is merged
+
+rmu hub remote                     # the origin URL stored on the tablet
+rmu hub remote set-url ssh://git@new-server.example/library.git
+rmu hub detach --prune-ref         # forget the hub (documents stay), drop its backups
 ```
 
 The tablet is chosen with the usual flags (`--host`, ssh config
 aliases, ...). The origin's URL is stored on the tablet at clone time;
 `--origin <url>` overrides it for one run, since ssh aliases differ
-between computers. The computer running `rmu` needs git 2.30 or newer.
+between computers; `remote set-url` changes it for good (the new URL
+must hold the same repository). The computer running `rmu` needs git
+2.30 or newer.
 
 Things to know:
 
@@ -198,17 +204,24 @@ Recovery:
   goes stale by itself once the tablet reboots or the watchdog fires;
   otherwise `--break-lock` takes it over once you are sure no other run
   is working on the tablet.
-- *Origin rewound or replaced, or the tablet's hub state lost*: `rmu hub
-  clone <origin> --reattach` attaches the tablet again, keeping its
-  documents; versions that match origin's history fast-forward, the rest
-  merge as new.
+- *An interrupted sync and then a reattach*: `clone --reattach` refuses
+  while the interrupted sync's journal is pending; run `rmu hub sync`
+  first.
+- *Origin rewound or replaced*: `rmu hub clone <origin> --reattach`
+  attaches the tablet again, keeping its documents and device id;
+  versions that match origin's history fast-forward, the rest merge as
+  new. A tablet whose hub state was lost or detached attaches with a
+  plain `rmu hub clone <origin>` the same way.
 
-Every `rmu hub` command prints a summary on a terminal and stable JSON
-with `--json` (errors included). When stdout is not a terminal it prints
-plain results instead, and the summary goes to stderr: the repository id
-for `init`, the commit the tablet is at for `clone` and `sync`, the
-backup commit for `backup`, `A`/`M`/`D <id>` per change for `status`,
-and `write`/`delete <id>` per document for `sync --dry-run`. Exit
+Every `rmu hub` command prints a summary on a terminal and JSON with
+`--json`: the command's report as the library defines it, plus a
+`command` field (fields are only ever added), or `{"error": {"kind",
+"exit_code", "message"}}`. When stdout is not a terminal it prints plain
+results instead, and the summary goes to stderr: the repository id for
+`init`, the commit the tablet is at for `clone` and `sync`, the backup
+commit for `backup`, `A`/`M`/`D <id>` per change for `status`,
+`write`/`delete <id>` per document for `sync --dry-run`, the stored URL
+for `remote`, and the deleted ref for `detach --prune-ref`. Exit
 statuses:
 
 | Status | Meaning                                                           |
@@ -220,6 +233,7 @@ statuses:
 | 4      | the tablet is locked or busy (see `--break-lock`)                 |
 | 5      | origin does not match the tablet (see `clone --reattach`)         |
 | 6      | the tablet is paired with the reMarkable cloud                    |
+| 7      | an interrupted sync must be finished first (`rmu hub sync`)       |
 
 See `docs/hub-design.md` for the full design.
 
