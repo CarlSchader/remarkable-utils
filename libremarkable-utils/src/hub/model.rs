@@ -591,7 +591,7 @@ macro_rules! json_path {
 }
 
 /// The two JSON files whose fields the rules distinguish.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum JsonFile {
     Metadata,
     Content,

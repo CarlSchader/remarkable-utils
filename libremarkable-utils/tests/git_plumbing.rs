@@ -1241,7 +1241,7 @@ fn rev_list_follows_first_parents_and_stops_at_exclusions() {
 }
 
 #[test]
-fn present_objects_checks_existence_without_reading_content() {
+fn object_sizes_checks_existence_without_reading_content() {
     let sandbox = Sandbox::new();
     let cache = sandbox.init("cache.git");
     let big = pattern(3 * 1024 * 1024, 7);
@@ -1252,11 +1252,12 @@ fn present_objects_checks_existence_without_reading_content() {
     let ids: Vec<Oid> = std::iter::repeat_n(blob.clone(), 20_000)
         .chain([absent.clone(), commit.clone()])
         .collect();
-    let present = cache.present_objects(&ids).unwrap();
+    let present = cache.object_sizes(&ids).unwrap();
     assert_eq!(present.len(), 2);
-    assert!(present.contains(&blob) && present.contains(&commit));
-    assert!(!present.contains(&absent));
-    assert!(cache.present_objects(&[]).unwrap().is_empty());
+    assert_eq!(present.get(&blob), Some(&(3 * 1024 * 1024)));
+    assert!(present.contains_key(&commit));
+    assert!(!present.contains_key(&absent));
+    assert!(cache.object_sizes(&[]).unwrap().is_empty());
 }
 
 #[test]

@@ -31,7 +31,7 @@
 //!
 //! Requires git 2.30 or newer (`rev-parse --end-of-options`).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs;
@@ -582,18 +582,19 @@ impl Repo {
             .collect()
     }
 
-    /// Which of `oids` the repository has, in one `cat-file --batch-check`
-    /// (headers only: no object content is read).
-    pub fn present_objects<'a>(
+    /// The size of each of `oids` the repository has (absent ones are
+    /// left out), in one `cat-file --batch-check`: headers only, no object
+    /// content is read.
+    pub fn object_sizes<'a>(
         &self,
         oids: impl IntoIterator<Item = &'a Oid>,
-    ) -> Result<HashSet<Oid>> {
+    ) -> Result<HashMap<Oid, u64>> {
         let request: Vec<u8> = oids
             .into_iter()
             .flat_map(|oid| format!("{oid}\n").into_bytes())
             .collect();
         if request.is_empty() {
-            return Ok(HashSet::new());
+            return Ok(HashMap::new());
         }
         let mut cmd = self.command("cat-file");
         cmd.arg("--batch-check");
@@ -622,7 +623,7 @@ impl Repo {
         out.split_inclusive(|&b| b == b'\n')
             .map(parse_batch_header)
             .filter_map(|header| match header {
-                Ok(BatchHeader::Found { oid, .. }) => Some(Ok(oid)),
+                Ok(BatchHeader::Found { oid, size, .. }) => Some(Ok((oid, size))),
                 Ok(BatchHeader::Missing(_)) => None,
                 Err(error) => Some(Err(error)),
             })
