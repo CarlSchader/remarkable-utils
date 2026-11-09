@@ -209,7 +209,9 @@ pub struct HubOptions {
     pub break_lock: bool,
     pub thresholds: GuardThresholds,
     /// Origin URL for this invocation (`--origin`); the tablet's stored
-    /// one otherwise.
+    /// one otherwise. `sync`, `backup`, `status`, `dry_run`, `remote` and
+    /// `detach` use it; `init`, `clone_tablet` and `set_remote_url` take
+    /// their origin as an argument and ignore it.
     pub origin: Option<String>,
     /// The date in fork names, `yyyy-mm-dd`; today (UTC) if `None`.
     pub date: Option<String>,
