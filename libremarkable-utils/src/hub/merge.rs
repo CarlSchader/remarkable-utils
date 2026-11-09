@@ -129,8 +129,9 @@ impl<S: std::hash::BuildHasher> BlobSource for HashMap<Oid, Vec<u8>, S> {
 pub trait History {
     /// The present versions of `doc` in origin's history: theirs itself
     /// and its first-parent ancestors (never device refs), newest first.
-    /// Called only for parents an item would otherwise lack, so theirs
-    /// itself never has them.
+    /// Called only for a parent an item would otherwise lack, when
+    /// neither theirs nor the base has that parent present outside the
+    /// trash.
     fn present_versions(&self, doc: &DocId) -> Result<Vec<DocVersion>>;
 }
 
@@ -314,7 +315,8 @@ pub enum NoteKind {
     /// The `.content` format is unknown to this rmu, so the document was
     /// compared as opaque JSON.
     Opaque,
-    /// Edited on one side while in the trash on the other: restored.
+    /// Moved out of the trash because it, or a document inside it, was
+    /// edited on a side that did not trash it.
     RestoredFromTrash { parent: String },
     /// Brought back from history because a present item needed it.
     Resurrected,
@@ -352,7 +354,7 @@ impl fmt::Display for Note {
             NoteKind::Opaque => write!(f, "{doc}: unknown .content format; compared as a whole"),
             NoteKind::RestoredFromTrash { parent } => write!(
                 f,
-                "{doc}: edited while in the trash on the other side; restored to {}",
+                "{doc}: moved out of the trash to {}, so an edit is not lost",
                 place(parent)
             ),
             NoteKind::Resurrected => {
@@ -1503,6 +1505,8 @@ struct State {
     moved_in: BTreeSet<DocId>,
     /// Parents looked up in history (found or not).
     tried: BTreeSet<DocId>,
+    /// Memoised [`is_edit`] answers.
+    edit_status: BTreeMap<(DocId, Side), bool>,
     resurrections: usize,
 }
 
@@ -1562,6 +1566,17 @@ fn trash_path(items: &BTreeMap<DocId, TreeItem>, start: &DocId) -> Option<Vec<Do
     Some(walk[..=end].to_vec())
 }
 
+/// Whether `start`'s path reaches the trash (no allocation).
+fn on_trash_path(items: &BTreeMap<DocId, TreeItem>, start: &DocId) -> bool {
+    std::iter::successors(Some(start.clone()), |id| tree_parent(items, id))
+        .take(items.len() + 1)
+        .any(|id| {
+            items
+                .get(&id)
+                .is_some_and(|item| item.parent == TRASH_PARENT)
+        })
+}
+
 /// Whether `item` may be moved under `parent` without creating an
 /// orphan or a cycle: the root, or a present folder not below `item`.
 fn safe_parent(items: &BTreeMap<DocId, TreeItem>, item: &DocId, parent: &str) -> bool {
@@ -1580,7 +1595,7 @@ fn safe_parent(items: &BTreeMap<DocId, TreeItem>, item: &DocId, parent: &str) ->
 fn trash_free_parent(items: &BTreeMap<DocId, TreeItem>, item: &DocId, parent: &str) -> bool {
     safe_parent(items, item, parent)
         && (parent.is_empty()
-            || DocId::new(parent).is_ok_and(|parent| trash_path(items, &parent).is_none()))
+            || DocId::new(parent).is_ok_and(|parent| !on_trash_path(items, &parent)))
 }
 
 /// The parsed metadata of a merged version.
@@ -1596,35 +1611,29 @@ fn merged_metadata(ctx: &Ctx, id: &DocId, version: &MergedVersion) -> Result<Val
     }
 }
 
-/// `side` changed `doc`'s fork-class content outside its own trash, so
-/// `doc` must not end up on a trash path (edits beat deletion).
-struct Edit {
-    doc: DocId,
+/// Whether `side` changed `doc`'s fork-class content outside its own
+/// trash, so `doc` must not end up on a trash path (edits beat
+/// deletion). Decided only for documents found on a trash path, and
+/// memoised: the tree rules move items, they never change what a side
+/// did, so an ordinary sync parses nothing for it.
+fn is_edit(
+    ctx: &Ctx,
+    memo: &mut BTreeMap<(DocId, Side), bool>,
+    doc: &DocId,
     side: Side,
-}
-
-/// Every edit among the present merged documents. Fixed for the whole
-/// tree pass: the tree rules move items, they never change what a side
-/// did.
-fn edits(ctx: &Ctx, state: &State) -> Result<Vec<Edit>> {
-    state
-        .metadata
-        .keys()
-        .flat_map(|id| [(id, Side::Ours), (id, Side::Theirs)])
-        .filter(|(id, side)| {
-            let sides = ctx.sides(id);
-            present(sides.side(*side)) && sides.side(*side) != sides.base
-        })
-        .map(|(id, side)| -> Result<Option<Edit>> {
-            // New on that side: changed without reading anything.
-            let changed = !present(ctx.sides(id).base) || ctx.fork_changed(id, side)?;
-            Ok((changed && !ctx.in_own_trash(id, side)?).then(|| Edit {
-                doc: id.clone(),
-                side,
-            }))
-        })
-        .filter_map(Result::transpose)
-        .collect()
+) -> Result<bool> {
+    if let Some(known) = memo.get(&(doc.clone(), side)) {
+        return Ok(*known);
+    }
+    let sides = ctx.sides(doc);
+    let version = sides.side(side);
+    // New on that side: changed without reading anything.
+    let edit = present(version)
+        && version != sides.base
+        && (!present(sides.base) || ctx.fork_changed(doc, side)?)
+        && !ctx.in_own_trash(doc, side)?;
+    memo.insert((doc.clone(), side), edit);
+    Ok(edit)
 }
 
 /// Tree rules in rounds of trash vs edit, orphans, cycles, until a round
@@ -1638,11 +1647,10 @@ fn edits(ctx: &Ctx, state: &State) -> Result<Vec<Edit>> {
 /// nothing. Anything else is an error, as is a tree left with
 /// violations.
 fn tree_rules(ctx: &Ctx, history: &dyn History, state: State) -> Result<State> {
-    let edits = edits(ctx, &state)?;
     let (state, _) = fixpoint(state, 2, "tree rules", |state| {
         let bound = 2 * state.items.len() + 1;
         let (state, restored) = fixpoint(state, bound, "trash vs edit", |state| {
-            restore_step(ctx, &edits, state)
+            restore_step(ctx, state)
         })?;
         let bound = state.items.len() + 2 * MAX_RESURRECTIONS;
         let (state, resurrected) = fixpoint(state, bound, "orphans", |state| {
@@ -1675,14 +1683,33 @@ fn tree_rules(ctx: &Ctx, history: &dyn History, state: State) -> Result<State> {
 /// trash-free path for good: items off trash paths never move and their
 /// paths never change, since every move is of an item on a trash path
 /// (at most one per item). So there are at most two moves per item.
-fn restore_step(ctx: &Ctx, edits: &[Edit], mut state: State) -> Result<(State, bool)> {
-    let Some((edit, path)) = edits
-        .iter()
-        .find_map(|edit| trash_path(&state.items, &edit.doc).map(|path| (edit, path)))
-    else {
+fn restore_step(ctx: &Ctx, mut state: State) -> Result<(State, bool)> {
+    // Documents in item order, sides ours then theirs (deterministic),
+    // stopping at the first edit.
+    let found = {
+        let State {
+            items, edit_status, ..
+        } = &mut state;
+        items
+            .keys()
+            .filter(|doc| on_trash_path(items, doc))
+            .flat_map(|doc| [(doc, Side::Ours), (doc, Side::Theirs)])
+            .try_fold((), |(), (doc, side)| {
+                match is_edit(ctx, edit_status, doc, side) {
+                    Ok(true) => ControlFlow::Break(Ok(Some((doc.clone(), side)))),
+                    Ok(false) => ControlFlow::Continue(()),
+                    Err(err) => ControlFlow::Break(Err(err)),
+                }
+            })
+    };
+    let Some((doc, side)) = (match found {
+        ControlFlow::Break(result) => result?,
+        ControlFlow::Continue(()) => None,
+    }) else {
         return Ok((state, false));
     };
-    let (item, parent) = restore_move(ctx, &state.items, edit.side, &path)?;
+    let path = trash_path(&state.items, &doc).expect("a candidate is on a trash path");
+    let (item, parent) = restore_move(ctx, &state.items, side, &path)?;
     state.set_parent(&item, &parent);
     state.note(&item, NoteKind::RestoredFromTrash { parent });
     state.moved_in.insert(item);
@@ -1725,10 +1752,10 @@ fn restore_move(
 }
 
 /// Tree rule 2, one step: a present item whose parent is missing gets
-/// that parent back from origin's history (a resurrected folder that was
-/// in the trash returns to its last location outside it); without
-/// history, or for a parent that is not a folder, the item moves to the
-/// root.
+/// that parent back: theirs' or the base's own version, else origin's
+/// history (a resurrected folder that was in the trash returns to its
+/// last location outside it); without any, or for a parent that is not
+/// a folder, the item moves to the root.
 ///
 /// Bound: each step resurrects a parent never looked up before (at most
 /// [`MAX_RESURRECTIONS`]) or moves an item to the root, after which it
@@ -1757,7 +1784,7 @@ fn orphan_step(ctx: &Ctx, history: &dyn History, mut state: State) -> Result<(St
                         return Err(MergeError::TooManyResurrections(MAX_RESURRECTIONS).into());
                     }
                     state.tried.insert(id.clone());
-                    history.present_versions(id)?
+                    parent_versions(ctx, history, id)?
                 }
                 None => Vec::new(),
             };
@@ -1793,6 +1820,27 @@ fn orphan_step(ctx: &Ctx, history: &dyn History, mut state: State) -> Result<(St
         TreeViolation::Cycle(_) => unreachable!("parent_violations reports no cycles"),
     }
     Ok((state, true))
+}
+
+/// The versions a missing parent can come back from, newest first:
+/// theirs' or the base's own version first (origin may still have the
+/// folder the tablet deleted), then origin's history, which is needed
+/// only when neither has it present outside the trash.
+fn parent_versions(ctx: &Ctx, history: &dyn History, id: &DocId) -> Result<Vec<DocVersion>> {
+    let sides = ctx.sides(id);
+    let local = [sides.theirs, sides.base]
+        .into_iter()
+        .flatten()
+        .find(|version| version.is_present());
+    match local {
+        Some(version) if ctx.side_parent(id, Some(version))?.as_deref() != Some(TRASH_PARENT) => {
+            Ok(vec![version.clone()])
+        }
+        Some(version) => Ok(std::iter::once(version.clone())
+            .chain(history.present_versions(id)?)
+            .collect()),
+        None => history.present_versions(id),
+    }
 }
 
 /// The newest version's metadata, with its parent replaced by the last

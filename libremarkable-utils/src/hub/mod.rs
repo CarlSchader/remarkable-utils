@@ -15,10 +15,11 @@
 //!   or a fault-injecting fake.
 //!
 //! Errors: pure functions that fail only on their own terms return
-//! their module's error ([`model::ModelError`], [`merge::MergeError`]);
-//! functions that call caller-supplied readers return [`crate::Result`],
-//! and their own failures are variants of [`crate::Error`]
-//! (`HubModel`, `HubMerge`, `HubDevice`). Hub errors never wrap [`crate::Error`].
+//! their module's error ([`model::ModelError`], [`merge::MergeError`],
+//! [`device::DeviceError`]). Functions that do I/O or call
+//! caller-supplied readers return [`crate::Result`]; their own failures
+//! are the variants `HubModel`, `HubMerge` and `HubDevice` of
+//! [`crate::Error`]. Hub errors never wrap [`crate::Error`].
 
 pub mod device;
 pub mod merge;
