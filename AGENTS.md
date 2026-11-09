@@ -68,6 +68,8 @@ This repository is **open source** (dual-licensed MIT OR Apache-2.0):
   against temp repos must stay hermetic (`GIT_CONFIG_GLOBAL=/dev/null`,
   `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_COUNT=0`, `GIT_DEFAULT_HASH=sha1`,
   temp `HOME`).
+  `Oid` (strict lowercase hex) and `FileMode` are shared with
+  `hub/model.rs`; don't add parallel id or mode types.
 - `xochitl.rs` — on-device file formats and **pure** tree logic (path/UUID
   resolution, glob matching/expansion, ambiguity rejection,
   conflict/cycle checks, rendering). Keep this module I/O-free so it
@@ -103,6 +105,8 @@ This repository is **open source** (dual-licensed MIT OR Apache-2.0):
   marker-sectioned SSH round trip, pure best-effort parsing (every
   field `Option`al — firmware/models differ), pure rendering.
 - `error.rs` — typed errors (`thiserror`).
+- `relative_path.rs` — the pure safe relative-path splitter shared by
+  `sync.rs` and `hub/model.rs`.
 
 ## reMarkable domain knowledge
 

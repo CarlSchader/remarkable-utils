@@ -1075,6 +1075,44 @@ fn existing_trees_carry_forward_whole_subtrees() {
 }
 
 #[test]
+fn gitlinks_carry_forward_as_single_entries_but_have_no_content() {
+    let sandbox = Sandbox::new();
+    let cache = sandbox.init("cache.git");
+    // A submodule commit the repository does not have: git never needs it.
+    let foreign: Oid = "1234567890123456789012345678901234567890".parse().unwrap();
+
+    let mut writer = cache.commit_writer(&NoProgress, None).unwrap();
+    writer
+        .add_existing("docs/c/sub", FileMode::Gitlink, &foreign)
+        .unwrap();
+    writer
+        .add_bytes("docs/c/metadata", FileMode::Regular, b"{}")
+        .unwrap();
+    let commit = writer.commit(&meta(&[], "gitlink\n")).unwrap();
+    let sub = cache
+        .ls_tree_recursive(commit.as_str())
+        .unwrap()
+        .into_iter()
+        .find(|e| e.path == b"docs/c/sub")
+        .unwrap();
+    assert_eq!(
+        (FileMode::from_bits(sub.mode), sub.kind, sub.oid),
+        (Some(FileMode::Gitlink), ObjectKind::Commit, foreign)
+    );
+
+    // A blob with gitlink mode is refused before anything is written, and
+    // the writer stays usable.
+    let mut writer = cache.commit_writer(&NoProgress, None).unwrap();
+    assert!(matches!(
+        writer.add_bytes("docs/c/sub", FileMode::Gitlink, b"x"),
+        Err(Error::InvalidGitInput(_))
+    ));
+    writer.add_bytes("a", FileMode::Regular, b"1").unwrap();
+    writer.commit(&meta(&[], "after\n")).unwrap();
+    assert_eq!(crash_reports(&cache), Vec::<String>::new());
+}
+
+#[test]
 fn fetch_prunes_only_on_request_and_signing_config_is_ignored() {
     let sandbox = Sandbox::new();
     let origin = sandbox.init("origin.git");

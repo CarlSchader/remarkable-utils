@@ -27,6 +27,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
+use crate::git::{self, FileMode, ObjectKind, Oid};
+use crate::relative_path::split_safe_relative;
 use crate::xochitl::{self, ItemKind};
 
 /// Repository path of the origin's identity and rules file.
@@ -64,22 +66,25 @@ pub enum ModelError {
     #[error("invalid page id '{0}'")]
     InvalidPageId(String),
 
-    /// A git object id that is not 40 or 64 lowercase hex digits.
-    #[error("invalid object id '{0}': expected 40 or 64 lowercase hex digits")]
-    InvalidObjectId(String),
-
     /// A repo or device id that is not a canonical lowercase UUID.
     #[error("invalid id '{0}': expected a lowercase UUID")]
     InvalidId(String),
 
-    /// A device name that is empty, too long, or has control characters.
-    #[error("invalid device name {0:?}: must be 1 to 64 characters without control characters")]
+    /// A device name that is empty, too long, or has control characters
+    /// or angle brackets (git identities cannot contain `<` or `>`).
+    #[error(
+        "invalid device name {0:?}: must be 1 to 64 characters without control characters, '<' or '>'"
+    )]
     InvalidDeviceName(String),
 
     /// A repository path that is not UTF-8. Never converted lossily: that
     /// would rename a carried-forward path, in effect deleting it.
     #[error("repository path '{}' is not UTF-8", .0.escape_ascii())]
     NonUtf8Path(Vec<u8>),
+
+    /// A tree entry whose mode git does not write for non-tree entries.
+    #[error("repository path '{path}' has unsupported mode {mode:06o}")]
+    UnsupportedEntryMode { path: String, mode: u32 },
 
     /// A repository path outside `docs/<uuid>/` and `.rmu/`.
     #[error("repository path '{0}' is outside docs/<uuid>/ and .rmu/")]
@@ -145,12 +150,9 @@ fn is_page_id(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
-fn is_object_id(s: &str) -> bool {
-    matches!(s.len(), 40 | 64) && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-}
-
 fn is_device_name(s: &str) -> bool {
-    (1..=MAX_DEVICE_NAME_CHARS).contains(&s.chars().count()) && !s.chars().any(char::is_control)
+    (1..=MAX_DEVICE_NAME_CHARS).contains(&s.chars().count())
+        && !s.chars().any(|c| c.is_control() || c == '<' || c == '>')
 }
 
 fn is_safe_relative_path(s: &str) -> bool {
@@ -222,14 +224,6 @@ validated_id!(
 );
 
 validated_id!(
-    /// A git object id (blob, tree or commit): 40 (SHA-1) or 64
-    /// (SHA-256) lowercase hex digits.
-    ObjectId,
-    is_object_id,
-    InvalidObjectId
-);
-
-validated_id!(
     /// The origin's identity, created by `init` (a random UUID).
     RepoId,
     is_canonical_uuid,
@@ -246,8 +240,9 @@ validated_id!(
 
 validated_id!(
     /// A tablet's user-chosen name: 1 to 64 characters, no control
-    /// characters. It ends up in git identities, fork names and commit
-    /// trailers, so a newline must never get through.
+    /// characters, no `<` or `>`. It ends up in git identities (which
+    /// cannot contain angle brackets), fork names and commit trailers, so
+    /// a newline must never get through.
     DeviceName,
     is_device_name,
     InvalidDeviceName
@@ -505,16 +500,7 @@ pub enum RepoPath {
 /// Split a relative path into components, rejecting absolute paths,
 /// empty, `.` and `..` components, and NUL bytes.
 fn checked_components(path: &str) -> Result<Vec<&str>> {
-    let components: Vec<&str> = path.split('/').collect();
-    let safe = !path.contains('\0')
-        && components
-            .iter()
-            .all(|c| !c.is_empty() && *c != "." && *c != "..");
-    if safe {
-        Ok(components)
-    } else {
-        Err(ModelError::UnsafePath(path.to_string()))
-    }
+    split_safe_relative(path).ok_or_else(|| ModelError::UnsafePath(path.to_string()))
 }
 
 /// `<uuid>` or `<uuid>.<ext>` (split at the first dot).
@@ -1007,10 +993,10 @@ impl StatSignature {
 #[serde(from = "ManifestTuple", into = "ManifestTuple")]
 pub struct ManifestEntry {
     pub stat: StatSignature,
-    pub blob: ObjectId,
+    pub blob: Oid,
 }
 
-type ManifestTuple = (u64, i64, i64, u64, ObjectId);
+type ManifestTuple = (u64, i64, i64, u64, Oid);
 
 impl From<ManifestTuple> for ManifestEntry {
     fn from((size, mtime_ns, ctime_ns, inode, blob): ManifestTuple) -> Self {
@@ -1042,8 +1028,8 @@ impl From<ManifestEntry> for ManifestTuple {
 /// reconciled (see "Restartability").
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Journal {
-    pub merge: ObjectId,
-    pub snapshot: ObjectId,
+    pub merge: Oid,
+    pub snapshot: Oid,
 }
 
 /// The hub state stored on the tablet ([`TABLET_STATE_PATH`]).
@@ -1061,14 +1047,14 @@ pub struct TabletState {
     /// is required: a silently missing base would bring back every
     /// deletion.
     #[serde(deserialize_with = "Option::deserialize")]
-    pub base: Option<ObjectId>,
+    pub base: Option<Oid>,
     /// Documents whose base differs from `base`; `None` is the empty
     /// base.
     #[serde(default)]
-    pub base_overrides: BTreeMap<DocId, Option<ObjectId>>,
+    pub base_overrides: BTreeMap<DocId, Option<Oid>>,
     /// Device-ref head, written right after each device-ref push.
     #[serde(deserialize_with = "Option::deserialize")]
-    pub device_ref: Option<ObjectId>,
+    pub device_ref: Option<Oid>,
     /// Xochitl-relative path → stat signature and blob at last record.
     /// Racy entries are left out (see [`StatSignature::keep_in_manifest`]).
     #[serde(default)]
@@ -1121,7 +1107,7 @@ impl TabletState {
     }
 
     /// The base commit of one document (`None` = empty base).
-    pub fn base_for(&self, doc: &DocId) -> Option<&ObjectId> {
+    pub fn base_for(&self, doc: &DocId) -> Option<&Oid> {
         self.base_overrides
             .get(doc)
             .map_or(self.base.as_ref(), Option::as_ref)
@@ -1130,68 +1116,65 @@ impl TabletState {
 
 // ---- trees and documents ---------------------------------------------------
 
-/// A git tree entry's mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum EntryMode {
-    Regular,
-    Executable,
-    Symlink,
-    Gitlink,
-}
-
-impl EntryMode {
-    /// Parse git's octal mode (`100644`, `100755`, `120000`, `160000`).
-    pub fn from_octal(mode: &str) -> Option<Self> {
-        match mode {
-            "100644" => Some(EntryMode::Regular),
-            "100755" => Some(EntryMode::Executable),
-            "120000" => Some(EntryMode::Symlink),
-            "160000" => Some(EntryMode::Gitlink),
-            _ => None,
-        }
-    }
-
-    /// Regular or executable: content that can be written to a file.
-    pub fn is_file(self) -> bool {
-        matches!(self, EntryMode::Regular | EntryMode::Executable)
-    }
-
-    pub fn as_octal(self) -> &'static str {
-        match self {
-            EntryMode::Regular => "100644",
-            EntryMode::Executable => "100755",
-            EntryMode::Symlink => "120000",
-            EntryMode::Gitlink => "160000",
-        }
-    }
-}
-
-/// One non-tree entry of a recursive tree listing.
+/// One non-tree entry of a [`TreeListing`]. Unlike [`git::TreeEntry`]
+/// (a raw `ls-tree` record with a byte path), its path is the listing's
+/// key, as UTF-8.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct TreeEntry {
-    pub mode: EntryMode,
-    pub id: ObjectId,
+pub struct ListingEntry {
+    pub mode: FileMode,
+    pub id: Oid,
 }
 
-impl TreeEntry {
-    pub fn regular(id: ObjectId) -> Self {
+impl ListingEntry {
+    pub fn regular(id: Oid) -> Self {
         Self {
-            mode: EntryMode::Regular,
+            mode: FileMode::Regular,
             id,
         }
     }
 }
 
 /// A flat, recursive tree listing: repository path → entry.
-pub type TreeListing = BTreeMap<String, TreeEntry>;
+pub type TreeListing = BTreeMap<String, ListingEntry>;
+
+/// Build a [`TreeListing`] from a raw recursive listing
+/// ([`git::Repo::ls_tree_recursive`]). This is the one place where git's
+/// byte paths become the model's string paths: a non-UTF-8 path is
+/// refused ([`ModelError::NonUtf8Path`]), never converted lossily, since
+/// a renamed carried-forward path would in effect be deleted. Tree
+/// entries are dropped (their contents imply them); any other mode git
+/// does not write is refused ([`ModelError::UnsupportedEntryMode`]).
+pub fn tree_listing(entries: impl IntoIterator<Item = git::TreeEntry>) -> Result<TreeListing> {
+    entries
+        .into_iter()
+        .filter(|entry| entry.kind != ObjectKind::Tree)
+        .map(|entry| {
+            let path = String::from_utf8(entry.path)
+                .map_err(|err| ModelError::NonUtf8Path(err.into_bytes()))?;
+            let mode = FileMode::from_bits(entry.mode).ok_or_else(|| {
+                ModelError::UnsupportedEntryMode {
+                    path: path.clone(),
+                    mode: entry.mode,
+                }
+            })?;
+            Ok((
+                path,
+                ListingEntry {
+                    mode,
+                    id: entry.oid,
+                },
+            ))
+        })
+        .collect()
+}
 
 /// One document's version in a tree: its `docs/<uuid>/` subtree.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DocVersion {
     /// Files the rules mirror.
-    pub files: BTreeMap<DocFile, TreeEntry>,
+    pub files: BTreeMap<DocFile, ListingEntry>,
     /// Other paths in the subtree (relative to it), carried forward.
-    pub other: BTreeMap<String, TreeEntry>,
+    pub other: BTreeMap<String, ListingEntry>,
 }
 
 impl DocVersion {
@@ -1234,26 +1217,22 @@ pub struct RepoTree {
 }
 
 impl MirrorRules {
-    /// Group a flat tree listing into per-document versions.
+    /// Group a flat tree listing into per-document versions. Listings
+    /// from git come through [`tree_listing`], which refuses non-UTF-8
+    /// paths.
     ///
-    /// Paths may come as strings or as git's raw bytes: a non-UTF-8 path
-    /// is refused ([`ModelError::NonUtf8Path`]), never converted lossily,
-    /// since a renamed carried-forward path would in effect be deleted.
     /// Only regular and executable entries count as mirrored files;
     /// anything else at a mirrored name (a symlink, a gitlink) goes to
     /// [`DocVersion::other`]: carried forward, never applied. Also fails
     /// on unsafe paths, which git trees cannot normally contain.
-    pub fn group_tree<P: AsRef<[u8]>>(
+    pub fn group_tree(
         &self,
-        listing: impl IntoIterator<Item = (P, TreeEntry)>,
+        listing: impl IntoIterator<Item = (String, ListingEntry)>,
     ) -> Result<RepoTree> {
         listing
             .into_iter()
             .try_fold(RepoTree::default(), |mut tree, (path, entry)| {
-                let bytes = path.as_ref();
-                let path = std::str::from_utf8(bytes)
-                    .map_err(|_| ModelError::NonUtf8Path(bytes.to_vec()))?;
-                match self.parse_repo_path(path) {
+                match self.parse_repo_path(&path) {
                     Ok(RepoPath::Mirrored(file)) if entry.mode.is_file() => {
                         tree.docs
                             .entry(file.doc)
@@ -1273,7 +1252,7 @@ impl MirrorRules {
                     }
                     Ok(RepoPath::Rmu(_))
                     | Err(ModelError::OutsideLayout(_) | ModelError::InvalidDocId(_)) => {
-                        tree.extra.insert(path.to_string(), entry);
+                        tree.extra.insert(path, entry);
                     }
                     Err(err) => return Err(err),
                 }
@@ -1509,7 +1488,7 @@ fn check_document<'a>(
 // ---- carry-forward ---------------------------------------------------------
 
 /// A snapshot's mirrored files and their blob ids.
-pub type SnapshotFiles = BTreeMap<MirroredFile, ObjectId>;
+pub type SnapshotFiles = BTreeMap<MirroredFile, Oid>;
 
 /// Build the snapshot tree from the base tree (each document at its own
 /// base version; group both with the repository's rules).
@@ -1535,11 +1514,11 @@ pub fn carry_forward(
     validation: &SnapshotValidation,
 ) -> Result<RepoTree> {
     let snapshot_docs = snapshot.iter().fold(
-        BTreeMap::<&DocId, BTreeMap<DocFile, TreeEntry>>::new(),
+        BTreeMap::<&DocId, BTreeMap<DocFile, ListingEntry>>::new(),
         |mut docs, (file, blob)| {
             docs.entry(&file.doc)
                 .or_default()
-                .insert(file.file.clone(), TreeEntry::regular(blob.clone()));
+                .insert(file.file.clone(), ListingEntry::regular(blob.clone()));
             docs
         },
     );
@@ -1602,7 +1581,7 @@ pub fn carry_forward(
 fn check_snapshot_files(
     doc: &DocId,
     validated: Option<&BTreeSet<DocFile>>,
-    snapshot: Option<&BTreeMap<DocFile, TreeEntry>>,
+    snapshot: Option<&BTreeMap<DocFile, ListingEntry>>,
 ) -> Result<()> {
     let validated: BTreeSet<&DocFile> = validated.into_iter().flatten().collect();
     let snapshot: BTreeSet<&DocFile> = snapshot.into_iter().flat_map(BTreeMap::keys).collect();
@@ -1654,8 +1633,8 @@ mod tests {
         PageId::new(id).unwrap()
     }
 
-    fn oid(n: u32) -> ObjectId {
-        ObjectId::new(format!("{n:040x}")).unwrap()
+    fn oid(n: u32) -> Oid {
+        format!("{n:040x}").parse().unwrap()
     }
 
     fn mirrored(uuid: &str, file: DocFile) -> MirroredFile {
@@ -1748,8 +1727,8 @@ mod tests {
 
     #[test]
     fn object_ids_are_lowercase_sha1_or_sha256_hex() {
-        assert!(ObjectId::new("a".repeat(40)).is_ok());
-        assert!(ObjectId::new("0123456789abcdef".repeat(4)).is_ok());
+        assert!("a".repeat(40).parse::<Oid>().is_ok());
+        assert!("0123456789abcdef".repeat(4).parse::<Oid>().is_ok());
         [
             "",
             &"a".repeat(39),
@@ -1760,7 +1739,10 @@ mod tests {
         .iter()
         .for_each(|bad| {
             assert!(
-                matches!(ObjectId::new(*bad), Err(ModelError::InvalidObjectId(_))),
+                matches!(
+                    bad.parse::<Oid>(),
+                    Err(crate::error::Error::InvalidGitInput(_))
+                ),
                 "{bad}"
             )
         });
@@ -2621,7 +2603,7 @@ mod tests {
                         .replace("{d2}", DOC2)
                         .replace("{f}", FOLDER)
                         .replace("{p}", PAGE),
-                    TreeEntry::regular(oid(*n)),
+                    ListingEntry::regular(oid(*n)),
                 )
             })
             .collect()
@@ -2644,8 +2626,8 @@ mod tests {
         ]);
         flat.insert(
             format!("docs/{DOC}/pages/run.sh"),
-            TreeEntry {
-                mode: EntryMode::Executable,
+            ListingEntry {
+                mode: FileMode::Executable,
                 id: oid(12),
             },
         );
@@ -2704,14 +2686,14 @@ mod tests {
     #[test]
     fn entry_modes() {
         [
-            EntryMode::Regular,
-            EntryMode::Executable,
-            EntryMode::Symlink,
-            EntryMode::Gitlink,
+            FileMode::Regular,
+            FileMode::Executable,
+            FileMode::Symlink,
+            FileMode::Gitlink,
         ]
         .iter()
-        .for_each(|mode| assert_eq!(EntryMode::from_octal(mode.as_octal()), Some(*mode)));
-        assert_eq!(EntryMode::from_octal("040000"), None);
+        .for_each(|mode| assert_eq!(FileMode::from_bits(mode.bits()), Some(*mode)));
+        assert_eq!(FileMode::from_bits(0o040000), None);
     }
 
     #[test]
@@ -3076,6 +3058,10 @@ mod tests {
             "nul\0",
             "esc\u{1b}[0m",
             &"x".repeat(65),
+            // Git identities cannot contain angle brackets.
+            "Evil <evil@example.invalid>",
+            "a<b",
+            "a>b",
         ]
         .iter()
         .for_each(|name| {
@@ -3139,22 +3125,22 @@ mod tests {
         let mut flat = listing(&[("docs/{d}/content", 1)]);
         flat.insert(
             format!("docs/{DOC}/metadata"),
-            TreeEntry {
-                mode: EntryMode::Gitlink,
+            ListingEntry {
+                mode: FileMode::Gitlink,
                 id: oid(2),
             },
         );
         flat.insert(
             format!("docs/{DOC}/pages/{PAGE}.rm"),
-            TreeEntry {
-                mode: EntryMode::Symlink,
+            ListingEntry {
+                mode: FileMode::Symlink,
                 id: oid(3),
             },
         );
         flat.insert(
             format!("docs/{DOC}/payload.pdf"),
-            TreeEntry {
-                mode: EntryMode::Executable,
+            ListingEntry {
+                mode: FileMode::Executable,
                 id: oid(4),
             },
         );
@@ -3170,24 +3156,84 @@ mod tests {
             ["metadata".to_string(), format!("pages/{PAGE}.rm")]
         );
         assert_eq!(tree.to_listing(), flat);
-        assert!(EntryMode::Regular.is_file() && EntryMode::Executable.is_file());
-        assert!(!EntryMode::Symlink.is_file() && !EntryMode::Gitlink.is_file());
+        assert!(FileMode::Regular.is_file() && FileMode::Executable.is_file());
+        assert!(!FileMode::Symlink.is_file() && !FileMode::Gitlink.is_file());
+    }
+
+    fn git_entry(path: &[u8], mode: u32, kind: ObjectKind, n: u32) -> git::TreeEntry {
+        git::TreeEntry {
+            mode,
+            kind,
+            oid: oid(n),
+            size: (kind == ObjectKind::Blob).then_some(10),
+            path: path.to_vec(),
+        }
     }
 
     #[test]
-    fn group_tree_takes_byte_paths_and_refuses_non_utf8() {
-        let flat = listing(&[("docs/{d}/metadata", 1), ("README.md", 2)]);
-        let bytes: Vec<(Vec<u8>, TreeEntry)> = flat
-            .iter()
-            .map(|(path, entry)| (path.clone().into_bytes(), entry.clone()))
-            .collect();
-        assert_eq!(rules().group_tree(bytes).unwrap().to_listing(), flat);
-        let bad = vec![(b"docs/caf\xe9".to_vec(), TreeEntry::regular(oid(1)))];
-        let err = rules().group_tree(bad).unwrap_err();
+    fn tree_listing_converts_git_entries() {
+        let doc_path = |name: &str| format!("docs/{DOC}/{name}").into_bytes();
+        let entries = vec![
+            git_entry(b"docs", 0o040000, ObjectKind::Tree, 1),
+            git_entry(&doc_path("metadata"), 0o100644, ObjectKind::Blob, 2),
+            git_entry(&doc_path("pages"), 0o040000, ObjectKind::Tree, 3),
+            git_entry(&doc_path("tool.sh"), 0o100755, ObjectKind::Blob, 4),
+            git_entry(&doc_path("link"), 0o120000, ObjectKind::Blob, 5),
+            git_entry(&doc_path("sub"), 0o160000, ObjectKind::Commit, 6),
+            git_entry(b"README.md", 0o100644, ObjectKind::Blob, 7),
+        ];
+        let listing = tree_listing(entries).unwrap();
+        let entry = |mode, n| ListingEntry { mode, id: oid(n) };
+        assert_eq!(
+            listing,
+            BTreeMap::from([
+                (format!("docs/{DOC}/metadata"), entry(FileMode::Regular, 2)),
+                (
+                    format!("docs/{DOC}/tool.sh"),
+                    entry(FileMode::Executable, 4)
+                ),
+                (format!("docs/{DOC}/link"), entry(FileMode::Symlink, 5)),
+                (format!("docs/{DOC}/sub"), entry(FileMode::Gitlink, 6)),
+                ("README.md".to_string(), entry(FileMode::Regular, 7)),
+            ])
+        );
+        let tree = rules().group_tree(listing.clone()).unwrap();
+        assert!(tree.docs[&doc(DOC)].is_present());
+        assert_eq!(tree.to_listing(), listing);
+        assert!(tree_listing(Vec::new()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn tree_listing_refuses_non_utf8_paths_and_unknown_modes() {
+        let err = tree_listing(vec![git_entry(
+            b"docs/caf\xe9",
+            0o100644,
+            ObjectKind::Blob,
+            1,
+        )])
+        .unwrap_err();
         assert!(matches!(&err, ModelError::NonUtf8Path(path) if path == b"docs/caf\xe9"));
         assert_eq!(
             err.to_string(),
             "repository path 'docs/caf\\xe9' is not UTF-8"
+        );
+        // Tree entries are dropped before the check, but a non-UTF-8
+        // directory's contents carry its name and are refused.
+        assert!(matches!(
+            tree_listing(vec![
+                git_entry(b"\xff", 0o040000, ObjectKind::Tree, 1),
+                git_entry(b"\xff/metadata", 0o100644, ObjectKind::Blob, 2),
+            ]),
+            Err(ModelError::NonUtf8Path(_))
+        ));
+        let err = tree_listing(vec![git_entry(b"old", 0o100664, ObjectKind::Blob, 1)]).unwrap_err();
+        assert!(matches!(
+            &err,
+            ModelError::UnsupportedEntryMode { path, mode: 0o100664 } if path == "old"
+        ));
+        assert_eq!(
+            err.to_string(),
+            "repository path 'old' has unsupported mode 100664"
         );
     }
 
@@ -3411,6 +3457,21 @@ mod tests {
     }
 
     #[test]
+    fn carry_forward_keeps_base_for_ok_documents_without_metadata() {
+        // An Ok outcome whose validated and snapshot file sets agree but
+        // lack metadata (never produced by validate_snapshot): no
+        // mismatch, and the base version is kept, not replaced.
+        let snapshot = snapshot_files(&[(DOC, DocFile::Content, 77)]);
+        let validation = validated(&snapshot, &[(DOC, DocOutcome::Ok)]);
+        assert_eq!(
+            validation.files[&doc(DOC)],
+            BTreeSet::from([DocFile::Content])
+        );
+        let result = carry_forward(&base_tree(), &snapshot, &validation).unwrap();
+        assert_eq!(result.docs[&doc(DOC)], base_tree().docs[&doc(DOC)]);
+    }
+
+    #[test]
     fn carry_forward_never_adds_quarantined_new_documents() {
         let snapshot = snapshot_files(&[(FOLDER, DocFile::Metadata, 50)]);
         let validation = validated(
@@ -3496,8 +3557,8 @@ mod tests {
         ]);
         flat.insert(
             format!("docs/{DOC}/metadata"),
-            TreeEntry {
-                mode: EntryMode::Symlink,
+            ListingEntry {
+                mode: FileMode::Symlink,
                 id: oid(2),
             },
         );

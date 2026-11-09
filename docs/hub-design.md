@@ -150,9 +150,10 @@ origin uses it for documents whose version matched nothing in origin
 that may be `null`: a silently missing `base` would read as the empty
 base and bring back every deletion, and a missing `journal` would skip
 reconciliation. Repo and device ids are random lowercase UUIDs; commit
-and blob ids are 40 or 64 lowercase hex digits; the device name is 1 to
-64 characters without control characters (it ends up in git
-identities, fork names and trailers); manifest keys must be safe
+and blob ids are 40 or 64 lowercase hex digits (uppercase is refused,
+not normalised); the device name is 1 to 64 characters without control
+characters, `<` or `>` (it ends up in git identities, fork names and
+trailers); manifest keys must be safe
 relative paths. A newer `format` is refused. Fields an rmu does not
 know are preserved when it rewrites the file, but a field may be added
 without a format bump only if it stays valid when an older rmu rewrites

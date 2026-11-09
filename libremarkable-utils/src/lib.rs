@@ -27,6 +27,8 @@
 //! - [`progress`] — observer trait for progress reporting; the
 //!   library itself never prints.
 //! - [`error`] — typed errors for all of the above.
+//! - `relative_path` (private) — the safe relative-path splitter shared
+//!   by `sync` and `hub::model`.
 //!
 //! Keep tool-specific CLI concerns out of this crate.
 
@@ -36,6 +38,7 @@ pub mod error;
 pub mod git;
 pub mod hub;
 pub mod progress;
+mod relative_path;
 pub mod ssh;
 pub mod status;
 pub mod sync;
