@@ -11,12 +11,17 @@
 //! - [`bundle`] — `.rmdoc` bundle creation (tar-from-device → zip).
 //! - [`ssh`] — subprocess transport around the system `ssh` binary
 //!   (multiplexed, optional password auth via a self-askpass helper).
+//! - [`git`] — plumbing over the system `git` binary for bare
+//!   repositories: remote transport, typed push rejection, tree
+//!   listing, batched blob reads, and commits via `fast-import`.
 //! - [`xochitl`] — on-device file formats and pure tree logic
 //!   (path/UUID resolution, rendering, conflict and cycle checks).
 //! - [`client`] — high-level operations: list, mkdir, upload,
 //!   download, delete, move, rename, restart xochitl.
 //! - [`sync`] — folder sync: endpoint parsing, snapshots, pure
 //!   planners, executors (see `docs/sync-design.md`).
+//! - [`hub`] — `rmu hub`, git-backed multi-tablet sync (see
+//!   `docs/hub-design.md`); [`hub::model`] is its pure data model.
 //! - [`status`] — device system state (model, firmware, CPU/RAM/disk,
 //!   battery), gathered in one round trip.
 //! - [`progress`] — observer trait for progress reporting; the
@@ -28,6 +33,8 @@
 pub mod bundle;
 pub mod client;
 pub mod error;
+pub mod git;
+pub mod hub;
 pub mod progress;
 pub mod ssh;
 pub mod status;
