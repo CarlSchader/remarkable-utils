@@ -74,11 +74,7 @@ pub fn item_from_metadata(
     content: Option<&Value>,
     size_bytes: Option<u64>,
 ) -> Option<Item> {
-    let kind = match metadata.get("type")?.as_str()? {
-        "DocumentType" => ItemKind::Document,
-        "CollectionType" => ItemKind::Folder,
-        _ => return None,
-    };
+    let kind = item_kind(metadata)?;
     let visible_name = metadata
         .get("visibleName")
         .and_then(Value::as_str)
@@ -122,6 +118,16 @@ pub fn item_from_metadata(
             ItemKind::Folder => None,
         },
     })
+}
+
+/// Item kind from parsed `.metadata` JSON. `None` for other item types
+/// (e.g. `TemplateType`) and for non-object metadata.
+pub fn item_kind(metadata: &Value) -> Option<ItemKind> {
+    match metadata.get("type")?.as_str()? {
+        "DocumentType" => Some(ItemKind::Document),
+        "CollectionType" => Some(ItemKind::Folder),
+        _ => None,
+    }
 }
 
 /// xochitl stores timestamps sometimes as strings, sometimes as numbers.

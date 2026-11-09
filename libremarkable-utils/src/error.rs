@@ -91,6 +91,10 @@ pub enum Error {
     /// xochitl did not come back after a restart attempt.
     #[error("failed to restart xochitl: {0}")]
     XochitlRestart(String),
+
+    /// `rmu hub` data-model error (layout, formats, mirror rules).
+    #[error(transparent)]
+    HubModel(#[from] crate::hub::model::ModelError),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

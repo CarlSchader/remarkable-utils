@@ -17,6 +17,8 @@
 //!   download, delete, move, rename, restart xochitl.
 //! - [`sync`] — folder sync: endpoint parsing, snapshots, pure
 //!   planners, executors (see `docs/sync-design.md`).
+//! - [`hub`] — `rmu hub`, git-backed multi-tablet sync (see
+//!   `docs/hub-design.md`); [`hub::model`] is its pure data model.
 //! - [`status`] — device system state (model, firmware, CPU/RAM/disk,
 //!   battery), gathered in one round trip.
 //! - [`progress`] — observer trait for progress reporting; the
@@ -28,6 +30,7 @@
 pub mod bundle;
 pub mod client;
 pub mod error;
+pub mod hub;
 pub mod progress;
 pub mod ssh;
 pub mod status;

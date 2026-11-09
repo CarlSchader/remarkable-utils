@@ -125,10 +125,12 @@ Read-only inspection of a reMarkable Paper Pro on firmware 3.28:
   "repo_id": "…",              // must match origin's .rmu/hub.json
   "origin": "…",               // default URL; overridable per computer
   "device_id": "…", "device_name": "…",
-  "base": "<commit>",          // default base for every document
-  "base_overrides": { "<doc-uuid>": "<commit>" },
+  "base": "<commit>",          // default base for every document;
+                               // null = empty base (see below)
+  "base_overrides": { "<doc-uuid>": "<commit>" },  // or null = empty base
   "device_ref": "<commit>",    // written right after each device-ref push
   "manifest": { "<path>": [size, mtime, ctime, inode, "<blob-id>"] },
+                               // xochitl-relative path; times in ns
   "quarantine": ["<doc-uuid>"],  // malformed documents, reported every run
   "journal": null              // { merge, snapshot } from before the push
                                // attempt until the apply is reconciled
@@ -139,6 +141,14 @@ Read-only inspection of a reMarkable Paper Pro on firmware 3.28:
 the user edited during a sync, or one that a crashed apply did not
 finish, keeps the version it actually has as its base. Overrides are
 cleared as soon as the document is reconciled.
+
+A base of `null` is the **empty base**: no common version, so the
+document merges by the "new on both" rules. `clone` into a non-empty
+origin uses it for documents whose version matched nothing in origin
+(see "Clone"). Repo and device ids are random lowercase UUIDs; commit
+and blob ids are 40 or 64 lowercase hex digits. Fields an rmu does not
+know are preserved when it rewrites the file, so optional fields can be
+added without a format bump; a newer `format` is refused.
 
 ## Repository layout
 
@@ -159,9 +169,14 @@ docs/<uuid>/highlights/<id>.json  <- <uuid>.highlights/<id>.json
 ```
 
 The mapping is a pure, tested function in both directions. The mirror is
-an **allowlist**: thumbnails, `.local`, `.tree`, rmu temp files and
-anything unrecognised stay on the tablet, are reported, and are never
-copied or deleted by a merge.
+an **allowlist**: thumbnails, `.local`, `.tree`, rmu temp files
+(`.rmu-*`) and anything unrecognised (including UUIDs not in canonical
+lowercase form, and page ids outside `[A-Za-z0-9_-]`) stay on the
+tablet, are reported, and are never copied or deleted by a merge.
+Repository paths outside `docs/<uuid>/` and `.rmu/` (a hand-committed
+README, say), and paths inside a document subtree that the active
+rules do not cover, are never applied to a tablet; they are carried
+forward unchanged.
 
 **Carry-forward.** A snapshot is built from the base tree, replacing
 only the paths the allowlist covers; every other path in the
@@ -252,15 +267,19 @@ as `Client::restart_xochitl` does today.
   stat or read errors, and byte counts that differ from the stat pass.
   The error names the path.
 - **A malformed document is quarantined**, not fatal: unparsable
-  `.metadata` or `.content`, a zero-length `.rm`, or files that
-  contradict each other. Its base version is carried forward (neither
+  `.metadata` or `.content` (or a `.metadata` that is not a JSON
+  object), a zero-length `.rm`, or files that contradict each other: a
+  folder with payload, page or highlight files; a `DocumentType`
+  without a `.content` object; `fileType` `pdf`/`epub` without that
+  payload. Its base version is carried forward (neither
   deleted nor changed), it gets a base override, it is never overwritten,
   and it is reported on every run and by `status` until it parses again.
 - **Files without a `.metadata`** under a UUID that has no document in
   base are an orphan — typically the by-design leftovers of an
   interrupted `rmu upload` or `rmu sync`. They are ignored and reported.
   If base does have that document, it is quarantined; it must never read
-  as a deletion.
+  as a deletion. Only allowlisted files count here: a leftover
+  thumbnail or `.local` alone does not keep a deleted document alive.
 
 Stat signatures are size, mtime, ctime and inode. Busybox `stat`'s `%Y`
 and `%Z` are whole seconds, but `%y`/`%z` print nanoseconds on the
@@ -581,7 +600,10 @@ own values for existing documents (re-read while xochitl is stopped). Documents 
 values stored in origin, minus model-specific zoom fields (the
 `customZoom*` fields; the survey saw `1404`×`1872` page sizes on a
 Paper Pro, so they may be a shared coordinate space, but they are
-dropped until a second model confirms it). "Resume where I left off on the
+dropped until a second model confirms it). For an existing document,
+each view-state path takes the tablet's value, or is removed when the
+tablet's file has none; page entries are matched by `id`, and pages
+the tablet does not have yet keep origin's values. "Resume where I left off on the
 other tablet" is a possible later feature; it would need comparable
 clocks and per-model translation.
 
@@ -824,7 +846,10 @@ To be handled in the implementation PRs named:
   question 1 and refuses on `true`.
 - Device layer: skip the `tar` call when there is nothing to download
   (BusyBox `tar` fails on an empty file list); stat signatures use
-  `%y`/`%z` for nanosecond times.
+  `%y`/`%z` for nanosecond times. The racy-entry rule ("Snapshot
+  validation") needs the time the manifest was recorded, which the
+  tablet state does not hold yet: add it as an optional field (no
+  format bump needed, unknown fields are preserved).
 
 ## Implementation plan
 
