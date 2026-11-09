@@ -51,6 +51,7 @@ pub enum OpKind {
     CloudPaired,
     DeviceInfo,
     StatAll,
+    StagedFiles,
     Download,
     ReadFiles,
     Sha256,
@@ -1029,6 +1030,18 @@ impl Tablet for FakeTablet {
         self.op(OpKind::StatAll, || {
             let mut listing = StatListing::default();
             walk(&self.xochitl, &self.xochitl, &mut listing)?;
+            listing.entries.sort_by(|a, b| a.path.cmp(&b.path));
+            Ok(listing)
+        })
+    }
+
+    fn staged_files(&self) -> Result<StatListing> {
+        self.op(OpKind::StagedFiles, || {
+            let root = PathBuf::from(self.paths.staging_root());
+            let mut listing = StatListing::default();
+            if root.is_dir() {
+                walk(&root, &root, &mut listing)?;
+            }
             listing.entries.sort_by(|a, b| a.path.cmp(&b.path));
             Ok(listing)
         })

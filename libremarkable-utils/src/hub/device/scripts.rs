@@ -587,8 +587,25 @@ pub(super) fn cloud_paired_script(paths: &TabletPaths) -> String {
 /// `find`/`stat` fails the pass: a partial listing must never read as
 /// deleted files.
 pub(super) fn stat_script(paths: &TabletPaths) -> String {
+    stat_script_in(&paths.xochitl_dir, false)
+}
+
+/// The stat pass over the staging root: every file interrupted runs left
+/// staged, as `<run>/<xochitl path>`. A missing staging root lists
+/// nothing.
+pub(super) fn staged_script(paths: &TabletPaths) -> String {
+    stat_script_in(&paths.staging_root(), true)
+}
+
+fn stat_script_in(dir: &str, missing_ok: bool) -> String {
+    let missing = if missing_ok {
+        format!("[ -d {} ] || exit 0\n", q(dir))
+    } else {
+        String::new()
+    };
     format!(
         "rmu_stat() {{\n\
+         {missing}\
          cd {dir} || exit 9\n\
          err=$(mktemp) || exit 1\n\
          nl='\n'\n\
@@ -599,7 +616,7 @@ pub(super) fn stat_script(paths: &TabletPaths) -> String {
          rm -f \"$err\"\n\
          }}\n\
          rmu_stat </dev/null\n",
-        dir = q(&paths.xochitl_dir),
+        dir = q(dir),
         format = q(STAT_FORMAT),
     )
 }
@@ -1505,6 +1522,13 @@ mod tests {
         let script = stat_script(&hostile());
         assert_quoted(&script, &hostile());
         assert!(script.contains(&format!("stat -c {}", shell_quote(STAT_FORMAT))));
+        assert!(!script.contains("|| exit 0"));
+        // The staged listing runs the same pass over the staging root,
+        // and lists nothing when there is none.
+        let staged = staged_script(&hostile());
+        assert_quoted(&staged, &hostile());
+        let root = shell_quote(&hostile().staging_root());
+        assert!(staged.contains(&format!("[ -d {root} ] || exit 0\ncd {root} || exit 9\n")));
     }
 
     #[test]

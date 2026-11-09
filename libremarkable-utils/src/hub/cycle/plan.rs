@@ -581,6 +581,46 @@ pub(super) fn verdict(
     })
 }
 
+/// Whether an interrupted apply finished a document that the user has
+/// changed since ([`Verdict::Other`]): every file the apply was to write
+/// (merge files not equivalent to the snapshot's) has left the staging
+/// directory (`pending`: the files still staged by the run that staged
+/// this merge completely), and every file it was to remove is gone. The
+/// user's changes are then on top of the merge (base = merge) rather
+/// than on top of the snapshot, which would read the merge as their
+/// own change and fork it.
+pub(super) fn apply_finished(
+    rules: &MirrorRules,
+    doc: &DocId,
+    merge: Option<&DocVersion>,
+    snapshot: Option<&DocVersion>,
+    tablet: &BTreeMap<DocFile, Oid>,
+    pending: &BTreeSet<String>,
+    json: &dyn JsonBlobs,
+) -> Result<bool> {
+    let (Some(merge), snapshot) = (present_files(merge), present_files(snapshot)) else {
+        return Ok(false);
+    };
+    let written = merge
+        .iter()
+        .try_fold(true, |done, (file, entry)| -> Result<bool> {
+            if !done {
+                return Ok(false);
+            }
+            let unchanged = match snapshot.and_then(|snapshot| snapshot.get(file)) {
+                Some(before) => entries_equivalent(rules, file, entry, before, json)?,
+                None => false,
+            };
+            Ok(unchanged || !pending.contains(&file.xochitl_path(doc)))
+        })?;
+    let removed = snapshot
+        .into_iter()
+        .flat_map(BTreeMap::keys)
+        .filter(|file| !merge.contains_key(*file))
+        .all(|file| !tablet.contains_key(file));
+    Ok(written && removed)
+}
+
 // ---- the manifest --------------------------------------------------------------------
 
 /// What the manifest is recorded from.

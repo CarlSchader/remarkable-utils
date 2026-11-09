@@ -13,6 +13,35 @@ use snapshot::ReadMode;
 /// mid-transfer on every attempt.
 const STAGE_BATCH_BYTES: u64 = 64 * 1024 * 1024;
 
+/// Staged last, as `.rmu-staged-<merge>`, once everything an apply of
+/// that merge needs is staged: reconciliation then knows that a planned
+/// file missing from that run's staging directory was moved into place.
+const STAGED_SENTINEL: &str = ".rmu-staged-";
+
+/// The files still staged by the run that completely staged `merge`
+/// (`None` if no run did), from the staging listing.
+fn pending_for(staged: &crate::hub::device::StatListing, merge: &Oid) -> Option<BTreeSet<String>> {
+    let sentinel = format!("{STAGED_SENTINEL}{merge}");
+    let runs: BTreeSet<&str> = staged
+        .entries
+        .iter()
+        .filter_map(|entry| {
+            let (run, path) = entry.path.split_once('/')?;
+            (path == sentinel).then_some(run)
+        })
+        .collect();
+    (!runs.is_empty()).then(|| {
+        staged
+            .entries
+            .iter()
+            .filter_map(|entry| {
+                let (run, path) = entry.path.split_once('/')?;
+                (runs.contains(run) && path != sentinel).then(|| path.to_string())
+            })
+            .collect()
+    })
+}
+
 /// The device ref to push to, its current head (the snapshot's second
 /// parent) and the lease. A head that does not continue the recorded
 /// one means another tablet uses this device id (see "Device ref
@@ -148,7 +177,6 @@ impl Hub<'_> {
     pub fn backup(&self, tablet: &dyn Tablet) -> Result<BackupReport> {
         let (mut report, warnings) = self.session(tablet, |s| {
             let mut p = self.prepare(s, false)?;
-            s.arm()?;
             let base_tree = virtual_base(&p.origin.store, p.origin.rules, &p.state)?;
             let snapshot = snapshot::build(p.origin.rules, &p.read, &base_tree)?;
             self.progress.step("Backing up the tablet to origin");
@@ -441,6 +469,27 @@ impl Hub<'_> {
             })
             .filter_map(Result::transpose)
             .collect::<Result<_>>()?;
+        // A document changed since an apply that finished it: the change
+        // is on top of the merge (see `plan::apply_finished`).
+        let pending = pending_for(&s.tablet.staged_files()?, &journal.merge);
+        let verdicts = verdicts
+            .into_iter()
+            .map(|(doc, verdict)| -> Result<(DocId, Verdict)> {
+                let finished = match (verdict, &pending) {
+                    (Verdict::Other, Some(pending)) => plan::apply_finished(
+                        rules,
+                        &doc,
+                        merge_tree.docs.get(&doc),
+                        snapshot_tree.docs.get(&doc),
+                        tablet.get(&doc).unwrap_or(&no_files),
+                        pending,
+                        &json,
+                    )?,
+                    _ => false,
+                };
+                Ok((doc, if finished { Verdict::AtMerge } else { verdict }))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
         // A conflict copy is finished only together with its original.
         let forks = message::forks(&message::trailers(&store.commit(&journal.merge)?.message));
         let verdicts = forks
@@ -503,8 +552,9 @@ impl Hub<'_> {
         );
         let finished: Vec<DocId> = finish.iter().map(|planned| planned.doc.clone()).collect();
         if !finish.is_empty() {
-            s.tablet.clear_staging(s.lock())?;
-            let sizes = self.stage(s, store, &finish)?;
+            // Into this run's own staging directory: the interrupted run's
+            // is what this judgement rests on until the state is written.
+            let sizes = self.stage(s, store, &finish, None)?;
             s.tablet.apply(s.lock(), &apply_plan(&finish, &sizes)?)?;
         }
         let kept: Vec<DocId> = verdicts
@@ -535,13 +585,14 @@ impl Hub<'_> {
     }
 
     /// Upload the planned writes into this run's staging directory, in
-    /// batches with the watchdog re-armed before each; the size of each
-    /// staged file.
+    /// batches with the watchdog re-armed before each, then the sentinel
+    /// of `merge` if given; the size of each staged file.
     fn stage(
         &self,
         s: &Session,
         store: &Store,
         planned: &[Planned],
+        merge: Option<&Oid>,
     ) -> Result<BTreeMap<XochitlPath, u64>> {
         let contents: Vec<(XochitlPath, &Content)> = planned
             .iter()
@@ -606,6 +657,13 @@ impl Hub<'_> {
                 }
             })
         })?;
+        if let Some(merge) = merge {
+            let sentinel = XochitlPath::new(format!("{STAGED_SENTINEL}{merge}"))?;
+            s.tablet
+                .stage(s.lock(), std::slice::from_ref(&sentinel), &mut |_, sink| {
+                    sink(0, &mut std::io::empty())
+                })?;
+        }
         self.progress.bytes_done();
         Ok(sizes)
     }
@@ -678,7 +736,6 @@ impl Hub<'_> {
 
     /// Steps 7–16.
     fn integrate(&self, s: &mut Session, mut p: Prepared) -> Result<SyncReport> {
-        s.arm()?;
         let rules = p.origin.rules;
         let base_tree = virtual_base(&p.origin.store, rules, &p.state)?;
         let snapshot = snapshot::build(rules, &p.read, &base_tree)?;
@@ -1022,7 +1079,7 @@ impl Hub<'_> {
             self.progress.step("Staging changes on the tablet");
             s.arm()?;
             s.tablet.clear_staging(s.lock())?;
-            let mut sizes = self.stage(s, store, &planned)?;
+            let mut sizes = self.stage(s, store, &planned, Some(&pushed.base))?;
             // 13.
             self.progress.step("Stopping xochitl");
             s.stop()?;
@@ -1188,7 +1245,7 @@ impl Hub<'_> {
                 })
                 .collect();
             if !restage.is_empty() {
-                sizes.extend(self.stage(s, store, &restage)?);
+                sizes.extend(self.stage(s, store, &restage, None)?);
             }
             if !final_plan.is_empty() {
                 s.arm()?;

@@ -460,6 +460,32 @@ fn stage_apply_read_and_delete(h: &dyn Harness) {
     t.release_lock(&lock).unwrap();
 }
 
+fn staged_files_lists_what_is_not_moved_yet(h: &dyn Harness) {
+    let t = h.tablet();
+    assert!(t.staged_files().unwrap().entries.is_empty());
+    let lock = t.acquire_lock(&request(), false).unwrap();
+    let (write, files) = metadata_only(DOC);
+    stage(t, &lock, &files).unwrap();
+    let staged = |t: &dyn Tablet| -> Vec<String> {
+        t.staged_files()
+            .unwrap()
+            .entries
+            .into_iter()
+            .map(|entry| entry.path)
+            .collect()
+    };
+    assert_eq!(staged(t), vec![format!("{}/{DOC}.metadata", lock.run())]);
+    t.arm_watchdog(&lock, WATCHDOG).unwrap();
+    t.stop_xochitl(&lock).unwrap();
+    t.apply(&lock, &ApplyPlan { docs: vec![write] }).unwrap();
+    t.start_xochitl(&lock).unwrap();
+    assert!(staged(t).is_empty());
+    t.clear_staging(&lock).unwrap();
+    assert!(staged(t).is_empty());
+    t.disarm_watchdog(&lock).unwrap();
+    t.release_lock(&lock).unwrap();
+}
+
 fn apply_sets_planned_modes(h: &dyn Harness) {
     let t = h.tablet();
     let lock = t.acquire_lock(&request(), false).unwrap();
@@ -633,6 +659,10 @@ const SCENARIOS: &[(&str, Scenario)] = &[
     ("xochitl_stop_and_start", xochitl_stop_and_start),
     ("state_round_trip", state_round_trip),
     ("stage_apply_read_and_delete", stage_apply_read_and_delete),
+    (
+        "staged_files_lists_what_is_not_moved_yet",
+        staged_files_lists_what_is_not_moved_yet,
+    ),
     ("apply_sets_planned_modes", apply_sets_planned_modes),
     (
         "apply_refuses_unstaged_files_before_any_change",

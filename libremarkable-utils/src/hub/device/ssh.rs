@@ -400,6 +400,14 @@ impl Tablet for SshTablet {
         })
     }
 
+    fn staged_files(&self) -> Result<StatListing> {
+        self.step("Listing staged files", || {
+            Ok(scripts::parse_stat_output(
+                &self.script_text(&scripts::staged_script(&self.paths))?,
+            )?)
+        })
+    }
+
     fn download(&self, files: &[XochitlPath], visit: &mut DownloadVisitor<'_>) -> Result<()> {
         if files.is_empty() {
             // BusyBox tar fails on an empty list.

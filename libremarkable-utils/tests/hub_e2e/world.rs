@@ -31,6 +31,7 @@ use libremarkable_utils::hub::model::{
 };
 use libremarkable_utils::progress::NoProgress;
 use serde_json::{Value, json};
+use test_support::Scratch;
 
 pub const DATE: &str = "2026-11-09";
 pub const MODEL: &str = "reMarkable Fake";
@@ -231,6 +232,8 @@ pub enum Kind {
 
 /// The world (see the module docs).
 pub struct World {
+    /// Everything lives here; removed on drop.
+    scratch: Scratch,
     pub root: PathBuf,
     pub git: Git,
     pub origin: String,
@@ -238,24 +241,16 @@ pub struct World {
     pub inks: Mutex<Inks>,
     ids: Mutex<u64>,
     pub options: HubOptions,
-    keep: bool,
-}
-
-impl Drop for World {
-    fn drop(&mut self) {
-        if !self.keep {
-            let _ = fs::remove_dir_all(&self.root);
-        }
-    }
 }
 
 impl World {
     /// A world with `tablets` fake tablets and an initialised origin.
     pub fn new(tablets: usize) -> Self {
-        Self::at(scratch("world"), tablets, true)
+        Self::at(Scratch::new("hub-e2e"), tablets, true)
     }
 
-    fn at(root: PathBuf, tablets: usize, init: bool) -> Self {
+    fn at(scratch: Scratch, tablets: usize, init: bool) -> Self {
+        let root = scratch.path().to_path_buf();
         fs::create_dir_all(root.join("home")).unwrap();
         let git = hermetic_git(&root.join("home"));
         let origin = root.join("origin.git").to_string_lossy().into_owned();
@@ -269,6 +264,7 @@ impl World {
             })
             .collect();
         let world = Self {
+            scratch,
             root,
             git,
             origin,
@@ -279,7 +275,6 @@ impl World {
                 date: Some(DATE.to_string()),
                 ..HubOptions::default()
             },
-            keep: false,
         };
         if init {
             world.hub(0).init(&world.origin).unwrap();
@@ -291,9 +286,9 @@ impl World {
     /// hub state) and caches; ink bookkeeping included. The fakes start
     /// fresh (xochitl running, a new boot id, no faults).
     pub fn duplicate(&self) -> Self {
-        let root = scratch("copy");
-        copy_dir(&self.root, &root);
-        let copy = Self::at(root, self.devices.len(), false);
+        let scratch = Scratch::new("hub-e2e");
+        copy_dir(&self.root, scratch.path());
+        let copy = Self::at(scratch, self.devices.len(), false);
         let inks = self.inks.lock().unwrap();
         *copy.inks.lock().unwrap() = Inks {
             expected: inks.expected.clone(),

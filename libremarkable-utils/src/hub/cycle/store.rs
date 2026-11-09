@@ -17,6 +17,7 @@ use std::fs::{self, File, TryLockError};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -77,6 +78,11 @@ fn lock_path(root: &Path, repo_id: &RepoId) -> PathBuf {
     root.join(format!("{repo_id}.lock"))
 }
 
+/// How long to wait for the cache lock before reporting it busy. A child
+/// process forked by another thread holds a copy of the descriptor (and
+/// so the lock) until it execs, so a brief wait is not contention.
+const LOCK_PATIENCE: Duration = Duration::from_secs(5);
+
 fn take_lock(path: &Path) -> Result<File> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
@@ -86,11 +92,21 @@ fn take_lock(path: &Path) -> Result<File> {
         .truncate(false)
         .write(true)
         .open(path)?;
-    match file.try_lock() {
-        Ok(()) => Ok(file),
-        Err(TryLockError::WouldBlock) => Err(CycleError::CacheBusy(path.to_path_buf()).into()),
-        Err(TryLockError::Error(error)) => Err(error.into()),
-    }
+    let deadline = Instant::now() + LOCK_PATIENCE;
+    let taken = std::iter::repeat_with(|| match file.try_lock() {
+        Ok(()) => Some(Ok(())),
+        Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+            std::thread::sleep(Duration::from_millis(20));
+            None
+        }
+        Err(TryLockError::WouldBlock) => {
+            Some(Err(CycleError::CacheBusy(path.to_path_buf()).into()))
+        }
+        Err(TryLockError::Error(error)) => Some(Err(Error::from(error))),
+    })
+    .find_map(|attempt| attempt);
+    taken.unwrap_or_else(|| Err(CycleError::CacheBusy(path.to_path_buf()).into()))?;
+    Ok(file)
 }
 
 /// An existing cache of `format`, else a fresh one (a missing or

@@ -371,6 +371,12 @@ pub trait Tablet {
     /// ctime, and inode of every non-directory entry.
     fn stat_all(&self) -> Result<StatListing>;
 
+    /// The same pass over the staging root: every file still staged, as
+    /// `<run>/<xochitl path>`. After an interrupted apply this is what
+    /// was not moved into place yet; a missing staging root lists
+    /// nothing.
+    fn staged_files(&self) -> Result<StatListing>;
+
     /// Stream the given files (one tar on a real tablet), calling `visit`
     /// once per file in the order the device sends them. Every requested
     /// file must arrive exactly once, as a regular file; an empty list
