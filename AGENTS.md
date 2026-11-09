@@ -149,11 +149,12 @@ This repository is **open source** (dual-licensed MIT OR Apache-2.0):
   (`cycle/message.rs`), the steps (`cycle/steps.rs`) and the read-only
   commands (`cycle/inspect.rs`). `tests/hub_e2e.rs` (harness in
   `tests/hub_e2e/world.rs`) runs fake tablets against a bare origin,
-  ending every scenario with one oracle (`World::check`: the tablets
-  equal origin, no ink lost, xochitl up, no lock or journal left) and
-  includes a crash matrix (a fault at every operation of a full
-  cycle); add a scenario for every new cycle rule and keep the matrix
-  passing.
+  ending every scenario that syncs to the end with one oracle
+  (`World::check`: the tablets equal origin, no ink lost, xochitl up, no
+  lock or journal left; refusals check `World::check_idle`) and
+  includes a crash matrix (a fault at every operation of a full cycle,
+  and of a run reconciling an earlier crash); add a scenario for every
+  new cycle rule and keep the matrix passing.
 - `status.rs` — device system state (`rmu status`): one
   marker-sectioned SSH round trip, pure best-effort parsing (every
   field `Option`al — firmware/models differ), pure rendering.

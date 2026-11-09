@@ -250,9 +250,10 @@ anything; their snapshot is best effort and they say so.
                 history; pre-read the tablet while xochitl still runs
  2. guard       take the tablet lock and arm the watchdog; refuse if the
                 tablet is paired with the reMarkable cloud; re-read the
-                tablet state; with a journal, fetch origin again, so
-                reconciliation never judges a lost push acknowledgement
-                against a stale cache
+                tablet state; fetch origin again, so reconciliation never
+                judges a lost push acknowledgement against a stale cache
+                (and a run that held the lock just before cannot make a
+                newer base read as a rewound origin)
  3. stop        (re-)arm the watchdog; systemctl stop xochitl
  4. reconcile   if a journal is left over, reconcile it now, while stopped
                 (see "Restartability")
@@ -301,14 +302,19 @@ while implementing it, beyond the steps above:
   if it changes before step 8 (an upgrade landed meanwhile), the run
   stops rather than merge a snapshot classified under other rules.
 - **Pre-read.** Before taking the lock, while xochitl runs, the tablet is
-  read best effort (files that change while read are left out). The
-  stopped read of step 5 then downloads only files whose stat moved
-  since, so a tablet with gigabytes of new data (a first clone) is down
-  for seconds, not for the whole download. A pre-read stat is trusted
-  only with a nanosecond mtime (a coarse one could hide a change within
-  its second); everything else is read again while stopped. Step 5 reads
-  **before** step 4 decides: reconciliation judges the files just read,
-  and a document it finishes is read again.
+  read best effort (files that change while read are left out) into a
+  `fast-import` of its own, committed apart (nothing points at that
+  commit). The stopped read of step 5 then downloads only files whose
+  stat moved since, so a tablet with gigabytes of new data (a first
+  clone) is down for seconds, not for the whole download. A pre-read
+  entry counts only with a nanosecond mtime (a coarse one could hide a
+  change within its second) and only if its blob is in the cache (a
+  pre-read cut mid-file loses its whole `fast-import`); everything else
+  is read again while stopped. Step 5 reads **before** step 4 decides:
+  reconciliation judges the files just read, and a document it finishes
+  is read again. `status` and `--dry-run` read the same way, with the
+  second read also while xochitl runs (retried once if a file changes
+  while read).
 - **Pure work after the start.** Validation, carry-forward, and (for
   `clone`) base inference run after step 6; while xochitl is stopped
   only the stat pass and downloads (streamed into `fast-import`) happen.
@@ -368,12 +374,19 @@ while implementing it, beyond the steps above:
   never written or deleted, and keep their base version's place in the
   tree checks (a folder deleted above one counts as orphaning it).
 - **Staging sentinel.** Once everything an apply of merge M needs is
-  staged, rmu stages an empty `.rmu-staged-<M>` next to it. Staging is
-  cleared only at step 12 of a run whose journal is already written,
-  and after a recorded apply; reconciliation stages into its own run's
-  directory without clearing. The device layer lists what is still
-  staged (`Tablet::staged_files`), so reconciliation can tell an apply
-  that finished a document from one that did not (see "Restartability").
+  staged, rmu stages `.rmu-staged-<M>/<doc>` (empty) for every document
+  the plan changes, then `.rmu-staged-<M>/done`, in one transfer, next to
+  it. Staging is cleared only at step 12 of a run whose journal is
+  already written, and after a recorded apply; reconciliation stages
+  into its own run's directory, with a sentinel of its own, without
+  clearing. The device layer lists what is still staged
+  (`Tablet::staged_files`), so reconciliation knows which documents an
+  interrupted run planned, and which of their files it had not moved
+  yet (see "Restartability").
+- **Quarantined documents never make a sync push**: the snapshot
+  carries their base version, which the merge never takes over
+  origin's, so they are left out of the "already agrees with origin"
+  test.
 
 ### Snapshot validation
 
@@ -621,17 +634,20 @@ may write files:
     ours = snapshot, theirs = origin) brings the merge's change again,
     staged while xochitl runs instead of during this outage;
   - every file is at its snapshot or merge version, some at each (the
-    apply stopped inside this document) → finish applying it (verify,
-    move, overlay view state, the step-14 tree checks), then base =
-    merge; a deletion interrupted after `.metadata` is finished as a
-    deletion, leftovers included;
+    apply stopped inside this document), and a run's complete staging
+    sentinel names the document → finish applying it (verify, move,
+    overlay view state, the step-14 tree checks), then base = merge; a
+    deletion interrupted after `.metadata` is finished as a deletion,
+    leftovers included. A document no run planned only looks half
+    applied (a quarantined one that lost its `.metadata`, say) and falls
+    under the next rule;
   - anything else (the user changed it since) → base override =
-    snapshot, unless the apply had finished the document: its staging
-    sentinel exists and none of the files it was to write is still
-    staged, and every file it was to remove is gone. Then the change is
-    on top of the merge and the document takes base = merge; without
-    this, an edit made after an unrecorded apply would read the merge as
-    the user's own change and fork it.
+    snapshot, unless the apply had finished the document: a run's
+    complete sentinel names it, none of the files it was to write is
+    still staged by that run, and every file it was to remove is gone.
+    Then the change is on top of the merge and the document takes base =
+    merge; without this, an edit made after an unrecorded apply would
+    read the merge as the user's own change and fork it.
 
   Documents whose merge and snapshot versions agree take base = merge.
   A document is never given base = merge unless its files are at the
@@ -671,13 +687,14 @@ Further:
   (device ids are random per clone, and a clone never reuses another
   tablet's state); a recorded value with no remote ref stops the run.
   `clone --reattach` is the way out of both stops.
-- **Known limits** (no ink is lost in either): a document the user
-  edits during the window of a sync that forks it is skipped, its copy
-  with it, and the next sync forks it again into a second copy (the
-  first one holds the tablet's version as of the snapshot); and a
-  document edited after the hub state was lost has no known base, so
-  `--reattach` treats it as new on both sides and forks it if it
-  differs from origin's.
+- **Known limits** (no ink is lost in any): a document the user edits
+  during the window of a sync that forks it is skipped, its copy with
+  it, and the next sync forks it again into a second copy (the first
+  one holds the tablet's version as of the snapshot); the same happens
+  when a forking sync's push lands and the run stops before its staging
+  completes, and the user then edits the original; and a document edited
+  after the hub state was lost has no known base, so `--reattach` treats
+  it as new on both sides and forks it if it differs from origin's.
 
 ## Merge rules
 
@@ -997,21 +1014,27 @@ clocks and per-model translation.
   injection crashes the run at every step (including a lost push
   acknowledgement and a half-finished apply) and asserts the next run
   converges without spurious or duplicate forks. As built
-  (`libremarkable-utils/tests/hub_e2e.rs`): every scenario ends with the
-  same oracles — the tablets equal origin (`.metadata`/`.content`
-  normalised, other files byte for byte, leftovers included), every ink
-  stroke ever drawn and not deliberately deleted is on origin and on
-  every tablet, xochitl runs, no lock or journal is left. The crash
-  matrix copies one prepared world per fault and injects, in turn, a
+  (`libremarkable-utils/tests/hub_e2e.rs`): every scenario that syncs to
+  the end finishes with the same oracles — the tablets equal origin
+  (`.metadata`/`.content` normalised, other files byte for byte,
+  leftovers included; a quarantined document must still be on its
+  tablet), every ink stroke ever drawn and not deliberately deleted is on
+  origin and on every tablet, xochitl runs, no lock or journal is left;
+  scenarios that are refused check that the tablet is untouched, running
+  and unlocked. The crash scenario includes two documents the crashing
+  tablet holds quarantined (one origin changed, one origin deleted),
+  repaired at the end so their ink is checked too. The crash matrix
+  copies one prepared world per fault and injects, in turn, a
   disconnection before every operation and after every mutation, a lost
   reply to every mutation, a failure of every operation, an apply killed
-  after every move, the watchdog firing after every move, and a download
-  cut after every file; after each, xochitl must be up or have an armed
-  watchdog, and the next run (with `--break-lock` only where the crash
-  left a lock nothing makes stale) must end with exactly the clean run's
-  conflict copies. A lost push acknowledgement is produced for real by
-  a `reference-transaction` hook on the origin that kills `receive-pack`
-  once the update is committed.
+  after every move, the watchdog firing after every move, a cut of the
+  stopped read after every file, and a disconnection at every operation
+  of a run that reconciles an earlier crash; after each, xochitl must be
+  up or have an armed watchdog, and the next run (with `--break-lock`
+  only where the crash left a lock nothing makes stale) must end with
+  exactly the clean run's conflict copies. A lost push acknowledgement
+  is produced for real by a `reference-transaction` hook on the origin
+  that kills `receive-pack` once the update is committed.
 - **Real device**, only with the owner's explicit go-ahead.
 
 ## Device questions

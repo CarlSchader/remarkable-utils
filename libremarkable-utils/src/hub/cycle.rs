@@ -8,12 +8,14 @@
 //! 1. preflight: read the tablet state, `ls-remote` origin, take the
 //!    local cache's `flock`, fetch origin `main` and the device ref, read
 //!    the mirror rules, check the repo id and that every base is an
-//!    ancestor of `main` (before the tablet is touched);
+//!    ancestor of `main` (before the tablet is touched); pre-read the
+//!    tablet while xochitl runs;
 //! 2. guard: take the tablet lock, arm the watchdog, refuse a
-//!    cloud-paired tablet, re-read the state under the lock;
+//!    cloud-paired tablet, re-read the state and fetch again under the
+//!    lock;
 //! 3. stop xochitl (watchdog armed);
-//! 4. reconcile a journal left by an interrupted run ([`Hub::reconcile`]),
-//!    while stopped, writing its result before anything else;
+//! 4. reconcile a journal left by an interrupted run, while stopped,
+//!    writing its result before anything else;
 //! 5. read the tablet: stat pass, download of changed files streamed into
 //!    `fast-import` (step 5 reads before step 4 decides, because
 //!    reconciliation judges the files it read; a document reconciliation
