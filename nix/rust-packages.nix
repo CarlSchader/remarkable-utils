@@ -54,8 +54,10 @@ flake-utils.lib.eachDefaultSystem (system: let
   # locally (Linux): with the GNU tools plus `flock`/`setsid` from
   # util-linux, and with BusyBox applets and `ash`, as on a tablet (named
   # by RMU_TEST_BUSYBOX, never put on PATH).
+  # gitMinimal is the git `rmu` falls back to at runtime (see the wrapper
+  # below), so the sandboxed tests exercise exactly that build.
   hermeticGitTestArgs = {
-    nativeCheckInputs = [pkgs.git] ++ lib.optional pkgs.stdenv.hostPlatform.isLinux pkgs.util-linux;
+    nativeCheckInputs = [pkgs.gitMinimal] ++ lib.optional pkgs.stdenv.hostPlatform.isLinux pkgs.util-linux;
     preCheck = ''
       ${lib.optionalString pkgs.stdenv.hostPlatform.isLinux "export RMU_TEST_BUSYBOX=${pkgs.busybox}/bin/busybox"}
       export HOME="$(mktemp -d)"
@@ -84,6 +86,9 @@ in {
       // {
         inherit cargoArtifacts;
         cargoTestExtraArgs = "--workspace";
+        # A check, not a build input for anything: an empty output instead
+        # of a target/ archive that references the whole deps closure.
+        doInstallCargoArtifacts = false;
       });
 
     rmu = craneLib.buildPackage (
@@ -98,9 +103,11 @@ in {
         nativeBuildInputs = [pkgs.makeWrapper];
         # rmu shells out to `git` and `ssh`. Suffix (not prefix) PATH so the
         # user's own binaries and their configuration win; ours are a fallback.
+        # rmu only needs git plumbing (local, ssh and https transports), which
+        # gitMinimal covers without full git's perl/python closure.
         postInstall = ''
           wrapProgram $out/bin/rmu \
-            --suffix PATH : ${lib.makeBinPath [pkgs.git pkgs.openssh]}
+            --suffix PATH : ${lib.makeBinPath [pkgs.gitMinimal pkgs.openssh]}
         '';
       }
     );
