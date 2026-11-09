@@ -22,6 +22,9 @@ flake-utils.lib.eachDefaultSystem (
           self.formatter.${system}
           # rmu shells out to the system ssh binary.
           pkgs.openssh
+          # rmu hub shells out to the system git binary; its tests create
+          # temporary git repositories.
+          pkgs.git
         ]
         ++ preCommitCheck.enabledPackages;
 

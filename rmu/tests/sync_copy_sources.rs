@@ -33,7 +33,7 @@ impl Fixture {
         let ssh = root.join("bin/ssh");
         fs::write(
             &ssh,
-            "#!/usr/bin/env sh\n\
+            "#!/bin/sh\n\
              while [ \"$#\" -gt 0 ] && [ \"$1\" != -- ]; do shift; done\n\
              [ \"$#\" -eq 3 ] || exit 97\n\
              shift\n\
