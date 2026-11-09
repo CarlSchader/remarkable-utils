@@ -680,16 +680,21 @@ Applied in rounds, in this order, until a round changes nothing:
    on that path (the document, or a trashed folder) goes back to its
    pre-trash parent: the one the editing side gives it, or the base's if
    that side lacks the item; then the walk continues upward, since that
-   parent may be in the trash too. If the trashed item has no pre-trash
-   parent (the editing side trashed it too, or neither the editing side
-   nor the base has one, or restoring it would create a cycle), the item
-   just below it on the path moves out instead: to the editing side's
+   parent may be in the trash too. If the trashed item cannot go back
+   (the editing side trashed it too; neither the editing side nor the
+   base has a parent for it; or that parent is gone from the merged
+   tree, is not a folder, or lies below the item, so restoring it would
+   create an orphan or a cycle), the item just below it on the path
+   moves out instead: to the editing side's
    parent, the base's, or the root, whichever is first off every trash
    path. Each move gets a note. So a folder both sides trashed stays in
    the trash, and the edited document comes out of it.
 2. **Orphans**: a present item whose parent is missing gets its whole
-   ancestor chain resurrected from the newest version in history; with
-   no such version it is moved to the root, with a note. A resurrected
+   ancestor chain resurrected: each parent from origin's or the base's
+   own version when one of them has it present outside the trash (the
+   tablet may have deleted a folder origin still has), else from the
+   newest version in origin's history; with no such version the item is
+   moved to the root, with a note. A resurrected
    folder that was in the trash comes back to its last non-trash
    location (root if it has none). An item whose parent exists but is
    not a folder also moves to the root.

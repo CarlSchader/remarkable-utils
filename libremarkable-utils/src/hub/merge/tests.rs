@@ -1670,7 +1670,15 @@ fn an_orphan_without_history_moves_to_the_root() {
     let mut lib = Lib::default();
     let folder = D::folder("Folder", "");
     let doc = D::notebook("New", u(9).as_str(), 1, "tablet");
+    // Origin deleted the folder the tablet added into: it comes back from
+    // the base's own version, no history needed.
     let (b, o, t) = three(&mut lib, &[(9, &folder)], &[(9, &folder), (1, &doc)], &[]);
+    let outcome = run(&lib, &b, &o, &t);
+    assert_eq!(outcome.resolutions[&u(9)], Resolution::Resurrected);
+    assert_eq!(outcome.docs[&u(9)], version_of(&mut lib, &folder));
+    assert_eq!(lib.md(&outcome, &u(1))["parent"], json!(u(9).as_str()));
+    // A parent nobody has, and no history: the root.
+    let (b, o, t) = three(&mut lib, &[], &[(1, &doc)], &[]);
     let outcome = run(&lib, &b, &o, &t);
     assert!(!outcome.docs.contains_key(&u(9)));
     assert_eq!(lib.md(&outcome, &u(1))["parent"], json!(""));
@@ -1799,13 +1807,14 @@ fn a_restore_that_would_close_a_cycle_moves_the_edit_out_instead() {
 
 #[test]
 fn a_resurrected_folder_on_a_cycle_goes_to_the_root() {
-    // Origin moved R into S and later deleted R; the tablet moved S into
-    // R. S needs R back, and R's newest version sits in S: a cycle. R was
-    // resurrected, so R goes to the root (not S, although S has the
-    // smaller UUID and differs from origin's parent).
+    // R was in the trash at the base. Origin restored R into S, then
+    // deleted it; the tablet moved S into R. S needs R back; the base's
+    // R is in the trash, so history gives its last location, inside S: a
+    // cycle. R was resurrected, so R goes to the root (not S, although S
+    // has the smaller UUID and differs from origin's parent).
     let mut lib = Lib::default();
     let s_folder = D::folder("S", "");
-    let r = D::folder("R", "");
+    let r = D::folder("R", "").trash();
     let (b, o, t) = three(
         &mut lib,
         &[(1, &s_folder), (2, &r)],
@@ -2782,4 +2791,209 @@ fn fixpoint_reports_change_and_refuses_to_run_past_its_bound() {
         }),
         Err(crate::error::Error::HubMerge(MergeError::InvalidDate(_)))
     ));
+}
+
+// ---- re-review follow-ups ---------------------------------------------------
+
+/// A blob source that counts reads.
+struct Counting<'a> {
+    blobs: &'a BTreeMap<Oid, Vec<u8>>,
+    reads: std::cell::Cell<usize>,
+}
+
+impl BlobSource for Counting<'_> {
+    fn read(&self, id: &Oid) -> Result<Vec<u8>> {
+        self.reads.set(self.reads.get() + 1);
+        self.blobs.read(id)
+    }
+}
+
+#[test]
+fn an_ordinary_sync_reads_only_the_merged_metadata() {
+    // The tablet is behind; origin has only view-state churn on 1000
+    // PDFs. Every document is decided by blob ids, and nothing is near
+    // the trash, so the only reads are the merged `.metadata` the tree
+    // rules need: one per document. (Deciding edits eagerly read four
+    // times as much.)
+    let mut lib = Lib::default();
+    let docs: Vec<(u32, D)> = library(1000);
+    let read: Vec<(u32, D)> = docs
+        .iter()
+        .map(|(n, d)| (*n, d.clone().scroll(*n)))
+        .collect();
+    let (b, o, t) = three(&mut lib, &refs(&docs), &refs(&docs), &refs(&read));
+    let counting = Counting {
+        blobs: &lib.blobs,
+        reads: std::cell::Cell::new(0),
+    };
+    let device = DeviceName::new(DEVICE).unwrap();
+    let consent = BTreeSet::new();
+    let params = MergeParams {
+        rules: MirrorRules::latest(),
+        device_name: &device,
+        date: DATE,
+        allow_deletions: false,
+        thresholds: GuardThresholds::default(),
+        consented_deletions: &consent,
+    };
+    let outcome = merge(
+        &MergeInput {
+            base: &b,
+            ours: &o,
+            theirs: &t,
+        },
+        &counting,
+        &NoHistory,
+        &params,
+    )
+    .unwrap();
+    assert_eq!(outcome.docs.len(), 1000);
+    assert_eq!(counting.reads.get(), 1000);
+}
+
+#[test]
+fn a_missing_parent_comes_back_from_origins_own_version_without_history() {
+    // The tablet deleted folder F; origin inked a notebook in F. The
+    // notebook is kept, F is deleted (unchanged in origin), and F comes
+    // back from origin's own version, not the root, even with no history.
+    let mut lib = Lib::default();
+    let folder = D::folder("F", "");
+    let doc = D::notebook("Notes", u(2).as_str(), 1, "base");
+    let (b, o, t) = three(
+        &mut lib,
+        &[(1, &doc), (2, &folder)],
+        &[],
+        &[(1, &doc.clone().ink(2, "origin")), (2, &folder)],
+    );
+    let outcome = run(&lib, &b, &o, &t);
+    assert_eq!(outcome.resolutions[&u(2)], Resolution::Resurrected);
+    assert_eq!(outcome.docs[&u(2)], version_of(&mut lib, &folder));
+    assert_eq!(lib.md(&outcome, &u(1))["parent"], json!(u(2).as_str()));
+}
+
+#[test]
+fn a_document_its_own_editor_trashed_through_a_folder_stays_in_the_trash() {
+    // The tablet inked N in F, then trashed F: N stays in the trash, with
+    // no note (the editing side's own tree has it on a trash path).
+    let mut lib = Lib::default();
+    let folder = D::folder("F", "");
+    let doc = D::notebook("Notes", u(2).as_str(), 1, "base");
+    let (b, o, t) = three(
+        &mut lib,
+        &[(1, &doc), (2, &folder)],
+        &[
+            (1, &doc.clone().ink(2, "tablet")),
+            (2, &folder.clone().trash()),
+        ],
+        &[(1, &doc), (2, &folder)],
+    );
+    let outcome = run(&lib, &b, &o, &t);
+    assert_eq!(lib.md(&outcome, &u(1))["parent"], json!(u(2).as_str()));
+    assert_eq!(lib.md(&outcome, &u(2))["parent"], json!(TRASH_PARENT));
+    assert!(outcome.notes.is_empty());
+}
+
+#[test]
+fn a_pre_trash_parent_that_is_gone_is_not_used() {
+    // Base: G, T in G, N in T. Origin trashed T, then deleted G; the
+    // tablet inked N. T's pre-trash parent G is gone, so T stays in the
+    // trash and N comes out to the root: never under a missing parent.
+    let mut lib = Lib::default();
+    let g = D::folder("G", "");
+    let t_folder = D::folder("T", u(1).as_str());
+    let doc = D::notebook("Notes", u(2).as_str(), 1, "base");
+    let (b, o, t) = three(
+        &mut lib,
+        &[(1, &g), (2, &t_folder), (3, &doc)],
+        &[(1, &g), (2, &t_folder), (3, &doc.clone().ink(2, "tablet"))],
+        &[(2, &t_folder.clone().trash()), (3, &doc)],
+    );
+    let outcome = run(&lib, &b, &o, &t);
+    assert!(!outcome.docs.contains_key(&u(1)));
+    assert_eq!(lib.md(&outcome, &u(2))["parent"], json!(TRASH_PARENT));
+    assert_eq!(lib.md(&outcome, &u(3))["parent"], json!(""));
+    assert_eq!(tree_violations(&merged_items(&lib, &outcome)), vec![]);
+}
+
+#[test]
+fn a_move_against_a_deletion_is_kept() {
+    let mut lib = Lib::default();
+    let folder = D::folder("F", "");
+    let doc = D::pdf("Paper", "", 1);
+    let (b, o, t) = three(
+        &mut lib,
+        &[(1, &doc), (2, &folder)],
+        &[(1, &doc.clone().move_to(u(2).as_str())), (2, &folder)],
+        &[(2, &folder)],
+    );
+    let outcome = run(&lib, &b, &o, &t);
+    assert_eq!(outcome.resolutions[&u(1)], Resolution::Kept(Side::Ours));
+    assert_eq!(lib.md(&outcome, &u(1))["parent"], json!(u(2).as_str()));
+}
+
+#[test]
+fn a_restore_heavy_merge_is_fast() {
+    // 500 folders trashed in origin, each holding a notebook the tablet
+    // inked, plus 1500 other inked notebooks: 500 restores.
+    let mut lib = Lib::default();
+    let folders: Vec<(u32, D)> = (1..=500u32)
+        .map(|n| (n, D::folder(&format!("F{n}"), "")))
+        .collect();
+    let notebooks: Vec<(u32, D)> = (1..=2000u32)
+        .map(|n| {
+            let parent = if n <= 500 {
+                u(n).to_string()
+            } else {
+                String::new()
+            };
+            (
+                10_000 + n,
+                D::notebook(&format!("N{n}"), &parent, 1, "base"),
+            )
+        })
+        .collect();
+    let base: Vec<(u32, &D)> = refs(&folders).into_iter().chain(refs(&notebooks)).collect();
+    let inked: Vec<(u32, D)> = notebooks
+        .iter()
+        .map(|(n, d)| (*n, d.clone().ink(2, &format!("tablet {n}"))))
+        .collect();
+    let trashed: Vec<(u32, D)> = folders
+        .iter()
+        .map(|(n, d)| (*n, d.clone().trash()))
+        .collect();
+    let ours: Vec<(u32, &D)> = refs(&folders).into_iter().chain(refs(&inked)).collect();
+    let theirs: Vec<(u32, &D)> = refs(&trashed).into_iter().chain(refs(&notebooks)).collect();
+    let (b, o, t) = three(&mut lib, &base, &ours, &theirs);
+    let started = std::time::Instant::now();
+    let outcome = run(&lib, &b, &o, &t);
+    let elapsed = started.elapsed();
+    let restores = outcome
+        .notes
+        .iter()
+        .filter(|note| matches!(note.kind, NoteKind::RestoredFromTrash { .. }))
+        .count();
+    assert_eq!(restores, 500);
+    let merged = merged_items(&lib, &outcome);
+    assert!((1..=500).all(|n| trash_path(&merged, &u(10_000 + n)).is_none()));
+    assert!(
+        elapsed < std::time::Duration::from_secs(20),
+        "merge took {elapsed:?}"
+    );
+}
+
+#[test]
+fn the_restore_note_does_not_claim_the_item_itself_was_edited() {
+    let note = Note {
+        doc: u(1),
+        kind: NoteKind::RestoredFromTrash {
+            parent: String::new(),
+        },
+    };
+    assert_eq!(
+        note.to_string(),
+        format!(
+            "{}: moved out of the trash to the root, so an edit is not lost",
+            u(1)
+        )
+    );
 }
