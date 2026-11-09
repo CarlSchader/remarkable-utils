@@ -31,3 +31,8 @@
 - [ ] Sync v2 phase 4 candidates: bounded transfer pipelining, watch
   mode, `--paranoid` re-hash, exclude patterns, `--dry-run --json`,
   `--pull-bundles` (annotated PDFs as `.rmdoc`).
+
+### rmu hub (git-backed multi-tablet sync)
+
+- [ ] Implement the plan in `docs/hub-design.md` (phases and PR order
+  are listed there).
