@@ -192,7 +192,8 @@ This repository is **open source** (dual-licensed MIT OR Apache-2.0):
   origin (`cycle/origin.rs`), `init` (`cycle/init.rs`), the local
   cache (`cycle/store.rs`: a bare repository per repo id under
   `$XDG_CACHE_HOME/rmu/hub`, an `flock`, raw commits and trees read
-  through one `cat-file`, bounded caches; never a tree read per commit
+  through one `cat-file` (whole trees too: a level per pipelined
+  batch, `CatFile::read_many`), bounded caches; never a tree read per commit
   of history: searches go through the **pure** history index,
   `cycle/history.rs`, built from one `rev-list` and one `diff-tree`
   stream), reading the tablet into `fast-import` (`cycle/snapshot.rs`),
