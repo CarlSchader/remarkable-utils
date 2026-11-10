@@ -193,7 +193,7 @@ Unchanged v1 rules that remain data-safety invariants:
   unchanged, not treated as deletions or rebound to another document;
   transfers into excluded paths are blocked until the exclusion clears.
 - `--delete` only propagates deletions of **mapped** files.
-- Uploads write `.metadata` last, so interruption leaves invisible
+- Uploads and new folders write `.metadata` last, so interruption leaves invisible
   orphans, not half-documents; dangling mappings **rebind** to
   same-name same-kind successors. Rebinding changes only the UUID:
   the last agreed stamps and hashes remain intact, and a persisted

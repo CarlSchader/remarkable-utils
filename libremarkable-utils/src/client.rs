@@ -388,23 +388,19 @@ impl Client {
     ) -> Result<Item> {
         let now = now_ms();
         self.progress.step("Registering document");
-        // .metadata is written LAST: a document only becomes visible to
-        // xochitl once it exists, so an interrupted upload leaves
-        // invisible orphan files instead of a broken document.
-        self.write_text(
-            &format!("{doc_uuid}.content"),
-            &xochitl::document_content_json(file_type),
-        )?;
-        self.write(|guard| {
-            self.session.run_checked(&format!(
-                "{guard}mkdir -p {}",
-                shell_quote(&self.remote_path(&doc_uuid))
-            ))
-        })?;
-        self.write_text(&format!("{doc_uuid}.pagedata"), "")?;
-        self.write_text(
-            &format!("{doc_uuid}.metadata"),
-            &xochitl::document_metadata_json(&name, &parent, now),
+        self.create_files(
+            &[
+                (
+                    format!("{doc_uuid}.content"),
+                    xochitl::document_content_json(file_type),
+                ),
+                (format!("{doc_uuid}.pagedata"), String::new()),
+                (
+                    format!("{doc_uuid}.metadata"),
+                    xochitl::document_metadata_json(&name, &parent, now),
+                ),
+            ],
+            std::slice::from_ref(&doc_uuid),
         )?;
         self.progress.finished();
 
@@ -468,7 +464,7 @@ impl Client {
         self.progress.step(&format!("Restoring bundle '{name}'"));
         self.write(|guard| {
             self.session.run_checked_with_stdin(
-                &format!("{guard}cd {} && tar -xf -", shell_quote(&self.dir)),
+                &restore_tar_script(&self.dir, tar_bytes.len() as u64, guard),
                 &tar_bytes,
                 &*self.progress,
             )
@@ -1091,17 +1087,34 @@ impl Client {
         self.write_text(&name, &text)
     }
 
+    /// Create a new item's `files` (name, text) and empty `dirs` in the
+    /// data dir in one guarded round trip (see [`create_files_script`]).
+    fn create_files(&self, files: &[(String, String)], dirs: &[String]) -> Result<()> {
+        self.write(|guard| {
+            crate::ssh::checked(
+                self.session
+                    .run_script(&create_files_script(&self.dir, files, dirs, guard))?,
+            )
+            .map(drop)
+        })
+    }
+
     /// Create a folder under `parent_uuid` **without conflict checks**
     /// — callers must have verified the name is free.
     pub fn create_folder_in(&self, visible_name: &str, parent_uuid: &str) -> Result<Item> {
         let folder_uuid = uuid::Uuid::new_v4().to_string();
         let now = now_ms();
-        self.write_text(
-            &format!("{folder_uuid}.metadata"),
-            &xochitl::folder_metadata_json(visible_name, parent_uuid, now),
+        self.create_files(
+            &[
+                (format!("{folder_uuid}.content"), "[]".to_string()),
+                (format!("{folder_uuid}.pagedata"), "\n".to_string()),
+                (
+                    format!("{folder_uuid}.metadata"),
+                    xochitl::folder_metadata_json(visible_name, parent_uuid, now),
+                ),
+            ],
+            &[],
         )?;
-        self.write_text(&format!("{folder_uuid}.content"), "[]")?;
-        self.write_text(&format!("{folder_uuid}.pagedata"), "\n")?;
         Ok(Item {
             uuid: folder_uuid,
             visible_name: visible_name.to_string(),
@@ -1135,6 +1148,81 @@ impl Client {
         })?;
         Ok(())
     }
+}
+
+/// Create a new item's files in the data dir `dir`, all or nothing as
+/// far as xochitl can tell: `fill` (shell) writes them into the private
+/// staging directory `"$tmp/x"` (inside `dir`, so the renames stay on
+/// one filesystem; `.rmu-*`, so the hub never mirrors a leftover), then
+/// `guard` (shell, newline-terminated, may be empty) runs, and each entry
+/// is renamed into place, every `.metadata` last: an item becomes visible
+/// to xochitl only once its `.metadata` exists, so an interruption leaves
+/// invisible orphans, never an item missing its `.content` (the same rule
+/// as the hub's apply). Pure.
+fn staged_create_script(dir: &str, fill: &str, guard: &str) -> String {
+    format!(
+        r#"cd {dir} || exit 1
+tmp=$(mktemp -d ./.rmu-create-XXXXXX) || exit 1
+trap 'rm -rf -- "$tmp"' EXIT
+trap 'exit 1' HUP INT TERM
+mkdir -- "$tmp/x" || exit 1
+{fill}{guard}for f in "$tmp"/x/*; do
+    case "$f" in *.metadata) continue ;; esac
+    [ -e "$f" ] || continue
+    mv -fT -- "$f" "${{f##*/}}" || exit 1
+done
+for f in "$tmp"/x/*.metadata; do
+    [ -e "$f" ] || continue
+    mv -fT -- "$f" "${{f##*/}}" || exit 1
+done
+"#,
+        dir = shell_quote(dir),
+    )
+}
+
+/// [`staged_create_script`] writing `files` (name, text) and creating
+/// empty `dirs`. The texts are embedded (quoted), so the script goes over
+/// stdin ([`SshSession::run_script`]). Pure.
+fn create_files_script(
+    dir: &str,
+    files: &[(String, String)],
+    dirs: &[String],
+    guard: &str,
+) -> String {
+    let fill: String = files
+        .iter()
+        .map(|(name, text)| {
+            format!(
+                "printf '%s' {} > \"$tmp\"/x/{} || exit 1\n",
+                shell_quote(text),
+                shell_quote(name)
+            )
+        })
+        .chain(
+            dirs.iter()
+                .map(|name| format!("mkdir -- \"$tmp\"/x/{} || exit 1\n", shell_quote(name))),
+        )
+        .collect();
+    staged_create_script(dir, &fill, guard)
+}
+
+/// [`staged_create_script`] unpacking the tar of `total` bytes on stdin.
+/// The archive is received whole and its length checked before it is
+/// unpacked: a cut stream can end cleanly at a file boundary. Pure.
+fn restore_tar_script(dir: &str, total: u64, guard: &str) -> String {
+    staged_create_script(
+        dir,
+        &format!(
+            r#"cat > "$tmp/t" || exit 1
+[ "$(wc -c < "$tmp/t")" -eq {total} ] || {{
+    echo 'incomplete remote upload: unexpected byte count' >&2
+    exit 1
+}}
+tar -xf "$tmp/t" -C "$tmp/x" || exit 1
+"#
+        ),
+        guard,
+    )
 }
 
 /// Parse `sha256sum` output lines (`HASH  uuid.ext`) into
@@ -1580,6 +1668,35 @@ mod tests {
         let (fetch, retained) = listing_delta(&cache, &stats);
         assert_eq!(fetch.len(), 3);
         assert!(retained.is_empty());
+    }
+
+    #[test]
+    fn created_files_are_staged_and_metadata_moves_last() {
+        let files = [
+            (
+                "u.metadata".to_string(),
+                "{\"visibleName\": \"it's\"}".to_string(),
+            ),
+            ("u.content".to_string(), "[]".to_string()),
+        ];
+        let script = create_files_script("/data dir", &files, &["u".to_string()], "GUARD\n");
+        assert!(script.starts_with("cd '/data dir' || exit 1\n"), "{script}");
+        let at = |text: &str| {
+            script
+                .find(text)
+                .unwrap_or_else(|| panic!("{text} not in {script}"))
+        };
+        // Everything is written to staging before the guard, which runs
+        // right before the first rename.
+        assert!(at("> \"$tmp\"/x/u.metadata") < at("GUARD"));
+        assert!(at("mkdir -- \"$tmp\"/x/u ") < at("GUARD"));
+        assert!(script.contains(r#"printf '%s' '{"visibleName": "it'\''s"}'"#));
+        assert!(at("GUARD") < at("for f in \"$tmp\"/x/*; do"));
+        // The .metadata pass comes after every other rename.
+        assert!(at("*.metadata) continue") < at("for f in \"$tmp\"/x/*.metadata; do"));
+        assert_eq!(script.matches("mv -fT").count(), 2);
+        let restore = restore_tar_script("/d", 512, "");
+        assert!(restore.find("-eq 512").unwrap() < restore.find("tar -xf").unwrap());
     }
 
     #[test]

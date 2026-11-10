@@ -103,7 +103,13 @@ This repository is **open source** (dual-licensed MIT OR Apache-2.0):
   (`Error::HubLocked`), with the read-only probe from `hub/device`
   riding along in the listing, and carries the probe's write guard in
   its own command right before its commit point; route new writes
-  through `Client::write`.
+  through `Client::write`. A new item's files are created in one round
+  trip (`Client::create_files`, `staged_create_script`): staged in a
+  private `.rmu-create-*` directory in the data dir, then renamed into
+  place with every `.metadata` **last** (xochitl sees an item once its
+  `.metadata` exists), as the hub's apply does; bundle restores go
+  through the same staging, their tar length-checked first. Never write
+  a new item's `.metadata` before its other files.
   `list_items`
   fetches metadata in batched round trips (with a listing cache it is
   incremental: stat everything, cat only changes); keep new
