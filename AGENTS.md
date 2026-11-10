@@ -103,7 +103,11 @@ This repository is **open source** (dual-licensed MIT OR Apache-2.0):
   never rmu's newest), `.rmu/hub.json` and tablet-state formats (newer
   format versions are refused, unknown fields preserved), view-state
   normalisation and overlay, per-document grouping of tree listings,
-  snapshot validation (quarantine/orphan) and carry-forward. Keep it
+  snapshot validation (quarantine/orphan) and carry-forward, one
+  submodule per concern (`model/ids.rs`, `layout.rs`, `rules.rs`,
+  `state.rs`, `grouping.rs`, `snapshot.rs`, each with its tests; shared
+  test helpers in `model/fixtures.rs`), re-exported from `hub::model`:
+  import through that path. Keep it
   I/O-free. `hub/merge.rs` is the **pure** merge engine, phase 1:
   per-document three-way merge (blob contents through a `BlobSource`,
   history through `History`), forks with deterministic UUIDv5 ids, tree
@@ -141,8 +145,11 @@ This repository is **open source** (dual-licensed MIT OR Apache-2.0):
   `hub/cycle.rs` composes all of it into the operations behind
   `rmu hub` (`Hub`: `init`, `clone_tablet` with reattach, `sync`,
   `backup`, `status`, `dry_run`, `remote`, `set_remote_url`, `detach`;
-  every report derives `Serialize`, warnings are the typed `Warning`):
-  the local cache (`cycle/store.rs`: a
+  every report derives `Serialize` (`cycle/report.rs`), warnings are
+  the typed `Warning`; `cycle.rs` itself keeps only the errors, options,
+  `Hub` and helpers its submodules share): the tablet session (lock,
+  watchdog, error path: `cycle/session.rs`), what a run knows about
+  origin (`cycle/origin.rs`), `init` (`cycle/init.rs`), the local cache (`cycle/store.rs`: a
   bare repository per repo id under `$XDG_CACHE_HOME/rmu/hub`, an
   `flock`, raw commits and trees read through one `cat-file`, bounded
   caches; never a tree read per commit of history: searches go through
@@ -153,9 +160,11 @@ This repository is **open source** (dual-licensed MIT OR Apache-2.0):
   verification, step-14 moved paths, tree and trash checks,
   reconciliation verdicts and finish, the manifest; new decisions go
   there, with tests), commit trailers (`cycle/message.rs`), the steps
-  (`cycle/steps.rs`), the read-only commands (`cycle/inspect.rs`, which
-  shares the sync's merge setup, `Hub::run_merge`) and `remote`/`detach`
-  (`cycle/admin.rs`). Base inference uses the merge's own "unchanged"
+  (`cycle/steps.rs`: `sync`, `backup`, steps 1–6; its submodules
+  `clone`, `reconcile` (step 4), `push` (7–11) and `apply` (12–16)),
+  the read-only commands (`cycle/inspect.rs`, which shares the sync's
+  merge setup, `Hub::run_merge` in `cycle/merge_run.rs`) and
+  `remote`/`detach` (`cycle/admin.rs`). Base inference uses the merge's own "unchanged"
   predicate (`merge::unchanged`); keep the two from drifting. `tests/hub_e2e.rs` (harness in
   `tests/hub_e2e/world.rs`) runs fake tablets against a bare origin,
   ending every scenario that syncs to the end with one oracle
