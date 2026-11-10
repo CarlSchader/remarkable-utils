@@ -386,8 +386,10 @@ impl fmt::Display for Warning {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SyncReport {
     pub update: MainUpdate,
-    /// The snapshot commit (device ref). For [`MainUpdate::Pulled`] it is
-    /// a local commit only.
+    /// The snapshot commit, on the device ref (pushed at step 7, unless
+    /// the device ref already held the same tree and its head is reused).
+    /// For [`MainUpdate::Pulled`] and [`MainUpdate::UpToDate`] it is not
+    /// on `main`.
     pub snapshot: Oid,
     /// The commit the tablet now agrees with.
     pub base: Oid,
