@@ -310,6 +310,7 @@ Exit statuses:
 | 5      | origin does not match the tablet (see `clone --reattach`), or lost its `main` (see Recovery) |
 | 6      | the tablet is paired with the reMarkable cloud                    |
 | 7      | an interrupted sync must be finished first (`rmu hub sync` against the current origin; `detach --force` discards it) |
+| 8      | the tablet did not answer (asleep or off the network): wake it and run the command again |
 
 See `docs/hub-design.md` for the full design.
 

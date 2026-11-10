@@ -58,6 +58,8 @@ Exit status:
   6  the tablet is paired with the reMarkable cloud (unpair it first)
   7  an interrupted sync must be finished first: run `rmu hub sync`
      against the current origin (for `detach`, --force discards it)
+  8  the tablet did not answer (asleep or off the network): wake it, keep
+     it awake, and run the command again
 
 Output: stdout carries the result only: a summary on a terminal, JSON
 with --json, otherwise plain ids (the summary then goes to stderr).
@@ -266,6 +268,7 @@ pub enum Failure {
     OriginMismatch,
     CloudPaired,
     JournalPending,
+    Unreachable,
 }
 
 impl Failure {
@@ -289,6 +292,7 @@ impl Failure {
                 | CycleError::DetachJournalPending
                 | CycleError::JournalMergeMissing { .. },
             ) => Self::JournalPending,
+            Error::Unreachable(_) => Self::Unreachable,
             _ => Self::Error,
         }
     }
@@ -301,6 +305,7 @@ impl Failure {
             Self::OriginMismatch => 5,
             Self::CloudPaired => 6,
             Self::JournalPending => 7,
+            Self::Unreachable => 8,
         }
     }
 }
