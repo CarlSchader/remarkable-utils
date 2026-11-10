@@ -2978,3 +2978,40 @@ fn a_locked_tablet_gets_no_pre_read() {
     libremarkable_utils::hub::device::Tablet::release_lock(tablet, &held).unwrap();
     world.sync(0).unwrap();
 }
+
+/// A journal is pending and origin is rewound past its merge: `sync`
+/// stops (`OriginRewound`, naming reattach), and the reattach it names
+/// goes ahead, discarding the journal nothing can reconcile any more,
+/// instead of sending the user back to `sync`.
+#[test]
+fn reattach_after_a_rewind_discards_a_journal_origin_lost() {
+    let template = crash_template();
+    let repo = template.git.open(Path::new(&template.origin)).unwrap();
+    let before = repo.rev_parse("refs/heads/main").unwrap().unwrap();
+    let (kill, _) = kill_leaving_a_half_applied_document(&template);
+    let world = crashed_by(&template, Fault::KillApplyAfter(kill));
+    let repo = world.git.open(Path::new(&world.origin)).unwrap();
+    repo.update_ref("refs/heads/main", &before, None).unwrap();
+    let tablet = world.tablet(0);
+    tablet.reconnect();
+    if tablet.watchdog_armed().is_some() {
+        tablet.fire_watchdog();
+    }
+    let error = world.sync(0).unwrap_err();
+    assert!(
+        is_cycle(&error, |e| matches!(e, CycleError::OriginRewound { .. })),
+        "{error}"
+    );
+    assert!(error.to_string().contains("--reattach"), "{error}");
+    assert!(error.to_string().contains("rmu hub detach"), "{error}");
+    let report = world.reattach(0).unwrap();
+    assert!(
+        report.warnings.contains(&Warning::JournalDiscarded),
+        "{report:?}"
+    );
+    assert!(world.device(0).state().unwrap().journal.is_none());
+    // The documents that lost their `.metadata` are in no base after a
+    // reattach (left alone); repaired, everything converges, ink intact.
+    world.repair(0);
+    world.converge();
+}

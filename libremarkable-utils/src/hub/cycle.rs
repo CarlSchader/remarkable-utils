@@ -90,9 +90,10 @@ pub enum CycleError {
     NotAttached,
 
     /// `clone --reattach` to the same repository while an interrupted
-    /// sync's journal is pending: `sync` reconciles it first.
+    /// sync's journal, whose merge origin has, is pending: `sync`
+    /// reconciles it first.
     #[error(
-        "an interrupted sync left a journal on the tablet; run `rmu hub sync` first, then reattach if it still fails"
+        "an interrupted sync left a journal on the tablet that origin can still finish; run `rmu hub sync` first (`rmu hub detach` then `rmu hub clone` would attach the tablet afresh, without it)"
     )]
     JournalPending,
 
@@ -128,7 +129,7 @@ pub enum CycleError {
     /// or replaced. Nothing is inferred (a rewound origin would read as
     /// "everything since was deleted").
     #[error(
-        "base commit {base} is not in origin's history: origin was rewound or replaced; stopping (`rmu hub clone --reattach` is the deliberate recovery)"
+        "base commit {base} is not in origin's history: origin was rewound or replaced; stopping (`rmu hub clone --reattach`, or `rmu hub detach` then `rmu hub clone`, attaches the tablet to it deliberately)"
     )]
     OriginRewound { base: Oid },
 
@@ -339,7 +340,9 @@ pub enum Warning {
     StagingNotCleared { error: String },
     /// `git maintenance run --auto` on the local cache failed.
     MaintenanceFailed { error: String },
-    /// `detach`: the journal of an interrupted sync was discarded.
+    /// `detach`, or `clone --reattach` to an origin that no longer has
+    /// the journaled merge: the journal of an interrupted sync was
+    /// discarded.
     JournalDiscarded,
     /// `detach`: the device ref on origin could not be deleted.
     DeviceRefNotPruned { error: String },

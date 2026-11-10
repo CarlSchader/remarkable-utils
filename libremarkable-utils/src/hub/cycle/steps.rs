@@ -23,8 +23,8 @@ use crate::hub::device::{
 use crate::hub::merge::{self, BlobSource, TreeItem};
 use crate::hub::model::{
     Classification, DeviceId, DeviceName, DocFile, DocId, DocOutcome, DocVersion, Journal,
-    JsonFile, ManifestEntry, MirrorRules, MirroredFile, RepoTree, StatSignature, TabletState,
-    XochitlPath,
+    JsonFile, ManifestEntry, MirrorRules, MirroredFile, RepoId, RepoTree, StatSignature,
+    TabletState, XochitlPath,
 };
 
 /// Staging uploads go in batches of about this many bytes, with the
@@ -138,6 +138,29 @@ fn recorded_forks(store: &Store, tip: &Oid, snapshot: &Oid) -> Result<Vec<(DocId
         .iter()
         .flat_map(|text| message::forks(&message::trailers(text)))
         .collect())
+}
+
+/// What `clone --reattach` does with an interrupted sync's journal. A
+/// merge origin's `main` (`main`, of repository `repo_id`) has: refused
+/// (`JournalPending`), since only that journal's reconciliation knows
+/// which documents its apply stopped inside, and `sync` runs it. Any
+/// other journal (origin was rewound or replaced, or the merge never
+/// landed) can never be reconciled: discarded, with a warning.
+fn pending_journal(
+    existing: Option<&TabletState>,
+    repo_id: &RepoId,
+    store: &Store,
+    main: &Oid,
+) -> Result<Option<Warning>> {
+    let Some((state, journal)) =
+        existing.and_then(|state| state.journal.as_ref().map(|journal| (state, journal)))
+    else {
+        return Ok(None);
+    };
+    if state.repo_id == *repo_id && store.is_ancestor(&journal.merge, main)? {
+        return Err(CycleError::JournalPending.into());
+    }
+    Ok(Some(Warning::JournalDiscarded))
 }
 
 /// String paths (from the pure helpers) as tablet paths.
@@ -263,6 +286,7 @@ impl Hub<'_> {
                 }
                 .into());
             }
+            pending_journal(before.as_ref(), &config.repo_id, &probe, &main)?;
             let pre = if self.may_pre_read(s.tablet)? {
                 let saved = store::pre_read_path(
                     &self.cache_dir,
@@ -294,15 +318,6 @@ impl Hub<'_> {
                 }
                 .into());
             }
-            // An interrupted apply against this very repository: only its
-            // reconciliation knows which documents it half wrote (a fresh
-            // state would fork them).
-            if existing
-                .as_ref()
-                .is_some_and(|state| state.journal.is_some() && state.repo_id == config.repo_id)
-            {
-                return Err(CycleError::JournalPending.into());
-            }
             let info = s.tablet.device_info()?;
             let device_id = existing
                 .as_ref()
@@ -316,6 +331,8 @@ impl Hub<'_> {
             if ctx.config != config {
                 return Err(CycleError::RepoConfigChanged.into());
             }
+            let discarded =
+                pending_journal(existing.as_ref(), &config.repo_id, &ctx.store, &ctx.main)?;
             self.progress.step("Stopping xochitl");
             s.stop()?;
             let mut writer = ctx.cache.repo.commit_writer(self.progress, None)?;
@@ -341,8 +358,9 @@ impl Hub<'_> {
                 &tablet_only,
                 &ReadBlobs::new(&read, &ctx.store),
             )?;
-            let mut warnings: Vec<Warning> = mixed_model_warning(&ctx.store, &ctx.main, &info)?
+            let mut warnings: Vec<Warning> = discarded
                 .into_iter()
+                .chain(mixed_model_warning(&ctx.store, &ctx.main, &info)?)
                 .collect();
             let mut state = TabletState::new(
                 ctx.config.repo_id.clone(),
