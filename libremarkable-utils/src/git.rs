@@ -1750,9 +1750,25 @@ pub fn parse_commit(data: &[u8]) -> Result<CommitObject> {
     })
 }
 
+/// A stored tree-entry mode as git reports it (its `canon_mode`, applied
+/// by `ls-tree`, `diff-tree` and `fast-import` alike): a regular file is
+/// `100644` or `100755` by its owner-execute bit (old trees hold `100664`
+/// or `100775`, which `fsck` only warns about), a symlink `120000`, a
+/// directory `040000`, anything else a gitlink.
+fn canon_mode(mode: u32) -> u32 {
+    match mode & 0o170000 {
+        0o100000 if mode & 0o100 != 0 => 0o100755,
+        0o100000 => 0o100644,
+        0o120000 => 0o120000,
+        0o040000 => 0o040000,
+        _ => 0o160000,
+    }
+}
+
 /// Parse a raw tree object (`<octal mode> SP <name> NUL <binary id>` per
-/// entry) into entries named by their bare names. Sizes are not part of
-/// a tree object (`None`); the kind follows from the mode.
+/// entry) into entries named by their bare names. Modes are canonical
+/// ([`canon_mode`]), as git reports them. Sizes are not part of a tree
+/// object (`None`); the kind follows from the mode.
 pub fn parse_tree(data: &[u8], format: ObjectFormat) -> Result<Vec<TreeEntry>> {
     let id_len = match format {
         ObjectFormat::Sha1 => 20,
@@ -1768,6 +1784,7 @@ pub fn parse_tree(data: &[u8], format: ObjectFormat) -> Result<Vec<TreeEntry>> {
             .and_then(|mode| std::str::from_utf8(mode).ok())
             .and_then(|mode| u32::from_str_radix(mode, 8).ok())
             .filter(|_| space < nul)
+            .map(canon_mode)
             .ok_or_else(malformed)?;
         let name = &rest[space + 1..nul];
         let id = rest.get(nul + 1..nul + 1 + id_len).ok_or_else(malformed)?;
@@ -2653,6 +2670,31 @@ mod tests {
         });
         // A SHA-1 tree read as SHA-256 runs out of id bytes.
         assert!(parse_tree(&entry("100644", b"f", A), ObjectFormat::Sha256).is_err());
+    }
+
+    #[test]
+    fn tree_modes_are_canonical_as_git_reports_them() {
+        let binary: Vec<u8> = (0..A.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&A[i..i + 2], 16).unwrap())
+            .collect();
+        [
+            ("100664", 0o100644, ObjectKind::Blob),
+            ("100600", 0o100644, ObjectKind::Blob),
+            ("100775", 0o100755, ObjectKind::Blob),
+            ("100700", 0o100755, ObjectKind::Blob),
+            ("120777", 0o120000, ObjectKind::Blob),
+            ("40755", 0o040000, ObjectKind::Tree),
+            ("160755", 0o160000, ObjectKind::Commit),
+            // No file type at all: git takes it for a gitlink.
+            ("644", 0o160000, ObjectKind::Commit),
+        ]
+        .into_iter()
+        .for_each(|(stored, mode, kind)| {
+            let raw = [stored.as_bytes(), b" f\0", &binary].concat();
+            let entries = parse_tree(&raw, ObjectFormat::Sha1).unwrap();
+            assert_eq!((entries[0].mode, entries[0].kind), (mode, kind), "{stored}");
+        });
     }
 
     #[test]

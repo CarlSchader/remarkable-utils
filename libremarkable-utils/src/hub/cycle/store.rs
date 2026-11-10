@@ -1620,6 +1620,110 @@ mod tests {
             .unwrap()
     }
 
+    /// Run `git` on `repo` (hermetically, with an identity), `stdin` in;
+    /// its stdout, trimmed (lossily decoded: ids and mode text are ASCII).
+    fn raw_git(scratch: &Scratch, repo: &Repo, args: &[&str], stdin: &[u8]) -> String {
+        use std::io::Write;
+        let mut child = std::process::Command::new("git")
+            .arg("--git-dir")
+            .arg(repo.git_dir())
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_COUNT", "0")
+            .env("HOME", scratch.path())
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.invalid")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(stdin).unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "git {args:?}");
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// A commit of a tree written as given (`--literally`: modes git no
+    /// longer writes but old trees hold), from entries `(mode, name, id)`
+    /// in git's order.
+    fn literal_tree(scratch: &Scratch, repo: &Repo, entries: &[(&str, &str, &str)]) -> String {
+        let raw: Vec<u8> = entries
+            .iter()
+            .flat_map(|(mode, name, id)| {
+                let binary = (0..id.len())
+                    .step_by(2)
+                    .map(|i| u8::from_str_radix(&id[i..i + 2], 16).unwrap());
+                format!("{mode} {name}\0")
+                    .into_bytes()
+                    .into_iter()
+                    .chain(binary)
+            })
+            .collect();
+        raw_git(
+            scratch,
+            repo,
+            &["hash-object", "-t", "tree", "--literally", "-w", "--stdin"],
+            &raw,
+        )
+    }
+
+    /// `tree_of` reads historic modes (`100664`, `100775`, kept in old
+    /// trees and only warned about by `fsck`) as `ls-tree` reports them,
+    /// outside `docs/` and inside a document's subtree alike.
+    #[test]
+    fn tree_of_reads_historic_modes_as_git_reports_them() {
+        [ObjectFormat::Sha1, ObjectFormat::Sha256]
+            .into_iter()
+            .for_each(|format| {
+                let scratch = Scratch::new("tree-of-modes");
+                let git = hermetic(&scratch);
+                let repo = git
+                    .init_bare(&scratch.path().join("r.git"), format)
+                    .unwrap();
+                let blob =
+                    |data: &[u8]| raw_git(&scratch, &repo, &["hash-object", "-w", "--stdin"], data);
+                let (metadata, data) = (blob(b"{\"type\":\"DocumentType\"}"), blob(b"x"));
+                let d = doc(1).to_string();
+                let subtree = literal_tree(
+                    &scratch,
+                    &repo,
+                    &[
+                        ("100664", "extra.txt", &data),
+                        ("100644", "metadata", &metadata),
+                    ],
+                );
+                let docs = literal_tree(&scratch, &repo, &[("40000", &d, &subtree)]);
+                let root = literal_tree(
+                    &scratch,
+                    &repo,
+                    &[
+                        ("100664", "README", &data),
+                        ("40000", "docs", &docs),
+                        ("100775", "tool", &data),
+                    ],
+                );
+                let tip: Oid = raw_git(&scratch, &repo, &["commit-tree", &root, "-m", "old"], b"")
+                    .parse()
+                    .unwrap();
+                // The tree really holds the historic modes.
+                let raw = raw_git(&scratch, &repo, &["cat-file", "tree", &root], b"");
+                assert!(raw.contains("100664 README") && raw.contains("100775 tool"));
+                let rules = MirrorRules::latest();
+                let listed =
+                    model::tree_listing(repo.ls_tree_recursive(tip.as_str()).unwrap()).unwrap();
+                let store = Store::new(repo.clone()).unwrap();
+                let tree = store.tree_of(rules, &tip).unwrap();
+                assert_eq!(tree, rules.group_tree(listed).unwrap(), "{format:?}");
+                assert_eq!(tree.extra["README"].mode, FileMode::Regular);
+                assert_eq!(tree.extra["tool"].mode, FileMode::Executable);
+                let version = store.version_at(rules, &tip, &doc(1)).unwrap().unwrap();
+                assert_eq!(version.other["extra.txt"].mode, FileMode::Regular);
+            });
+    }
+
     /// `tree_of` against the full `ls-tree -r` listing it is built from
     /// by definition, in both object formats, on a tree with nested
     /// pages, an executable, a symlink and a gitlink at mirrored names,
