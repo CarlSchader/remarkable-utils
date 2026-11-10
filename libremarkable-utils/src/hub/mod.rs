@@ -13,14 +13,17 @@
 //! - [`device`] — tablet I/O behind the [`device::Tablet`] trait (lock,
 //!   watchdog, stat pass, streaming download, staged apply), over SSH
 //!   or a fault-injecting fake.
+//! - [`cycle`] — the operations composing them: `init`, `clone`,
+//!   `sync`, `backup`, `status`, `--dry-run` ([`cycle::Hub`]).
 //!
 //! Errors: pure functions that fail only on their own terms return
 //! their module's error ([`model::ModelError`], [`merge::MergeError`],
 //! [`device::DeviceError`]). Functions that do I/O or call
 //! caller-supplied readers return [`crate::Result`]; their own failures
-//! are the variants `HubModel`, `HubMerge` and `HubDevice` of
-//! [`crate::Error`]. Hub errors never wrap [`crate::Error`].
+//! are the variants `HubModel`, `HubMerge`, `HubDevice` and `HubCycle`
+//! of [`crate::Error`]. Hub errors never wrap [`crate::Error`].
 
+pub mod cycle;
 pub mod device;
 pub mod merge;
 pub mod model;

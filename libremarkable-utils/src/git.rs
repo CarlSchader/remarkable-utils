@@ -31,7 +31,7 @@
 //!
 //! Requires git 2.30 or newer (`rev-parse --end-of-options`).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs;
@@ -472,6 +472,46 @@ impl Repo {
         }
     }
 
+    /// Delete the full remote ref `dst`, only if it is at `expected`
+    /// (`--force-with-lease`): a compare-and-swap like [`Repo::push`]'s,
+    /// with the same errors ([`Error::PushRejected`] when it moved).
+    pub fn delete_remote_ref(&self, url: &str, dst: &str, expected: &Oid) -> Result<()> {
+        validate_ref_name(dst)?;
+        let mut cmd = self.command("push");
+        cmd.args(["--porcelain", "--no-verify"])
+            .arg(format!("--force-with-lease={dst}:{expected}"))
+            .arg("--end-of-options")
+            .arg(url)
+            .arg(format!(":{dst}"));
+        let output = output("push", &mut cmd)?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let status = parse_push_porcelain(&String::from_utf8_lossy(&output.stdout))
+            .into_iter()
+            .find(|status| status.to == dst);
+        match status {
+            Some(status) if status.flag == '-' && output.status.success() => Ok(()),
+            Some(status) if status.flag == '!' => {
+                let reason = status.reason.unwrap_or_else(|| status.summary.clone());
+                match status.summary.as_str() {
+                    "[rejected]" => Err(Error::PushRejected {
+                        reference: dst.to_string(),
+                        reason,
+                    }),
+                    summary => Err(Error::PushFailed {
+                        reference: dst.to_string(),
+                        reason: format!("{summary} ({reason})"),
+                        stderr: stderr.trim().to_string(),
+                    }),
+                }
+            }
+            Some(status) => Err(output_error(
+                "push",
+                format!("unexpected status {:?} deleting {dst}", status.flag),
+            )),
+            None => Err(failure("push", &output)),
+        }
+    }
+
     /// Resolve `rev` like `git rev-parse --verify`; `None` if it does not
     /// resolve. A full hex id resolves even if the object is absent:
     /// append `^{commit}` (or `^{object}`) to require that it exists.
@@ -556,6 +596,91 @@ impl Repo {
         let mut cmd = self.command("ls-tree");
         cmd.args(["-r", "-t", "-z", "--long", "--end-of-options", treeish]);
         parse_ls_tree(&run("ls-tree", &mut cmd)?)
+    }
+
+    /// Commits reachable from `revisions` (e.g. `["<tip>", "^<stop>"]`;
+    /// object ids or full ref names, never options), newest first in
+    /// git's default order. With `first_parent`, only first parents are
+    /// followed: on a branch whose every update is a merge with the
+    /// previous tip as first parent, that is the branch's own history.
+    pub fn rev_list(&self, revisions: &[&str], first_parent: bool) -> Result<Vec<Oid>> {
+        let options: &[&str] = if first_parent {
+            &["--first-parent"]
+        } else {
+            &[]
+        };
+        self.rev_list_with(revisions, options)
+    }
+
+    fn rev_list_with(&self, revisions: &[&str], options: &[&str]) -> Result<Vec<Oid>> {
+        if let Some(bad) = revisions
+            .iter()
+            .find(|rev| rev.is_empty() || rev.starts_with('-') || rev.contains(char::is_control))
+        {
+            return Err(Error::InvalidGitInput(format!("invalid revision {bad:?}")));
+        }
+        let mut cmd = self.command("rev-list");
+        cmd.args(options).arg("--end-of-options").args(revisions);
+        let out = run("rev-list", &mut cmd)?;
+        out.split(|&b| b == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| parse_oid_line("rev-list", line))
+            .collect()
+    }
+
+    /// Every commit reachable from `revisions`, children before their
+    /// parents (`--topo-order`), so the first commit of a line of history
+    /// is its newest.
+    pub fn rev_list_topo(&self, revisions: &[&str]) -> Result<Vec<Oid>> {
+        self.rev_list_with(revisions, &["--topo-order"])
+    }
+
+    /// The size of each of `oids` the repository has (absent ones are
+    /// left out), in one `cat-file --batch-check`: headers only, no object
+    /// content is read.
+    pub fn object_sizes<'a>(
+        &self,
+        oids: impl IntoIterator<Item = &'a Oid>,
+    ) -> Result<HashMap<Oid, u64>> {
+        let request: Vec<u8> = oids
+            .into_iter()
+            .flat_map(|oid| format!("{oid}\n").into_bytes())
+            .collect();
+        if request.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut cmd = self.command("cat-file");
+        cmd.arg("--batch-check");
+        let mut process = Process::spawn("cat-file", &mut cmd)?;
+        let mut stdin = process.child.stdin.take().expect("stdin was piped");
+        let mut stdout = process.child.stdout.take().expect("stdout was piped");
+        // Feed the request from a thread: the replies could otherwise fill
+        // the pipe while the request is still being written.
+        let (written, out) = thread::scope(|scope| {
+            let writer = scope.spawn(move || stdin.write_all(&request));
+            let mut out = Vec::new();
+            let read = stdout.read_to_end(&mut out);
+            (
+                writer
+                    .join()
+                    .unwrap_or_else(|_| Err(io::Error::other("writer panicked"))),
+                read.map(|_| out),
+            )
+        });
+        let status = process.wait_checked();
+        let out = match (written, out, status) {
+            (_, _, Err(error)) => return Err(error),
+            (Err(error), _, _) | (_, Err(error), _) => return Err(error.into()),
+            (Ok(()), Ok(out), Ok(_)) => out,
+        };
+        out.split_inclusive(|&b| b == b'\n')
+            .map(parse_batch_header)
+            .filter_map(|header| match header {
+                Ok(BatchHeader::Found { oid, size, .. }) => Some(Ok((oid, size))),
+                Ok(BatchHeader::Missing(_)) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .collect()
     }
 
     /// Start a `cat-file --batch` process for reading many objects.
@@ -764,6 +889,23 @@ impl CommitWriter<'_> {
             )));
         }
         validate_path(&path)?;
+        let (mark, oid) = self.stream_blob(&String::from_utf8_lossy(&path), size, reader)?;
+        self.entries.push((path, mode.bits(), DataRef::Mark(mark)));
+        Ok(oid)
+    }
+
+    /// Write a blob without adding it to the commit's tree, returning
+    /// its id; [`Self::add_existing`] can add it later. Used when whether
+    /// a file belongs in the tree is decided after its content streamed
+    /// by (a snapshot validates documents only once all files are read).
+    /// `label` names the content in a [`Error::BlobSizeMismatch`]. Like
+    /// every object written here, the blob is stored only once the commit
+    /// is written.
+    pub fn write_blob(&mut self, label: &str, size: u64, reader: &mut dyn Read) -> Result<Oid> {
+        self.stream_blob(label, size, reader).map(|(_, oid)| oid)
+    }
+
+    fn stream_blob(&mut self, label: &str, size: u64, reader: &mut dyn Read) -> Result<(u64, Oid)> {
         let mark = self.next_mark;
         self.next_mark += 1;
         self.write(format!("blob\nmark :{mark}\ndata {size}\n").as_bytes())?;
@@ -771,15 +913,14 @@ impl CommitWriter<'_> {
         if copied != size {
             self.abort();
             return Err(Error::BlobSizeMismatch {
-                path: String::from_utf8_lossy(&path).into_owned(),
+                path: label.to_string(),
                 expected: size,
                 actual: (copied < size).then_some(copied),
             });
         }
         self.write(format!("\nget-mark :{mark}\n").as_bytes())?;
         let oid = self.read_mark()?;
-        self.entries.push((path, mode.bits(), DataRef::Mark(mark)));
-        Ok(oid)
+        Ok((mark, oid))
     }
 
     /// [`Self::add_blob`] for content already in memory.
@@ -1199,6 +1340,109 @@ fn parse_batch_header(line: &[u8]) -> Result<BatchHeader> {
         }),
         _ => Err(malformed()),
     }
+}
+
+/// The parts of a commit object rmu reads (from [`CatFile::read`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitObject {
+    pub tree: Oid,
+    /// First parent first.
+    pub parents: Vec<Oid>,
+    /// Everything after the header (lossily decoded: rmu only looks for
+    /// its own ASCII trailers in it).
+    pub message: String,
+}
+
+/// Parse a raw commit object: header lines (`tree`, `parent`, and others,
+/// which are skipped, continuation lines included), a blank line, then
+/// the message.
+pub fn parse_commit(data: &[u8]) -> Result<CommitObject> {
+    let malformed = |why: &str| output_error("cat-file", format!("malformed commit: {why}"));
+    let (header, message) = match data.windows(2).position(|pair| pair == b"\n\n") {
+        Some(end) => (&data[..end], &data[end + 2..]),
+        None => (data.strip_suffix(b"\n").unwrap_or(data), &b""[..]),
+    };
+    let oid_of = |value: &[u8]| {
+        std::str::from_utf8(value)
+            .ok()
+            .and_then(|s| s.parse::<Oid>().ok())
+            .ok_or_else(|| malformed("bad object id"))
+    };
+    let (tree, parents) = header.split(|&b| b == b'\n').try_fold(
+        (None, Vec::new()),
+        |(tree, mut parents), line| {
+            if let Some(value) = line.strip_prefix(b"tree ") {
+                if tree.is_some() {
+                    return Err(malformed("two trees"));
+                }
+                return Ok((Some(oid_of(value)?), parents));
+            }
+            if let Some(value) = line.strip_prefix(b"parent ") {
+                parents.push(oid_of(value)?);
+            }
+            Ok((tree, parents))
+        },
+    )?;
+    Ok(CommitObject {
+        tree: tree.ok_or_else(|| malformed("no tree"))?,
+        parents,
+        message: String::from_utf8_lossy(message).into_owned(),
+    })
+}
+
+/// Parse a raw tree object (`<octal mode> SP <name> NUL <binary id>` per
+/// entry) into entries named by their bare names. Sizes are not part of
+/// a tree object (`None`); the kind follows from the mode.
+pub fn parse_tree(data: &[u8], format: ObjectFormat) -> Result<Vec<TreeEntry>> {
+    let id_len = match format {
+        ObjectFormat::Sha1 => 20,
+        ObjectFormat::Sha256 => 32,
+    };
+    let malformed = || output_error("cat-file", "malformed tree object");
+    let entry_at = |rest: &[u8]| -> Result<(TreeEntry, usize)> {
+        let space = rest.iter().position(|&b| b == b' ').ok_or_else(malformed)?;
+        let nul = rest.iter().position(|&b| b == 0).ok_or_else(malformed)?;
+        // Octal digits only (`from_str_radix` alone would take a sign).
+        let mode = Some(&rest[..space])
+            .filter(|mode| !mode.is_empty() && mode.iter().all(|b| (b'0'..=b'7').contains(b)))
+            .and_then(|mode| std::str::from_utf8(mode).ok())
+            .and_then(|mode| u32::from_str_radix(mode, 8).ok())
+            .filter(|_| space < nul)
+            .ok_or_else(malformed)?;
+        let name = &rest[space + 1..nul];
+        let id = rest.get(nul + 1..nul + 1 + id_len).ok_or_else(malformed)?;
+        // A name is one path component, as `git fsck` requires.
+        if name.is_empty() || name == b"." || name == b".." || name.contains(&b'/') {
+            return Err(malformed());
+        }
+        let kind = match mode {
+            0o040000 => ObjectKind::Tree,
+            0o160000 => ObjectKind::Commit,
+            _ => ObjectKind::Blob,
+        };
+        let hex: String = id.iter().map(|b| format!("{b:02x}")).collect();
+        Ok((
+            TreeEntry {
+                mode,
+                kind,
+                oid: hex.parse()?,
+                size: None,
+                path: name.to_vec(),
+            },
+            nul + 1 + id_len,
+        ))
+    };
+    // Collecting into a `Result` stops at the first error.
+    let mut rest = data;
+    std::iter::from_fn(|| {
+        (!rest.is_empty()).then(|| {
+            entry_at(rest).map(|(entry, used)| {
+                rest = &rest[used..];
+                entry
+            })
+        })
+    })
+    .collect()
 }
 
 /// One ref's line of `push --porcelain`:
@@ -1944,5 +2188,101 @@ mod tests {
         drop(writer);
         assert!(!crash_report.exists());
         assert_eq!(repo.rev_parse(SCRATCH_REF).unwrap(), None);
+    }
+
+    #[test]
+    fn commit_objects_parse_tree_parents_and_message() {
+        let raw = format!(
+            "tree {A}\nparent {B}\nparent {A}\nauthor X <x@example.invalid> 1 +0000\n\
+             committer rmu <rmu@example.invalid> 2 +0000\ngpgsig -----BEGIN-----\n \n \
+             parent {B}\n -----END-----\n\nsubject\n\nRmu-Device: Tablet\n"
+        );
+        let commit = parse_commit(raw.as_bytes()).unwrap();
+        assert_eq!(commit.tree, oid(A));
+        // A continuation line of another header is never a parent.
+        assert_eq!(commit.parents, vec![oid(B), oid(A)]);
+        assert_eq!(commit.message, "subject\n\nRmu-Device: Tablet\n");
+        let root = parse_commit(format!("tree {A}\nauthor X <x> 1 +0000\n\n").as_bytes()).unwrap();
+        assert!(root.parents.is_empty() && root.message.is_empty());
+        [
+            format!("parent {A}\n\nno tree\n"),
+            format!("tree {A}\ntree {B}\n\ntwo trees\n"),
+            "tree nothex\n\nx\n".to_string(),
+        ]
+        .iter()
+        .for_each(|bad| {
+            assert!(
+                matches!(parse_commit(bad.as_bytes()), Err(Error::GitOutput { .. })),
+                "{bad}"
+            );
+        });
+    }
+
+    #[test]
+    fn tree_objects_parse_modes_names_and_binary_ids() {
+        let binary = |hex: &str| -> Vec<u8> {
+            (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                .collect()
+        };
+        let entry = |mode: &str, name: &[u8], hex: &str| {
+            [mode.as_bytes(), b" ", name, b"\0", &binary(hex)].concat()
+        };
+        let raw = [
+            entry("100644", b"a b\n\xff", A),
+            entry("40000", b"docs", B),
+            entry("160000", b"sub", A),
+            entry("100755", b"x", B),
+        ]
+        .concat();
+        let entries = parse_tree(&raw, ObjectFormat::Sha1).unwrap();
+        let summary: Vec<_> = entries
+            .iter()
+            .map(|e| (e.mode, e.kind, e.oid.clone(), e.path.clone(), e.size))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                (
+                    0o100644,
+                    ObjectKind::Blob,
+                    oid(A),
+                    b"a b\n\xff".to_vec(),
+                    None
+                ),
+                (0o040000, ObjectKind::Tree, oid(B), b"docs".to_vec(), None),
+                (0o160000, ObjectKind::Commit, oid(A), b"sub".to_vec(), None),
+                (0o100755, ObjectKind::Blob, oid(B), b"x".to_vec(), None),
+            ]
+        );
+        assert_eq!(parse_tree(b"", ObjectFormat::Sha1).unwrap(), vec![]);
+        let long = format!("{A}{}", &B[..24]);
+        let sha256 = parse_tree(&entry("100644", b"f", &long), ObjectFormat::Sha256).unwrap();
+        assert_eq!(sha256[0].oid, oid(&long));
+        let truncated = &raw[..raw.len() - 1];
+        [
+            truncated.to_vec(),
+            entry("10064x", b"f", A),
+            entry("100644", b"", A),
+            entry("+100644", b"f", A),
+            entry("100644", b"a/b", A),
+            entry("40000", b".", A),
+            entry("40000", b"..", A),
+            b"100644 f".to_vec(),
+            entry("100644", b"f", A)[..10].to_vec(),
+        ]
+        .iter()
+        .for_each(|bad| {
+            assert!(
+                matches!(
+                    parse_tree(bad, ObjectFormat::Sha1),
+                    Err(Error::GitOutput { .. })
+                ),
+                "{bad:?}"
+            );
+        });
+        // A SHA-1 tree read as SHA-256 runs out of id bytes.
+        assert!(parse_tree(&entry("100644", b"f", A), ObjectFormat::Sha256).is_err());
     }
 }

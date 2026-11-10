@@ -1,0 +1,134 @@
+//! `remote` and `detach`: the tablet's attachment, without a sync. Both
+//! leave xochitl running and never touch documents.
+
+use super::store;
+use super::{
+    CycleError, DetachReport, Hub, OriginCtx, RemoteReport, SetUrlReport, Warning, check_url,
+};
+use crate::error::Result;
+use crate::hub::device::Tablet;
+use crate::hub::model::TabletState;
+
+fn remote_report(state: &TabletState, effective: String) -> RemoteReport {
+    RemoteReport {
+        repo_id: state.repo_id.clone(),
+        device_id: state.device_id.clone(),
+        device_name: state.device_name.clone(),
+        origin: state.origin.clone(),
+        effective,
+    }
+}
+
+impl Hub<'_> {
+    /// `rmu hub remote`: the tablet's attachment and the origin URL it
+    /// stores, and the one this invocation would use
+    /// ([`super::HubOptions::origin`] if set). Read-only: no lock.
+    pub fn remote(&self, tablet: &dyn Tablet) -> Result<RemoteReport> {
+        let state = tablet.read_state()?.ok_or(CycleError::NotAttached)?;
+        let effective = self.origin_url(&state.origin)?;
+        Ok(remote_report(&state, effective))
+    }
+
+    /// `rmu hub remote set-url <url>`: store `url` as the tablet's origin,
+    /// under the lock. `url` must hold the tablet's repository (its repo
+    /// id, a `main` with every base of the tablet in its history): a
+    /// wrong URL is refused here, not at the next sync.
+    /// [`super::HubOptions::origin`] does not apply.
+    pub fn set_remote_url(&self, tablet: &dyn Tablet, url: &str) -> Result<SetUrlReport> {
+        check_url(url)?;
+        let (mut report, warnings) = self.session(tablet, |s| {
+            self.progress.step("Checking origin");
+            let first = s.tablet.read_state()?.ok_or(CycleError::NotAttached)?;
+            let (cache, refs) = store::open_cache(&self.git, &self.cache_dir, &first.repo_id, url)?;
+            let origin =
+                OriginCtx::new(cache, url.to_string(), Some(&first.device_id), Some(refs))?;
+            origin.check(&first)?;
+            self.progress.step("Locking the tablet");
+            let took_over = s.acquire(&self.request, self.options.break_lock)?;
+            s.arm()?;
+            let mut state = s.tablet.read_state()?.ok_or(CycleError::NotAttached)?;
+            if state.repo_id != first.repo_id || state.device_id != first.device_id {
+                return Err(CycleError::StateChanged.into());
+            }
+            let previous = std::mem::replace(&mut state.origin, url.to_string());
+            s.write_state(&state)?;
+            let report = SetUrlReport {
+                previous,
+                remote: remote_report(&state, url.to_string()),
+                took_over,
+                warnings: Vec::new(),
+            };
+            Ok((report, None))
+        })?;
+        report.warnings.extend(warnings);
+        Ok(report)
+    }
+
+    /// `rmu hub detach`: forget the hub state on the tablet, under the
+    /// lock. Documents are untouched; the staging directories go too. A
+    /// pending journal is discarded with the state (a warning: a
+    /// document an interrupted apply stopped inside stays as it is). With
+    /// `prune_ref`, the tablet's device ref is first deleted from origin
+    /// (the URL as for a sync), leased on the value just advertised; a
+    /// failure there is a warning, and the ref can be deleted by hand.
+    pub fn detach(&self, tablet: &dyn Tablet, prune_ref: bool) -> Result<DetachReport> {
+        let (mut report, warnings) = self.session(tablet, |s| {
+            self.progress.step("Locking the tablet");
+            let took_over = s.acquire(&self.request, self.options.break_lock)?;
+            s.arm()?;
+            let state = s.tablet.read_state()?.ok_or(CycleError::NotAttached)?;
+            let mut warnings = Vec::new();
+            let pruned = if prune_ref {
+                self.progress.step("Deleting the device ref from origin");
+                match self.prune_device_ref(&state) {
+                    Ok(pruned) => pruned,
+                    Err(error) => {
+                        warnings.push(Warning::DeviceRefNotPruned {
+                            error: error.to_string(),
+                        });
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            if state.journal.is_some() {
+                warnings.push(Warning::JournalDiscarded);
+            }
+            if let Err(error) = s.tablet.clear_staging(s.lock()) {
+                warnings.push(Warning::StagingNotCleared {
+                    error: error.to_string(),
+                });
+            }
+            self.progress.step("Forgetting the hub state");
+            s.tablet.remove_state(s.lock())?;
+            let report = DetachReport {
+                repo_id: state.repo_id,
+                device_id: state.device_id,
+                pruned,
+                took_over,
+                warnings,
+            };
+            Ok((report, None))
+        })?;
+        report.warnings.extend(warnings);
+        Ok(report)
+    }
+
+    /// Delete the tablet's device ref (whichever name origin has) at the
+    /// value origin advertises; the name deleted, if any.
+    fn prune_device_ref(&self, state: &TabletState) -> Result<Option<String>> {
+        let url = self.origin_url(&state.origin)?;
+        let (cache, refs) = store::open_cache(&self.git, &self.cache_dir, &state.repo_id, &url)?;
+        store::device_ref_names(&state.device_id)
+            .into_iter()
+            .filter_map(|name| {
+                let advertised = refs.iter().find(|reference| reference.name == name)?;
+                Some((name, advertised.oid.clone()))
+            })
+            .try_fold(None, |pruned, (name, oid)| {
+                cache.repo.delete_remote_ref(&url, &name, &oid)?;
+                Ok(pruned.or(Some(name)))
+            })
+    }
+}

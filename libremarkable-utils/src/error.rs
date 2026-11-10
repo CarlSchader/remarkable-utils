@@ -159,6 +159,11 @@ pub enum Error {
     /// `rmu hub` device-layer error (lock, watchdog, transfers, apply).
     #[error(transparent)]
     HubDevice(#[from] crate::hub::device::DeviceError),
+
+    /// `rmu hub` sync-cycle error (guards, identity and ancestry checks,
+    /// the deletion guard, the local cache).
+    #[error(transparent)]
+    HubCycle(#[from] crate::hub::cycle::CycleError),
 }
 
 fn describe_actual(expected: u64, actual: Option<u64>) -> String {
