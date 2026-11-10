@@ -13,15 +13,12 @@
 //!
 //! Connections are multiplexed via `ControlMaster` by default so one
 //! logical operation (which may issue several ssh commands) only
-//! authenticates once. rmu opens the master itself (again if it ended
-//! between commands), logging to a file in the session's control
-//! directory: a backgrounded master's stderr is /dev/null, and when it
-//! dies its clients exit 255 without a word.
+//! authenticates once; rmu opens the master itself (see `master`).
 //!
-//! A sleeping or unreachable tablet must not hang a run: unless the user's
-//! ssh config or `-o` options set them, `ConnectTimeout` and
-//! `ServerAliveInterval` get rmu's defaults (see [`TIMEOUT_DEFAULTS`]),
-//! decided once per session from `ssh -G`. ssh giving up on the tablet is
+//! A sleeping or unreachable tablet must not hang a run: where ssh would
+//! use its built-in `ConnectTimeout` and `ServerAliveInterval` (none),
+//! rmu adds its own ([`TIMEOUT_DEFAULTS`]; how it decides, and what it
+//! cannot tell apart, is in `master`). ssh giving up on the tablet is
 //! [`Error::Unreachable`].
 //!
 //! Streaming diagnostics are drained concurrently. On Unix, once the direct
@@ -35,7 +32,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::{Mutex, OnceLock, PoisonError};
+use std::sync::{Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 
 #[cfg(unix)]
@@ -50,6 +47,11 @@ use std::{
 
 use crate::error::{Error, Result};
 use crate::progress::{NoProgress, Progress};
+
+mod master;
+
+use master::{Master, explain_from_master_log};
+pub use master::{TIMEOUT_DEFAULTS, failure, is_unreachable, timeout_defaults};
 
 /// Default hostname of a reMarkable tablet when connected over USB.
 pub const DEFAULT_USB_HOST: &str = "10.11.99.1";
@@ -66,28 +68,6 @@ pub const ASKPASS_MODE_ENV: &str = "RMU_ASKPASS_MODE";
 
 /// Carries the password to the askpass helper invocation.
 pub const ASKPASS_PASSWORD_ENV: &str = "RMU_ASKPASS_PASSWORD";
-
-/// rmu's value for each ssh option the user left at ssh's built-in
-/// default: the option, its built-in values as `ssh -G` prints them, and
-/// rmu's value.
-/// `ServerAliveCountMax` keeps its own value (3 by default): three
-/// unanswered probes 10 s apart end a command within about 40 s.
-pub const TIMEOUT_DEFAULTS: &[(&str, &[&str], &str)] = &[
-    // Older OpenSSH prints an unset timeout as -1.
-    ("ConnectTimeout", &["none", "-1"], "15"),
-    ("ServerAliveInterval", &["0"], "10"),
-];
-
-/// What ssh prints (exit 255) when the tablet does not answer: a connect
-/// or banner timeout (Linux, then macOS wording), the keepalive giving up,
-/// no route to it (asleep on the local network).
-const UNREACHABLE: &[&str] = &[
-    "Connection timed out",
-    "Operation timed out",
-    "not responding",
-    "No route to host",
-    "Host is down",
-];
 
 /// How ssh should authenticate.
 #[derive(Clone, Default)]
@@ -123,6 +103,10 @@ pub struct SshOptions {
     pub auth: Auth,
     /// Multiplex connections via ControlMaster (recommended).
     pub multiplex: bool,
+    /// Add rmu's [`TIMEOUT_DEFAULTS`] where ssh's built-in values would
+    /// apply; `false` leaves timeouts to the user's ssh config and
+    /// `extra_options` alone.
+    pub default_timeouts: bool,
 }
 
 impl Default for SshOptions {
@@ -134,6 +118,7 @@ impl Default for SshOptions {
             extra_options: Vec::new(),
             auth: Auth::Default,
             multiplex: true,
+            default_timeouts: true,
         }
     }
 }
@@ -147,9 +132,8 @@ pub struct SshSession {
     control_dir: Option<PathBuf>,
     /// [`timeout_defaults`] for this destination, decided on first use.
     defaults: OnceLock<Vec<String>>,
-    /// Serialises opening the master; `true` once one opened without a
-    /// socket (multiplexing unavailable: commands then connect directly).
-    no_master: Mutex<bool>,
+    /// Serialises opening the master.
+    master: Mutex<Master>,
     #[cfg(test)]
     ssh_exe: Option<PathBuf>,
 }
@@ -170,7 +154,7 @@ impl SshSession {
             askpass_exe,
             control_dir,
             defaults: OnceLock::new(),
-            no_master: Mutex::new(false),
+            master: Mutex::new(Master::OnDemand),
             #[cfg(test)]
             ssh_exe: None,
         })
@@ -212,34 +196,10 @@ impl SshSession {
         cmd
     }
 
-    /// rmu's timeout defaults, from the effective configuration that
-    /// `ssh -G` reports once per session. If it cannot tell (`ssh -G`
-    /// failing, an option missing from its output), rmu adds nothing
-    /// rather than risk overriding the user's config.
-    fn timeout_defaults(&self) -> &[String] {
-        self.defaults.get_or_init(|| {
-            self.user_command()
-                .arg("-G")
-                .arg("--")
-                .arg(self.target())
-                .stdin(Stdio::null())
-                .output()
-                .ok()
-                .filter(|output| output.status.success())
-                .map(|output| {
-                    timeout_defaults(
-                        &String::from_utf8_lossy(&output.stdout),
-                        &self.opts.extra_options,
-                    )
-                })
-                .unwrap_or_default()
-        })
-    }
-
     /// ssh invocation with all options and env set, but no destination.
     fn base_command(&self) -> Command {
         let mut cmd = self.user_command();
-        self.timeout_defaults().iter().for_each(|opt| {
+        self.timeout_options().iter().for_each(|opt| {
             cmd.arg("-o").arg(opt);
         });
         if let Some((socket, _)) = self.master_paths() {
@@ -268,73 +228,11 @@ impl SshSession {
         cmd
     }
 
-    /// The master's control socket and log, when multiplexing.
-    fn master_paths(&self) -> Option<(PathBuf, PathBuf)> {
-        self.control_dir
-            .as_ref()
-            .map(|dir| (dir.join("cm"), dir.join("master.log")))
-    }
-
-    /// Open the multiplexing master unless it is up: before the first
-    /// command, and again after it ended (`ControlPersist` expiring
-    /// between commands, a lost connection). A tablet that does not
-    /// answer is the error; any other failure is left to the command,
-    /// which then connects, and reports it, itself.
-    fn ensure_master(&self) -> Result<()> {
-        let Some((socket, log)) = self.master_paths() else {
-            return Ok(());
-        };
-        let mut no_master = self
-            .no_master
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if *no_master || socket.exists() {
-            return Ok(());
-        }
-        // The user's own multiplexing options win over rmu's, so the
-        // master could be a plain connection, backgrounded for good:
-        // leave the connections to ssh then.
-        if ["ControlMaster", "ControlPath", "ControlPersist"]
-            .iter()
-            .any(|option| sets_option(&self.opts.extra_options, option))
-        {
-            *no_master = true;
-            return Ok(());
-        }
-        // Truncated: only this master's own words explain its clients.
-        fs::write(&log, b"")?;
-        let stderr = fs::OpenOptions::new().append(true).open(&log)?;
-        let status = self
-            .base_command()
-            .arg("-E")
-            .arg(&log)
-            .args(["-f", "-N", "--"])
-            .arg(self.target())
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(stderr)
-            .status()?;
-        let output = Output {
-            status,
-            stdout: Vec::new(),
-            stderr: fs::read(&log).unwrap_or_default(),
-        };
-        if is_unreachable(&output) {
-            return Err(failure(&output));
-        }
-        *no_master = status.success() && !socket.exists();
-        Ok(())
-    }
-
     fn command(&self, remote_cmd: &str) -> Result<Command> {
         self.ensure_master()?;
         let mut cmd = self.base_command();
         cmd.arg("--").arg(self.target()).arg(remote_cmd);
         Ok(cmd)
-    }
-
-    fn master_log(&self) -> Option<PathBuf> {
-        self.master_paths().map(|(_, log)| log)
     }
 
     /// A streaming command, its failure explained by the master's log.
@@ -698,21 +596,6 @@ impl Drop for DownloadTemp {
     }
 }
 
-#[cfg(test)]
-fn download_to_local(
-    command: &mut Command,
-    local: &Path,
-    total: Option<u64>,
-    progress: &dyn Progress,
-) -> Result<()> {
-    download_with(
-        || Ok(StreamingChild::spawn(command, false)?),
-        local,
-        total,
-        progress,
-    )
-}
-
 /// Download the stdout of the command `spawn` starts to `local`.
 fn download_with(
     spawn: impl FnOnce() -> Result<StreamingChild>,
@@ -822,11 +705,6 @@ struct StreamingChild {
 }
 
 impl StreamingChild {
-    #[cfg(test)]
-    fn spawn(command: &mut Command, with_stdin: bool) -> std::io::Result<Self> {
-        Self::spawn_io(command, with_stdin, with_stdin)
-    }
-
     /// `drain_stdout = false` leaves stdout to the caller (downloads).
     fn spawn_io(
         command: &mut Command,
@@ -1109,86 +987,6 @@ fn checked(output: Output) -> Result<Output> {
     Err(failure(&output))
 }
 
-/// The error for a failed command: [`Error::Unreachable`] when ssh gave
-/// up on the tablet (see [`is_unreachable`]), else [`Error::Remote`].
-pub fn failure(output: &Output) -> Error {
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    if is_unreachable(output) {
-        return Error::Unreachable(stderr);
-    }
-    Error::Remote {
-        status: output.status.code().unwrap_or(-1),
-        stderr,
-    }
-}
-
-/// A multiplexed command whose master connection died exits 255 without
-/// a word; the master's log at `log` says why. Appends the log's last
-/// line about an unreachable tablet to the command's stderr.
-fn explain_from_master_log(output: &mut Output, log: Option<&Path>) {
-    if output.status.code() != Some(255) || is_unreachable(output) {
-        return;
-    }
-    let Some(log) = log.and_then(|log| fs::read_to_string(log).ok()) else {
-        return;
-    };
-    explain(output, &log);
-}
-
-/// [`explain_from_master_log`] given the log's text. Pure.
-fn explain(output: &mut Output, log: &str) {
-    if let Some(line) = log
-        .lines()
-        .rev()
-        .find(|line| UNREACHABLE.iter().any(|text| line.contains(text)))
-    {
-        if !output.stderr.is_empty() && !output.stderr.ends_with(b"\n") {
-            output.stderr.push(b'\n');
-        }
-        output.stderr.extend_from_slice(line.trim().as_bytes());
-    }
-}
-
-/// Whether ssh itself failed (255) because the tablet did not answer:
-/// asleep, off the network, or gone silent mid-command.
-pub fn is_unreachable(output: &Output) -> bool {
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    output.status.code() == Some(255) && UNREACHABLE.iter().any(|text| stderr.contains(text))
-}
-
-/// Whether the `-o` options `extra` set `option` (`Option=value`,
-/// `Option value` and `Option = value`, any case). Pure.
-fn sets_option(extra: &[String], option: &str) -> bool {
-    extra.iter().any(|opt| {
-        opt.trim()
-            .split(|c: char| c == '=' || c.is_whitespace())
-            .next()
-            .is_some_and(|key| key.eq_ignore_ascii_case(option))
-    })
-}
-
-/// `-o Option=value` arguments for the [`TIMEOUT_DEFAULTS`] that neither
-/// the user's `-o` options (`extra`) nor their ssh config set, given
-/// `effective`, the output of `ssh -G` (lowercase `option value` lines,
-/// built-in defaults included). An option missing from `effective` is
-/// left alone. Pure.
-pub fn timeout_defaults(effective: &str, extra: &[String]) -> Vec<String> {
-    let effective_value = |option: &str| {
-        effective.lines().find_map(|line| {
-            let (key, value) = line.trim().split_once(' ')?;
-            key.eq_ignore_ascii_case(option).then(|| value.trim())
-        })
-    };
-    TIMEOUT_DEFAULTS
-        .iter()
-        .filter(|(option, _, _)| !sets_option(extra, option))
-        .filter(|(option, builtin, _)| {
-            effective_value(option).is_some_and(|value| builtin.contains(&value))
-        })
-        .map(|(option, _, value)| format!("{option}={value}"))
-        .collect()
-}
-
 /// Short-pathed private directory for ControlMaster sockets.
 ///
 /// `/tmp` rather than `std::env::temp_dir()`: socket paths are limited
@@ -1264,6 +1062,21 @@ mod tests {
             fn drop(&mut self) {
                 fs::remove_dir_all(&self.0).unwrap();
             }
+        }
+
+        /// The download path every session download takes, from `command`.
+        fn download_to_local(
+            command: &mut Command,
+            local: &Path,
+            total: Option<u64>,
+            progress: &dyn Progress,
+        ) -> Result<()> {
+            download_with(
+                || Ok(StreamingChild::spawn_io(command, false, false)?),
+                local,
+                total,
+                progress,
+            )
         }
 
         // Inject only the subprocess command, exercising the same download
@@ -1462,363 +1275,6 @@ mod tests {
             assert_eq!(fs::read(&target).unwrap(), b"untouched");
             fixture.assert_no_temps();
         }
-    }
-
-    /// `ssh -G` output (an excerpt) with the given values.
-    fn effective(connect_timeout: &str, alive_interval: &str) -> String {
-        format!(
-            "user root\nhostname 10.11.99.1\nport 22\nserveralivecountmax 3\n\
-             serveraliveinterval {alive_interval}\ntcpkeepalive yes\n\
-             connecttimeout {connect_timeout}\ncontrolmaster false\n"
-        )
-    }
-
-    #[test]
-    fn timeout_defaults_fill_only_what_ssh_left_at_its_builtin() {
-        let none: &[String] = &[];
-        // Nothing configured: both defaults (older OpenSSH prints -1).
-        let both = ["ConnectTimeout=15", "ServerAliveInterval=10"];
-        assert_eq!(timeout_defaults(&effective("none", "0"), none), both);
-        assert_eq!(timeout_defaults(&effective("-1", "0"), none), both);
-        // Set in the user's ssh config: theirs stays.
-        assert_eq!(
-            timeout_defaults(&effective("5", "0"), none),
-            ["ServerAliveInterval=10"]
-        );
-        assert_eq!(
-            timeout_defaults(&effective("none", "60"), none),
-            ["ConnectTimeout=15"]
-        );
-        assert!(timeout_defaults(&effective("30", "120"), none).is_empty());
-        // An option ssh -G did not report, or no output at all (it
-        // failed): nothing added rather than a guess.
-        assert_eq!(
-            timeout_defaults("connecttimeout none\n", none),
-            ["ConnectTimeout=15"]
-        );
-        assert!(timeout_defaults("", none).is_empty());
-    }
-
-    #[test]
-    fn timeout_defaults_yield_to_the_users_own_options() {
-        let effective = effective("none", "0");
-        let options = |opts: &[&str]| opts.iter().map(|o| o.to_string()).collect::<Vec<_>>();
-        // Any spelling ssh accepts, any case, even ssh's own default value.
-        [
-            "ConnectTimeout=0",
-            "connecttimeout 60",
-            "CONNECTTIMEOUT = 5",
-        ]
-        .iter()
-        .for_each(|opt| {
-            assert_eq!(
-                timeout_defaults(&effective, &options(&[opt])),
-                ["ServerAliveInterval=10"],
-                "{opt}"
-            );
-        });
-        assert!(
-            timeout_defaults(
-                &effective,
-                &options(&["ServerAliveInterval=0", "ConnectTimeout=3"])
-            )
-            .is_empty()
-        );
-        // Similar names are other options.
-        assert_eq!(
-            timeout_defaults(&effective, &options(&["ServerAliveCountMax=1"])).len(),
-            2
-        );
-    }
-
-    #[cfg(unix)]
-    mod mock_ssh {
-        use super::*;
-
-        struct Scratch(PathBuf);
-
-        impl Scratch {
-            fn new() -> Self {
-                let path =
-                    std::env::temp_dir().join(format!("rmu-ssh-defaults-{}", uuid::Uuid::new_v4()));
-                fs::create_dir(&path).unwrap();
-                Self(path)
-            }
-
-            /// A session whose ssh answers `-G` with `effective`, and
-            /// otherwise records its arguments and runs `script`.
-            fn session(&self, effective: &str, script: &str, extra: &[&str]) -> SshSession {
-                self.session_with(effective, script, extra, false)
-            }
-
-            /// [`Self::session`], multiplexed: `-N` opens the master (its
-            /// socket, a plain file here) unless `open-fails` exists,
-            /// whose text is then ssh's message; `-O` closes it. Scripts
-            /// see the socket as `$sock` and the master's log as `$log`.
-            fn session_with(
-                &self,
-                effective: &str,
-                script: &str,
-                extra: &[&str],
-                multiplex: bool,
-            ) -> SshSession {
-                let exe = self.0.join("ssh");
-                let effective_file = self.0.join("effective");
-                fs::write(&effective_file, effective).unwrap();
-                let file = |name: &str| shell_quote(&self.0.join(name).to_string_lossy());
-                test_support::write_script(
-                    &exe,
-                    &format!(
-                        "for arg in \"$@\"; do [ \"$arg\" = -G ] && exec cat {effective}; done\n\
-                         sock=\n\
-                         for arg in \"$@\"; do case \"$arg\" in ControlPath=*) sock=${{arg#ControlPath=}} ;; esac; done\n\
-                         log=${{sock%/*}}/master.log\n\
-                         case \" $* \" in\n\
-                         *' -N '*)\n\
-                         [ ! -e {fails} ] || {{ cat {fails} >&2; exit 255; }}\n\
-                         : > \"$sock\"; echo opened >> {opened}; exit 0 ;;\n\
-                         *' -O '*) rm -f \"$sock\"; exit 0 ;;\n\
-                         esac\n\
-                         printf '%s\\n' \"$@\" >> {args}\n\
-                         {script}\n",
-                        effective = shell_quote(&effective_file.to_string_lossy()),
-                        args = shell_quote(&self.args_file().to_string_lossy()),
-                        fails = file("open-fails"),
-                        opened = file("opened"),
-                    ),
-                );
-                let mut session = SshSession::new(SshOptions {
-                    destination: "tablet.invalid".into(),
-                    extra_options: extra.iter().map(|o| o.to_string()).collect(),
-                    multiplex,
-                    ..SshOptions::default()
-                })
-                .unwrap();
-                session.set_ssh_exe(exe);
-                session
-            }
-
-            fn opened(&self) -> usize {
-                fs::read_to_string(self.0.join("opened"))
-                    .unwrap_or_default()
-                    .lines()
-                    .count()
-            }
-
-            fn args_file(&self) -> PathBuf {
-                self.0.join("args")
-            }
-
-            fn args(&self) -> Vec<String> {
-                fs::read_to_string(self.args_file())
-                    .unwrap_or_default()
-                    .lines()
-                    .map(str::to_string)
-                    .collect()
-            }
-        }
-
-        impl Drop for Scratch {
-            fn drop(&mut self) {
-                let _ = fs::remove_dir_all(&self.0);
-            }
-        }
-
-        #[test]
-        fn defaults_reach_the_command_line_after_the_users_options() {
-            let scratch = Scratch::new();
-            let session =
-                scratch.session(&effective("none", "0"), "echo ok", &["ConnectTimeout=4"]);
-            assert_eq!(session.run_checked("true").unwrap(), "ok\n");
-            assert_eq!(session.run_checked("true").unwrap(), "ok\n");
-            let args = scratch.args();
-            let position = |value: &str| args.iter().position(|arg| arg == value);
-            assert!(
-                position("ConnectTimeout=4").unwrap() < position("ServerAliveInterval=10").unwrap()
-            );
-            assert_eq!(position("ConnectTimeout=15"), None, "{args:?}");
-            // Both commands carry the defaults decided once.
-            assert_eq!(
-                args.iter()
-                    .filter(|arg| *arg == "ServerAliveInterval=10")
-                    .count(),
-                2
-            );
-        }
-
-        #[test]
-        fn a_dead_master_explains_its_silent_clients() {
-            let scratch = Scratch::new();
-            let dead = shell_quote(&scratch.0.join("dead").to_string_lossy());
-            // The master dies with the tablet silent: its log says why,
-            // its client exits 255 without a word.
-            let session = scratch.session_with(
-                &effective("none", "0"),
-                &format!(
-                    "if [ -e {dead} ]; then\n\
-                     echo 'Timeout, server tablet.invalid not responding.' >> \"$log\"\n\
-                     rm -f \"$sock\"; exit 255\n\
-                     fi\n\
-                     echo ok"
-                ),
-                &[],
-                true,
-            );
-            assert_eq!(session.run_checked("true").unwrap(), "ok\n");
-            assert_eq!(session.run_checked("true").unwrap(), "ok\n");
-            assert_eq!(scratch.opened(), 1, "one master for both");
-            fs::write(scratch.0.join("dead"), "").unwrap();
-            match session.run_checked("true") {
-                Err(Error::Unreachable(detail)) => assert!(
-                    detail.contains("Timeout, server tablet.invalid not responding."),
-                    "{detail}"
-                ),
-                other => panic!("{other:?}"),
-            }
-            assert!(matches!(session.run("true"), Err(Error::Unreachable(_))));
-            assert!(matches!(
-                session
-                    .run_script("true")
-                    .map(|output| is_unreachable(&output)),
-                Ok(true)
-            ));
-            // Awake again: a new master, whose log does not carry the old
-            // one's words.
-            fs::remove_file(scratch.0.join("dead")).unwrap();
-            assert_eq!(session.run_checked("true").unwrap(), "ok\n");
-            assert_eq!(scratch.opened(), 4);
-            let log = fs::read_to_string(session.master_log().unwrap()).unwrap();
-            assert!(!log.contains("not responding"), "{log}");
-            // Without the master's word, a silent 255 is the remote's.
-            let silent = Scratch::new();
-            let session = silent.session_with(&effective("none", "0"), "exit 255", &[], true);
-            assert!(matches!(
-                session.run_checked("true"),
-                Err(Error::Remote { status: 255, .. })
-            ));
-        }
-
-        #[test]
-        fn the_users_multiplexing_options_leave_connections_to_ssh() {
-            ["ControlPath=none", "controlmaster no", "ControlPersist = 5"]
-                .iter()
-                .for_each(|option| {
-                    let scratch = Scratch::new();
-                    let session =
-                        scratch.session_with(&effective("none", "0"), "echo ok", &[option], true);
-                    assert_eq!(session.run_checked("true").unwrap(), "ok\n");
-                    assert_eq!(scratch.opened(), 0, "{option}");
-                });
-        }
-
-        #[test]
-        fn a_master_that_cannot_connect_is_the_only_try() {
-            let scratch = Scratch::new();
-            fs::write(
-                scratch.0.join("open-fails"),
-                "ssh: connect to host tablet.invalid port 22: Connection timed out\n",
-            )
-            .unwrap();
-            let session = scratch.session_with(&effective("none", "0"), "echo ok", &[], true);
-            assert!(matches!(
-                session.run_checked("true"),
-                Err(Error::Unreachable(detail)) if detail.contains("Connection timed out")
-            ));
-            assert!(scratch.args().is_empty(), "the command never ran");
-            // Other failures are left to the command, which reports them.
-            fs::write(
-                scratch.0.join("open-fails"),
-                "root@tablet.invalid: Permission denied (publickey).\n",
-            )
-            .unwrap();
-            assert_eq!(session.run_checked("true").unwrap(), "ok\n");
-        }
-
-        #[test]
-        fn a_configured_value_is_left_to_ssh() {
-            let scratch = Scratch::new();
-            let session = scratch.session(&effective("7", "30"), "echo ok", &[]);
-            session.run_checked("true").unwrap();
-            let args = scratch.args();
-            assert!(
-                !args
-                    .iter()
-                    .any(|arg| arg.starts_with("ConnectTimeout") || arg.starts_with("ServerAlive")),
-                "{args:?}"
-            );
-        }
-
-        #[test]
-        fn a_tablet_that_does_not_answer_is_the_typed_error() {
-            let scratch = Scratch::new();
-            let timeout = scratch.session(
-                &effective("none", "0"),
-                "echo 'ssh: connect to host tablet.invalid port 22: Connection timed out' >&2\nexit 255",
-                &[],
-            );
-            let unreachable = |result: Result<String>| match result {
-                Err(error @ Error::Unreachable(_)) => error.to_string(),
-                other => panic!("{other:?}"),
-            };
-            let message = unreachable(timeout.run_checked("true"));
-            assert!(message.contains("Connection timed out"), "{message}");
-            assert!(message.contains("asleep"), "{message}");
-            // Raw runs too, and the keepalive giving up mid-command.
-            assert!(matches!(timeout.run("true"), Err(Error::Unreachable(_))));
-            let silent = scratch.session(
-                &effective("none", "0"),
-                "echo 'Timeout, server tablet.invalid not responding.' >&2\nexit 255",
-                &[],
-            );
-            unreachable(silent.run_checked("true"));
-            // Other ssh failures, and the same words from a remote
-            // command, stay remote errors.
-            let refused = scratch.session(
-                &effective("none", "0"),
-                "echo 'ssh: connect to host tablet.invalid port 22: Connection refused' >&2\nexit 255",
-                &[],
-            );
-            assert!(matches!(
-                refused.run_checked("true"),
-                Err(Error::Remote { status: 255, .. })
-            ));
-            assert!(refused.run("true").is_ok());
-            let remote = scratch.session(
-                &effective("none", "0"),
-                "echo 'curl: Connection timed out' >&2\nexit 28",
-                &[],
-            );
-            assert!(matches!(
-                remote.run_checked("true"),
-                Err(Error::Remote { status: 28, .. })
-            ));
-        }
-    }
-
-    #[test]
-    fn explain_appends_the_masters_reason_to_a_silent_failure() {
-        use std::os::unix::process::ExitStatusExt;
-        let output = |code: i32, stderr: &str| Output {
-            status: std::process::ExitStatus::from_raw(code << 8),
-            stdout: Vec::new(),
-            stderr: stderr.as_bytes().to_vec(),
-        };
-        let log = "Warning: Permanently added 'tablet' to the list of known hosts.\n\
-                   Timeout, server tablet not responding.\n";
-        let mut silent = output(255, "");
-        explain(&mut silent, log);
-        assert_eq!(silent.stderr, b"Timeout, server tablet not responding.");
-        assert!(is_unreachable(&silent));
-        let mut said = output(255, "partial");
-        explain(&mut said, log);
-        assert_eq!(
-            said.stderr,
-            b"partial\nTimeout, server tablet not responding."
-        );
-        // A log without such a line changes nothing.
-        let mut other = output(255, "");
-        explain(&mut other, "Warning: Permanently added 'tablet'.\n");
-        assert!(other.stderr.is_empty());
     }
 
     #[test]

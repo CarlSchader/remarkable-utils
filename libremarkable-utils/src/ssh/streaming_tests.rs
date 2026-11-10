@@ -524,7 +524,7 @@ fn check_early_errors() {
     // even though the child would otherwise keep its pipes open for a minute.
     let mut command = Command::new("sh");
     command.args(["-c", "exec sleep 60"]);
-    let mut child = StreamingChild::spawn(&mut command, true).unwrap();
+    let mut child = StreamingChild::spawn_io(&mut command, true, true).unwrap();
     let pid = child.child.id();
     let progress = Recorder::default();
     let transfer = {
@@ -537,7 +537,7 @@ fn check_early_errors() {
 
     let mut command = Command::new("sh");
     command.args(["-c", "printf payload; exec sleep 60"]);
-    let mut child = StreamingChild::spawn(&mut command, false).unwrap();
+    let mut child = StreamingChild::spawn_io(&mut command, false, false).unwrap();
     let pid = child.child.id();
     let transfer = {
         let mut stdout = child.child.stdout.take().unwrap();
@@ -547,7 +547,7 @@ fn check_early_errors() {
     assert_reaped(pid);
 
     // Exercise cleanup before finish (e.g. a transfer setup error).
-    let child = StreamingChild::spawn(&mut command, false).unwrap();
+    let child = StreamingChild::spawn_io(&mut command, false, false).unwrap();
     let pid = child.child.id();
     drop(child);
     assert_reaped(pid);
