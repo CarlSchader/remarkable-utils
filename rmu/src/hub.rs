@@ -12,7 +12,8 @@
 //! asking for credentials when stdin and stderr are both terminals.
 //!
 //! `log`, `restore` and `add` work on origin alone: with `--origin` they
-//! never contact the tablet unless `--host` is given too; without it the
+//! never contact the tablet unless a flag naming it (`--host`, `--user`,
+//! ...) is given too; without it the
 //! tablet supplies its stored origin URL ([`wants_tablet`]).
 
 mod json;
@@ -161,7 +162,7 @@ pub enum HubCommand {
     },
     /// Show the library's history (one entry per sync, restore and add),
     /// or one document's (by logical path or UUID). No tablet is needed
-    /// with --origin
+    /// with --origin (unless --host or another SSH flag names one)
     #[command(after_help = AFTER_HELP)]
     Log {
         /// A document's logical path (as it is now, or was) or UUID
@@ -174,7 +175,7 @@ pub enum HubCommand {
     },
     /// Bring back an old version of a document, deleted ones included, as
     /// a new document (the original is never touched); every tablet gets
-    /// it at its next sync. No tablet is needed with --origin
+    /// it at its next sync. No tablet is needed with --origin (unless --host or another SSH flag names one)
     #[command(after_help = AFTER_HELP)]
     Restore {
         /// The document's logical path (at that commit) or UUID
@@ -188,7 +189,7 @@ pub enum HubCommand {
         origin: OriginArg,
     },
     /// Add a PDF or EPUB to the library on origin; every tablet gets it at
-    /// its next sync. No tablet is needed with --origin
+    /// its next sync. No tablet is needed with --origin (unless --host or another SSH flag names one)
     #[command(after_help = AFTER_HELP)]
     Add {
         /// The .pdf or .epub file
@@ -390,20 +391,21 @@ pub struct Env<'a> {
     pub quiet: bool,
     pub xochitl_dir: &'a str,
     pub progress: Arc<dyn Progress>,
-    /// `--host` was given explicitly (not its default).
-    pub host_given: bool,
+    /// A flag naming the tablet (`--host`, `--user`, `--port`, `-i`, `-o`,
+    /// `--password`, `--password-file`) was given explicitly.
+    pub tablet_given: bool,
 }
 
 /// Whether a command contacts the tablet. `init` never does; `log`,
 /// `restore` and `add` only without `--origin` (the tablet supplies its
-/// stored URL) or with an explicit `--host` (for its base, or as the
-/// commit's author); every other command always does.
-pub fn wants_tablet(command: &HubCommand, host_given: bool) -> bool {
+/// stored URL) or with an explicit flag naming the tablet (for its base,
+/// or as the commit's author); every other command always does.
+pub fn wants_tablet(command: &HubCommand, tablet_given: bool) -> bool {
     match command {
         HubCommand::Init { .. } => false,
         HubCommand::Log { origin, .. }
         | HubCommand::Restore { origin, .. }
-        | HubCommand::Add { origin, .. } => origin.origin.is_none() || host_given,
+        | HubCommand::Add { origin, .. } => origin.origin.is_none() || tablet_given,
         _ => true,
     }
 }
@@ -526,7 +528,7 @@ pub fn run(
         &*env.progress,
     )
     .with_options(options(&args.command));
-    let tablet = match wants_tablet(&args.command, env.host_given) {
+    let tablet = match wants_tablet(&args.command, env.tablet_given) {
         false => None,
         true => Some(
             SshTablet::new(connect().map_err(setup_error)?)

@@ -11,6 +11,7 @@ use std::ops::ControlFlow;
 use serde_json::Value;
 
 use super::history::{DocStep, HistoryIndex};
+use super::message::Author;
 use super::origin::OriginCtx;
 use super::plan::JsonBlobs;
 use super::store::{self, Store};
@@ -19,7 +20,8 @@ use crate::error::{Error, Result};
 use crate::git::{CommitMeta, FileMode, Oid, Signature};
 use crate::hub::device::{DeviceInfo, Tablet};
 use crate::hub::model::{
-    DocFile, DocId, DocVersion, ListingEntry, MirrorRules, RepoTree, TabletState,
+    DeviceId, DeviceName, DocFile, DocId, DocVersion, ListingEntry, MirrorRules, RepoTree,
+    TabletState,
 };
 use crate::xochitl::{self, Item, TRASH_PARENT};
 
@@ -34,6 +36,25 @@ pub(super) struct Library {
 pub(super) struct Attached {
     pub state: TabletState,
     pub info: DeviceInfo,
+}
+
+/// The tablet given to `restore` or `add`, as its commit's trailers name
+/// it; owned, so it outlives borrows of the [`Library`].
+pub(super) struct Signer {
+    name: DeviceName,
+    id: DeviceId,
+    info: DeviceInfo,
+}
+
+impl Signer {
+    pub fn author(&self) -> Author<'_> {
+        Author {
+            name: &self.name,
+            id: &self.id,
+            model: self.info.model.as_deref(),
+            firmware: self.info.firmware.as_deref(),
+        }
+    }
 }
 
 impl Library {
@@ -51,6 +72,15 @@ impl Library {
                 },
                 overrides: state.base_overrides.len(),
             }
+        })
+    }
+
+    /// The tablet given, for the trailers of a commit.
+    pub fn signer(&self) -> Option<Signer> {
+        self.tablet.as_ref().map(|attached| Signer {
+            name: attached.state.device_name.clone(),
+            id: attached.state.device_id.clone(),
+            info: attached.info.clone(),
         })
     }
 
@@ -159,10 +189,7 @@ impl Hub<'_> {
         let origin = &library.origin;
         let theirs = origin.store.tree_of(origin.rules, &origin.main)?;
         if theirs.docs.contains_key(&new.doc) {
-            return Err(Error::InvalidGitInput(format!(
-                "document {} already exists on origin",
-                new.doc
-            )));
+            return Err(CycleError::DocExists(new.doc.clone()).into());
         }
         let decided = decide(origin, &theirs)?;
         let mut writer = origin.cache.repo.commit_writer(self.progress, None)?;
@@ -226,14 +253,26 @@ impl Hub<'_> {
 pub(super) fn items_of(tree: &RepoTree, json: &dyn JsonBlobs) -> Result<Vec<Item>> {
     tree.docs
         .iter()
-        .filter_map(|(doc, version)| Some((doc, version.files.get(&DocFile::Metadata)?)))
-        .map(|(doc, entry)| {
-            Ok(json.json(&entry.id)?.and_then(|metadata| {
-                xochitl::item_from_metadata(doc.as_str(), &metadata, None, None)
-            }))
-        })
+        .filter_map(|(doc, version)| Some((doc, &version.files.get(&DocFile::Metadata)?.id)))
+        .map(|(doc, metadata)| item_of(json, doc, metadata))
         .filter_map(Result::transpose)
         .collect()
+}
+
+/// The item a `.metadata` blob makes of `doc`, if it is one.
+fn item_of(json: &dyn JsonBlobs, doc: &DocId, metadata: &Oid) -> Result<Option<Item>> {
+    Ok(json
+        .json(metadata)?
+        .and_then(|metadata| xochitl::item_from_metadata(doc.as_str(), &metadata, None, None)))
+}
+
+/// An item's parent from its `.metadata` (`""`, the root, if none).
+pub(super) fn parent_of(metadata: &Value) -> String {
+    metadata
+        .get("parent")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
 }
 
 /// Where an item with parent `parent` is, by the items of one tree (see
@@ -258,20 +297,25 @@ pub(super) type FolderLookup<'a> = dyn FnMut(&str) -> Result<Option<(String, Str
 /// [`place`] by a lookup of each folder's name and parent; a chain
 /// longer than `bound` folders is broken (a cycle).
 pub(super) fn place_with(parent: &str, bound: usize, lookup: &mut FolderLookup) -> Result<Place> {
-    let mut names = Vec::new();
-    let mut current = parent.to_string();
-    let root = loop {
-        match current.as_str() {
-            "" => break "",
-            TRASH_PARENT => break "trash/",
-            uuid => match lookup(uuid)? {
-                Some((name, next)) if names.len() <= bound => {
+    // Up the chain, collecting names, to the root, the trash, or a break.
+    let walk = (0..=bound).try_fold(
+        (parent.to_string(), Vec::new()),
+        |(current, mut names), _| match current.as_str() {
+            "" => ControlFlow::Break(Ok(("", names))),
+            TRASH_PARENT => ControlFlow::Break(Ok(("trash/", names))),
+            uuid => match lookup(uuid) {
+                Ok(Some((name, next))) => {
                     names.push(name);
-                    current = next;
+                    ControlFlow::Continue((next, names))
                 }
-                _ => break "?/",
+                Ok(None) => ControlFlow::Break(Ok(("?/", names))),
+                Err(error) => ControlFlow::Break(Err(error)),
             },
-        }
+        },
+    );
+    let (root, mut names) = match walk {
+        ControlFlow::Break(found) => found?,
+        ControlFlow::Continue((_, names)) => ("?/", names),
     };
     names.reverse();
     let path = match (root, names.is_empty()) {
@@ -354,11 +398,7 @@ pub(super) fn resolve_doc(
     let resolve = |metadata: &BTreeMap<DocId, Oid>| -> Result<Option<DocId>> {
         let items = metadata
             .iter()
-            .map(|(doc, id)| {
-                Ok(store.json(id)?.and_then(|metadata| {
-                    xochitl::item_from_metadata(doc.as_str(), &metadata, None, None)
-                }))
-            })
+            .map(|(doc, id)| item_of(store, doc, id))
             .filter_map(Result::transpose)
             .collect::<Result<Vec<Item>>>()?;
         match xochitl::resolve_item_ref(&items, reference) {
@@ -413,11 +453,17 @@ pub(super) fn resolve_doc(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::xochitl::ItemKind;
 
-    fn item(uuid: &str, name: &str, parent: &str, kind: ItemKind) -> Item {
+    /// An item for tests of placement and naming.
+    pub(in crate::hub::cycle) fn item(
+        uuid: &str,
+        name: &str,
+        parent: &str,
+        kind: ItemKind,
+    ) -> Item {
         Item {
             uuid: uuid.to_string(),
             visible_name: name.to_string(),
@@ -466,5 +512,79 @@ mod tests {
         assert!(!usable_folder(&items, "trash"));
         assert!(!usable_folder(&items, "gone"));
         assert!(!usable_folder(&items, "loop-a"), "a broken chain");
+    }
+
+    /// A new document whose id is already on origin is refused before
+    /// anything is decided or pushed.
+    #[test]
+    fn a_new_document_never_replaces_one_on_origin() {
+        use crate::git::{CommitMeta, FileMode, Git, ObjectFormat, Signature};
+        use crate::hub::device::LockRequest;
+        use crate::hub::model::{REPO_CONFIG_PATH, RepoConfig, RepoId};
+        let scratch = test_support::Scratch::new("library-guard");
+        let git = Git::new()
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_COUNT", "0")
+            .env("GIT_DEFAULT_HASH", "sha1")
+            .env("HOME", scratch.path());
+        let origin = scratch.path().join("origin.git");
+        let repo = git.init_bare(&origin, ObjectFormat::Sha1).unwrap();
+        let doc = DocId::new("8c1f0b9e-0000-4000-8000-000000000001").unwrap();
+        let mut writer = repo
+            .commit_writer(&crate::progress::NoProgress, None)
+            .unwrap();
+        let config = RepoConfig::new(RepoId::random()).to_json();
+        writer
+            .add_bytes(REPO_CONFIG_PATH, FileMode::Regular, config.as_bytes())
+            .unwrap();
+        let metadata = xochitl::document_metadata_json("Existing", "", 1);
+        writer
+            .add_bytes(
+                format!("docs/{doc}/metadata"),
+                FileMode::Regular,
+                metadata.as_bytes(),
+            )
+            .unwrap();
+        let who = Signature {
+            name: "Test".to_string(),
+            email: "test@example.invalid".to_string(),
+            time: 1_800_000_000,
+            offset_minutes: 0,
+        };
+        let main = writer
+            .commit(&CommitMeta {
+                parents: Vec::new(),
+                author: who.clone(),
+                committer: who,
+                message: "test\n".to_string(),
+            })
+            .unwrap();
+        repo.update_ref(store::MAIN, &main, None).unwrap();
+        let hub = Hub::new(
+            git,
+            scratch.path().join("cache"),
+            LockRequest::for_this_process("test-host"),
+            &crate::progress::NoProgress,
+        )
+        .with_options(super::super::HubOptions {
+            origin: Some(origin.display().to_string()),
+            ..Default::default()
+        });
+        let mut library = hub.open_library(None, false).unwrap();
+        let new = NewDoc {
+            doc: doc.clone(),
+            files: BTreeMap::new(),
+            other: BTreeMap::new(),
+        };
+        let result = hub.push_new_doc::<()>(&mut library, &new, &mut |_, _| {
+            panic!("decided for a document that exists")
+        });
+        assert!(
+            matches!(&result, Err(Error::HubCycle(CycleError::DocExists(found))) if *found == doc),
+            "{:?}",
+            result.err()
+        );
+        assert_eq!(repo.rev_parse(store::MAIN).unwrap(), Some(main));
     }
 }

@@ -8,9 +8,10 @@ use serde_json::Value;
 
 use super::history::HistoryIndex;
 use super::library::{
-    Decided, NewDoc, items_of, metadata_of, name_of, place, resolve_doc, usable_folder,
+    Decided, NewDoc, Signer, items_of, metadata_of, name_of, parent_of, place, resolve_doc,
+    usable_folder,
 };
-use super::message::{self, Author};
+use super::message;
 use super::origin::OriginCtx;
 use super::store::{LOCAL_MAIN, Store};
 use super::{CycleError, Hub, RestoreReport, unix_now};
@@ -52,28 +53,45 @@ fn version_to_restore(
     at: &Oid,
     doc: &DocId,
 ) -> Result<(Oid, DocVersion)> {
-    if let Some(subtree) = index.subtree_at(at, doc).flatten() {
+    let present = |subtree: &Oid| -> Result<Option<DocVersion>> {
         let version = store.doc_version(rules, doc, subtree)?;
-        if version.is_present() {
-            return Ok((at.clone(), version));
-        }
+        Ok(version.is_present().then_some(version))
+    };
+    if let Some(version) = index
+        .subtree_at(at, doc)
+        .flatten()
+        .map(present)
+        .transpose()?
+        .flatten()
+    {
+        return Ok((at.clone(), version));
     }
-    for (commit, (_, before, _)) in index.doc_chain(at, doc).unwrap_or_default() {
-        let Some(before) = before else {
-            continue;
-        };
-        let version = store.doc_version(rules, doc, before)?;
-        if version.is_present()
-            && let Some(parent) = store.commit(commit)?.parents.first()
-        {
-            return Ok((parent.clone(), version));
-        }
-    }
-    Err(CycleError::NoVersionAt {
-        doc: doc.clone(),
-        at: at.clone(),
-    }
-    .into())
+    // Newest first: the version each deletion (or change) replaced, held
+    // by the commit's first parent.
+    index
+        .doc_chain(at, doc)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(commit, (_, before, _))| Some((commit, before?)))
+        .map(|(commit, before)| -> Result<Option<(Oid, DocVersion)>> {
+            let Some(version) = present(before)? else {
+                return Ok(None);
+            };
+            Ok(store
+                .commit(commit)?
+                .parents
+                .first()
+                .map(|parent| (parent.clone(), version)))
+        })
+        .find_map(Result::transpose)
+        .transpose()?
+        .ok_or_else(|| {
+            CycleError::NoVersionAt {
+                doc: doc.clone(),
+                at: at.clone(),
+            }
+            .into()
+        })
 }
 
 /// Where the copy goes: its original folder if that is present, a
@@ -173,26 +191,11 @@ impl Hub<'_> {
         };
         let copy = DocId::new(uuid::Uuid::new_v4().to_string())?;
         let original_name = name_of(&metadata).unwrap_or_else(|| doc.to_string());
-        let original_parent = metadata
-            .get("parent")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
+        let original_parent = parent_of(&metadata);
         let date = self.date();
         let now_ms = unix_now().saturating_mul(1000);
-        let device = library.tablet.as_ref().map(|attached| {
-            (
-                attached.state.device_name.clone(),
-                attached.state.device_id.clone(),
-                attached.info.clone(),
-            )
-        });
-        let author = device.as_ref().map(|(name, id, info)| Author {
-            name,
-            id,
-            model: info.model.as_deref(),
-            firmware: info.firmware.as_deref(),
-        });
+        let signer = library.signer();
+        let author = signer.as_ref().map(Signer::author);
         let new = NewDoc {
             doc: copy.clone(),
             files: version.files,
@@ -213,6 +216,7 @@ impl Hub<'_> {
             })?;
         Ok(RestoreReport {
             original: doc,
+            original_name,
             copy,
             name,
             place,
@@ -227,20 +231,8 @@ impl Hub<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hub::cycle::library::tests::item;
     use serde_json::json;
-
-    fn item(uuid: &str, name: &str, parent: &str, kind: ItemKind) -> Item {
-        Item {
-            uuid: uuid.to_string(),
-            visible_name: name.to_string(),
-            parent: parent.to_string(),
-            kind,
-            file_type: None,
-            created_time: 0,
-            last_modified: 0,
-            size_bytes: None,
-        }
-    }
 
     #[test]
     fn the_copy_goes_to_its_folder_if_it_still_holds_documents() {

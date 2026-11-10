@@ -87,10 +87,12 @@ struct Cli {
     #[arg(short, long, global = true)]
     quiet: bool,
 
-    /// Whether `--host` was given rather than defaulted (`rmu hub log`,
-    /// `restore` and `add` contact the tablet then, even with `--origin`).
+    /// Whether a flag naming the tablet (`--host`, `--user`, `--port`,
+    /// `-i`, `-o`, `--password`, `--password-file`) was given rather than
+    /// defaulted: `rmu hub log`, `restore` and `add` contact the tablet
+    /// then, even with `--origin`.
     #[arg(skip)]
-    host_given: bool,
+    tablet_given: bool,
 
     #[command(subcommand)]
     command: Command,
@@ -251,7 +253,7 @@ fn main() -> ExitCode {
                 quiet: cli.quiet,
                 xochitl_dir: &cli.xochitl_dir,
                 progress: progress.clone(),
-                host_given: cli.host_given,
+                tablet_given: cli.tablet_given,
             },
             || make_session(&cli, &format!("{}@{}", cli.user, cli.host)),
         ),
@@ -282,7 +284,9 @@ where
     use clap::{CommandFactory, FromArgMatches};
     let matches = Cli::command().try_get_matches_from(args)?;
     let mut cli = Cli::from_arg_matches(&matches)?;
-    cli.host_given = matches.value_source("host") == Some(clap::parser::ValueSource::CommandLine);
+    cli.tablet_given = TABLET_FLAGS
+        .iter()
+        .any(|flag| matches.value_source(flag) == Some(clap::parser::ValueSource::CommandLine));
     if cli.no_restart && matches!(cli.command, Command::Hub(_)) {
         return Err(Cli::command().error(
             clap::error::ErrorKind::ArgumentConflict,
@@ -291,6 +295,17 @@ where
     }
     Ok(cli)
 }
+
+/// The global flags that name the tablet or how to reach it (their ids).
+const TABLET_FLAGS: [&str; 7] = [
+    "host",
+    "user",
+    "port",
+    "identity",
+    "ssh_option",
+    "password",
+    "password_file",
+];
 
 /// Build a session for a destination string (`host` or `user@host`).
 fn make_session(cli: &Cli, destination: &str) -> Result<SshSession> {

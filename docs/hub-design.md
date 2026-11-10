@@ -1254,9 +1254,10 @@ library once, exactly as `clone` finds its cache. Without `--origin`
 the tablet (chosen with the global SSH flags, as for every command) is
 asked for its hub state, and its stored URL and its repository's cache
 are used; origin's repo id must be the tablet's (`RepoMismatch`
-otherwise). `--origin` together with an explicit `--host` uses both:
-the URL given, and the tablet for its base (`log`) and as the author
-(`restore`, `add`). The tablet is only read: its state file, and for
+otherwise). `--origin` together with an explicit flag naming the tablet
+(`--host`, `--user`, `--port`, `-i`, `-o`, `--password`,
+`--password-file`) uses both: the URL given, and the tablet for its
+base (`log`) and as the author (`restore`, `add`). The tablet is only read: its state file, and for
 `restore`/`add` its model and firmware (for the trailers).
 
 **`rmu hub log`.** Without an argument it shows the library's history:
@@ -1316,7 +1317,8 @@ it.
 document (fresh random UUID) in `folder` (a logical path or UUID on
 `main`; the root by default; it must be a folder outside the trash),
 named `--name` or the file's stem. A name already taken in that folder
-is refused, as `rmu upload` does. Its files: `.metadata` as `rmu
+is refused, as `rmu upload` does, and so is a `.pdf` that does not start
+with `%PDF-` within its first KiB. Its files: `.metadata` as `rmu
 upload` writes it (`new: true`, never opened), the payload, and
 `.content`, without a `.pagedata` (firmware 3.28 writes none for
 documents it creates). For a PDF whose page count can be read,
@@ -1340,10 +1342,28 @@ inside object streams; Flate streams with PNG predictors are decoded
 with `flate2`, which `zip` already brings in with its pure-Rust
 `zlib-rs` backend. When the cross-reference data is unusable it
 rebuilds the table by scanning for `N G obj`. It then reads `/Root`,
-`/Pages` and `/Count`, and walks the page tree counting its leaves
-(cycles, depth and size bounded). The count is used only when the walk
-agrees with `/Count`; anything else (encrypted object streams, filters
-other than Flate, a damaged file) falls back to the skeleton. The
+`/Pages` and `/Count`, and walks the page tree counting its leaves. The
+count is used only when the walk agrees with `/Count`; anything else
+(encrypted object streams, filters other than Flate, a damaged file)
+falls back to the skeleton. `add` is fed files from anywhere, so every
+count runs within limits (`pdf::Limits`), and running out of any of
+them is "no count", the skeleton again: a work budget of 16 units per
+byte of the file plus 64 Mi (a unit per byte searched, parsed or
+decoded and per object built), so no input makes it search the rest of
+the file once per object; 16 MiB per decoded stream; 32 MiB of object
+streams held decoded; a million cross-reference entries across every
+section and the scan, checked against the declared counts before
+anything is allocated (offsets past the end of the file are dropped);
+256 Ki objects per parse; a million page-tree nodes; and nesting,
+reference hops, sections and tree depth. Stream data is read only for
+cross-reference and object streams, and a hex string ends at its first
+non-hex byte. Measured (`tests/pdf_bounds.rs`, a counting allocator):
+the hostile files from review (cross-reference stream bombs, chained
+sections, huge arrays in object streams, quadratic scans, a valid
+table of pages followed by unterminated streams) peak at 33 MiB of heap
+(67 MiB for a stream filling the entry cap) and take under 50 ms in a
+release build; 12 million mutated files stayed within their limits
+without a panic. The
 alternatives were worse: a count given by the user can be wrong, and a
 wrong list is worse than none (a list whose length disagrees with the
 PDF is a change each tablet would make on its own); always writing the
@@ -1486,7 +1506,12 @@ Needing writes (answered during device validation, with go-ahead):
    stopping xochitl safe on the Paper Pro with encrypted storage, and
    within the start-limit window when repeated?
 7. Does xochitl accept a `.content` whose page list was merged
-   externally?
+   externally? And the page list `rmu hub add` writes: its registers name
+   author `1` without a `cPages.uuids` table defining it, and its `idx`
+   values past 26 pages (`baa`, `bab`, ...) are rmu's own scheme, not
+   checked against what xochitl writes for long PDFs. Neither matters to
+   the merge (`uuids` is derived and `idx` compares within a document),
+   but if xochitl rejects such a list, `add` switches to the skeleton.
 
 ### Device survey results
 

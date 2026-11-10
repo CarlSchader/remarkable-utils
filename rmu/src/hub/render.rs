@@ -861,7 +861,7 @@ fn log_entry(lines: &mut Vec<String>, entry: &LogEntry, tablet: Option<&TabletBa
     lines.extend(entry.restored.iter().map(|restored| {
         format!(
             "    restored {} as of {} as {}",
-            restored.original,
+            label(names, &restored.original),
             short(&restored.from),
             label(names, &restored.copy)
         )
@@ -975,7 +975,8 @@ fn restore(report: &RestoreReport) -> Vec<String> {
     };
     let mut lines = vec![
         format!(
-            "Restored {} {from} as \"{}\" ({}) in {}",
+            "Restored \"{}\" ({}) {from} as \"{}\" ({}) in {}",
+            report.original_name,
             report.original,
             report.name,
             report.copy,

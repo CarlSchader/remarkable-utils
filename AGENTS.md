@@ -40,7 +40,7 @@ This repository is **open source** (dual-licensed MIT OR Apache-2.0):
 | `nix/lib/git-hooks.nix` | Pre-commit hooks: treefmt + clippy (offline vendored)  |
 | `libremarkable-utils/`  | Library crate (see module map below)                   |
 | `rmu/`                  | `rmu` CLI binary crate (clap; all config via flags, no config file) |
-| `rmu/src/hub.rs`, `rmu/src/hub/` | `rmu hub` over the library's `Hub`: arguments, `wants_tablet` (`log`, `restore` and `add` skip the tablet with `--origin` unless `--host` is given; `main.rs` records whether it was), `execute` (runs a command on any `&dyn Tablet`, or none for those), exit statuses (`Failure`), `finish` (output and error details); pure `render.rs` (human summary, plain ids) and `json.rs` (`--json`, `"schema": 1`, unstable until device validation: the library's serialised reports plus `schema` and `command`, and the error object). Tests: `hub/tests.rs` (fabricated reports) with `hub/tests/` (`parsing`, `output`, `golden`: one exact JSON per report type and error shape, update them deliberately; `commands`: against the fake tablet), and `rmu/tests/hub_cli.rs` (the real binary over a mock `ssh` that rewrites the tablet's paths into a scratch dir) |
+| `rmu/src/hub.rs`, `rmu/src/hub/` | `rmu hub` over the library's `Hub`: arguments, `wants_tablet` (`log`, `restore` and `add` skip the tablet with `--origin` unless a flag naming it, `--host` or another SSH flag, is given; `main.rs` records whether one was), `execute` (runs a command on any `&dyn Tablet`, or none for those), exit statuses (`Failure`), `finish` (output and error details); pure `render.rs` (human summary, plain ids) and `json.rs` (`--json`, `"schema": 1`, unstable until device validation: the library's serialised reports plus `schema` and `command`, and the error object). Tests: `hub/tests.rs` (fabricated reports) with `hub/tests/` (`parsing`, `output`, `golden`: one exact JSON per report type and error shape, update them deliberately; `commands`: against the fake tablet), and `rmu/tests/hub_cli.rs` (the real binary over a mock `ssh` that rewrites the tablet's paths into a scratch dir) |
 | `test-support/`         | Unpublished dev-dependency: helpers shared by tests (`Scratch` temp dirs with mock `bin/` + `PATH`, `write_script`, `rerun_test`, `assert_success`, `set_modified`, `pdf`: a fabricated N-page PDF) |
 | `Cargo.toml`            | Workspace root; shared deps in `[workspace.dependencies]` |
 
@@ -200,8 +200,14 @@ This repository is **open source** (dual-licensed MIT OR Apache-2.0):
   deps; Flate through `flate2`, already in the tree via `zip`):
   cross-reference tables and streams, object streams, a scan fallback,
   and a count only when a walk of the page tree agrees with `/Count`.
-  Hostile input must never panic (a test damages files byte by byte);
-  `rmu hub add` falls back to an unmaterialised page list on `None`.
+  Input is hostile: every count runs within `Limits` (a work budget per
+  byte, caps on decoded bytes, entries, objects per parse, page-tree
+  nodes), and running out is `None`; keep every new loop and allocation
+  paid for by the budget or a cap. It must never panic (a fuzz pass and
+  a byte-damage sweep run in the unit tests), and `tests/pdf_bounds.rs`
+  measures peak heap and time on hostile files with a counting
+  allocator. `rmu hub add` falls back to an unmaterialised page list on
+  `None`.
 - `status.rs` — device system state (`rmu status`): one
   marker-sectioned SSH round trip, pure best-effort parsing (every
   field `Option`al — firmware/models differ), pure rendering.

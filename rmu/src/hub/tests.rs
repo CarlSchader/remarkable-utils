@@ -400,7 +400,10 @@ fn log_report() -> LogReport {
             from: oid('b'),
         }],
         added: vec![doc(4)],
-        names: BTreeMap::from([(doc(4), "Old (restored 2026-11-09)".to_string())]),
+        names: BTreeMap::from([
+            (doc(3), "Old".to_string()),
+            (doc(4), "Old (restored 2026-11-09)".to_string()),
+        ]),
         ..log_entry('d', CommitKind::Restore)
     };
     LogReport {
@@ -470,6 +473,7 @@ fn doc_log_report() -> DocLogReport {
 fn restore_report() -> RestoreReport {
     RestoreReport {
         original: doc(3),
+        original_name: "Old".into(),
         copy: doc(4),
         name: "Old (restored 2026-11-09)".into(),
         place: projects(),

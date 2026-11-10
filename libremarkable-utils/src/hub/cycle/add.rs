@@ -10,8 +10,8 @@ use std::path::Path;
 
 use serde_json::{Value, json};
 
-use super::library::{Decided, NewDoc, items_of, place, usable_folder};
-use super::message::{self, Author};
+use super::library::{Decided, NewDoc, Signer, items_of, place, usable_folder};
+use super::message;
 use super::{AddReport, CycleError, Hub, rmu_signature, unix_now};
 use crate::error::{Error, Result};
 use crate::git::{CommitMeta, FileMode};
@@ -77,18 +77,6 @@ pub(super) fn added_content(
     content
 }
 
-/// A visible name for a new document: trimmed, not empty, without `/`.
-fn checked_name(name: &str) -> Result<String> {
-    let name = name.trim();
-    if name.is_empty() {
-        return Err(Error::InvalidName("name cannot be empty".to_string()));
-    }
-    if name.contains('/') {
-        return Err(Error::InvalidName("name cannot contain '/'".to_string()));
-    }
-    Ok(name.to_string())
-}
-
 impl Hub<'_> {
     /// `rmu hub add <file> [folder]`: a `.pdf` or `.epub` as a new
     /// document (fresh UUID) in `folder` (a logical path or UUID on
@@ -121,24 +109,34 @@ impl Hub<'_> {
             .and_then(|extension| extension.to_str())
             .map(str::to_ascii_lowercase)
             .unwrap_or_default();
+        let file_name = || {
+            file.file_name().map_or_else(
+                || file.display().to_string(),
+                |name| name.to_string_lossy().into_owned(),
+            )
+        };
         let payload_file = match file_type.as_str() {
             "pdf" => DocFile::PayloadPdf,
             "epub" => DocFile::PayloadEpub,
-            _ => return Err(CycleError::NotAddable(file_type).into()),
+            _ => return Err(CycleError::NotAddable(file_name()).into()),
         };
         if !file.is_file() {
             return Err(Error::FileNotFound(file.to_path_buf()));
         }
-        let name = checked_name(&match name {
-            Some(name) => name.to_string(),
-            None => file.file_stem().map_or_else(
-                || "untitled".to_string(),
-                |stem| stem.to_string_lossy().into_owned(),
-            ),
-        })?;
+        let stem = file.file_stem().map_or_else(
+            || "untitled".to_string(),
+            |stem| stem.to_string_lossy().into_owned(),
+        );
+        let name = xochitl::checked_name(name.unwrap_or(&stem))?.to_string();
         self.progress.step("Reading the file");
         let bytes = std::fs::read(file)?;
+        // The page count runs within the counter's own limits; anything it
+        // cannot settle (a damaged or hostile file included) is `None`,
+        // and the document gets the unmaterialised skeleton.
         let pages = match payload_file {
+            DocFile::PayloadPdf if !crate::pdf::is_pdf(&bytes) => {
+                return Err(CycleError::NotAPdf(file_name()).into());
+            }
             DocFile::PayloadPdf => crate::pdf::page_count(&bytes),
             _ => None,
         };
@@ -151,7 +149,7 @@ impl Hub<'_> {
             let items = items_of(&theirs, &origin.store)?;
             let parent = xochitl::resolve_folder_ref(&items, folder_ref)?;
             if !usable_folder(&items, &parent) {
-                return Err(CycleError::FolderInTrash(folder_ref.to_string()).into());
+                return Err(CycleError::FolderUnusable(folder_ref.to_string()).into());
             }
             parent
         };
@@ -183,19 +181,8 @@ impl Hub<'_> {
             ]),
             other: BTreeMap::new(),
         };
-        let device = library.tablet.as_ref().map(|attached| {
-            (
-                attached.state.device_name.clone(),
-                attached.state.device_id.clone(),
-                attached.info.clone(),
-            )
-        });
-        let author = device.as_ref().map(|(name, id, info)| Author {
-            name,
-            id,
-            model: info.model.as_deref(),
-            firmware: info.firmware.as_deref(),
-        });
+        let signer = library.signer();
+        let author = signer.as_ref().map(Signer::author);
         let now_ms = unix_now().saturating_mul(1000);
         let (commit, attempts, place) =
             self.push_new_doc(&mut library, &new, &mut |origin, theirs| {
@@ -321,12 +308,5 @@ mod tests {
         );
         assert!(same(&v[1], &v[2]), "materialised again over rmu's list");
         assert!(!same(&v[1], &v[3]), "another page count is a change");
-    }
-
-    #[test]
-    fn names_are_checked() {
-        assert_eq!(checked_name("  Paper ").unwrap(), "Paper");
-        assert!(matches!(checked_name(" "), Err(Error::InvalidName(_))));
-        assert!(matches!(checked_name("a/b"), Err(Error::InvalidName(_))));
     }
 }

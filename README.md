@@ -166,8 +166,8 @@ rmu hub add paper.pdf Books --origin ssh://git@server.example/library.git
 ```
 
 `log`, `restore` and `add` work on origin alone. With `--origin` they
-need no tablet at all (add `--host` to have the tablet's base shown, or
-to record it as the author); without it the tablet supplies its stored
+need no tablet at all (add `--host`, or another SSH flag, to have the
+tablet's base shown, or to record it as the author); without it the tablet supplies its stored
 URL. `restore` never overwrites anything: the version (of a deleted
 document too, `--at` the commit that deleted it or any later one)
 becomes a new document, `<name> (restored <date>)`, in its old folder if

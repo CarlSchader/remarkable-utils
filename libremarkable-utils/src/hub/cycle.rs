@@ -262,13 +262,23 @@ pub enum CycleError {
     #[error("document {doc} has no version at or before commit {at}")]
     NoVersionAt { doc: DocId, at: Oid },
 
-    /// `add` of a file that is not a PDF or an EPUB.
+    /// `add` of a file that is not a PDF or an EPUB (by its name).
     #[error("rmu hub add takes .pdf and .epub files, not '{0}'")]
     NotAddable(String),
 
-    /// `add` into a folder in the trash.
-    #[error("folder '{0}' is in the trash")]
-    FolderInTrash(String),
+    /// `add` of a `.pdf` that does not start like one.
+    #[error("'{0}' is not a PDF: it does not start with %PDF-")]
+    NotAPdf(String),
+
+    /// `add` into a folder in the trash, or one whose parent chain does
+    /// not reach the root.
+    #[error("folder '{0}' is in the trash, or its parent chain does not reach the root")]
+    FolderUnusable(String),
+
+    /// The new document's id is on origin already (never expected: ids
+    /// are random).
+    #[error("document {0} already exists on origin")]
+    DocExists(DocId),
 
     /// `add`: the folder went away (deleted, or moved to the trash) while
     /// retrying the push.

@@ -11,7 +11,7 @@ use std::rc::Rc;
 use serde_json::Value;
 
 use super::history::{DocStep, HistoryIndex};
-use super::library::{metadata_of, name_of, place_with, resolve_doc};
+use super::library::{metadata_of, name_of, parent_of, place_with, resolve_doc};
 use super::message::{self, ADDED, CONSENT, DEVICE, DEVICE_ID, FIRMWARE, MODEL, RESTORED};
 use super::plan::JsonBlobs;
 use super::store::Store;
@@ -174,22 +174,9 @@ fn place_at(store: &Store, rules: &MirrorRules, commit: &Oid, parent: &str) -> R
         };
         Ok(metadata_of(store, &version)?.map(|metadata| {
             let name = name_of(&metadata).unwrap_or_else(|| uuid.to_string());
-            let parent = metadata
-                .get("parent")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            (name, parent)
+            (name, parent_of(&metadata))
         }))
     })
-}
-
-fn parent_of(metadata: &Value) -> String {
-    metadata
-        .get("parent")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string()
 }
 
 impl Hub<'_> {
@@ -297,7 +284,7 @@ fn log_entry(
     changes: &[DocStep<'_>],
 ) -> Result<LogEntry> {
     let info = commit_info(store, commit)?;
-    let mut entry = LogEntry {
+    let entry = LogEntry {
         commit: commit.clone(),
         kind: info.kind,
         author: info.author,
@@ -328,21 +315,41 @@ fn log_entry(
         deleted: Vec::new(),
         names: BTreeMap::new(),
     };
-    for (doc, before, after) in changes {
-        let before = present(store, rules, doc, *before)?;
-        let after = present(store, rules, doc, *after)?;
-        let (list, named) = match (&before, &after) {
-            (None, Some((_, metadata))) => (&mut entry.added, metadata),
-            (Some((_, metadata)), None) => (&mut entry.deleted, metadata),
-            (Some(_), Some((_, metadata))) => (&mut entry.changed, metadata),
-            (None, None) => continue,
-        };
-        list.push((*doc).clone());
-        if let Some(name) = name_of(named) {
-            entry.names.insert((*doc).clone(), name);
-        }
-    }
-    Ok(entry)
+    let entry = changes.iter().try_fold(
+        entry,
+        |mut entry, (doc, before, after)| -> Result<LogEntry> {
+            let before = present(store, rules, doc, *before)?;
+            let after = present(store, rules, doc, *after)?;
+            let (list, named) = match (&before, &after) {
+                (None, Some((_, metadata))) => (&mut entry.added, metadata),
+                (Some((_, metadata)), None) => (&mut entry.deleted, metadata),
+                (Some(_), Some((_, metadata))) => (&mut entry.changed, metadata),
+                (None, None) => return Ok(entry),
+            };
+            list.push((*doc).clone());
+            if let Some(name) = name_of(named) {
+                entry.names.insert((*doc).clone(), name);
+            }
+            Ok(entry)
+        },
+    )?;
+    // Each restore's original, by the name of the version restored.
+    entry
+        .restored
+        .clone()
+        .iter()
+        .try_fold(entry, |mut entry, restored| -> Result<LogEntry> {
+            let version = store.version_at(rules, &restored.from, &restored.original)?;
+            let name = version
+                .map(|version| metadata_of(store, &version))
+                .transpose()?
+                .flatten()
+                .and_then(|metadata| name_of(&metadata));
+            if let Some(name) = name {
+                entry.names.entry(restored.original.clone()).or_insert(name);
+            }
+            Ok(entry)
+        })
 }
 
 /// The events of `doc`'s own touches on `main`'s first-parent chain, by
@@ -445,14 +452,15 @@ fn last_known_name(
     main: &Oid,
     doc: &DocId,
 ) -> Result<Option<String>> {
-    for (_, (_, before, after)) in index.doc_chain(main, doc).unwrap_or_default() {
-        for subtree in [after, before] {
-            if let Some((_, metadata)) = present(store, rules, doc, subtree)? {
-                return Ok(name_of(&metadata));
-            }
-        }
-    }
-    Ok(None)
+    index
+        .doc_chain(main, doc)
+        .unwrap_or_default()
+        .into_iter()
+        .flat_map(|(_, (_, before, after))| [after, before])
+        .map(|subtree| present(store, rules, doc, subtree))
+        .find_map(Result::transpose)
+        .transpose()
+        .map(|found| found.and_then(|(_, metadata)| name_of(&metadata)))
 }
 
 #[cfg(test)]

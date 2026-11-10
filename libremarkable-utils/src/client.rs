@@ -861,13 +861,7 @@ impl Client {
 
     /// Rename a document or folder.
     pub fn rename(&self, item_ref: &str, new_name: &str) -> Result<Item> {
-        let name = new_name.trim();
-        if name.is_empty() {
-            return Err(Error::InvalidName("name cannot be empty".to_string()));
-        }
-        if name.contains('/') {
-            return Err(Error::InvalidName("name cannot contain '/'".to_string()));
-        }
+        let name = xochitl::checked_name(new_name)?;
 
         let items = self.list_items_full()?;
         let item = xochitl::resolve_item_ref(&items, item_ref)?.clone();

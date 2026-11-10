@@ -4058,6 +4058,7 @@ fn a_restored_version_arrives_on_both_tablets_as_a_new_document() {
         .restore(None, "Projects/Notes", &then.to_string()[..10])
         .unwrap();
     assert_eq!(report.original, lib.notes);
+    assert_eq!(report.original_name, "Notes");
     assert_eq!(report.from, then);
     assert_eq!(report.name, format!("Notes (restored {})", world::DATE));
     assert_eq!(report.place.parent, lib.folder.as_str());
@@ -4284,7 +4285,7 @@ fn add_refuses_taken_names_trashed_folders_and_other_files() {
         .add(None, &file, Some(lib.archive.as_str()), None)
         .unwrap_err();
     assert!(
-        is_cycle(&error, |e| matches!(e, CycleError::FolderInTrash(_))),
+        is_cycle(&error, |e| matches!(e, CycleError::FolderUnusable(_))),
         "{error}"
     );
     let error = desk
@@ -4298,7 +4299,21 @@ fn add_refuses_taken_names_trashed_folders_and_other_files() {
     std::fs::write(&text, b"text").unwrap();
     let error = desk.add(None, &text, None, None).unwrap_err();
     assert!(
-        is_cycle(&error, |e| matches!(e, CycleError::NotAddable(_))),
+        is_cycle(
+            &error,
+            |e| matches!(e, CycleError::NotAddable(name) if name == "notes.txt")
+        ),
+        "{error}"
+    );
+    // A `.pdf` that is not one.
+    let fake = world.root.join("files").join("fake.pdf");
+    std::fs::write(&fake, b"<html>not a pdf</html>").unwrap();
+    let error = desk.add(None, &fake, None, None).unwrap_err();
+    assert!(
+        is_cycle(
+            &error,
+            |e| matches!(e, CycleError::NotAPdf(name) if name == "fake.pdf")
+        ),
         "{error}"
     );
     // Nothing was pushed.
@@ -4575,4 +4590,61 @@ fn log_restore_and_add_through_the_tablets_origin() {
         is_cycle(&error, |e| matches!(e, CycleError::RepoMismatch { .. })),
         "{error}"
     );
+}
+
+#[test]
+fn a_lost_acknowledgement_of_an_add_is_resolved_by_looking_at_origin() {
+    let (world, _) = two_tablets();
+    let before = origin_main(&world);
+    let trigger = lose_next_main_push_ack(&world);
+    // The push lands, its acknowledgement does not: rmu fetches and finds
+    // its commit on origin.
+    let report = world
+        .desk()
+        .add(None, &world.pdf_file("Lost.pdf", 2), None, None)
+        .unwrap();
+    assert!(!trigger.exists(), "the hook did not fire");
+    assert_eq!(report.push_attempts, 1);
+    let main = origin_main(&world);
+    assert_eq!(main, report.commit);
+    let repo = world.git.open(Path::new(&world.origin)).unwrap();
+    assert_eq!(
+        repo.rev_list(&[main.as_str(), &format!("^{before}")], false)
+            .unwrap()
+            .len(),
+        1,
+        "exactly one new commit"
+    );
+    world.converge();
+    let names = origin_names(&world);
+    assert_eq!(names.values().filter(|name| *name == "Lost").count(), 1);
+}
+
+#[test]
+fn a_restore_lands_while_a_tablet_edits_the_original() {
+    let (world, lib) = two_tablets();
+    let page = world.pages(0, &lib.notes)[0].clone();
+    let old_ink = doc_ink(&world, 0, &lib.notes);
+    world.ink(0, &lib.notes, &page);
+    world.converge();
+    // Tablet B inks the original and has not synced when the copy of the
+    // old version lands.
+    world.ink(1, &lib.notes, &page);
+    let edited = doc_ink(&world, 1, &lib.notes);
+    let first = world
+        .git
+        .open(Path::new(&world.origin))
+        .unwrap()
+        .rev_list(&["refs/heads/main"], true)
+        .unwrap();
+    let report = world
+        .desk()
+        .restore(None, lib.notes.as_str(), first[first.len() - 2].as_str())
+        .unwrap();
+    world.converge();
+    assert!(world.conflicts().is_empty(), "{:?}", world.conflicts());
+    (0..2).for_each(|i| {
+        assert_eq!(doc_ink(&world, i, &lib.notes), edited, "tablet {i}");
+        assert_eq!(doc_ink(&world, i, &report.copy), old_ink, "tablet {i}");
+    });
 }

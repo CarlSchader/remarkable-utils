@@ -578,7 +578,7 @@ fn renders_the_library_history() {
         &[
             "History of origin ssh://git@example.invalid/library.git (repository 0f0e0d0c-0000-4000-8000-0000000000a1), newest first",
             "Tablet \"Desk tablet\" has the library as of cccccccccccc (2 documents at a base of their own)",
-            "dddddddddddd  2026-11-09 14:03  restore  rmu\n    1 added\n    added: \"Old (restored 2026-11-09)\" (8c1f0b9e-0000-4000-8000-000000000004)\n    restored 8c1f0b9e-0000-4000-8000-000000000003 as of bbbbbbbbbbbb as \"Old (restored 2026-11-09)\"",
+            "dddddddddddd  2026-11-09 14:03  restore  rmu\n    1 added\n    added: \"Old (restored 2026-11-09)\" (8c1f0b9e-0000-4000-8000-000000000004)\n    restored \"Old\" (8c1f0b9e-0000-4000-8000-000000000003) as of bbbbbbbbbbbb as \"Old (restored 2026-11-09)\"",
             "cccccccccccc  2026-11-09 14:03  sync     Desk tablet (reMarkable Fake, 3.28.0)  <- the tablet's base",
             "    1 added, 1 changed, 1 deleted",
             "    deleted: \"Old\" (8c1f0b9e-0000-4000-8000-000000000003)",
@@ -643,7 +643,7 @@ fn renders_restore_and_add() {
     contains_all(
         &human,
         &[
-            "Restored 8c1f0b9e-0000-4000-8000-000000000003 as of bbbbbbbbbbbb, just before its deletion (asked for dddddddddddd) as \"Old (restored 2026-11-09)\" (8c1f0b9e-0000-4000-8000-000000000004) in /Projects",
+            "Restored \"Old\" (8c1f0b9e-0000-4000-8000-000000000003) as of bbbbbbbbbbbb, just before its deletion (asked for dddddddddddd) as \"Old (restored 2026-11-09)\" (8c1f0b9e-0000-4000-8000-000000000004) in /Projects",
             "Pushed to origin (eeeeeeeeeeee); every tablet gets it at its next sync",
             "(after 2 push attempts: origin moved meanwhile)",
         ],

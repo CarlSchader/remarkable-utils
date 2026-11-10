@@ -345,8 +345,9 @@ pub struct LogEntry {
     pub added: Vec<DocId>,
     pub changed: Vec<DocId>,
     pub deleted: Vec<DocId>,
-    /// The visible name of each of those documents: after the commit, or
-    /// before it for a deletion.
+    /// The visible name of each of those documents (after the commit, or
+    /// before it for a deletion) and of each restore's original (in the
+    /// version restored).
     pub names: BTreeMap<DocId, String>,
 }
 
@@ -458,6 +459,8 @@ pub struct DocLogReport {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RestoreReport {
     pub original: DocId,
+    /// The name of the version restored.
+    pub original_name: String,
     /// The new document.
     pub copy: DocId,
     pub name: String,

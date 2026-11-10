@@ -626,6 +626,7 @@ fn log_report_json() {
                     "forks": [],
                     "kind": "restore",
                     "names": {
+                        "8c1f0b9e-0000-4000-8000-000000000003": "Old",
                         "8c1f0b9e-0000-4000-8000-000000000004": "Old (restored 2026-11-09)"
                     },
                     "notes": [],
@@ -831,6 +832,7 @@ fn restore_report_json() {
             "from": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
             "name": "Old (restored 2026-11-09)",
             "original": "8c1f0b9e-0000-4000-8000-000000000003",
+            "original_name": "Old",
             "place": {
                 "parent": "8c1f0b9e-0000-4000-8000-000000000028",
                 "path": "/Projects"

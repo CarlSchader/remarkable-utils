@@ -384,10 +384,28 @@ fn history_commands_contact_the_tablet_only_when_needed() {
         let crate::Command::Hub(args) = &cli.command else {
             unreachable!()
         };
-        wants_tablet(&args.command, cli.host_given)
+        wants_tablet(&args.command, cli.tablet_given)
     };
     assert!(parsed(&["rmu", "hub", "log"]));
     assert!(!parsed(&["rmu", "hub", "log", "--origin", "/srv/lib.git"]));
+    // Any flag naming the tablet or how to reach it counts as naming it.
+    [
+        &["--user", "admin"][..],
+        &["--port", "2222"],
+        &["-i", "/keys/tablet"],
+        &["-o", "ConnectTimeout=5"],
+        &["--password-file", "/run/pw"],
+        &["--password"],
+    ]
+    .iter()
+    .for_each(|flag| {
+        let argv: Vec<&str> = ["rmu", "hub", "log", "--origin", "/srv/lib.git"]
+            .iter()
+            .chain(flag.iter())
+            .copied()
+            .collect();
+        assert!(parsed(&argv), "{flag:?}");
+    });
     assert!(parsed(&[
         "rmu",
         "hub",
@@ -435,7 +453,7 @@ fn history_commands_contact_the_tablet_only_when_needed() {
     ]));
     // The default host is not "given".
     let cli = crate::parse_cli(["rmu", "hub", "log"]).unwrap();
-    assert!(!cli.host_given);
+    assert!(!cli.tablet_given);
 }
 
 #[test]
