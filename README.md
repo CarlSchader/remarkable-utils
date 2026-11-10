@@ -158,7 +158,22 @@ rmu hub backup                     # back up to origin only; nothing is merged
 rmu hub remote                     # the origin URL stored on the tablet
 rmu hub remote set-url ssh://git@new-server.example/library.git
 rmu hub detach --prune-ref         # forget the hub (documents stay), drop its backups
+
+rmu hub log                        # the library's history: one entry per sync
+rmu hub log Books/Notes            # one document's history (path or UUID)
+rmu hub restore Books/Notes --at 1a2b3c4d   # an old version, as a new document
+rmu hub add paper.pdf Books --origin ssh://git@server.example/library.git
 ```
+
+`log`, `restore` and `add` work on origin alone. With `--origin` they
+need no tablet at all (add `--host` to have the tablet's base shown, or
+to record it as the author); without it the tablet supplies its stored
+URL. `restore` never overwrites anything: the version (of a deleted
+document too, `--at` the commit that deleted it or any later one)
+becomes a new document, `<name> (restored <date>)`, in its old folder if
+that still exists, else at the root. `add` takes a PDF or an EPUB and
+puts it in the folder given (the root by default). Both commit to
+origin, so every tablet gets the new document at its next sync.
 
 The tablet is chosen with the usual flags (`--host`, ssh config
 aliases, ...). The origin's URL is stored on the tablet at clone time;
@@ -252,35 +267,28 @@ Recovery:
   Running `rmu hub init` on it again is a last resort: it starts a new
   repository, so every tablet then needs `clone --reattach` and the old
   history stays behind.
-- *Getting a deleted document back*: its files stay in origin's history.
-  Restore commands are planned; until then, git finds them:
-
-  ```sh
-  # the commits that deleted documents, and the documents' ids
-  git --git-dir ~/library.git log --diff-filter=D --name-only --format='%h %ad %s' -- 'docs/*/metadata'
-  git --git-dir ~/library.git show <commit>^:docs/<id>/metadata     # its name ("visibleName")
-  git --git-dir ~/library.git show <commit>^:docs/<id>/payload.pdf > recovered.pdf
-  rmu upload recovered.pdf                                          # the PDF, without annotations
-  ```
-
-  Handwriting (notebooks, annotations) is in the same commit
-  (`git --git-dir ~/library.git ls-tree -r <commit>^ docs/<id>`); bringing
-  it back onto a tablet needs the planned restore command.
+- *Getting a deleted document back*: `rmu hub log <path>` finds it by
+  the path it had (or `rmu hub log` lists every deletion), and
+  `rmu hub restore <path or id> --at main` brings back the version it
+  had just before it was deleted, handwriting included, as a new
+  document that every tablet gets at its next sync.
 
 Every `rmu hub` command prints a summary on a terminal. When stdout is
 not a terminal it prints plain results instead, and the summary goes to
 stderr: the repository id for `init`, the commit the tablet is at for
 `clone` and `sync`, the backup commit for `backup`, `A`/`M`/`D <id>` per
 change for `status`, `write`/`delete <id>` per document for
-`sync --dry-run`, the stored URL for `remote`, and the deleted ref for
-`detach --prune-ref`.
+`sync --dry-run`, the stored URL for `remote`, the deleted ref for
+`detach --prune-ref`, one commit per entry for `log`, and the new
+document's id for `restore` and `add`.
 
 With `--json` it prints JSON instead. **The JSON format is unstable
 until the hub has been validated on devices**: field names may still
 change (`"schema"` will then be bumped). Today (`"schema": 1`) a result
 is the command's report as the library serialises it, plus `schema` and
 `command` (`init`, `clone`, `sync`, `sync --dry-run`, `backup`,
-`status`, `remote`, `remote set-url`, `detach`). An error is:
+`status`, `remote`, `remote set-url`, `detach`, `log`, `restore`,
+`add`; a document's `log` carries its id as `doc`). An error is:
 
 ```json
 {"schema": 1, "error": {"kind": "lock_held", "exit_code": 4, "message": "..."}}

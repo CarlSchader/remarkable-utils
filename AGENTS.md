@@ -40,8 +40,8 @@ This repository is **open source** (dual-licensed MIT OR Apache-2.0):
 | `nix/lib/git-hooks.nix` | Pre-commit hooks: treefmt + clippy (offline vendored)  |
 | `libremarkable-utils/`  | Library crate (see module map below)                   |
 | `rmu/`                  | `rmu` CLI binary crate (clap; all config via flags, no config file) |
-| `rmu/src/hub.rs`, `rmu/src/hub/` | `rmu hub` over the library's `Hub`: arguments, `execute` (runs a command on any `&dyn Tablet`), exit statuses (`Failure`), `finish` (output and error details); pure `render.rs` (human summary, plain ids) and `json.rs` (`--json`, `"schema": 1`, unstable until device validation: the library's serialised reports plus `schema` and `command`, and the error object). Tests: `hub/tests.rs` (fabricated reports) with `hub/tests/` (`parsing`, `output`, `golden`: one exact JSON per report type and error shape, update them deliberately; `commands`: against the fake tablet), and `rmu/tests/hub_cli.rs` (the real binary over a mock `ssh` that rewrites the tablet's paths into a scratch dir) |
-| `test-support/`         | Unpublished dev-dependency: helpers shared by tests (`Scratch` temp dirs with mock `bin/` + `PATH`, `write_script`, `rerun_test`, `assert_success`, `set_modified`) |
+| `rmu/src/hub.rs`, `rmu/src/hub/` | `rmu hub` over the library's `Hub`: arguments, `wants_tablet` (`log`, `restore` and `add` skip the tablet with `--origin` unless `--host` is given; `main.rs` records whether it was), `execute` (runs a command on any `&dyn Tablet`, or none for those), exit statuses (`Failure`), `finish` (output and error details); pure `render.rs` (human summary, plain ids) and `json.rs` (`--json`, `"schema": 1`, unstable until device validation: the library's serialised reports plus `schema` and `command`, and the error object). Tests: `hub/tests.rs` (fabricated reports) with `hub/tests/` (`parsing`, `output`, `golden`: one exact JSON per report type and error shape, update them deliberately; `commands`: against the fake tablet), and `rmu/tests/hub_cli.rs` (the real binary over a mock `ssh` that rewrites the tablet's paths into a scratch dir) |
+| `test-support/`         | Unpublished dev-dependency: helpers shared by tests (`Scratch` temp dirs with mock `bin/` + `PATH`, `write_script`, `rerun_test`, `assert_success`, `set_modified`, `pdf`: a fabricated N-page PDF) |
 | `Cargo.toml`            | Workspace root; shared deps in `[workspace.dependencies]` |
 
 ### `libremarkable-utils` module map
@@ -173,7 +173,16 @@ This repository is **open source** (dual-licensed MIT OR Apache-2.0):
   `clone`, `reconcile` (step 4), `push` (7–11) and `apply` (12–16)),
   the read-only commands (`cycle/inspect.rs`, which shares the sync's
   merge setup, `Hub::run_merge` in `cycle/merge_run.rs`) and
-  `remote`/`detach` (`cycle/admin.rs`). Base inference uses the merge's own "unchanged"
+  `remote`/`detach` (`cycle/admin.rs`), and `log`/`restore`/`add`,
+  which need no tablet (`docs/hub-design.md`, "History, restore and
+  add"): `cycle/library.rs` (origin through `--origin` or a tablet's
+  stored URL, items and document resolution at a commit, and the push
+  of one new document onto `main`, retried like a sync's),
+  `cycle/log.rs` (from the history index's `chain`/`doc_chain`: a
+  first-parent chain with each commit's document changes), and
+  `cycle/restore.rs`/`cycle/add.rs` with their pure naming, placement
+  and `.content` rules (deterministic UUIDv5 page ids for added PDFs;
+  never change them, or every added document forks). Base inference uses the merge's own "unchanged"
   predicate (`merge::unchanged`); keep the two from drifting. `tests/hub_e2e.rs` (harness in
   `tests/hub_e2e/world.rs`) runs fake tablets against a bare origin,
   ending every scenario that syncs to the end with one oracle
@@ -186,6 +195,12 @@ This repository is **open source** (dual-licensed MIT OR Apache-2.0):
   in release with `--ignored --nocapture` when touching history
   searches); add a scenario for every new cycle rule and keep the
   matrices passing.
+- `pdf.rs` — a minimal, conservative PDF page counter (pure, no native
+  deps; Flate through `flate2`, already in the tree via `zip`):
+  cross-reference tables and streams, object streams, a scan fallback,
+  and a count only when a walk of the page tree agrees with `/Count`.
+  Hostile input must never panic (a test damages files byte by byte);
+  `rmu hub add` falls back to an unmaterialised page list on `None`.
 - `status.rs` — device system state (`rmu status`): one
   marker-sectioned SSH round trip, pure best-effort parsing (every
   field `Option`al — firmware/models differ), pure rendering.
@@ -231,6 +246,7 @@ cargo run -p rmu -- --help         # run the CLI
 cargo run -p rmu -- sync --dry-run ./dir remarkable:/   # sync plan preview
 cargo run -p rmu -- hub status     # hub: changes since the last sync (read-only)
 cargo run -p rmu -- hub sync --dry-run --json   # hub: planned merge, as JSON
+cargo run -p rmu -- hub log --origin ~/library.git   # hub: history, no tablet needed
 cargo build --workspace            # build everything
 cargo test --workspace             # run tests
 cargo clippy --all-features --all-targets -- -D warnings  # mandatory lint

@@ -568,3 +568,111 @@ fn a_document_back_after_its_deletion_is_noted() {
         "{human}"
     );
 }
+
+#[test]
+fn renders_the_library_history() {
+    let report = Report::Log(log_report());
+    let human = text(&render::human(&report, &BTreeMap::new()));
+    contains_all(
+        &human,
+        &[
+            "History of origin ssh://git@example.invalid/library.git (repository 0f0e0d0c-0000-4000-8000-0000000000a1), newest first",
+            "Tablet \"Desk tablet\" has the library as of cccccccccccc (2 documents at a base of their own)",
+            "dddddddddddd  2026-11-09 14:03  restore  rmu\n    1 added\n    added: \"Old (restored 2026-11-09)\" (8c1f0b9e-0000-4000-8000-000000000004)\n    restored 8c1f0b9e-0000-4000-8000-000000000003 as of bbbbbbbbbbbb as \"Old (restored 2026-11-09)\"",
+            "cccccccccccc  2026-11-09 14:03  sync     Desk tablet (reMarkable Fake, 3.28.0)  <- the tablet's base",
+            "    1 added, 1 changed, 1 deleted",
+            "    deleted: \"Old\" (8c1f0b9e-0000-4000-8000-000000000003)",
+            "    conflict copy \"Notes (conflict Desk tablet 2026-11-09)\" (8c1f0b9e-0000-4000-8000-000000000002) of \"Notes\" (8c1f0b9e-0000-4000-8000-000000000001)",
+            "    1 document deleted with --allow-deletions",
+            "    note: 8c1f0b9e-0000-4000-8000-000000000001: \"visibleName\" changed on both sides",
+            "aaaaaaaaaaaa  2026-11-09 14:03  init     rmu",
+            "... and 5 older entries (-n sets how many are shown)",
+        ],
+    );
+    assert_eq!(
+        render::plain(&report),
+        vec![
+            oid('d').to_string(),
+            oid('c').to_string(),
+            oid('a').to_string()
+        ]
+    );
+    assert!(render::warnings(&report).is_empty());
+    assert!(render::named_docs(&report).is_empty());
+}
+
+#[test]
+fn renders_a_documents_history() {
+    let report = Report::DocLog(doc_log_report());
+    let human = text(&render::human(&report, &BTreeMap::new()));
+    contains_all(
+        &human,
+        &[
+            "\"Notes\" (8c1f0b9e-0000-4000-8000-000000000001), in /Projects",
+            "dddddddddddd  2026-11-09 14:03  Desk tablet: changed; conflict copy 8c1f0b9e-0000-4000-8000-000000000002 made from it",
+            "cccccccccccc  2026-11-09 14:03  Desk tablet: renamed from \"Draft\" to \"Notes\"; moved from the root to /Projects",
+            "bbbbbbbbbbbb  2026-11-09 14:03  Desk tablet: its version as of aaaaaaaaaaaa restored as 8c1f0b9e-0000-4000-8000-000000000004",
+            "aaaaaaaaaaaa  2026-11-09 14:03  Desk tablet: added as \"Draft\" in the root",
+            "Tablet \"Desk tablet\" has it as of cccccccccccc",
+            "To bring a version back as a new document: rmu hub restore 8c1f0b9e-0000-4000-8000-000000000001 --at <commit>",
+        ],
+    );
+    let deleted = DocLogReport {
+        place: None,
+        tablet: Some(TabletBase {
+            base: None,
+            ..doc_log_report().tablet.unwrap()
+        }),
+        ..doc_log_report()
+    };
+    let human = text(&render::human(&Report::DocLog(deleted), &BTreeMap::new()));
+    contains_all(
+        &human,
+        &[
+            "\"Notes\" (8c1f0b9e-0000-4000-8000-000000000001), deleted on origin",
+            "Tablet \"Desk tablet\" has no base for it yet",
+        ],
+    );
+    assert_eq!(render::plain(&report).len(), 4);
+}
+
+#[test]
+fn renders_restore_and_add() {
+    let report = Report::Restore(restore_report());
+    let human = text(&render::human(&report, &BTreeMap::new()));
+    contains_all(
+        &human,
+        &[
+            "Restored 8c1f0b9e-0000-4000-8000-000000000003 as of bbbbbbbbbbbb, just before its deletion (asked for dddddddddddd) as \"Old (restored 2026-11-09)\" (8c1f0b9e-0000-4000-8000-000000000004) in /Projects",
+            "Pushed to origin (eeeeeeeeeeee); every tablet gets it at its next sync",
+            "(after 2 push attempts: origin moved meanwhile)",
+        ],
+    );
+    assert_eq!(render::plain(&report), vec![doc(4).to_string()]);
+    let report = Report::Add(add_report(Some(3)));
+    let human = text(&render::human(&report, &BTreeMap::new()));
+    contains_all(
+        &human,
+        &[
+            "Added \"Report\" (8c1f0b9e-0000-4000-8000-000000000005) to the root: pdf, 2.00 KiB, 3 pages (page list written)",
+            "Pushed to origin (ffffffffffff)",
+        ],
+    );
+    assert!(!human.contains("push attempts"));
+    assert_eq!(render::plain(&report), vec![doc(5).to_string()]);
+    let human = text(&render::human(
+        &Report::Add(add_report(None)),
+        &BTreeMap::new(),
+    ));
+    assert!(
+        human.contains("pdf, 2.00 KiB, page list left to the tablet's first open"),
+        "{human}"
+    );
+}
+
+#[test]
+fn times_are_utc() {
+    assert_eq!(render::when(0), "1970-01-01 00:00");
+    assert_eq!(render::when(TIME), "2026-11-09 14:03");
+    assert_eq!(render::when(-60), "1969-12-31 23:59");
+}
