@@ -188,7 +188,8 @@ This repository is **open source** (dual-licensed MIT OR Apache-2.0):
   every report derives `Serialize` (`cycle/report.rs`), warnings are
   the typed `Warning`; `cycle.rs` itself keeps only the errors, options,
   `Hub` and helpers its submodules share): the tablet session (lock,
-  watchdog, error path: `cycle/session.rs`), what a run knows about
+  watchdog, error path, and the first start's device time, the read's
+  racy-entry reference: `cycle/session.rs`), what a run knows about
   origin (`cycle/origin.rs`), `init` (`cycle/init.rs`), the local
   cache (`cycle/store.rs`: a bare repository per repo id under
   `$XDG_CACHE_HOME/rmu/hub`, an `flock`, raw commits and trees read
@@ -200,7 +201,8 @@ This repository is **open source** (dual-licensed MIT OR Apache-2.0):
   the **pure** decisions (`cycle/plan.rs`: version equivalence, the
   apply plan, verification, step-14 moved paths, tree and trash checks,
   reconciliation verdicts and finish, the manifest, the single-stop
-  network estimate; new decisions go there, with tests), commit
+  network estimate and its verdicts, `single_stop_at_start`/`_at_plan`/
+  `_overdue`; new decisions go there, with tests), commit
   trailers (`cycle/message.rs`), the steps (`cycle/steps.rs`: `sync`,
   `backup`, steps 1–6, and whether a small sync keeps xochitl stopped
   through step 16, `SingleStop`, with its budget checks; every cycle

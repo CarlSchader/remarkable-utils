@@ -196,8 +196,13 @@ Things to know:
   and while changes are applied, each usually seconds; transfers happen
   with the UI up. A small sync (little to send and to apply) keeps it
   down once instead, through its few seconds of network work, with one
-  start of the UI instead of two. A watchdog on the tablet starts the UI again if the
-  computer disappears mid-sync (`--watchdog <secs>`, default 600).
+  start of the UI instead of two; past 10 s it brings the UI back and
+  goes on as usual. A watchdog on the tablet starts the UI again if the
+  computer disappears mid-sync (`--watchdog <secs>`, default 600; 60 s
+  while a small sync keeps the UI down). If git asks you for a password
+  or passphrase during a sync, answer within a minute, or use a
+  credential helper or ssh agent; `rmu hub sync --two-windows` always
+  keeps the network work with the UI up.
 - **Conflicts never lose ink.** When the same document changed on two
   tablets in ways that cannot be merged, the tablet that syncs second
   keeps origin's version under the original name and gets its own as a
