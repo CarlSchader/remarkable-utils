@@ -843,8 +843,12 @@ impl Store {
     }
 
     /// Read the trees among `oids` the cache does not have, in one
-    /// pipelined batch, into the cache.
-    fn prefetch_trees<'o>(&self, oids: impl IntoIterator<Item = &'o Oid>) -> Result<()> {
+    /// pipelined batch, into the cache. Fewer than two are left to
+    /// [`Self::tree`], which reads one as cheaply.
+    fn prefetch_trees<'o>(&self, oids: impl ExactSizeIterator<Item = &'o Oid>) -> Result<()> {
+        if oids.len() < 2 {
+            return Ok(());
+        }
         let missing: Vec<Oid> = {
             let mut trees = self.trees.borrow_mut();
             oids.into_iter()
@@ -854,7 +858,7 @@ impl Store {
                 .into_iter()
                 .collect()
         };
-        if missing.is_empty() {
+        if missing.len() < 2 {
             return Ok(());
         }
         let objects = self.with_cat(|cat| cat.read_many(&missing))?;
