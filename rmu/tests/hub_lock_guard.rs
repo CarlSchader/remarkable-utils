@@ -1,7 +1,8 @@
 //! The other `rmu` commands and the hub lock, over a mock `ssh`: each
-//! host ("tablet", "other") is a scratch directory; the mock runs every
-//! remote command locally after rewriting the tablet's fixed paths
-//! (`/home/root/…`, the boot id) into that host's directory. Writes
+//! host ("tablet", "other") is a simulated tablet
+//! (`test_support::tablet::SimulatedTablet`), a scratch directory in which
+//! the mock runs every remote command with the curated tablet tools after
+//! rewriting the tablet's fixed paths (`/home/root/…`, the boot id). Writes
 //! refuse while a live hub lock is held (also one taken between the look
 //! and the write: each write's own command checks again), a stale one
 //! does not count, reads are unaffected, and `rmu sync` warns before its
@@ -15,78 +16,45 @@ use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use test_support::tablet::{BOOT_ID, REWRITING_SSH, SimulatedTablet, Toolset};
 use test_support::{Scratch, assert_success};
 
-/// The mock `ssh`. `MOCK_LOCK_WHEN` (a substring of a command) and
-/// `MOCK_LOCK_RECORD` simulate a hub run taking the lock right before
-/// that command runs (once).
-const MOCK_SSH: &str = r#"while [ "$#" -gt 0 ] && [ "$1" != -- ]; do shift; done
-[ "$#" -ge 3 ] || { echo "mock ssh: unexpected arguments" >&2; exit 90; }
-host=${2#*@}
-shift 2
-MOCK_DEVICE=$MOCK_ROOT/$host
-export MOCK_DEVICE
-dev=$(printf '%s\n' "$MOCK_DEVICE" | sed 's/[\\&#]/\\&/g')
-rewrite() {
-    sed -e "s#/home/root/#$dev/home/root/#g" \
-        -e "s#/proc/sys/kernel/random/boot_id#$dev/boot_id#g"
-}
-command=$(printf '%s\n' "$1" | rewrite)
-printf '%s\n----\n' "$command" >> "$MOCK_DEVICE/ssh.log"
-lock=$MOCK_DEVICE/home/root/.local/share/rmu/lock
-case "$command" in
-*"${MOCK_LOCK_WHEN:-no command contains this}"*)
-    if [ ! -e "$lock" ]; then
-        mkdir -p "$lock"
-        printf '%s' "$MOCK_LOCK_RECORD" > "$lock/owner"
-    fi ;;
-esac
-if [ "$command" = "sh -s" ]; then
-    rewrite | sh -s
-    exit $?
-fi
-exec sh -c "$command"
-"#;
-
-const BOOT_ID: &str = "0f0e0d0c-0000-4000-8000-0000000000b1";
 const DOC: &str = "8c1f0b9e-0000-4000-8000-000000000001";
 const FOLDER: &str = "8c1f0b9e-0000-4000-8000-0000000000f1";
-const XOCHITL: &str = "home/root/.local/share/remarkable/xochitl";
-const STATE: &str = "home/root/.local/share/rmu";
-
 struct Tablets {
     scratch: Scratch,
+    hosts: BTreeMap<&'static str, SimulatedTablet>,
 }
 
 impl Tablets {
     /// Hosts "tablet" and "other", each with one PDF.
     fn new() -> Self {
         let scratch = Scratch::new("hub-lock-guard");
-        scratch.mock_command("ssh", MOCK_SSH);
-        scratch.mock_command(
-            "systemctl",
-            "printf '%s\\n' \"$*\" >> \"$MOCK_DEVICE/systemctl.log\"\n",
-        );
-        let tablets = Self { scratch };
-        ["tablet", "other"].iter().for_each(|host| {
-            fs::create_dir_all(tablets.xochitl(host)).unwrap();
-            fs::create_dir_all(tablets.state_dir(host)).unwrap();
-            fs::write(tablets.device(host).join("boot_id"), format!("{BOOT_ID}\n")).unwrap();
-            tablets.put_document(host, DOC, "Paper one");
-        });
+        scratch.mock_command("ssh", REWRITING_SSH);
+        let hosts = ["tablet", "other"]
+            .into_iter()
+            .map(|host| {
+                let device = scratch.join("hosts").join(host);
+                (host, SimulatedTablet::new(&device, &Toolset::Host))
+            })
+            .collect();
+        let tablets = Self { scratch, hosts };
+        ["tablet", "other"]
+            .iter()
+            .for_each(|host| tablets.put_document(host, DOC, "Paper one"));
         tablets
     }
 
-    fn device(&self, host: &str) -> PathBuf {
-        self.scratch.join("hosts").join(host)
+    fn host(&self, host: &str) -> &SimulatedTablet {
+        &self.hosts[host]
     }
 
     fn xochitl(&self, host: &str) -> PathBuf {
-        self.device(host).join(XOCHITL)
+        self.host(host).xochitl()
     }
 
     fn state_dir(&self, host: &str) -> PathBuf {
-        self.device(host).join(STATE)
+        self.host(host).state_dir()
     }
 
     fn put_document(&self, host: &str, id: &str, name: &str) {
@@ -167,8 +135,10 @@ impl Tablets {
 
     /// Whether xochitl was restarted on "tablet" (not just reset).
     fn restarted(&self) -> bool {
-        fs::read_to_string(self.device("tablet").join("systemctl.log"))
-            .is_ok_and(|log| log.contains("restart xochitl.service"))
+        self.host("tablet")
+            .tools()
+            .systemctl_log()
+            .contains("restart xochitl.service")
     }
 
     fn local_books(&self) -> String {
@@ -317,7 +287,8 @@ fn the_restart_checks_too() {
         6,
         "the folder was written before the lock"
     );
-    let log = fs::read_to_string(tablets.device("tablet").join("systemctl.log")).unwrap();
+    let log =
+        fs::read_to_string(tablets.host("tablet").tools().sys().join("systemctl.log")).unwrap();
     assert_eq!(log, "reset-failed xochitl.service\n", "never restarted");
 
     // The lock was already there at the restart's fresh look.
@@ -385,9 +356,8 @@ const NOT_RESTARTED: &str = "Error: changes were written, but xochitl was not re
 fn the_check_costs_no_extra_round_trip() {
     let tablets = Tablets::new();
     assert_success(&tablets.rmu(&["mkdir", "Books"]));
-    let log = fs::read_to_string(tablets.device("tablet").join("ssh.log")).unwrap();
-    let commands: Vec<&str> = log.split("\n----\n").filter(|c| !c.is_empty()).collect();
-    let probing: Vec<&&str> = commands
+    let commands = tablets.host("tablet").commands();
+    let probing: Vec<&String> = commands
         .iter()
         .filter(|command| command.contains("__hub_lock__"))
         .collect();
