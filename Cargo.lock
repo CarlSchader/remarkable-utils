@@ -438,6 +438,7 @@ dependencies = [
  "indicatif",
  "libremarkable-utils",
  "rpassword",
+ "serde",
  "serde_json",
  "test-support",
 ]

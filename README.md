@@ -134,6 +134,168 @@ rmu --host 192.168.1.50 --user root -i ~/.ssh/remarkable ls
 rmu -o ProxyJump=bastion ls              # any ssh -o option is accepted
 ```
 
+### Multi-tablet library: `rmu hub`
+
+`rmu hub` keeps one library on several tablets in sync, git style. An
+**origin** (a git repository on a machine you control) holds the library
+with its full history; each tablet is a working copy that you read,
+annotate and write on as usual. A sync backs the tablet up to origin,
+merges its changes with what other tablets pushed meanwhile, pushes the
+result, and applies everyone else's changes to the tablet.
+
+```sh
+rmu hub init ~/library.git                      # a new bare repository
+rmu hub init ssh://git@server.example/library.git  # or an existing empty one
+
+rmu hub clone ~/library.git --name "Desk tablet"  # attach a tablet; first sync
+rmu --host 192.168.1.60 hub clone ssh://git@server.example/library.git --name "Travel tablet"
+
+rmu hub sync                       # back up, merge, push, apply
+rmu hub status                     # changes since the last sync, conflict copies
+rmu hub sync --dry-run             # what a sync would write and delete
+rmu hub backup                     # back up to origin only; nothing is merged
+
+rmu hub remote                     # the origin URL stored on the tablet
+rmu hub remote set-url ssh://git@new-server.example/library.git
+rmu hub detach --prune-ref         # forget the hub (documents stay), drop its backups
+```
+
+The tablet is chosen with the usual flags (`--host`, ssh config
+aliases, ...). The origin's URL is stored on the tablet at clone time;
+`--origin <url>` overrides it for one run, since ssh aliases differ
+between computers; `remote set-url` changes it for good (the new URL
+must hold the same repository). The computer running `rmu` needs git
+2.30 or newer.
+
+Things to know:
+
+- **Keep the origin private and self-hosted.** It holds your complete
+  library (documents and handwriting, with history); host it on a
+  machine or server you control, reachable over ssh or as a local path.
+  URLs with an embedded password are refused; use an ssh key or a git
+  credential helper.
+- **Not together with the reMarkable cloud.** The two would fight over
+  the same documents, so `rmu hub` refuses a tablet that is paired with
+  the cloud. Unpair it first.
+- **The UI goes down briefly**, twice per sync: while the tablet is read
+  and while changes are applied, each usually seconds; transfers happen
+  with the UI up. A watchdog on the tablet starts the UI again if the
+  computer disappears mid-sync (`--watchdog <secs>`, default 600).
+- **Conflicts never lose ink.** When the same document changed on two
+  tablets in ways that cannot be merged, the tablet that syncs second
+  keeps origin's version under the original name and gets its own as a
+  conflict copy (`<name> (conflict <tablet> <date>)`); rename or delete
+  the copy once you have looked at it. An edit wins over a deletion,
+  and reading position and zoom stay per tablet.
+- **Large deletions need consent.** A sync that would delete many
+  documents (more than 10 and more than 10% of the library, more than
+  50, or all of them because the tablet suddenly looks empty) stops
+  before pushing and lists them; rerun with
+  `--allow-deletions` if that is what you want.
+- **Every state is recoverable**: every sync is a git commit on origin,
+  and every tablet's own state is backed up to its own ref on origin
+  (`refs/rmu/devices/<id>`) before anything is merged.
+- **Leave the tablet alone during a hub sync**: don't run other `rmu`
+  write commands (`upload`, `mv`, `rm`, `rename`, `sync`, `restart`)
+  against it while `rmu hub` is working on it. (The hub skips what
+  changes under it rather than overwrite it; making those commands wait
+  for the hub's lock is planned.)
+
+Recovery:
+
+- *Interrupted sync* (cable pulled, laptop closed): run `rmu hub sync`
+  again; it works out what the interrupted run did and carries on.
+- *"The tablet is locked"*: another sync is running, or one died. A lock
+  goes stale by itself once the tablet reboots or the watchdog fires;
+  otherwise `--break-lock` takes it over once you are sure no other run
+  is working on the tablet.
+- *An interrupted sync and then a reattach, a new URL or a detach*:
+  `clone --reattach`, `remote set-url` (to an origin without the
+  interrupted merge) and `detach` refuse while the interrupted sync's
+  journal is pending; run `rmu hub sync` against the current origin
+  first. `detach --force` discards the journal (documents the
+  interrupted apply was writing may stay half-updated on the tablet;
+  both versions stay in origin's history).
+- *Origin moved without the tablets' backups*: copy them along with
+  `main` (`git push <new origin> 'refs/rmu/*:refs/rmu/*'`); otherwise
+  `rmu hub clone <origin> --reattach` starts the tablet's backup history
+  afresh.
+- *Origin rewound or replaced*: `rmu hub clone <origin> --reattach`
+  attaches the tablet again, keeping its documents and device id;
+  versions that match origin's history fast-forward, the rest merge as
+  new. A tablet whose hub state was lost or detached attaches with a
+  plain `rmu hub clone <origin>` the same way.
+- *Origin lost its `main` branch* (emptied, or the wrong URL): first
+  check the URL (`rmu hub remote`, `--origin`). Then restore origin from
+  a backup, or from the local cache of the computer that synced most
+  recently: a bare repository at `~/.cache/rmu/hub/<repo-id>.git`
+  (`$XDG_CACHE_HOME/rmu/hub/...`) holding origin's `main` as
+  `refs/remotes/origin/main`. The error prints the exact command:
+
+  ```sh
+  git --git-dir ~/.cache/rmu/hub/<repo-id>.git push <origin> refs/remotes/origin/main:refs/heads/main
+  ```
+
+  Running `rmu hub init` on it again is a last resort: it starts a new
+  repository, so every tablet then needs `clone --reattach` and the old
+  history stays behind.
+- *Getting a deleted document back*: its files stay in origin's history.
+  Restore commands are planned; until then, git finds them:
+
+  ```sh
+  # the commits that deleted documents, and the documents' ids
+  git --git-dir ~/library.git log --diff-filter=D --name-only --format='%h %ad %s' -- 'docs/*/metadata'
+  git --git-dir ~/library.git show <commit>^:docs/<id>/metadata     # its name ("visibleName")
+  git --git-dir ~/library.git show <commit>^:docs/<id>/payload.pdf > recovered.pdf
+  rmu upload recovered.pdf                                          # the PDF, without annotations
+  ```
+
+  Handwriting (notebooks, annotations) is in the same commit
+  (`git --git-dir ~/library.git ls-tree -r <commit>^ docs/<id>`); bringing
+  it back onto a tablet needs the planned restore command.
+
+Every `rmu hub` command prints a summary on a terminal. When stdout is
+not a terminal it prints plain results instead, and the summary goes to
+stderr: the repository id for `init`, the commit the tablet is at for
+`clone` and `sync`, the backup commit for `backup`, `A`/`M`/`D <id>` per
+change for `status`, `write`/`delete <id>` per document for
+`sync --dry-run`, the stored URL for `remote`, and the deleted ref for
+`detach --prune-ref`.
+
+With `--json` it prints JSON instead. **The JSON format is unstable
+until the hub has been validated on devices**: field names may still
+change (`"schema"` will then be bumped). Today (`"schema": 1`) a result
+is the command's report as the library serialises it, plus `schema` and
+`command` (`init`, `clone`, `sync`, `sync --dry-run`, `backup`,
+`status`, `remote`, `remote set-url`, `detach`). An error is:
+
+```json
+{"schema": 1, "error": {"kind": "lock_held", "exit_code": 4, "message": "..."}}
+```
+
+with `kind` one of `error`, `deletions_need_consent`, `lock_held`,
+`origin_mismatch`, `cloud_paired` and `journal_pending`. A
+`deletions_need_consent` error also carries `from_origin` and
+`from_tablet` (document ids), `empty_snapshot` (the tablet looked
+empty) and `names` (id to visible name, from history: the tablet may no
+longer have these documents). Reports carry the same `names` for the
+documents they list as deleted.
+
+Exit statuses:
+
+| Status | Meaning                                                           |
+|--------|-------------------------------------------------------------------|
+| 0      | success                                                           |
+| 1      | error (worth retrying as is when origin kept moving, or the tablet's state or origin's configuration changed during the run) |
+| 2      | invalid arguments                                                 |
+| 3      | the deletion guard refused (see `--allow-deletions`)              |
+| 4      | the tablet is locked or busy, or this computer's cache is in use by another run (see `--break-lock`) |
+| 5      | origin does not match the tablet (see `clone --reattach`), or lost its `main` (see Recovery) |
+| 6      | the tablet is paired with the reMarkable cloud                    |
+| 7      | an interrupted sync must be finished first (`rmu hub sync` against the current origin; `detach --force` discards it) |
+
+See `docs/hub-design.md` for the full design.
+
 ### Authentication
 
 Key-based auth (your ssh config, keys, and agent) is the default and the
@@ -167,7 +329,7 @@ uuid=$(rmu -q upload ./sample.pdf)
 | Path                   | Description                                       |
 |------------------------|---------------------------------------------------|
 | `libremarkable-utils/` | Library crate: SSH transport, xochitl file model, logical-tree operations |
-| `rmu/`                 | `rmu` CLI — entry point for tablet utilities      |
+| `rmu/`                 | `rmu` CLI — entry point for tablet utilities (`rmu hub` in `rmu/src/hub.rs`) |
 | `nix/`                 | Flake modules (packages, shells, checks, treefmt) |
 
 ## Development
