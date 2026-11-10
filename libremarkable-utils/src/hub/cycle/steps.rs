@@ -19,7 +19,7 @@ use super::{
     BackupReport, CycleError, Hub, MainUpdate, Reconciled, SyncReport, TakeOver, quarantine_report,
     read_summary, rmu_signature, unix_now,
 };
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::git::{CommitMeta, CommitWriter, Oid, Repo};
 use crate::hub::device::{DeviceInfo, LockState, Tablet};
 use crate::hub::merge::MergeOutcome;
@@ -132,7 +132,7 @@ impl Hub<'_> {
         repo: &Repo,
         store: &Store,
         saved: &std::path::Path,
-    ) -> TabletRead {
+    ) -> Result<TabletRead> {
         let known: BTreeMap<XochitlPath, Known> = snapshot::known_from_manifest(manifest)
             .into_iter()
             .chain(snapshot::saved_known(&store::load_pre_read(saved)))
@@ -141,7 +141,7 @@ impl Hub<'_> {
             store::save_pre_read(saved, entries);
         };
         let Ok(mut writer) = repo.commit_writer(self.progress, None) else {
-            return TabletRead::default();
+            return Ok(TabletRead::default());
         };
         let read = snapshot::read_tablet(
             tablet,
@@ -159,9 +159,12 @@ impl Hub<'_> {
             ReadMode::BestEffort,
         );
         // A read that failed outright (its stat pass, say) read nothing:
-        // the saved progress stays as its last checkpoint left it.
-        let Ok(read) = read else {
-            return TabletRead::default();
+        // the saved progress stays as its last checkpoint left it. A
+        // tablet that stopped answering ends the run.
+        let read = match read {
+            Ok(read) => read,
+            Err(error @ Error::Unreachable(_)) => return Err(error),
+            Err(_) => return Ok(TabletRead::default()),
         };
         let time = unix_now();
         let committed = writer.commit(&CommitMeta {
@@ -173,7 +176,7 @@ impl Hub<'_> {
         if committed.is_ok() {
             save(&read.manifest_entries());
         }
-        read
+        Ok(read)
     }
 
     /// Whether to pre-read: not while another run holds the tablet lock,
@@ -216,7 +219,7 @@ impl Hub<'_> {
                 &origin.cache.repo,
                 &origin.store,
                 &saved,
-            )
+            )?
         } else {
             TabletRead::default()
         };

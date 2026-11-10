@@ -1078,6 +1078,47 @@ fn crash_before_every_operation() {
     });
 }
 
+/// The tablet stops answering (falls asleep) at any operation: the run
+/// ends with the typed error, after at most one more try on the error
+/// path (each would wait for a timeout), and the next run recovers.
+#[test]
+fn tablet_asleep_at_every_operation() {
+    use libremarkable_utils::error::Error;
+    use libremarkable_utils::hub::device::DeviceError;
+    let template = crash_template();
+    let reference = reference(&template);
+    (1..=reference.ops.len()).for_each(|k| {
+        let what = format!("asleep at op {k} ({:?})", reference.ops[k - 1]);
+        let world = template.duplicate();
+        world.tablet(0).inject(Fault::SleepAtOp(k));
+        let result = world.sync(0);
+        world::no_contract_violation(&result);
+        // An apply's failure is always `ApplyIncomplete`, saying why.
+        let asleep = match &result {
+            Err(Error::Unreachable(_)) => true,
+            Err(Error::HubDevice(DeviceError::ApplyIncomplete { reason, .. })) => {
+                reason.contains("did not answer")
+            }
+            // Asleep after the run's last change: only the lock is left.
+            Ok(report) => report.warnings.iter().any(|warning| {
+                matches!(
+                    warning,
+                    Warning::DisarmFailed { .. } | Warning::ReleaseFailed { .. }
+                )
+            }),
+            _ => false,
+        };
+        assert!(asleep, "{what}: {result:?}");
+        let after = world.tablet(0).ops().len() - k;
+        assert!(
+            after <= 1,
+            "{what}: {after} operation(s) after the last answer: {:?}",
+            world.tablet(0).ops()
+        );
+        recover(&world, &reference, &what);
+    });
+}
+
 #[test]
 fn crash_after_every_mutation_took_effect() {
     let template = crash_template();

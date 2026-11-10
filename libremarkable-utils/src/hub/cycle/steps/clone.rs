@@ -127,7 +127,7 @@ impl Hub<'_> {
                     &cache.repo,
                     &probe,
                     &saved,
-                )
+                )?
             } else {
                 TabletRead::default()
             };

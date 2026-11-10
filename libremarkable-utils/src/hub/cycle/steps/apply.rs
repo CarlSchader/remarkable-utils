@@ -387,12 +387,15 @@ impl Hub<'_> {
         p.state.journal = None;
         s.write_state(&p.state)?;
         let mut warnings = Vec::new();
-        if applied.before.is_some()
-            && let Err(error) = s.tablet.clear_staging(s.lock())
-        {
-            warnings.push(Warning::StagingNotCleared {
-                error: error.to_string(),
-            });
+        if applied.before.is_some() {
+            match s.tablet.clear_staging(s.lock()) {
+                // Starting xochitl would only wait for another timeout.
+                Err(error @ Error::Unreachable(_)) => return Err(error),
+                Err(error) => warnings.push(Warning::StagingNotCleared {
+                    error: error.to_string(),
+                }),
+                Ok(()) => {}
+            }
         }
         // 16.
         if s.maybe_stopped {

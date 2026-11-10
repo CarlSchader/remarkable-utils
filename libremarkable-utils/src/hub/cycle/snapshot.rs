@@ -14,7 +14,7 @@ use serde_json::Value;
 use super::plan::{LocalJson, json_kind};
 use super::store::Store;
 use super::{CycleError, Downloaded};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::git::{CommitWriter, Oid};
 use crate::hub::device::{StatListing, Tablet};
 use crate::hub::merge::TreeItem;
@@ -406,8 +406,12 @@ pub(super) fn read_tablet(
     });
     progress.bytes_done();
     match (downloaded, mode) {
+        // A tablet that stopped answering would not answer the next steps
+        // either: no best effort then.
+        (Err(error @ Error::Unreachable(_)), _) | (Err(error), ReadMode::Strict) => {
+            return Err(error);
+        }
         (Ok(()), _) | (Err(_), ReadMode::BestEffort) => {}
-        (Err(error), ReadMode::Strict) => return Err(error),
     }
     let (files, json) = candidates.iter().try_fold(
         (BTreeMap::new(), BTreeMap::new()),

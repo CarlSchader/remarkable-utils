@@ -104,13 +104,7 @@ fn checked(output: Output) -> Result<Output> {
 }
 
 fn remote_error(output: &Output) -> Error {
-    guard_error(output.status.code()).map_or_else(
-        || Error::Remote {
-            status: output.status.code().unwrap_or(-1),
-            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-        },
-        Error::from,
-    )
+    guard_error(output.status.code()).map_or_else(|| crate::ssh::failure(output), Error::from)
 }
 
 /// Guard exit statuses from checked session calls as typed errors.
@@ -343,8 +337,10 @@ impl Tablet for SshTablet {
                     &String::from_utf8_lossy(&output.stdout),
                 )?);
             }
-            if let Some(error) = guard_error(output.status.code()) {
-                return Err(error.into());
+            // A tablet that stopped answering would not answer the check
+            // below either; trying costs another timeout.
+            if guard_error(output.status.code()).is_some() || crate::ssh::is_unreachable(&output) {
+                return Err(remote_error(&output));
             }
             // As in `Client::restart_xochitl`: the command channel can
             // drop while xochitl comes back; check (the lock too, in case
@@ -554,6 +550,9 @@ fn apply_report(output: &Output, written: usize) -> Result<ApplyReport> {
         }
         .into()
     };
+    if crate::ssh::is_unreachable(output) {
+        return Err(incomplete(crate::ssh::failure(output).to_string()));
+    }
     if !output.status.success() {
         return Err(incomplete(format!(
             "exit {:?}: {}",
@@ -844,6 +843,59 @@ mod tests {
         .unwrap();
         session.set_ssh_exe(ssh);
         SshTablet::new(session)
+    }
+
+    /// A tablet that does not answer: every command is a connect timeout.
+    #[cfg(unix)]
+    #[test]
+    fn a_tablet_that_does_not_answer_is_tried_once() {
+        use crate::hub::device::harness::Scratch;
+        use crate::hub::device::lock::{HeldLock, LockOwner};
+        let scratch = Scratch::new("asleep");
+        let ssh = scratch.0.join("ssh");
+        let calls = scratch.0.join("calls");
+        test_support::write_script(
+            &ssh,
+            &format!(
+                "case \" $* \" in *' -G '*) exit 1 ;; esac\n\
+                 echo call >> {}\n\
+                 echo 'ssh: connect to host mock.invalid port 22: Connection timed out' >&2\n\
+                 exit 255\n",
+                crate::ssh::shell_quote(&calls.to_string_lossy()),
+            ),
+        );
+        let mut session = SshSession::new(crate::ssh::SshOptions {
+            destination: "mock.invalid".into(),
+            multiplex: false,
+            ..crate::ssh::SshOptions::default()
+        })
+        .unwrap();
+        session.set_ssh_exe(ssh);
+        let tablet = SshTablet::new(session);
+        let count = || std::fs::read_to_string(&calls).unwrap().lines().count();
+        assert!(matches!(tablet.lock_state(), Err(Error::Unreachable(_))));
+        assert!(matches!(
+            tablet.xochitl_active(),
+            Err(Error::Unreachable(_))
+        ));
+        assert_eq!(count(), 2);
+        // No check of whether xochitl came back anyway: that would only
+        // wait for another timeout.
+        let lock = HeldLock::new(
+            LockOwner {
+                run: "0".repeat(32),
+                host: "laptop".into(),
+                pid: 1,
+                started_unix: 0,
+                boot_id: "boot".into(),
+            },
+            None,
+        );
+        assert!(matches!(
+            tablet.start_xochitl(&lock),
+            Err(Error::Unreachable(_))
+        ));
+        assert_eq!(count(), 3);
     }
 
     #[cfg(unix)]

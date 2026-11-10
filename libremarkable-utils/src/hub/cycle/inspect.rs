@@ -136,7 +136,7 @@ impl Hub<'_> {
                 &state.repo_id,
                 store::PreReadOf::Device(&state.device_id),
             ),
-        );
+        )?;
         let known = snapshot::known_from_manifest(&state.manifest)
             .into_iter()
             .chain(snapshot::pre_read_known(&pre))

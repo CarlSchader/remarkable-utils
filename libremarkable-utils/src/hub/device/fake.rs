@@ -106,6 +106,9 @@ pub enum Fault {
     /// The `n`th operation of any kind fails without effect, and every
     /// operation after it until [`FakeTablet::reconnect`].
     DisconnectAtOp(usize),
+    /// As [`Fault::DisconnectAtOp`], with the errors ssh reports when the
+    /// tablet stops answering (asleep): [`Error::Unreachable`].
+    SleepAtOp(usize),
     /// The next download delivers `k` files, then fails as a lost
     /// connection.
     FailDownloadAfter(usize),
@@ -142,6 +145,7 @@ enum MutationFault {
 enum OpFault {
     Fail,
     Disconnect,
+    Sleep,
 }
 
 enum Pending {
@@ -175,6 +179,8 @@ struct FakeState {
     cut_download_in: Option<usize>,
     fire_after_moves: Option<usize>,
     disconnected: bool,
+    /// The disconnection is a tablet that stopped answering.
+    asleep: bool,
 }
 
 impl FakeState {
@@ -188,6 +194,7 @@ impl FakeState {
             Fault::DisconnectAfter(n) => mutation(n, MutationFault::DisconnectAfter),
             Fault::FailOp(n) => Pending::Op(self.ops + n, OpFault::Fail),
             Fault::DisconnectAtOp(n) => Pending::Op(self.ops + n, OpFault::Disconnect),
+            Fault::SleepAtOp(n) => Pending::Op(self.ops + n, OpFault::Sleep),
             Fault::KillApplyAfter(k) => {
                 self.kill_apply_after = Some(k);
                 return;
@@ -347,6 +354,7 @@ impl FakeTabletBuilder {
             cut_download_in: None,
             fire_after_moves: None,
             disconnected: false,
+            asleep: false,
             armed_since_start: false,
         };
         self.faults
@@ -436,6 +444,11 @@ fn transport_error(detail: String) -> Error {
         status: 255,
         stderr: format!("fake tablet: {detail}"),
     }
+}
+
+/// What ssh reports for a tablet that stopped answering.
+fn asleep_error() -> Error {
+    Error::Unreachable("Timeout, server fake tablet not responding.".to_string())
 }
 
 fn remote_failure(detail: String) -> Error {
@@ -643,7 +656,9 @@ impl FakeTablet {
 
     /// Accept operations again after a disconnection (a new rmu run).
     pub fn reconnect(&self) {
-        self.state().disconnected = false;
+        let mut state = self.state();
+        state.disconnected = false;
+        state.asleep = false;
     }
 
     /// Count the operation, run due edits, apply injected faults.
@@ -654,15 +669,18 @@ impl FakeTablet {
             state.log.push(kind);
             let op = state.ops;
             let edits = state.due_edits(op);
-            let outcome = if state.disconnected {
+            let outcome = if state.disconnected && state.asleep {
+                Err(asleep_error())
+            } else if state.disconnected {
                 Err(transport_error("disconnected".to_string()))
             } else if let Some(fault) = state.op_fault(op) {
-                if fault == OpFault::Disconnect {
-                    state.disconnected = true;
-                }
-                Err(transport_error(format!(
-                    "injected failure of operation {op}"
-                )))
+                state.disconnected = fault != OpFault::Fail;
+                state.asleep = fault == OpFault::Sleep;
+                Err(if state.asleep {
+                    asleep_error()
+                } else {
+                    transport_error(format!("injected failure of operation {op}"))
+                })
             } else if kind.is_mutating() {
                 state.mutations += 1;
                 let n = state.mutations;
