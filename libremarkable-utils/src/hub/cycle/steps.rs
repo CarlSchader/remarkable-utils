@@ -18,13 +18,13 @@ use super::{
 use crate::error::{Error, Result};
 use crate::git::{CommitMeta, Expected, Oid, Repo};
 use crate::hub::device::{
-    ApplyPlan, DeviceError, DeviceInfo, DocApply, StagedFile, StatEntry, Tablet,
+    ApplyPlan, DeviceError, DeviceInfo, DocApply, LockState, StagedFile, StatEntry, Tablet,
 };
 use crate::hub::merge::{self, BlobSource, TreeItem};
 use crate::hub::model::{
     Classification, DeviceId, DeviceName, DocFile, DocId, DocOutcome, DocVersion, Journal,
-    JsonFile, ManifestEntry, MirrorRules, MirroredFile, RepoTree, StatSignature, TabletState,
-    XochitlPath,
+    JsonFile, ManifestEntry, MirrorRules, MirroredFile, RepoId, RepoTree, StatSignature,
+    TabletState, XochitlPath,
 };
 
 /// Staging uploads go in batches of about this many bytes, with the
@@ -35,9 +35,13 @@ const STAGE_BATCH_BYTES: u64 = 64 * 1024 * 1024;
 
 /// The device ref to push to, its current head (the snapshot's second
 /// parent) and the lease. A head that does not continue the recorded
-/// one means another tablet uses this device id (see "Device ref
+/// one (rewritten or replaced), or none where one was recorded (origin
+/// moved without `refs/rmu/*`), stops the run (see "Device ref
 /// bookkeeping"); `clone --reattach` is the way out.
-fn device_ref(origin: &OriginCtx, state: &TabletState) -> Result<(String, Option<Oid>, Expected)> {
+pub(super) fn device_ref(
+    origin: &OriginCtx,
+    state: &TabletState,
+) -> Result<(String, Option<Oid>, Expected)> {
     let [primary, _] = store::device_ref_names(&state.device_id);
     let conflict = |reference: &str, remote: String| -> Error {
         CycleError::DeviceRefConflict {
@@ -52,7 +56,11 @@ fn device_ref(origin: &OriginCtx, state: &TabletState) -> Result<(String, Option
     };
     match (&state.device_ref, &origin.remote.device) {
         (None, None) => Ok((primary, None, Expected::Absent)),
-        (Some(_), None) => Err(conflict(&primary, "absent".to_string())),
+        (Some(recorded), None) => Err(CycleError::DeviceRefMissing {
+            reference: primary,
+            recorded: recorded.clone(),
+        }
+        .into()),
         // A first push whose recording was lost (device ids are random
         // per clone, and a clone never reuses another tablet's state).
         (None, Some(remote)) => Ok((
@@ -138,6 +146,39 @@ fn recorded_forks(store: &Store, tip: &Oid, snapshot: &Oid) -> Result<Vec<(DocId
         .iter()
         .flat_map(|text| message::forks(&message::trailers(text)))
         .collect())
+}
+
+/// What `clone --reattach` does with an interrupted sync's journal. A
+/// merge origin's `main` (`main`, of repository `repo_id`) has: refused
+/// (`JournalPending`), since only that journal's reconciliation knows
+/// which documents its apply stopped inside, and `sync` runs it. Any
+/// other journal (origin was rewound or replaced, or the merge never
+/// landed) can never be reconciled: discarded, with a warning.
+fn pending_journal(
+    existing: Option<&TabletState>,
+    repo_id: &RepoId,
+    store: &Store,
+    main: &Oid,
+) -> Result<Option<Warning>> {
+    let Some((state, journal)) =
+        existing.and_then(|state| state.journal.as_ref().map(|journal| (state, journal)))
+    else {
+        return Ok(None);
+    };
+    if state.repo_id == *repo_id && store.is_ancestor(&journal.merge, main)? {
+        return Err(CycleError::JournalPending.into());
+    }
+    Ok(Some(Warning::JournalDiscarded))
+}
+
+/// What the stopped read may take as known besides the manifest: what
+/// earlier pre-reads saved at `saved`, then this run's pre-read (newer).
+/// Both are checked against the tablet's stat and the cache.
+fn saved_then_pre_read(saved: &std::path::Path, pre: &TabletRead) -> BTreeMap<XochitlPath, Known> {
+    snapshot::saved_known(&store::load_pre_read(saved))
+        .into_iter()
+        .chain(snapshot::pre_read_known(pre))
+        .collect()
 }
 
 /// String paths (from the pure helpers) as tablet paths.
@@ -251,7 +292,40 @@ impl Hub<'_> {
             let probe = Store::new(cache.repo.clone())?;
             let config = probe.repo_config(&main)?;
             let rules = config.rules()?;
-            let pre = self.pre_read(s.tablet, rules, &BTreeMap::new(), &cache.repo, &probe);
+            // Read-only refusals first, so a tablet that would be refused
+            // under the lock gets no (full) pre-read; checked again there.
+            if s.tablet.cloud_paired()? {
+                return Err(CycleError::CloudPaired.into());
+            }
+            let before = s.tablet.read_state()?;
+            if let Some(existing) = before.as_ref().filter(|_| !reattach) {
+                return Err(CycleError::AlreadyAttached {
+                    repo_id: existing.repo_id.clone(),
+                }
+                .into());
+            }
+            pending_journal(before.as_ref(), &config.repo_id, &probe, &main)?;
+            let destination = s.tablet.destination();
+            let saved = store::pre_read_path(
+                &self.cache_dir,
+                &config.repo_id,
+                match before.as_ref() {
+                    Some(state) => store::PreReadOf::Device(&state.device_id),
+                    None => store::PreReadOf::Destination(&destination),
+                },
+            );
+            let pre = if self.may_pre_read(s.tablet)? {
+                self.pre_read(
+                    s.tablet,
+                    rules,
+                    &BTreeMap::new(),
+                    &cache.repo,
+                    &probe,
+                    &saved,
+                )
+            } else {
+                TabletRead::default()
+            };
             drop(probe);
             self.progress.step("Locking the tablet");
             let took_over = s.acquire(&self.request, self.options.break_lock)?;
@@ -266,15 +340,6 @@ impl Hub<'_> {
                 }
                 .into());
             }
-            // An interrupted apply against this very repository: only its
-            // reconciliation knows which documents it half wrote (a fresh
-            // state would fork them).
-            if existing
-                .as_ref()
-                .is_some_and(|state| state.journal.is_some() && state.repo_id == config.repo_id)
-            {
-                return Err(CycleError::JournalPending.into());
-            }
             let info = s.tablet.device_info()?;
             let device_id = existing
                 .as_ref()
@@ -288,15 +353,17 @@ impl Hub<'_> {
             if ctx.config != config {
                 return Err(CycleError::RepoConfigChanged.into());
             }
+            let discarded =
+                pending_journal(existing.as_ref(), &config.repo_id, &ctx.store, &ctx.main)?;
             self.progress.step("Stopping xochitl");
             s.stop()?;
             let mut writer = ctx.cache.repo.commit_writer(self.progress, None)?;
             let read = snapshot::read_tablet(
                 s.tablet,
                 rules,
-                &snapshot::pre_read_known(&pre),
+                &saved_then_pre_read(&saved, &pre),
                 &ctx.store,
-                &mut writer,
+                snapshot::Sink::plain(&mut writer),
                 self.progress,
                 ReadMode::Strict,
             )?;
@@ -313,8 +380,9 @@ impl Hub<'_> {
                 &tablet_only,
                 &ReadBlobs::new(&read, &ctx.store),
             )?;
-            let mut warnings: Vec<Warning> = mixed_model_warning(&ctx.store, &ctx.main, &info)?
+            let mut warnings: Vec<Warning> = discarded
                 .into_iter()
+                .chain(mixed_model_warning(&ctx.store, &ctx.main, &info)?)
                 .collect();
             let mut state = TabletState::new(
                 ctx.config.repo_id.clone(),
@@ -329,8 +397,12 @@ impl Hub<'_> {
             state.quarantine = tablet_only.quarantined.keys().cloned().collect();
             state.manifest = read_manifest(&read, started_at);
             // Attached from here on: an interrupted clone continues with
-            // `sync`.
+            // `sync`. What a pre-read saved before the tablet had a device
+            // id is its own no longer.
             s.write_state(&state)?;
+            if before.is_none() {
+                let _ = std::fs::remove_file(&saved);
+            }
             let prepared = Prepared {
                 origin: ctx,
                 state,
@@ -355,38 +427,75 @@ impl Hub<'_> {
     /// need none), into a commit of its own that nothing points at: the
     /// stopped read then downloads only files whose stat moved since, so
     /// the UI is down for seconds even when the tablet has gigabytes of
-    /// new data. Any failure (a download cut, even mid-file, which ends
-    /// the `fast-import` it streamed into) only makes it smaller, down to
-    /// nothing.
+    /// new data. `fast-import` is checkpointed about every
+    /// [`super::HubOptions::pre_read_checkpoint`] bytes and what is
+    /// durable is saved at `saved`, so a cut (even mid-file, which ends
+    /// the `fast-import`) loses at most that much, in this run and the
+    /// next: the files an earlier pre-read saved count as known too.
+    /// Every entry is checked against the tablet's stat (nanosecond
+    /// mtimes only) and the cache before the stopped read trusts it.
     pub(super) fn pre_read(
         &self,
         tablet: &dyn Tablet,
         rules: &MirrorRules,
-        known: &BTreeMap<XochitlPath, Known>,
+        manifest: &BTreeMap<XochitlPath, ManifestEntry>,
         repo: &Repo,
         store: &Store,
+        saved: &std::path::Path,
     ) -> TabletRead {
-        let attempt = || -> Result<TabletRead> {
-            let mut writer = repo.commit_writer(self.progress, None)?;
-            let read = snapshot::read_tablet(
-                tablet,
-                rules,
-                known,
-                store,
-                &mut writer,
-                self.progress,
-                ReadMode::BestEffort,
-            )?;
-            let time = unix_now();
-            writer.commit(&CommitMeta {
-                parents: Vec::new(),
-                author: rmu_signature(time),
-                committer: rmu_signature(time),
-                message: "rmu hub: pre-read (not pushed)\n".to_string(),
-            })?;
-            Ok(read)
+        let known: BTreeMap<XochitlPath, Known> = snapshot::known_from_manifest(manifest)
+            .into_iter()
+            .chain(snapshot::saved_known(&store::load_pre_read(saved)))
+            .collect();
+        let mut save = |entries: &BTreeMap<XochitlPath, ManifestEntry>| {
+            store::save_pre_read(saved, entries);
         };
-        attempt().unwrap_or_default()
+        let Ok(mut writer) = repo.commit_writer(self.progress, None) else {
+            return TabletRead::default();
+        };
+        let read = snapshot::read_tablet(
+            tablet,
+            rules,
+            &known,
+            store,
+            snapshot::Sink {
+                writer: &mut writer,
+                checkpoints: Some(snapshot::Checkpoints {
+                    every: self.options.pre_read_checkpoint.max(1),
+                    save: &mut save,
+                }),
+            },
+            self.progress,
+            ReadMode::BestEffort,
+        );
+        // A read that failed outright (its stat pass, say) read nothing:
+        // the saved progress stays as its last checkpoint left it.
+        let Ok(read) = read else {
+            return TabletRead::default();
+        };
+        let time = unix_now();
+        let committed = writer.commit(&CommitMeta {
+            parents: Vec::new(),
+            author: rmu_signature(time),
+            committer: rmu_signature(time),
+            message: "rmu hub: pre-read (not pushed)\n".to_string(),
+        });
+        if committed.is_ok() {
+            save(&read.manifest_entries());
+        }
+        read
+    }
+
+    /// Whether to pre-read: not while another run holds the tablet lock,
+    /// since this run would be refused, unless the lock is stale (its
+    /// watchdog fired, as after a crash) or being broken. (A lock left by
+    /// a run the tablet rebooted under also goes stale, but telling needs
+    /// the boot id; such a run reads without a pre-read, from the saved
+    /// one.)
+    fn may_pre_read(&self, tablet: &dyn Tablet) -> Result<bool> {
+        Ok(self.options.break_lock
+            || tablet.lock_state()? == LockState::Free
+            || tablet.watchdog_fired()?)
     }
 
     /// Steps 1–6 (with step 4 only if `reconcile`).
@@ -398,13 +507,29 @@ impl Hub<'_> {
         let mut origin = OriginCtx::new(cache, url, Some(&first.device_id), Some(refs))?;
         origin.check(&first)?;
         let rules = origin.rules;
-        let pre = self.pre_read(
-            s.tablet,
-            rules,
-            &snapshot::known_from_manifest(&first.manifest),
-            &origin.cache.repo,
-            &origin.store,
+        // Read-only refusals first (checked again under the lock): a
+        // paired tablet is refused, and a locked one is not downloaded in
+        // full for nothing.
+        if s.tablet.cloud_paired()? {
+            return Err(CycleError::CloudPaired.into());
+        }
+        let saved = store::pre_read_path(
+            &self.cache_dir,
+            &first.repo_id,
+            store::PreReadOf::Device(&first.device_id),
         );
+        let pre = if self.may_pre_read(s.tablet)? {
+            self.pre_read(
+                s.tablet,
+                rules,
+                &first.manifest,
+                &origin.cache.repo,
+                &origin.store,
+                &saved,
+            )
+        } else {
+            TabletRead::default()
+        };
         self.progress.step("Locking the tablet");
         let took_over = s.acquire(&self.request, self.options.break_lock)?;
         s.arm()?;
@@ -428,7 +553,7 @@ impl Hub<'_> {
         s.stop()?;
         let known: BTreeMap<XochitlPath, Known> = snapshot::known_from_manifest(&state.manifest)
             .into_iter()
-            .chain(snapshot::pre_read_known(&pre))
+            .chain(saved_then_pre_read(&saved, &pre))
             .collect();
         let mut writer = origin.cache.repo.commit_writer(self.progress, None)?;
         let mut read = snapshot::read_tablet(
@@ -436,7 +561,7 @@ impl Hub<'_> {
             rules,
             &known,
             &origin.store,
-            &mut writer,
+            snapshot::Sink::plain(&mut writer),
             self.progress,
             ReadMode::Strict,
         )?;
@@ -452,7 +577,7 @@ impl Hub<'_> {
                         rules,
                         &read.as_known(),
                         &origin.store,
-                        &mut writer,
+                        snapshot::Sink::plain(&mut writer),
                         self.progress,
                         ReadMode::Strict,
                     )?;
@@ -534,7 +659,7 @@ impl Hub<'_> {
         let json = Overlay::read(read, store);
         let tablet = read.doc_files();
         let forks = message::forks(&message::trailers(&store.commit(&journal.merge)?.message));
-        let verdicts = plan::verdicts(&plan::Journaled {
+        let journaled = plan::Journaled {
             rules,
             merge: &merge_tree,
             snapshot: &snapshot_tree,
@@ -542,18 +667,15 @@ impl Hub<'_> {
             staged: &staged,
             forks: &forks,
             json: &json,
-        })?;
+        };
+        let verdicts = plan::verdicts(&journaled)?;
         // The step-14 tree checks, against the tablet as just read.
         let (finish, skipped) = plan::finish(&plan::Finish {
-            rules,
+            journaled: &journaled,
             verdicts: &verdicts,
-            merge: &merge_tree,
-            tablet: &tablet,
             local: &read.local_json(),
             current: &read.items(),
             merged: &tree_items(&merge_tree, &json)?,
-            forks: &forks,
-            json: &json,
         })?;
         let finished: Vec<DocId> = finish.iter().map(|planned| planned.doc.clone()).collect();
         if !finish.is_empty() {
@@ -808,11 +930,13 @@ impl Hub<'_> {
         self.progress.step("Merging");
         let run = self.run_merge(&p.origin, &p.state, base_tree, snapshot, &p.read)?;
         let outcome = run.outcome;
+        let names = run.names;
         if outcome.guard.blocked() {
             return Err(CycleError::DeletionsNeedConsent {
                 from_origin: outcome.guard.from_origin.iter().cloned().collect(),
                 from_tablet: outcome.guard.from_tablet.iter().cloned().collect(),
                 empty_snapshot: outcome.guard.empty_snapshot,
+                names,
             }
             .into());
         }
@@ -830,6 +954,7 @@ impl Hub<'_> {
                 merged: run.theirs,
                 outcome,
                 attempts: attempt,
+                names,
             }));
         }
         // The tablet has no changes of its own: origin's tree is applied
@@ -849,6 +974,7 @@ impl Hub<'_> {
                 merged: run.theirs,
                 outcome,
                 attempts: attempt,
+                names,
             }));
         }
         let record = MergeRecord {
@@ -898,6 +1024,7 @@ impl Hub<'_> {
             merged,
             outcome,
             attempts: attempt,
+            names,
         };
         match store::push(
             &p.origin.cache.repo,
@@ -1155,6 +1282,7 @@ impl Hub<'_> {
             forks: pushed.outcome.forks.clone(),
             summary: pushed.outcome.summary(),
             deletions: pushed.outcome.guard.clone(),
+            names: pushed.names,
             reconciled: p.reconciled.take(),
             push_attempts: pushed.attempts,
             took_over: p.took_over.take(),

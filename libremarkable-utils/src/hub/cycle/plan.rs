@@ -596,7 +596,7 @@ fn trash_blame<'a>(
 
 /// Where an interrupted run left one document whose merge and snapshot
 /// versions differ (see "Restartability").
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Verdict {
     /// Every file is at the merge version: base = merge.
     AtMerge,
@@ -606,6 +606,12 @@ pub(super) enum Verdict {
     /// Every file is at one of the two, some at each (the apply stopped
     /// inside this document): finish applying it, then base = merge.
     Mixed,
+    /// The apply stopped inside this document and the user changed it
+    /// since, but only in files the merge leaves alone or the apply had
+    /// already written: finish it to this version (the files still
+    /// pending from the merge, the user's elsewhere: [`partial_target`]),
+    /// then base = merge.
+    Partial(DocVersion),
     /// Anything else (the user changed it): base override = snapshot.
     Other,
 }
@@ -688,6 +694,135 @@ pub(super) fn apply_finished(
         .filter(|file| !merge.contains_key(*file))
         .all(|file| !tablet.contains_key(file));
     Ok(written && removed)
+}
+
+/// For a document an interrupted apply stopped inside and the user changed
+/// since ([`Verdict::Other`] by its files): the version to finish it to,
+/// if every file is one of
+/// - at the merge version;
+/// - one the merge leaves as the snapshot had it, whatever the user did
+///   to it (their change);
+/// - at the snapshot version with the apply's write still pending
+///   (`pending`: the files the run that staged this merge completely
+///   has not moved) or, for a file the merge removes, still there;
+/// - one the merge changes that the apply had moved into place, changed
+///   by the user since (their change on top of the merge);
+///
+/// and some file of the merge's change was written and some is pending.
+/// The version is the merge's files where they are pending and the
+/// tablet's elsewhere, so finishing writes only the pending files, never
+/// one the user changed, and the document then takes base = merge with
+/// the user's changes on top. `None` otherwise (nothing applied yet: the
+/// snapshot base merges the user's change; or a user change the merge
+/// conflicts with: forked by the next merge, see "Known limits").
+pub(super) fn partial_target(
+    rules: &MirrorRules,
+    doc: &DocId,
+    merge: Option<&DocVersion>,
+    snapshot: Option<&DocVersion>,
+    tablet: &BTreeMap<DocFile, Oid>,
+    pending: &BTreeSet<String>,
+    json: &dyn JsonBlobs,
+) -> Result<Option<DocVersion>> {
+    let (Some(merge), Some(snapshot)) = (present_files(merge), present_files(snapshot)) else {
+        return Ok(None);
+    };
+    let same = |file: &DocFile, a: Option<&Oid>, b: Option<&Oid>| -> Result<bool> {
+        match (a, b) {
+            (None, None) => Ok(true),
+            (Some(a), Some(b)) => blobs_equivalent(rules, file, a, b, json),
+            _ => Ok(false),
+        }
+    };
+    let files: BTreeSet<&DocFile> = merge
+        .keys()
+        .chain(snapshot.keys())
+        .chain(tablet.keys())
+        .collect();
+    // Per file: take the merge's entry (pending) or keep the tablet's,
+    // and whether the merge's change to it was written.
+    let judged = files.into_iter().try_fold(
+        Some((BTreeMap::new(), false, false)),
+        |state, file| -> Result<_> {
+            let Some((mut target, written, waiting)) = state else {
+                return Ok(None);
+            };
+            let m = merge.get(file);
+            let (m_id, s_id, t_id) = (
+                m.map(|e| &e.id),
+                snapshot.get(file).map(|e| &e.id),
+                tablet.get(file),
+            );
+            let at_merge = same(file, m_id, t_id)?;
+            let merge_keeps = same(file, m_id, s_id)?;
+            let staged = pending.contains(&file.xochitl_path(doc));
+            let keep = |target: &mut BTreeMap<DocFile, ListingEntry>| {
+                if let Some(blob) = t_id {
+                    let mode = m
+                        .or_else(|| snapshot.get(file))
+                        .map_or(crate::git::FileMode::Regular, |entry| entry.mode);
+                    target.insert(
+                        file.clone(),
+                        ListingEntry {
+                            mode,
+                            id: blob.clone(),
+                        },
+                    );
+                }
+            };
+            let (written, waiting) = if at_merge {
+                keep(&mut target);
+                (written || !merge_keeps, waiting)
+            } else if merge_keeps {
+                keep(&mut target);
+                (written, waiting)
+            } else if same(file, s_id, t_id)? && (m.is_none() || staged) {
+                if let Some(entry) = m {
+                    target.insert(file.clone(), entry.clone());
+                }
+                (written, true)
+            } else if m.is_some() && !staged {
+                keep(&mut target);
+                (true, waiting)
+            } else {
+                return Ok(None);
+            };
+            Ok(Some((target, written, waiting)))
+        },
+    )?;
+    Ok(judged
+        .filter(|(target, written, waiting)| {
+            *written && *waiting && target.contains_key(&DocFile::Metadata)
+        })
+        .map(|(files, ..)| DocVersion {
+            files,
+            other: BTreeMap::new(),
+        }))
+}
+
+/// The first [`partial_target`] of `doc` among the runs that planned it.
+fn partial_of(
+    input: &Journaled,
+    doc: &DocId,
+    files: &BTreeMap<DocFile, Oid>,
+) -> Result<Option<DocVersion>> {
+    input
+        .staged
+        .iter()
+        .filter(|run| run.planned.contains(doc))
+        .map(|run| {
+            partial_target(
+                input.rules,
+                doc,
+                input.merge.docs.get(doc),
+                input.snapshot.docs.get(doc),
+                files,
+                &run.pending,
+                input.json,
+            )
+        })
+        .find_map(Result::transpose)
+        .transpose()
 }
 
 /// Staged after everything an apply of a merge needs, in the same run's
@@ -812,7 +947,7 @@ pub(super) fn verdicts(input: &Journaled) -> Result<BTreeMap<DocId, Verdict>> {
                     if finished {
                         Verdict::AtMerge
                     } else {
-                        Verdict::Other
+                        partial_of(input, doc, files)?.map_or(Verdict::Other, Verdict::Partial)
                     }
                 }
                 other => other,
@@ -827,9 +962,14 @@ pub(super) fn verdicts(input: &Journaled) -> Result<BTreeMap<DocId, Verdict>> {
         .fold(verdicts, |mut verdicts, (original, copy)| {
             let original_done = matches!(
                 verdicts.get(original),
-                None | Some(Verdict::AtMerge | Verdict::Mixed)
+                None | Some(Verdict::AtMerge | Verdict::Mixed | Verdict::Partial(_))
             );
-            if !original_done && verdicts.get(copy) == Some(&Verdict::Mixed) {
+            if !original_done
+                && matches!(
+                    verdicts.get(copy),
+                    Some(Verdict::Mixed | Verdict::Partial(_))
+                )
+            {
                 verdicts.insert(copy.clone(), Verdict::Other);
             }
             verdicts
@@ -838,19 +978,14 @@ pub(super) fn verdicts(input: &Journaled) -> Result<BTreeMap<DocId, Verdict>> {
 
 /// What reconciliation finishes.
 pub(super) struct Finish<'a> {
-    pub rules: &'a MirrorRules,
+    /// What the verdicts were judged on.
+    pub journaled: &'a Journaled<'a>,
     pub verdicts: &'a BTreeMap<DocId, Verdict>,
-    pub merge: &'a RepoTree,
-    /// The tablet's mirrored files now, per document, by blob.
-    pub tablet: &'a BTreeMap<DocId, BTreeMap<DocFile, Oid>>,
     /// The tablet's current JSON, per document (view state to overlay).
     pub local: &'a BTreeMap<DocId, LocalJson>,
     /// The tablet's tree as read, and every merged document's item.
     pub current: &'a BTreeMap<DocId, TreeItem>,
     pub merged: &'a BTreeMap<DocId, TreeItem>,
-    /// `(original, copy)` of the merge's forks.
-    pub forks: &'a [(DocId, DocId)],
-    pub json: &'a dyn JsonBlobs,
 }
 
 /// Reconciliation's finish (see "Restartability"): a plan for every
@@ -859,42 +994,65 @@ pub(super) struct Finish<'a> {
 /// refuse on the tablet as read, in apply order; and the refused ones,
 /// which keep the snapshot as their base instead.
 pub(super) fn finish(input: &Finish) -> Result<(Vec<Planned>, BTreeSet<DocId>)> {
+    let journaled = input.journaled;
     let empty = LocalJson::new();
-    let planned: Vec<Planned> = input
+    let no_files = BTreeMap::new();
+    // Each document to finish, its plan, and whether the user's own
+    // `.metadata` stays (its tree item is then the tablet's).
+    let planned: Vec<(Planned, bool)> = input
         .verdicts
         .iter()
-        .filter(|(_, verdict)| **verdict == Verdict::Mixed)
-        .map(|(doc, _)| {
-            let Some(target) = input.merge.docs.get(doc).filter(|v| v.is_present()) else {
-                return Ok(Some(Planned {
-                    doc: doc.clone(),
-                    change: Change::Delete,
-                }));
+        .filter(|(_, verdict)| matches!(verdict, Verdict::Mixed | Verdict::Partial(_)))
+        .map(|(doc, verdict)| -> Result<Option<(Planned, bool)>> {
+            let files = journaled.tablet.get(doc).unwrap_or(&no_files);
+            let (target, own_metadata) = match verdict {
+                // The user's own `.metadata` stays when the target keeps it.
+                Verdict::Partial(target) => (
+                    target,
+                    target.files.get(&DocFile::Metadata).map(|entry| &entry.id)
+                        == files.get(&DocFile::Metadata),
+                ),
+                _ => match journaled.merge.docs.get(doc).filter(|v| v.is_present()) {
+                    Some(target) => (target, false),
+                    // An interrupted deletion (`.metadata` goes first):
+                    // finish it, leftovers included.
+                    None => {
+                        return Ok(Some((
+                            Planned {
+                                doc: doc.clone(),
+                                change: Change::Delete,
+                            },
+                            false,
+                        )));
+                    }
+                },
             };
-            let current = input.tablet.get(doc).map(|files| DocVersion {
+            let current = journaled.tablet.get(doc).map(|files| DocVersion {
                 files: files
                     .iter()
                     .map(|(file, blob)| (file.clone(), ListingEntry::regular(blob.clone())))
                     .collect(),
                 other: BTreeMap::new(),
             });
-            plan_doc(
-                input.rules,
+            Ok(plan_doc(
+                journaled.rules,
                 doc,
                 Some(target),
                 current.as_ref(),
                 input.local.get(doc).unwrap_or(&empty),
-                input.json,
-            )
+                journaled.json,
+            )?
+            .map(|planned| (planned, own_metadata)))
         })
         .filter_map(Result::transpose)
         .collect::<Result<_>>()?;
     let items: BTreeMap<DocId, Option<TreeItem>> = planned
         .iter()
-        .map(|entry| {
-            let item = match entry.change {
-                Change::Delete => None,
-                Change::Write { .. } => input.merged.get(&entry.doc).cloned(),
+        .map(|(entry, own_metadata)| {
+            let item = match (&entry.change, own_metadata) {
+                (Change::Delete, _) => None,
+                (Change::Write { .. }, true) => input.current.get(&entry.doc).cloned(),
+                (Change::Write { .. }, false) => input.merged.get(&entry.doc).cloned(),
             };
             (entry.doc.clone(), item)
         })
@@ -902,11 +1060,16 @@ pub(super) fn finish(input: &Finish) -> Result<(Vec<Planned>, BTreeSet<DocId>)> 
     let skipped = tree_skips(
         input.current,
         &items,
-        &partners(input.forks.iter().cloned()),
+        &partners(journaled.forks.iter().cloned()),
     );
-    let copies: BTreeSet<DocId> = input.forks.iter().map(|(_, copy)| copy.clone()).collect();
+    let copies: BTreeSet<DocId> = journaled
+        .forks
+        .iter()
+        .map(|(_, copy)| copy.clone())
+        .collect();
     let kept = planned
         .into_iter()
+        .map(|(entry, _)| entry)
         .filter(|entry| !skipped.contains(&entry.doc))
         .collect();
     Ok((order(kept, input.merged, input.current, &copies), skipped))

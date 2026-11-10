@@ -144,7 +144,10 @@ This repository is **open source** (dual-licensed MIT OR Apache-2.0):
   every report derives `Serialize`, warnings are the typed `Warning`):
   the local cache (`cycle/store.rs`: a
   bare repository per repo id under `$XDG_CACHE_HOME/rmu/hub`, an
-  `flock`, raw commits and trees read through one `cat-file`), reading
+  `flock`, raw commits and trees read through one `cat-file`, bounded
+  caches; never a tree read per commit of history: searches go through
+  the **pure** history index, `cycle/history.rs`, built from one
+  `rev-list` and one `diff-tree` stream), reading
   the tablet into `fast-import` (`cycle/snapshot.rs`), the **pure**
   decisions (`cycle/plan.rs`: version equivalence, the apply plan,
   verification, step-14 moved paths, tree and trash checks,
@@ -160,8 +163,11 @@ This repository is **open source** (dual-licensed MIT OR Apache-2.0):
   lock or journal left; refusals check `World::check_idle`) and
   includes crash matrices (a fault at every operation of a full cycle,
   of a run reconciling an earlier crash, of a pull-only run, of a clone
-  and of a backup; the run after each recovery must be quiet); add a
-  scenario for every new cycle rule and keep the matrices passing.
+  and of a backup; the run after each recovery must be quiet), and a
+  scale test (`reattach_scale_*`, `#[ignore]`d at full size: run them
+  in release with `--ignored --nocapture` when touching history
+  searches); add a scenario for every new cycle rule and keep the
+  matrices passing.
 - `status.rs` — device system state (`rmu status`): one
   marker-sectioned SSH round trip, pure best-effort parsing (every
   field `Option`al — firmware/models differ), pure rendering.

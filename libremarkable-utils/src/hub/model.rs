@@ -987,8 +987,14 @@ impl StatSignature {
     /// Pro's ext4, are always kept, so applied files are not downloaded
     /// again on every sync.
     pub fn keep_in_manifest(&self, reference_ns: i64) -> bool {
-        let coarse = self.mtime_ns.rem_euclid(NANOS_PER_SEC) == 0;
-        !coarse || self.mtime_ns.div_euclid(NANOS_PER_SEC) < reference_ns.div_euclid(NANOS_PER_SEC)
+        self.fine_mtime()
+            || self.mtime_ns.div_euclid(NANOS_PER_SEC) < reference_ns.div_euclid(NANOS_PER_SEC)
+    }
+
+    /// Whether the mtime has sub-second precision (a whole second is
+    /// taken as a coarse filesystem's).
+    pub fn fine_mtime(&self) -> bool {
+        self.mtime_ns.rem_euclid(NANOS_PER_SEC) != 0
     }
 }
 

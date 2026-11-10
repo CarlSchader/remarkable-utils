@@ -1257,6 +1257,124 @@ fn rev_list_topo_lists_every_ancestor_children_first() {
 
 #[cfg(unix)]
 #[test]
+fn trees_resolved_and_diffed_one_level_deep() {
+    let sandbox = Sandbox::new();
+    let cache = sandbox.init("cache.git");
+    let root = commit_files(&cache, &[], &[("docs/a/x", b"1"), ("top", b"t")], "root\n");
+    let next = commit_files(
+        &cache,
+        &[&root],
+        &[("docs/a/x", b"2"), ("docs/b/y/z", b"3"), ("top", b"t")],
+        "next\n",
+    );
+    let commits = cache.rev_list_parents(next.as_str()).unwrap();
+    assert_eq!(commits.len(), 2);
+    assert_eq!(commits[0].commit, next);
+    assert_eq!(commits[0].parents, vec![root.clone()]);
+    let names = [
+        format!("{root}:docs"),
+        format!("{next}:docs"),
+        format!("{root}:top"),
+        format!("{root}:nothing"),
+    ];
+    let found = cache.resolve(&names).unwrap();
+    let kinds: Vec<Option<ObjectKind>> =
+        found.iter().map(|f| f.as_ref().map(|(_, k)| *k)).collect();
+    assert_eq!(
+        kinds,
+        [
+            Some(ObjectKind::Tree),
+            Some(ObjectKind::Tree),
+            Some(ObjectKind::Blob),
+            None
+        ]
+    );
+    let (old, new) = (found[0].clone().unwrap().0, found[1].clone().unwrap().0);
+    let empty = cache.object_format().unwrap().empty_tree();
+    let diffs = cache
+        .tree_diffs(&[
+            (old.clone(), new.clone()),
+            (empty, old.clone()),
+            (new.clone(), new.clone()),
+        ])
+        .unwrap();
+    let names = |changes: &Vec<libremarkable_utils::git::RawChange>| -> Vec<String> {
+        changes
+            .iter()
+            .map(|change| String::from_utf8_lossy(&change.path).into_owned())
+            .collect()
+    };
+    // One entry per changed subtree, however deep its changes.
+    assert_eq!(names(&diffs[0]), ["a", "b"]);
+    assert_eq!(names(&diffs[1]), ["a"]);
+    assert!(diffs[2].is_empty());
+    // A pair diff-tree cannot read is an error, never "unchanged".
+    let missing: Oid = "e".repeat(40).parse().unwrap();
+    assert!(
+        cache
+            .tree_diffs(&[(old, new), (missing.clone(), missing)])
+            .is_err()
+    );
+    assert!(matches!(
+        cache.rev_list_parents("--all"),
+        Err(Error::InvalidGitInput(_))
+    ));
+    assert!(matches!(
+        cache.resolve(&["a\nb".to_string()]),
+        Err(Error::InvalidGitInput(_))
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn checkpointed_blobs_survive_an_aborted_writer() {
+    let sandbox = Sandbox::new();
+    let cache = sandbox.init("cache.git");
+    let pack_dir = cache.git_dir().join("objects").join("pack");
+    let keeps = || {
+        std::fs::read_dir(&pack_dir)
+            .map(|entries| {
+                entries
+                    .filter(|entry| {
+                        entry.as_ref().is_ok_and(|entry| {
+                            entry.path().extension().is_some_and(|e| e == "keep")
+                        })
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
+    };
+    let mut writer = cache.commit_writer(&NoProgress, None).unwrap();
+    let kept = writer.write_blob("kept", 4, &mut &b"kept"[..]).unwrap();
+    // More objects than fast-import's unpack limit: the checkpoint writes
+    // a real (kept) pack instead of loose objects.
+    let many: Vec<Oid> = (0..150)
+        .map(|n| {
+            let data = format!("blob {n}");
+            writer
+                .write_blob("many", data.len() as u64, &mut data.as_bytes())
+                .unwrap()
+        })
+        .collect();
+    writer.checkpoint().unwrap();
+    assert_eq!(keeps(), 1);
+    writer.checkpoint().unwrap();
+    let lost = writer.write_blob("lost", 4, &mut &b"lost"[..]).unwrap();
+    // A reader cut part-way kills fast-import, as a cut download does.
+    let cut = writer.write_blob("cut", 10, &mut &b"cut"[..]);
+    assert!(cut.is_err());
+    assert!(writer.checkpoint().is_err());
+    drop(writer);
+    let sizes = cache.object_sizes([&kept, &lost]).unwrap();
+    assert_eq!(sizes.get(&kept), Some(&4));
+    assert!(!sizes.contains_key(&lost));
+    assert_eq!(cache.object_sizes(&many).unwrap().len(), many.len());
+    // The killed fast-import's `.keep` is gone: the pack can be repacked.
+    assert_eq!(keeps(), 0);
+}
+
+#[cfg(unix)]
+#[test]
 fn deleting_a_remote_ref_is_leased() {
     let sandbox = Sandbox::new();
     let origin = sandbox.init("origin.git");

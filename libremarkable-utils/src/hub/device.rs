@@ -365,6 +365,11 @@ pub trait Tablet {
     /// `devicetoken` check; no credential leaves the device).
     fn cloud_paired(&self) -> Result<bool>;
 
+    /// Where this tablet is reached from this computer (for `SshTablet`,
+    /// the SSH destination and port): a local label for what rmu keeps
+    /// about a tablet before it has a device id. No I/O.
+    fn destination(&self) -> String;
+
     fn device_info(&self) -> Result<DeviceInfo>;
 
     /// One pass over the xochitl data dir: size, nanosecond mtime and

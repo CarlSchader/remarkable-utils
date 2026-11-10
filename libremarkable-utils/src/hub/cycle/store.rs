@@ -4,15 +4,20 @@
 //! `$XDG_CACHE_HOME/rmu/hub/<repo-id>.git` with origin's object format,
 //! guarded by an `flock` on `<repo-id>.lock` next to it, so two runs on
 //! one computer never write it at once. It is disposable: a missing or
-//! mismatched one is re-created and fetched again.
+//! mismatched one is re-created and fetched again. It records the origin
+//! URL it was last opened with (`rmu-origin` inside it), so a `clone` from
+//! that URL fetches into it instead of transferring the library again.
 //!
 //! [`Store`] reads it through one `cat-file --batch` process: commits,
-//! trees (raw tree objects, so walking a history needs no process per
-//! commit), document versions, blobs. It implements the merge engine's
-//! [`BlobSource`] and, through [`StoreHistory`], its [`History`].
+//! trees (raw tree objects), document versions, blobs; its caches are
+//! bounded ([`Bounded`]). Searches over history go through the
+//! [`HistoryIndex`] of origin `main` (one `rev-list` and one `diff-tree`
+//! process), never a tree read per commit. It implements the merge
+//! engine's [`BlobSource`] and, through [`StoreHistory`], its
+//! [`History`].
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, TryLockError};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -23,10 +28,12 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::CycleError;
+use super::history::HistoryIndex;
 use super::plan::JsonBlobs;
 use crate::error::{Error, Result};
 use crate::git::{
-    self, CatFile, CommitObject, Expected, Git, ObjectFormat, ObjectKind, Oid, Repo, TreeEntry,
+    self, CatFile, CommitChanges, CommitObject, Expected, Git, ObjectFormat, ObjectKind, Oid,
+    RawChange, Repo, TreeEntry,
 };
 use crate::hub::merge::{BlobSource, History};
 use crate::hub::model::{
@@ -66,6 +73,54 @@ pub(super) struct Remote {
     pub main: Option<Oid>,
     /// The device ref, as fetched.
     pub device: Option<RemoteRef>,
+}
+
+/// Where the last pre-read of a tablet against the cache of `repo_id`
+/// keeps what it read: next to the cache, under its `flock`.
+pub(super) fn pre_read_path(root: &Path, repo_id: &RepoId, tablet: PreReadOf) -> PathBuf {
+    let key = match tablet {
+        PreReadOf::Device(device) => device.to_string(),
+        PreReadOf::Destination(destination) => {
+            let digest = Sha256::digest(destination.as_bytes());
+            let hex: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
+            format!("at-{hex}")
+        }
+    };
+    root.join(format!("{repo_id}.pre-read-{key}.json"))
+}
+
+/// Whose pre-read: an attached tablet's (its device id), or one not
+/// attached yet (where this computer reaches it, [`Tablet::destination`]).
+pub(super) enum PreReadOf<'a> {
+    Device(&'a DeviceId),
+    Destination(&'a str),
+}
+
+/// A saved pre-read (see [`save_pre_read`]); empty if there is none or
+/// it is unreadable (it is only a hint: every entry is checked against
+/// the tablet's stat and the cache before use).
+pub(super) fn load_pre_read(path: &Path) -> BTreeMap<model::XochitlPath, model::ManifestEntry> {
+    fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+/// Keep what a pre-read read (each file's stat and blob), replacing the
+/// last one atomically. Best effort.
+pub(super) fn save_pre_read(
+    path: &Path,
+    entries: &BTreeMap<model::XochitlPath, model::ManifestEntry>,
+) {
+    let temp = path.with_extension("json.tmp");
+    let _ = serde_json::to_vec(entries)
+        .map_err(io_error)
+        .and_then(|bytes| fs::write(&temp, bytes))
+        .and_then(|()| fs::rename(&temp, path));
+}
+
+fn io_error(error: serde_json::Error) -> std::io::Error {
+    std::io::Error::other(error)
 }
 
 /// The local cache, held under its `flock` for as long as this lives.
@@ -121,6 +176,17 @@ fn open_or_create(git: &Git, path: &Path, format: ObjectFormat) -> Result<Repo> 
     git.init_bare(path, format)
 }
 
+/// The file inside a cache recording the origin URL it was last opened
+/// with.
+const ORIGIN_FILE: &str = "rmu-origin";
+
+/// Under the cache's lock, before any writer exists: record `url`, and
+/// remove the `.keep` files a killed `fast-import` left (best effort).
+fn opened(repo: &Repo, url: &str) {
+    let _ = fs::write(repo.git_dir().join(ORIGIN_FILE), url);
+    let _ = repo.remove_fast_import_keeps();
+}
+
 /// Open (or create) the cache of `repo_id` under `root`, matching the
 /// object format origin advertises (`url`), and take its lock. Returns
 /// the advertisement too, for the first [`fetch`] to reuse.
@@ -138,6 +204,7 @@ pub(super) fn open_cache(
         Some(format) if format != repo.object_format()? => open_or_create(git, &path, format)?,
         _ => repo,
     };
+    opened(&repo, url);
     Ok((Cache { repo, _lock: lock }, refs))
 }
 
@@ -169,26 +236,36 @@ fn sweep_incoming(root: &Path) -> Result<()> {
         })
 }
 
-/// For a first contact (`clone`), when the repo id is not known yet:
-/// fetch origin's `main` into a temporary repository, read its repo id,
-/// then make that the cache (or fetch from it into an existing cache).
+/// For a first contact (`clone`), when the repo id is not known yet. A
+/// cache this computer keeps for `url` (its recorded origin) is fetched
+/// into, if `main` there still has that cache's repo id. Otherwise
+/// origin's `main` goes into a temporary repository, whose repo id names
+/// the cache: the temporary one becomes it, or (a cache with that id
+/// exists, recorded for another URL) it is fetched from locally. Either
+/// way the library crosses the network once.
 pub(super) fn bootstrap_cache(git: &Git, root: &Path, url: &str) -> Result<(Cache, Oid)> {
     fs::create_dir_all(root)?;
     sweep_incoming(root)?;
+    if let Some(found) = known_cache(git, root, url)? {
+        return Ok(found);
+    }
     let token = uuid::Uuid::new_v4().simple().to_string();
     let temp = root.join(format!("incoming-{token}.git"));
     let temp_lock = root.join(format!("incoming-{token}.lock"));
     let held = take_lock(&temp_lock)?;
+    let not_initialised = || CycleError::NotInitialised {
+        url: url.to_string(),
+    };
     let result = (|| {
         let probe = git.init_bare(&temp, ObjectFormat::Sha1)?;
         let refs = probe.ls_remote(url)?;
-        let main = refs
+        let format = refs
             .iter()
             .find(|reference| reference.name == MAIN)
-            .ok_or_else(|| CycleError::NotInitialised {
-                url: url.to_string(),
-            })?;
-        let probe = match main.oid.object_format() {
+            .ok_or_else(not_initialised)?
+            .oid
+            .object_format();
+        let probe = match format {
             ObjectFormat::Sha1 => probe,
             format => {
                 fs::remove_dir_all(&temp)?;
@@ -196,15 +273,10 @@ pub(super) fn bootstrap_cache(git: &Git, root: &Path, url: &str) -> Result<(Cach
             }
         };
         probe.fetch(url, &[&format!("+{MAIN}:{LOCAL_MAIN}")], false)?;
-        let main = probe
-            .rev_parse(LOCAL_MAIN)?
-            .ok_or_else(|| CycleError::NotInitialised {
-                url: url.to_string(),
-            })?;
+        let main = probe.rev_parse(LOCAL_MAIN)?.ok_or_else(not_initialised)?;
         let config = Store::new(probe.clone())?.repo_config(&main)?;
         let lock = take_lock(&lock_path(root, &config.repo_id))?;
         let path = root.join(format!("{}.git", config.repo_id));
-        let format = main.object_format();
         let repo = match git.open(&path) {
             Ok(repo) if repo.object_format()? == format => {
                 repo.fetch(
@@ -224,6 +296,7 @@ pub(super) fn bootstrap_cache(git: &Git, root: &Path, url: &str) -> Result<(Cach
                 git.open(&path)?
             }
         };
+        opened(&repo, url);
         Ok((Cache { repo, _lock: lock }, main))
     })();
     if temp.exists() {
@@ -232,6 +305,56 @@ pub(super) fn bootstrap_cache(git: &Git, root: &Path, url: &str) -> Result<(Cach
     drop(held);
     let _ = fs::remove_file(&temp_lock);
     result
+}
+
+/// The repo ids of the caches under `root` recorded for `url`.
+fn caches_for(root: &Path, url: &str) -> Vec<RepoId> {
+    fs::read_dir(root)
+        .map(|entries| {
+            entries
+                .filter_map(|entry| entry.ok())
+                .filter_map(|entry| {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    let id = RepoId::new(name.strip_suffix(".git")?).ok()?;
+                    let recorded = fs::read_to_string(entry.path().join(ORIGIN_FILE)).ok()?;
+                    (recorded == url).then_some(id)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A cache recorded for `url`, locked and fetched up to date, whose
+/// fetched `main` has its repo id. One whose origin now holds another
+/// repository is left as it was.
+fn known_cache(git: &Git, root: &Path, url: &str) -> Result<Option<(Cache, Oid)>> {
+    caches_for(root, url)
+        .into_iter()
+        .map(|repo_id| -> Result<Option<(Cache, Oid)>> {
+            let (cache, refs) = open_cache(git, root, &repo_id, url)?;
+            if !refs.iter().any(|reference| reference.name == MAIN) {
+                return Err(CycleError::NotInitialised {
+                    url: url.to_string(),
+                }
+                .into());
+            }
+            let previous = cache.repo.rev_parse(LOCAL_MAIN)?;
+            let main = fetch(&cache.repo, url, None, Some(refs))?
+                .main
+                .ok_or_else(|| CycleError::NotInitialised {
+                    url: url.to_string(),
+                })?;
+            let config = Store::new(cache.repo.clone())?.repo_config(&main);
+            if config.is_ok_and(|config| config.repo_id == repo_id) {
+                return Ok(Some((cache, main)));
+            }
+            if let Some(previous) = previous {
+                cache.repo.update_ref(LOCAL_MAIN, &previous, None)?;
+            }
+            Ok(None)
+        })
+        .find_map(Result::transpose)
+        .transpose()
 }
 
 /// `ls-remote` origin (unless `advertised` is the advertisement just
@@ -295,15 +418,77 @@ pub(super) fn push(
 }
 
 /// Reads the cache (see the module docs). Not `Sync`: one per run.
+/// A cache holding about `capacity` weight at most, in two generations:
+/// when the young one reaches half the capacity, the old one is dropped
+/// and the young one takes its place; a hit in the old one moves the
+/// entry back to the young one. Memory stays bounded however long the
+/// history, and entries in use stay cached.
+pub(super) struct Bounded<V> {
+    capacity: usize,
+    young: HashMap<Oid, (V, usize)>,
+    old: HashMap<Oid, (V, usize)>,
+    weight: usize,
+}
+
+impl<V: Clone> Bounded<V> {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            young: HashMap::new(),
+            old: HashMap::new(),
+            weight: 0,
+        }
+    }
+
+    pub fn get(&mut self, key: &Oid) -> Option<V> {
+        if let Some((value, _)) = self.young.get(key) {
+            return Some(value.clone());
+        }
+        let (value, weight) = self.old.remove(key)?;
+        self.insert(key.clone(), value.clone(), weight);
+        Some(value)
+    }
+
+    pub fn insert(&mut self, key: Oid, value: V, weight: usize) {
+        if self.weight + weight > self.capacity / 2 && !self.young.is_empty() {
+            self.old = std::mem::take(&mut self.young);
+            self.weight = 0;
+        }
+        self.weight += weight;
+        self.young.insert(key, (value, weight));
+    }
+
+    /// Entries held (both generations).
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.young.len() + self.old.len()
+    }
+}
+
+/// Cache bounds: commits by count, trees by entries, JSON by an estimate
+/// of its parsed size ([`PARSED_JSON_FACTOR`] times its source bytes).
+const COMMIT_CACHE: usize = 16 * 1024;
+const TREE_CACHE: usize = 256 * 1024;
+const JSON_CACHE: usize = 64 * 1024 * 1024;
+
+/// A parsed `serde_json::Value` takes about this many times its source
+/// bytes (measured: a 700-page PDF's 168 KB `.content` parses into about
+/// 2.7 MB, a node per small register).
+const PARSED_JSON_FACTOR: usize = 16;
+
 pub(super) struct Store {
     pub repo: Repo,
     format: ObjectFormat,
     cat: RefCell<Option<CatFile>>,
-    commits: RefCell<HashMap<Oid, Rc<CommitObject>>>,
-    trees: RefCell<HashMap<Oid, Rc<Vec<TreeEntry>>>>,
-    json: RefCell<HashMap<Oid, Option<Rc<Value>>>>,
-    chains: RefCell<HashMap<Oid, Rc<Vec<Oid>>>>,
-    topo: RefCell<HashMap<Oid, Rc<Vec<Oid>>>>,
+    commits: RefCell<Bounded<Rc<CommitObject>>>,
+    trees: RefCell<Bounded<Rc<Vec<TreeEntry>>>>,
+    json: RefCell<Bounded<Option<Rc<Value>>>>,
+    /// The first-parent chain of the last tip asked for.
+    chain: RefCell<Option<(Oid, Rc<Vec<Oid>>)>>,
+    /// The history index of the last tip asked for.
+    history: RefCell<Option<Rc<HistoryIndex>>>,
+    /// The ancestors of the last tip asked for (when it has no index).
+    ancestry: RefCell<Option<(Oid, Rc<std::collections::HashSet<Oid>>)>>,
 }
 
 impl Store {
@@ -313,11 +498,12 @@ impl Store {
             repo,
             format,
             cat: RefCell::new(None),
-            commits: RefCell::default(),
-            trees: RefCell::default(),
-            json: RefCell::default(),
-            chains: RefCell::default(),
-            topo: RefCell::default(),
+            commits: RefCell::new(Bounded::new(COMMIT_CACHE)),
+            trees: RefCell::new(Bounded::new(TREE_CACHE)),
+            json: RefCell::new(Bounded::new(JSON_CACHE)),
+            chain: RefCell::default(),
+            history: RefCell::default(),
+            ancestry: RefCell::default(),
         })
     }
 
@@ -378,13 +564,13 @@ impl Store {
     }
 
     pub fn commit(&self, oid: &Oid) -> Result<Rc<CommitObject>> {
-        if let Some(found) = self.commits.borrow().get(oid) {
-            return Ok(Rc::clone(found));
+        if let Some(found) = self.commits.borrow_mut().get(oid) {
+            return Ok(found);
         }
         let commit = Rc::new(git::parse_commit(&self.object(oid, ObjectKind::Commit)?)?);
         self.commits
             .borrow_mut()
-            .insert(oid.clone(), Rc::clone(&commit));
+            .insert(oid.clone(), Rc::clone(&commit), 1);
         Ok(commit)
     }
 
@@ -394,8 +580,8 @@ impl Store {
     }
 
     fn tree(&self, oid: &Oid) -> Result<Rc<Vec<TreeEntry>>> {
-        if let Some(found) = self.trees.borrow().get(oid) {
-            return Ok(Rc::clone(found));
+        if let Some(found) = self.trees.borrow_mut().get(oid) {
+            return Ok(found);
         }
         let entries = Rc::new(git::parse_tree(
             &self.object(oid, ObjectKind::Tree)?,
@@ -403,7 +589,7 @@ impl Store {
         )?);
         self.trees
             .borrow_mut()
-            .insert(oid.clone(), Rc::clone(&entries));
+            .insert(oid.clone(), Rc::clone(&entries), entries.len() + 1);
         Ok(entries)
     }
 
@@ -416,8 +602,18 @@ impl Store {
             .cloned())
     }
 
-    /// The tree id of `docs/<doc>` in `commit`, if it has one.
+    /// The tree id of `docs/<doc>` in `commit`, if it has one: from the
+    /// history index when one is built that has the commit, else by
+    /// reading its trees.
     pub fn doc_subtree(&self, commit: &Oid, doc: &DocId) -> Result<Option<Oid>> {
+        if let Some(found) = self
+            .history
+            .borrow()
+            .as_ref()
+            .and_then(|index| index.subtree_at(commit, doc))
+        {
+            return Ok(found.cloned());
+        }
         let root = self.commit(commit)?.tree.clone();
         let Some(docs) = self
             .child(&root, "docs")?
@@ -477,19 +673,105 @@ impl Store {
         Ok(rules.group_tree(listing)?)
     }
 
-    /// Every ancestor of `tip`, children before parents.
-    pub fn ancestors(&self, tip: &Oid) -> Result<Rc<Vec<Oid>>> {
-        if let Some(found) = self.topo.borrow().get(tip) {
+    /// The history index of `tip` (origin `main`), built once per tip.
+    pub fn history(&self, tip: &Oid) -> Result<Rc<HistoryIndex>> {
+        if let Some(found) = self
+            .history
+            .borrow()
+            .as_ref()
+            .filter(|index| index.tip() == Some(tip))
+        {
             return Ok(Rc::clone(found));
         }
-        let all = Rc::new(self.repo.rev_list_topo(&[tip.as_str()])?);
-        self.topo.borrow_mut().insert(tip.clone(), Rc::clone(&all));
-        Ok(all)
+        let commits = self.repo.rev_list_parents(tip.as_str())?;
+        // Each commit's `docs` tree, then the `docs/<uuid>` entries that
+        // differ from its first parent's: one entry per changed document,
+        // however many files changed in it.
+        let names: Vec<String> = commits
+            .iter()
+            .map(|entry| format!("{}:docs", entry.commit))
+            .collect();
+        let docs: HashMap<&Oid, Oid> = commits
+            .iter()
+            .zip(self.repo.resolve(&names)?)
+            .filter_map(|(entry, found)| match found {
+                Some((tree, ObjectKind::Tree)) => Some((&entry.commit, tree)),
+                _ => None,
+            })
+            .collect();
+        let empty = self.format.empty_tree();
+        let docs_of = |commit: Option<&Oid>| {
+            commit
+                .and_then(|commit| docs.get(commit))
+                .unwrap_or(&empty)
+                .clone()
+        };
+        let pairs: Vec<(usize, (Oid, Oid))> = commits
+            .iter()
+            .enumerate()
+            .map(|(at, entry)| {
+                (
+                    at,
+                    (docs_of(entry.parents.first()), docs_of(Some(&entry.commit))),
+                )
+            })
+            .filter(|(_, (old, new))| old != new)
+            .collect();
+        let diffs = self.repo.tree_diffs(
+            &pairs
+                .iter()
+                .map(|(_, pair)| pair.clone())
+                .collect::<Vec<_>>(),
+        )?;
+        let changes: Vec<CommitChanges> = pairs
+            .iter()
+            .zip(diffs)
+            .map(|((at, _), changes)| CommitChanges {
+                commit: commits[*at].commit.clone(),
+                changes: changes
+                    .into_iter()
+                    .map(|change| RawChange {
+                        path: [&b"docs/"[..], &change.path].concat(),
+                        ..change
+                    })
+                    .collect(),
+            })
+            .collect();
+        let index = Rc::new(HistoryIndex::build(&commits, &changes)?);
+        *self.history.borrow_mut() = Some(Rc::clone(&index));
+        Ok(index)
+    }
+
+    /// Whether `commit` is `tip` or one of its ancestors (absent from the
+    /// cache: no), from `tip`'s history index if one is built, else from
+    /// one `rev-list` of `tip` (both kept for the next question).
+    pub fn is_ancestor(&self, commit: &Oid, tip: &Oid) -> Result<bool> {
+        if let Some(index) = self
+            .history
+            .borrow()
+            .as_ref()
+            .filter(|index| index.tip() == Some(tip))
+        {
+            return Ok(index.contains(commit));
+        }
+        if let Some((_, set)) = self.ancestry.borrow().as_ref().filter(|(at, _)| at == tip) {
+            return Ok(set.contains(commit));
+        }
+        let set: Rc<std::collections::HashSet<Oid>> = Rc::new(
+            self.repo
+                .rev_list(&[tip.as_str()], false)?
+                .into_iter()
+                .collect(),
+        );
+        let found = set.contains(commit);
+        *self.ancestry.borrow_mut() = Some((tip.clone(), set));
+        Ok(found)
     }
 
     /// The newest ancestor of `tip` (children before parents; device refs
-    /// are never ancestors of `main` unless merged into it) whose version
-    /// of `doc` satisfies `matches`. Each distinct version is judged once.
+    /// are never searched, but snapshots merged into `main` are its
+    /// ancestors) whose version of `doc` satisfies `matches`. Each
+    /// distinct version is judged once, newest first, until one matches.
     pub fn newest_matching(
         &self,
         rules: &MirrorRules,
@@ -497,32 +779,25 @@ impl Store {
         doc: &DocId,
         matches: &mut dyn FnMut(&DocVersion) -> Result<bool>,
     ) -> Result<Option<Oid>> {
-        let commits = self.ancestors(tip)?;
-        let mut tried = std::collections::HashSet::new();
-        commits.iter().try_fold(None, |found, commit| {
-            if found.is_some() {
-                return Ok(found);
-            }
-            let Some(subtree) = self.doc_subtree(commit, doc)? else {
-                return Ok(None);
-            };
-            if !tried.insert(subtree.clone()) {
-                return Ok(None);
-            }
-            let version = self.doc_version(rules, doc, &subtree)?;
-            Ok(matches(&version)?.then(|| commit.clone()))
-        })
+        self.history(tip)?
+            .versions(doc)
+            .into_iter()
+            .filter_map(|(commit, subtree)| Some((commit, subtree?)))
+            .map(|(commit, subtree)| -> Result<Option<Oid>> {
+                let version = self.doc_version(rules, doc, subtree)?;
+                Ok(matches(&version)?.then(|| commit.clone()))
+            })
+            .find_map(Result::transpose)
+            .transpose()
     }
 
     /// `tip` and its first-parent ancestors, newest first.
     pub fn first_parents(&self, tip: &Oid) -> Result<Rc<Vec<Oid>>> {
-        if let Some(found) = self.chains.borrow().get(tip) {
+        if let Some((_, found)) = self.chain.borrow().as_ref().filter(|(at, _)| at == tip) {
             return Ok(Rc::clone(found));
         }
         let chain = Rc::new(self.repo.rev_list(&[tip.as_str()], true)?);
-        self.chains
-            .borrow_mut()
-            .insert(tip.clone(), Rc::clone(&chain));
+        *self.chain.borrow_mut() = Some((tip.clone(), Rc::clone(&chain)));
         Ok(chain)
     }
 
@@ -578,13 +853,16 @@ impl BlobSource for Store {
 
 impl JsonBlobs for Store {
     fn json(&self, id: &Oid) -> Result<Option<Rc<Value>>> {
-        if let Some(found) = self.json.borrow().get(id) {
-            return Ok(found.clone());
+        if let Some(found) = self.json.borrow_mut().get(id) {
+            return Ok(found);
         }
-        let parsed = serde_json::from_slice::<Value>(&self.blob(id)?)
-            .ok()
-            .map(Rc::new);
-        self.json.borrow_mut().insert(id.clone(), parsed.clone());
+        let bytes = self.blob(id)?;
+        let parsed = serde_json::from_slice::<Value>(&bytes).ok().map(Rc::new);
+        self.json.borrow_mut().insert(
+            id.clone(),
+            parsed.clone(),
+            bytes.len() * PARSED_JSON_FACTOR + 1,
+        );
         Ok(parsed)
     }
 }
@@ -597,39 +875,278 @@ pub(super) struct StoreHistory<'a> {
     pub tip: &'a Oid,
 }
 
-impl StoreHistory<'_> {
-    /// `doc`'s distinct versions along the first-parent chain, newest
-    /// first, with the commit each was found at (consecutive commits
-    /// sharing a subtree are visited once).
-    pub fn versions(&self, doc: &DocId) -> Result<Vec<(Oid, DocVersion)>> {
-        let chain = self.store.first_parents(self.tip)?;
-        let subtrees = chain
-            .iter()
-            .map(|commit| Ok((commit, self.store.doc_subtree(commit, doc)?)))
-            .collect::<Result<Vec<_>>>()?;
-        let (versions, _) = subtrees.into_iter().try_fold(
-            (Vec::new(), None::<Oid>),
-            |(mut versions, previous), (commit, subtree)| -> Result<_> {
-                if let Some(subtree) = subtree.as_ref().filter(|s| previous.as_ref() != Some(*s)) {
-                    versions.push((
-                        commit.clone(),
-                        self.store.doc_version(self.rules, doc, subtree)?,
-                    ));
-                }
-                Ok((versions, subtree))
-            },
-        )?;
-        Ok(versions)
+impl History for StoreHistory<'_> {
+    /// `doc`'s present versions along `tip`'s first-parent chain, newest
+    /// first, from the history index.
+    fn present_versions(&self, doc: &DocId) -> Result<Vec<DocVersion>> {
+        self.store
+            .history(self.tip)?
+            .first_parent_versions(doc)
+            .into_iter()
+            .flatten()
+            .map(|subtree| self.store.doc_version(self.rules, doc, subtree))
+            .filter(|version| !matches!(version, Ok(version) if !version.is_present()))
+            .collect()
     }
 }
 
-impl History for StoreHistory<'_> {
-    fn present_versions(&self, doc: &DocId) -> Result<Vec<DocVersion>> {
-        Ok(self
-            .versions(doc)?
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::git::{CommitMeta, FileMode, Signature};
+    use test_support::Scratch;
+
+    fn doc(n: u32) -> DocId {
+        DocId::new(format!("8c1f0b9e-0000-4000-8000-{n:012x}")).unwrap()
+    }
+
+    /// A commit whose tree is exactly `files` (path, content).
+    fn commit(repo: &Repo, parents: &[&Oid], files: &[(String, &str)]) -> Oid {
+        let mut writer = repo
+            .commit_writer(&crate::progress::NoProgress, None)
+            .unwrap();
+        files.iter().for_each(|(path, data)| {
+            writer
+                .add_bytes(path.as_str(), FileMode::Regular, data.as_bytes())
+                .unwrap();
+        });
+        let who = Signature {
+            name: "Test".to_string(),
+            email: "test@example.invalid".to_string(),
+            time: 1_800_000_000,
+            offset_minutes: 0,
+        };
+        writer
+            .commit(&CommitMeta {
+                parents: parents.iter().map(|&parent| parent.clone()).collect(),
+                author: who.clone(),
+                committer: who,
+                message: "test\n".to_string(),
+            })
+            .unwrap()
+    }
+
+    /// `docs/<doc>`'s subtree in `commit`, by a full tree listing.
+    fn listed(repo: &Repo, commit: &Oid, doc: &DocId) -> Option<Oid> {
+        let path = format!("docs/{doc}");
+        repo.ls_tree_recursive(commit.as_str())
+            .unwrap()
             .into_iter()
-            .map(|(_, version)| version)
-            .filter(DocVersion::is_present)
-            .collect())
+            .find(|entry| entry.path == path.as_bytes() && entry.kind == ObjectKind::Tree)
+            .map(|entry| entry.oid)
+    }
+
+    /// The history index against full tree reads, on a history with a
+    /// root adding documents, a deletion and a re-add of the same
+    /// subtree, a blob at `docs/<uuid>` turning into a tree and back, and
+    /// a merge taking the side branch's version.
+    #[test]
+    fn the_history_index_agrees_with_tree_reads() {
+        let scratch = Scratch::new("history-index");
+        let git = crate::git::Git::new()
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", scratch.path());
+        let repo = git
+            .init_bare(&scratch.path().join("r.git"), ObjectFormat::Sha1)
+            .unwrap();
+        let (d1, d2, d3) = (doc(1), doc(2), doc(3));
+        let meta = |d: &DocId, v: &'static str| (format!("docs/{d}/metadata"), v);
+        let blob = |d: &DocId, v: &'static str| (format!("docs/{d}"), v);
+        let root = commit(&repo, &[], &[meta(&d1, "1"), meta(&d2, "2")]);
+        let a = commit(&repo, &[&root], &[meta(&d1, "1a")]);
+        let b = commit(
+            &repo,
+            &[&a],
+            &[meta(&d1, "1a"), meta(&d2, "2"), blob(&d3, "x")],
+        );
+        // The side's version of d1 is on no first-parent commit.
+        let side = commit(
+            &repo,
+            &[&root],
+            &[meta(&d1, "1x"), meta(&d2, "2"), meta(&d3, "3")],
+        );
+        let merge = commit(
+            &repo,
+            &[&b, &side],
+            &[meta(&d1, "1s"), meta(&d2, "2"), meta(&d3, "3")],
+        );
+        let tip = commit(&repo, &[&merge], &[meta(&d2, "2"), blob(&d3, "y")]);
+        let store = Store::new(repo.clone()).unwrap();
+        let index = store.history(&tip).unwrap();
+        let commits = repo.rev_list_topo(&[tip.as_str()]).unwrap();
+        let chain = repo.rev_list(&[tip.as_str()], true).unwrap();
+        [&d1, &d2, &d3, &doc(4)].into_iter().for_each(|d| {
+            let truth: Vec<Option<Oid>> = commits.iter().map(|c| listed(&repo, c, d)).collect();
+            commits.iter().zip(&truth).for_each(|(c, expected)| {
+                assert_eq!(
+                    index.subtree_at(c, d),
+                    Some(expected.as_ref()),
+                    "{d} at {c}"
+                );
+                assert_eq!(&store.doc_subtree(c, d).unwrap(), expected, "{d} at {c}");
+            });
+            // Each distinct version (absent included) at its newest holder.
+            let mut seen = std::collections::HashSet::new();
+            let versions: Vec<(&Oid, Option<&Oid>)> = commits
+                .iter()
+                .zip(&truth)
+                .filter(|(_, version)| seen.insert(*version))
+                .map(|(c, version)| (c, version.as_ref()))
+                .collect();
+            assert_eq!(index.versions(d), versions, "{d}");
+            // The first-parent chain's present versions, newest first, one
+            // per stretch.
+            let (stretches, _) = chain.iter().map(|c| listed(&repo, c, d)).fold(
+                (Vec::new(), None::<Option<Oid>>),
+                |(mut out, previous), version| {
+                    if previous.as_ref() != Some(&version) {
+                        out.extend(version.clone());
+                    }
+                    (out, Some(version))
+                },
+            );
+            let indexed: Vec<Oid> = index
+                .first_parent_versions(d)
+                .into_iter()
+                .flatten()
+                .cloned()
+                .collect();
+            assert_eq!(indexed, stretches, "{d}");
+            // The merge's history: those stretches' present versions,
+            // never a version only a merged side line has.
+            let rules = MirrorRules::latest();
+            let history = StoreHistory {
+                store: &store,
+                rules,
+                tip: &tip,
+            };
+            let present: Vec<DocVersion> = stretches
+                .iter()
+                .map(|subtree| store.doc_version(rules, d, subtree).unwrap())
+                .filter(DocVersion::is_present)
+                .collect();
+            assert_eq!(history.present_versions(d).unwrap(), present, "{d}");
+        });
+        // The ancestry check: from the index of `tip`, and for another
+        // tip from one rev-list (the index stays `tip`'s).
+        assert!(store.is_ancestor(&side, &tip).unwrap());
+        assert!(!store.is_ancestor(&tip, &merge).unwrap());
+        assert!(store.is_ancestor(&root, &a).unwrap());
+        assert!(!store.is_ancestor(&side, &a).unwrap());
+        let unknown: Oid = "f".repeat(40).parse().unwrap();
+        assert!(!store.is_ancestor(&unknown, &tip).unwrap());
+        assert!(!store.is_ancestor(&unknown, &a).unwrap());
+        // A subtree at a commit the index lacks is read from its trees.
+        let detached = commit(&repo, &[], &[meta(&d1, "z")]);
+        assert_eq!(
+            store.doc_subtree(&detached, &d1).unwrap(),
+            listed(&repo, &detached, &d1)
+        );
+    }
+
+    fn oid(n: u32) -> Oid {
+        format!("{n:040x}").parse().unwrap()
+    }
+
+    /// This process's peak resident set size in KiB (Linux), after
+    /// `reset` cleared it.
+    fn peak_rss_kib(reset: bool) -> Option<u64> {
+        if reset {
+            let _ = fs::write("/proc/self/clear_refs", "5");
+        }
+        fs::read_to_string("/proc/self/status")
+            .ok()?
+            .lines()
+            .find_map(|line| line.strip_prefix("VmHWM:"))
+            .and_then(|value| value.trim().trim_end_matches("kB").trim().parse().ok())
+    }
+
+    /// Building the index of a history whose commits change every file
+    /// of a big library (2000 notebooks of 100 pages: 204,000 files):
+    /// time and memory must follow documents, not files.
+    /// `cargo test --release -p libremarkable-utils --lib -- --ignored
+    /// --nocapture index_of_a_history_with_many_files`.
+    #[test]
+    #[ignore = "measurement; run in release with --ignored --nocapture"]
+    fn index_of_a_history_with_many_files() {
+        let scratch = Scratch::new("history-files");
+        let git = crate::git::Git::new()
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", scratch.path());
+        let repo = git
+            .init_bare(&scratch.path().join("r.git"), ObjectFormat::Sha1)
+            .unwrap();
+        let who = Signature {
+            name: "Test".to_string(),
+            email: "test@example.invalid".to_string(),
+            time: 1_800_000_000,
+            offset_minutes: 0,
+        };
+        let library = |parent: Option<&Oid>, ink: &str| -> Oid {
+            let mut writer = repo
+                .commit_writer(&crate::progress::NoProgress, None)
+                .unwrap();
+            let page = writer
+                .write_blob("page", ink.len() as u64, &mut ink.as_bytes())
+                .unwrap();
+            let json = writer.write_blob("json", 2, &mut &b"{}"[..]).unwrap();
+            (0..2000u32).for_each(|n| {
+                let d = doc(n);
+                [("metadata", &json), ("content", &json)]
+                    .into_iter()
+                    .for_each(|(name, blob)| {
+                        writer
+                            .add_existing(format!("docs/{d}/{name}"), FileMode::Regular, blob)
+                            .unwrap();
+                    });
+                (0..100).for_each(|p| {
+                    writer
+                        .add_existing(format!("docs/{d}/pages/p{p}.rm"), FileMode::Regular, &page)
+                        .unwrap();
+                });
+            });
+            writer
+                .commit(&CommitMeta {
+                    parents: parent.into_iter().cloned().collect(),
+                    author: who.clone(),
+                    committer: who.clone(),
+                    message: "library\n".to_string(),
+                })
+                .unwrap()
+        };
+        let first = library(None, "ink 1");
+        let tip = library(Some(&first), "ink 2");
+        let store = Store::new(repo).unwrap();
+        let before = peak_rss_kib(true);
+        let started = std::time::Instant::now();
+        let index = store.history(&tip).unwrap();
+        let took = started.elapsed();
+        let grew = peak_rss_kib(false)
+            .zip(before)
+            .map(|(after, before)| after.saturating_sub(before));
+        eprintln!(
+            "index of 2 commits x 204,000 files: {took:.2?}, peak RSS +{} KiB",
+            grew.map_or("?".to_string(), |kib| kib.to_string())
+        );
+        assert_eq!(index.versions(&doc(7)).len(), 2);
+    }
+
+    #[test]
+    fn bounded_caches_drop_the_old_generation_and_keep_what_is_used() {
+        let mut cache = Bounded::new(4);
+        (1..=2).for_each(|n| cache.insert(oid(n), n, 1));
+        // The young generation is full: 3 starts a new one.
+        cache.insert(oid(3), 3, 1);
+        assert_eq!(cache.get(&oid(1)), Some(1));
+        cache.insert(oid(4), 4, 1);
+        assert!(cache.len() <= 4);
+        // 1 was used, so it survived the drop; 2 was not and is gone.
+        assert_eq!(cache.get(&oid(2)), None);
+        assert_eq!(cache.get(&oid(1)), Some(1));
+        // An entry heavier than the capacity is still cached alone.
+        cache.insert(oid(9), 9, 100);
+        assert_eq!(cache.get(&oid(9)), Some(9));
     }
 }
