@@ -607,9 +607,6 @@ impl Repo {
         }
     }
 
-    /// Point local ref `name` (a full `refs/...` name) at `new`; with
-    /// `old`, only if the ref currently has that value (atomic
-    /// compare-and-swap).
     /// Pack every object reachable from the repository's refs into one
     /// pack, objects borrowed from its alternates included (`repack -a
     /// -d`, without `-l`): afterwards it no longer needs them.
@@ -627,6 +624,16 @@ impl Repo {
         run("update-ref", &mut cmd).map(drop)
     }
 
+    /// Whether the repository has any ref at all.
+    pub fn has_refs(&self) -> Result<bool> {
+        let mut cmd = self.command("for-each-ref");
+        cmd.args(["--count=1", "--format=%(refname)"]);
+        Ok(!run("for-each-ref", &mut cmd)?.is_empty())
+    }
+
+    /// Point local ref `name` (a full `refs/...` name) at `new`; with
+    /// `old`, only if the ref currently has that value (atomic
+    /// compare-and-swap).
     pub fn update_ref(&self, name: &str, new: &Oid, old: Option<&Expected>) -> Result<()> {
         validate_ref_name(name)?;
         let mut cmd = self.command("update-ref");

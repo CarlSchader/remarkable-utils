@@ -184,6 +184,16 @@ pub enum CycleError {
     #[error("origin kept moving: the push was rejected {0} times; try again")]
     PushRetriesExhausted(usize),
 
+    /// The local cache of this repository has another object format than
+    /// origin advertises: another repository answers at that URL (or a
+    /// converted one). The cache, which may hold the last copy of a
+    /// replaced origin's history, is kept.
+    #[error(
+        "origin {url} serves another object format than the local cache {cache}: a different (or converted) repository answers there; the cache is kept, move it away if that origin is intended",
+        cache = .cache.display()
+    )]
+    CacheFormatMismatch { cache: PathBuf, url: String },
+
     /// Another run on this computer holds the local cache.
     #[error("the local cache is in use by another rmu hub run on this computer ({0})")]
     CacheBusy(PathBuf),
