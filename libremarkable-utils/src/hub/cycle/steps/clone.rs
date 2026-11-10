@@ -3,15 +3,15 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+use super::Prepared;
 use super::{read_manifest, saved_then_pre_read};
 use crate::error::Result;
 use crate::git::Oid;
 use crate::hub::cycle::message;
+use crate::hub::cycle::origin::OriginCtx;
 use crate::hub::cycle::snapshot::{self, ReadMode, Snapshot, TabletRead};
 use crate::hub::cycle::store::{self, Store};
-use crate::hub::cycle::{
-    CycleError, Hub, OriginCtx, Prepared, SyncReport, Warning, check_url, default_name,
-};
+use crate::hub::cycle::{CycleError, Hub, SyncReport, Warning, check_url, default_name};
 use crate::hub::device::{DeviceInfo, Tablet};
 use crate::hub::merge::{self, BlobSource};
 use crate::hub::model::{
@@ -81,6 +81,8 @@ impl Hub<'_> {
     /// a journal for the same repository is pending (`sync` reconciles
     /// it). `origin` is used as given: [`super::HubOptions::origin`] does
     /// not apply.
+    ///
+    /// [`super::HubOptions::origin`]: crate::hub::cycle::HubOptions::origin
     pub fn clone_tablet(
         &self,
         tablet: &dyn Tablet,

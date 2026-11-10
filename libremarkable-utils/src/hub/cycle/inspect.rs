@@ -9,13 +9,15 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 
+use super::merge_run::names_of;
 use super::message;
+use super::origin::{OriginCtx, virtual_base};
 use super::plan::{self, Change, JsonBlobs, Planned};
 use super::snapshot::{self, ReadMode, TabletRead};
 use super::store::{self, Store};
 use super::{
-    CycleError, DocChange, DryRunReport, Hub, OpenConflict, OriginCtx, StatusReport, commit_tree,
-    names_of, quarantine_report, read_summary, tablet_versions, virtual_base,
+    CycleError, DocChange, DryRunReport, Hub, OpenConflict, StatusReport, commit_tree,
+    quarantine_report, read_summary, tablet_versions,
 };
 use crate::error::Result;
 use crate::git::Oid;

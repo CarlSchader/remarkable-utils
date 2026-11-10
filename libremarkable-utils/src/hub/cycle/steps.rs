@@ -10,19 +10,46 @@ mod reconcile;
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use super::origin::{OriginCtx, virtual_base};
 use super::plan;
+use super::session::Session;
 use super::snapshot::{self, Known, ReadMode, TabletRead};
 use super::store::{self, Store};
 use super::{
-    BackupReport, CycleError, Hub, OriginCtx, Prepared, Session, SyncReport, quarantine_report,
-    read_summary, rmu_signature, unix_now, virtual_base,
+    BackupReport, CycleError, Hub, MainUpdate, Reconciled, SyncReport, TakeOver, quarantine_report,
+    read_summary, rmu_signature, unix_now,
 };
 use crate::error::Result;
-use crate::git::{CommitMeta, Repo};
-use crate::hub::device::{LockState, Tablet};
-use crate::hub::model::{ManifestEntry, MirrorRules, XochitlPath};
+use crate::git::{CommitMeta, CommitWriter, Oid, Repo};
+use crate::hub::device::{DeviceInfo, LockState, Tablet};
+use crate::hub::merge::MergeOutcome;
+use crate::hub::model::{DocId, ManifestEntry, MirrorRules, RepoTree, TabletState, XochitlPath};
 
 pub(super) use self::push::device_ref;
+
+/// What steps 1–6 produced.
+struct Prepared<'p> {
+    origin: OriginCtx,
+    state: TabletState,
+    read: TabletRead,
+    /// Holds every blob the reads streamed; it becomes the snapshot.
+    writer: Option<CommitWriter<'p>>,
+    /// Device time of the step-6 start (racy-entry reference).
+    started_at: i64,
+    info: DeviceInfo,
+    took_over: Option<TakeOver>,
+    reconciled: Option<Reconciled>,
+}
+
+/// What steps 8–11 decided.
+struct Pushed {
+    update: MainUpdate,
+    base: Oid,
+    merged: RepoTree,
+    outcome: MergeOutcome,
+    attempts: usize,
+    names: BTreeMap<DocId, String>,
+}
 
 /// The manifest after a run that wrote nothing.
 fn read_manifest(read: &TabletRead, started_at: i64) -> BTreeMap<XochitlPath, ManifestEntry> {
