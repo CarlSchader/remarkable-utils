@@ -452,15 +452,19 @@ impl Repo {
         run("fetch", &mut cmd).map(drop)
     }
 
-    /// [`Repo::fetch`] of the tips only (`--depth=1`), without history:
-    /// enough to read a file of a branch's newest commit.
-    pub fn fetch_tips(&self, url: &str, refspecs: &[&str]) -> Result<()> {
-        let mut cmd = self.command("fetch");
-        cmd.args(["--quiet", "--no-tags", "--no-prune", "--depth=1"])
-            .arg("--end-of-options")
-            .arg(url)
-            .args(refspecs);
-        run("fetch", &mut cmd).map(drop)
+    /// Remove the `.keep` files `git fast-import` leaves on the packs its
+    /// checkpoints wrote when it is killed (their content is exactly
+    /// `fast-import`): git never repacks or prunes a kept pack. Call only
+    /// while no fast-import runs on this repository. Returns how many.
+    pub fn remove_fast_import_keeps(&self) -> Result<usize> {
+        let removed = keep_files(&self.git_dir.join("objects").join("pack"))
+            .into_iter()
+            .filter(|keep| {
+                fs::read(keep).is_ok_and(|content| content.trim_ascii() == b"fast-import")
+            })
+            .map(|keep| fs::remove_file(keep).map_err(Error::from))
+            .collect::<Result<Vec<()>>>()?;
+        Ok(removed.len())
     }
 
     /// Push commit `src` to the full remote ref `dst`.

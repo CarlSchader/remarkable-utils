@@ -1313,24 +1313,17 @@ fn first_parent_changes_of_a_merged_history() {
     ));
 }
 
-#[cfg(unix)]
 #[test]
-fn fetching_tips_brings_no_history() {
+fn only_fast_imports_own_keep_files_are_removed() {
     let sandbox = Sandbox::new();
-    let origin = sandbox.init("origin.git");
-    let url = origin.git_dir().to_str().unwrap();
-    let c1 = commit_files(&origin, &[], &[("f", b"1")], "c1\n");
-    let c2 = commit_files(&origin, &[&c1], &[("f", b"2")], "c2\n");
-    origin.update_ref(MAIN, &c2, None).unwrap();
-    let probe = sandbox.init("probe.git");
-    probe
-        .fetch_tips(url, &["+refs/heads/main:refs/remotes/origin/main"])
-        .unwrap();
-    assert_eq!(
-        probe.rev_parse("refs/remotes/origin/main").unwrap(),
-        Some(c2.clone())
-    );
-    assert!(probe.object_sizes([&c1]).unwrap().is_empty());
+    let cache = sandbox.init("cache.git");
+    let pack_dir = cache.git_dir().join("objects").join("pack");
+    std::fs::create_dir_all(&pack_dir).unwrap();
+    std::fs::write(pack_dir.join("pack-a.keep"), b"fast-import\n").unwrap();
+    std::fs::write(pack_dir.join("pack-b.keep"), b"kept by hand\n").unwrap();
+    assert_eq!(cache.remove_fast_import_keeps().unwrap(), 1);
+    assert!(!pack_dir.join("pack-a.keep").exists());
+    assert!(pack_dir.join("pack-b.keep").exists());
 }
 
 #[cfg(unix)]

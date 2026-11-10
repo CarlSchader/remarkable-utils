@@ -3477,3 +3477,109 @@ fn a_pending_page_the_user_inked_is_never_kept_over_the_merge() {
         world.converge();
     });
 }
+
+// ---- transfer ----------------------------------------------------------------------------
+
+/// A clone (or reattach) of tablet `i` from its computer, counting the
+/// pack bytes it fetches (`GIT_TRACE_PACKFILE`).
+fn fetched_by_clone(world: &World, i: usize, reattach: bool) -> u64 {
+    static PROGRESS: libremarkable_utils::progress::NoProgress =
+        libremarkable_utils::progress::NoProgress;
+    let trace = world.root.join(format!("packs-{i}-{reattach}"));
+    let hub = libremarkable_utils::hub::cycle::Hub::new(
+        world.git.clone().env("GIT_TRACE_PACKFILE", &trace),
+        world.device(i).cache.clone(),
+        libremarkable_utils::hub::device::LockRequest::for_this_process("test-host"),
+        &PROGRESS,
+    )
+    .with_options(world.options.clone());
+    let name =
+        (!reattach).then(|| libremarkable_utils::hub::model::DeviceName::new("Tablet B").unwrap());
+    hub.clone_tablet(world.tablet(i), &world.origin, name, reattach)
+        .unwrap();
+    std::fs::metadata(&trace).map_or(0, |meta| meta.len())
+}
+
+/// The library crosses the network once: a first clone on a computer with
+/// no cache fetches it once (not into a probe and then again into the
+/// cache), and a reattach to an up-to-date cache fetches next to nothing.
+#[test]
+fn a_clone_fetches_the_library_once() {
+    let world = World::new(2);
+    let paper = world.create(0, Kind::Pdf, "Paper", "");
+    // An incompressible payload, so pack bytes show what moved.
+    let payload: Vec<u8> = std::iter::successors(Some(0x2545_f491_4f6c_dd1du64), |x| {
+        let x = x ^ (x << 13);
+        let x = x ^ (x >> 7);
+        Some(x ^ (x << 17))
+    })
+    .take(256 * 1024)
+    .flat_map(u64::to_le_bytes)
+    .collect();
+    world
+        .device(0)
+        .tablet
+        .write_file(&format!("{paper}.pdf"), &payload)
+        .unwrap();
+    world.clone_tablet(0).unwrap();
+    let size = payload.len() as u64;
+    let first = fetched_by_clone(&world, 1, false);
+    eprintln!("first clone, no cache: {first} pack bytes fetched for a {size}-byte library");
+    assert!(
+        first >= size && first < size + size / 2,
+        "{first} for {size}"
+    );
+    std::fs::remove_dir_all(world.device(1).tablet.state_dir()).unwrap();
+    let again = fetched_by_clone(&world, 1, true);
+    eprintln!("reattach, cache up to date: {again} pack bytes fetched");
+    assert!(again < size / 10, "{again} for {size}");
+    world.converge();
+}
+
+/// Another repository now answers at the URL a cache was recorded for: a
+/// reattach does not take that cache (whose repo id no longer matches),
+/// leaves it as it was, and attaches to the new repository.
+#[test]
+fn a_clone_from_a_replaced_origin_ignores_the_old_cache() {
+    let (world, _, _) = two_notebooks();
+    let old_id = world.device(1).state().unwrap().repo_id;
+    let old_cache = world.device(1).cache.join(format!("{old_id}.git"));
+    let git_dir = format!("--git-dir={}", old_cache.display());
+    let old_main = world::git_cli(
+        &world.root,
+        &[&git_dir, "rev-parse", "refs/remotes/origin/main"],
+    );
+    let other = World::new(1);
+    other.create(0, Kind::Notebook { pages: 1 }, "Elsewhere", "");
+    other.clone_tablet(0).unwrap();
+    std::fs::remove_dir_all(&world.origin).unwrap();
+    world::copy_dir(Path::new(&other.origin), Path::new(&world.origin));
+    std::fs::remove_dir_all(world.device(1).tablet.state_dir()).unwrap();
+    let report = world.reattach(1).unwrap();
+    let new_id = world.device(1).state().unwrap().repo_id;
+    assert_eq!(
+        new_id,
+        other.device(0).state().unwrap().repo_id,
+        "{report:?}"
+    );
+    assert_eq!(
+        world::git_cli(
+            &world.root,
+            &[&git_dir, "rev-parse", "refs/remotes/origin/main"]
+        ),
+        old_main
+    );
+}
+
+/// A `.keep` a killed `fast-import` left in the cache is removed the next
+/// time the cache is opened (git never repacks a kept pack).
+#[test]
+fn a_killed_fast_imports_keep_files_are_removed_on_open() {
+    let (world, _, _) = two_notebooks();
+    let id = world.device(0).state().unwrap().repo_id;
+    let pack_dir = world.device(0).cache.join(format!("{id}.git/objects/pack"));
+    std::fs::create_dir_all(&pack_dir).unwrap();
+    std::fs::write(pack_dir.join("pack-killed.keep"), b"fast-import\n").unwrap();
+    world.sync(0).unwrap();
+    assert!(!pack_dir.join("pack-killed.keep").exists());
+}

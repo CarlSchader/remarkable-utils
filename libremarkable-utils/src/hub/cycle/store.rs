@@ -4,7 +4,9 @@
 //! `$XDG_CACHE_HOME/rmu/hub/<repo-id>.git` with origin's object format,
 //! guarded by an `flock` on `<repo-id>.lock` next to it, so two runs on
 //! one computer never write it at once. It is disposable: a missing or
-//! mismatched one is re-created and fetched again.
+//! mismatched one is re-created and fetched again. It records the origin
+//! URL it was last opened with (`rmu-origin` inside it), so a `clone` from
+//! that URL fetches into it instead of transferring the library again.
 //!
 //! [`Store`] reads it through one `cat-file --batch` process: commits,
 //! trees (raw tree objects), document versions, blobs; its caches are
@@ -160,6 +162,17 @@ fn open_or_create(git: &Git, path: &Path, format: ObjectFormat) -> Result<Repo> 
     git.init_bare(path, format)
 }
 
+/// The file inside a cache recording the origin URL it was last opened
+/// with.
+const ORIGIN_FILE: &str = "rmu-origin";
+
+/// Under the cache's lock, before any writer exists: record `url`, and
+/// remove the `.keep` files a killed `fast-import` left (best effort).
+fn opened(repo: &Repo, url: &str) {
+    let _ = fs::write(repo.git_dir().join(ORIGIN_FILE), url);
+    let _ = repo.remove_fast_import_keeps();
+}
+
 /// Open (or create) the cache of `repo_id` under `root`, matching the
 /// object format origin advertises (`url`), and take its lock. Returns
 /// the advertisement too, for the first [`fetch`] to reuse.
@@ -177,6 +190,7 @@ pub(super) fn open_cache(
         Some(format) if format != repo.object_format()? => open_or_create(git, &path, format)?,
         _ => repo,
     };
+    opened(&repo, url);
     Ok((Cache { repo, _lock: lock }, refs))
 }
 
@@ -208,14 +222,19 @@ fn sweep_incoming(root: &Path) -> Result<()> {
         })
 }
 
-/// For a first contact (`clone`), when the repo id is not known yet:
-/// fetch only the tip of origin's `main` into a temporary repository and
-/// read its repo id there, then open (or create) that cache, take its
-/// lock and fetch `main` into it: incremental when the cache exists, so
-/// a reattach does not transfer the whole history again.
+/// For a first contact (`clone`), when the repo id is not known yet. A
+/// cache this computer keeps for `url` (its recorded origin) is fetched
+/// into, if `main` there still has that cache's repo id. Otherwise
+/// origin's `main` goes into a temporary repository, whose repo id names
+/// the cache: the temporary one becomes it, or (a cache with that id
+/// exists, recorded for another URL) it is fetched from locally. Either
+/// way the library crosses the network once.
 pub(super) fn bootstrap_cache(git: &Git, root: &Path, url: &str) -> Result<(Cache, Oid)> {
     fs::create_dir_all(root)?;
     sweep_incoming(root)?;
+    if let Some(found) = known_cache(git, root, url)? {
+        return Ok(found);
+    }
     let token = uuid::Uuid::new_v4().simple().to_string();
     let temp = root.join(format!("incoming-{token}.git"));
     let temp_lock = root.join(format!("incoming-{token}.lock"));
@@ -239,17 +258,31 @@ pub(super) fn bootstrap_cache(git: &Git, root: &Path, url: &str) -> Result<(Cach
                 git.init_bare(&temp, format)?
             }
         };
-        probe.fetch_tips(url, &[&format!("+{MAIN}:{LOCAL_MAIN}")])?;
-        let tip = probe.rev_parse(LOCAL_MAIN)?.ok_or_else(not_initialised)?;
-        let config = Store::new(probe.clone())?.repo_config(&tip)?;
+        probe.fetch(url, &[&format!("+{MAIN}:{LOCAL_MAIN}")], false)?;
+        let main = probe.rev_parse(LOCAL_MAIN)?.ok_or_else(not_initialised)?;
+        let config = Store::new(probe.clone())?.repo_config(&main)?;
         let lock = take_lock(&lock_path(root, &config.repo_id))?;
-        let repo = open_or_create(git, &root.join(format!("{}.git", config.repo_id)), format)?;
-        repo.fetch(url, &[&format!("+{MAIN}:{LOCAL_MAIN}")], false)?;
-        let main = repo.rev_parse(LOCAL_MAIN)?.ok_or_else(not_initialised)?;
-        // Origin replaced between the two fetches: this is not that cache.
-        if Store::new(repo.clone())?.repo_config(&main)?.repo_id != config.repo_id {
-            return Err(CycleError::RepoConfigChanged.into());
-        }
+        let path = root.join(format!("{}.git", config.repo_id));
+        let repo = match git.open(&path) {
+            Ok(repo) if repo.object_format()? == format => {
+                repo.fetch(
+                    temp.to_str().ok_or_else(|| {
+                        Error::InvalidGitInput("cache path is not UTF-8".to_string())
+                    })?,
+                    &[&format!("+{LOCAL_MAIN}:{LOCAL_MAIN}")],
+                    false,
+                )?;
+                repo
+            }
+            _ => {
+                if path.exists() {
+                    fs::remove_dir_all(&path)?;
+                }
+                fs::rename(&temp, &path)?;
+                git.open(&path)?
+            }
+        };
+        opened(&repo, url);
         Ok((Cache { repo, _lock: lock }, main))
     })();
     if temp.exists() {
@@ -258,6 +291,56 @@ pub(super) fn bootstrap_cache(git: &Git, root: &Path, url: &str) -> Result<(Cach
     drop(held);
     let _ = fs::remove_file(&temp_lock);
     result
+}
+
+/// The repo ids of the caches under `root` recorded for `url`.
+fn caches_for(root: &Path, url: &str) -> Vec<RepoId> {
+    fs::read_dir(root)
+        .map(|entries| {
+            entries
+                .filter_map(|entry| entry.ok())
+                .filter_map(|entry| {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    let id = RepoId::new(name.strip_suffix(".git")?).ok()?;
+                    let recorded = fs::read_to_string(entry.path().join(ORIGIN_FILE)).ok()?;
+                    (recorded == url).then_some(id)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A cache recorded for `url`, locked and fetched up to date, whose
+/// fetched `main` has its repo id. One whose origin now holds another
+/// repository is left as it was.
+fn known_cache(git: &Git, root: &Path, url: &str) -> Result<Option<(Cache, Oid)>> {
+    caches_for(root, url)
+        .into_iter()
+        .map(|repo_id| -> Result<Option<(Cache, Oid)>> {
+            let (cache, refs) = open_cache(git, root, &repo_id, url)?;
+            if !refs.iter().any(|reference| reference.name == MAIN) {
+                return Err(CycleError::NotInitialised {
+                    url: url.to_string(),
+                }
+                .into());
+            }
+            let previous = cache.repo.rev_parse(LOCAL_MAIN)?;
+            let main = fetch(&cache.repo, url, None, Some(refs))?
+                .main
+                .ok_or_else(|| CycleError::NotInitialised {
+                    url: url.to_string(),
+                })?;
+            let config = Store::new(cache.repo.clone())?.repo_config(&main);
+            if config.is_ok_and(|config| config.repo_id == repo_id) {
+                return Ok(Some((cache, main)));
+            }
+            if let Some(previous) = previous {
+                cache.repo.update_ref(LOCAL_MAIN, &previous, None)?;
+            }
+            Ok(None)
+        })
+        .find_map(Result::transpose)
+        .transpose()
 }
 
 /// `ls-remote` origin (unless `advertised` is the advertisement just
