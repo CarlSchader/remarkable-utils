@@ -793,6 +793,29 @@ mod tests {
                 };
                 check(RUN, 0);
                 check(OTHER_RUN, EXIT_LOCK_LOST);
+                // Whole lines only: a record whose run or boot id merely
+                // contains ours is not ours.
+                let owner = paths.lock_owner();
+                let record = fs::read_to_string(&owner).unwrap();
+                let edited = |from: &str, to: &str| {
+                    assert!(record.contains(from), "{from:?} not in {record:?}");
+                    fs::write(&owner, record.replace(from, to)).unwrap();
+                };
+                edited(&format!("run={RUN}\n"), &format!("run={RUN}x\n"));
+                check(RUN, EXIT_LOCK_LOST);
+                let boot = fs::read_to_string(&paths.boot_id).unwrap();
+                let boot = boot.trim();
+                edited(&format!("boot_id={boot}\n"), &format!("boot_id={boot}x\n"));
+                check(RUN, EXIT_REBOOTED);
+                fs::write(&owner, &record).unwrap();
+                check(RUN, 0);
+                // An unreadable boot id stops the guard (rather than reading
+                // as an empty one).
+                let boot_file = fs::read(&paths.boot_id).unwrap();
+                fs::remove_file(&paths.boot_id).unwrap();
+                check(RUN, 1);
+                fs::write(&paths.boot_id, boot_file).unwrap();
+                check(RUN, 0);
                 // The watchdog marker comes before ownership...
                 fs::write(paths.watchdog_marker(), b"").unwrap();
                 check(RUN, EXIT_WATCHDOG_FIRED);
@@ -899,6 +922,57 @@ mod tests {
                 assert!(harness.systemctl_log().ends_with(
                     "stop xochitl.service\nreset-failed xochitl.service\nstart xochitl.service\n"
                 ));
+            });
+        }
+
+        #[test]
+        fn a_superseded_sleeper_never_fires_and_a_firing_one_clears_its_files() {
+            on_both(false, |harness| {
+                if !harness.has_tool("setsid") || !harness.has_tool("flock") {
+                    eprintln!("setsid or flock not available; skipping");
+                    return;
+                }
+                let t = harness.ssh_tablet();
+                let paths = t.paths().clone();
+                let lock = t.acquire_lock(&request(), false).unwrap();
+                let marker = Path::new(&paths.watchdog_marker()).to_path_buf();
+                let group = || {
+                    let record = fs::read_to_string(paths.watchdog_pid()).unwrap();
+                    record.split(' ').next().unwrap().to_string()
+                };
+                let alive = |group: &str| {
+                    std::process::Command::new("sh")
+                        .args(["-c", "kill -0 -- \"-$1\" 2>/dev/null", "sh", group])
+                        .status()
+                        .unwrap()
+                        .success()
+                };
+                let eventually = |done: &dyn Fn() -> bool| {
+                    (0..100).any(|_| {
+                        let ok = done();
+                        if !ok {
+                            std::thread::sleep(Duration::from_millis(100));
+                        }
+                        ok
+                    })
+                };
+                // A later arming's token (or `disarmed`) in the token file:
+                // the sleeper wakes and exits without firing.
+                t.arm_watchdog(&lock, Duration::from_secs(1)).unwrap();
+                let first = group();
+                fs::write(paths.watchdog_token(), "superseded\n").unwrap();
+                assert!(eventually(&|| !alive(&first)), "the sleeper is still there");
+                assert!(!marker.exists(), "a superseded sleeper fired");
+                let log = harness.systemctl_log();
+                assert!(!log.contains("start xochitl.service"), "{log}");
+                // Its own token: it removes the token and pid files, then fires.
+                t.arm_watchdog(&lock, Duration::from_secs(1)).unwrap();
+                let second = group();
+                assert!(eventually(&|| marker.exists()), "the sleeper did not fire");
+                assert!(eventually(&|| !alive(&second)));
+                assert!(harness.systemctl_log().ends_with("start xochitl.service\n"));
+                assert!(!Path::new(&paths.watchdog_token()).exists());
+                assert!(!Path::new(&paths.watchdog_pid()).exists());
             });
         }
 

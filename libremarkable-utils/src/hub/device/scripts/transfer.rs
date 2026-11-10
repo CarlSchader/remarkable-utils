@@ -762,16 +762,56 @@ mod tests {
 
     #[test]
     fn staging_checks_the_guard_without_holding_the_flock() {
-        // Run in `behaviour::staging_does_not_wait_for_the_guard_flock`.
+        // Run in `behaviour::staging_does_not_wait_for_the_guard_flock`
+        // and `behaviour::staged_files_get_fresh_mtimes`. Pinned: nothing
+        // is extracted unless the cd into the run's own directory worked.
         let staging = format!("{}/x", hostile().staging_root());
         let script = stage_command(&hostile(), RUN, &staging);
-        assert!(script.contains("rmu_guard\n"));
+        assert!(script.contains(&format!(
+            "rmu_guard\nmkdir -p -- {s} && cd {s} && tar -xf - && find . -type f -exec touch -c -- {{}} +\n",
+            s = q(&staging)
+        )));
         assert_quoted_with(&script, &hostile(), &[&staging]);
         assert_quoted(&clear_staging_script(&hostile(), RUN), &hostile());
     }
 
     #[test]
-    fn apply_script_orders_steps_and_checks_the_marker() {
+    fn every_step_renders_quoted_and_stops_the_apply_on_failure() {
+        // `-T`: a target that exists as a directory fails the move instead
+        // of receiving the file; `|| exit 1`: a failed step never goes on
+        // to report its document done.
+        let doc = DocId::new(DOC).unwrap();
+        let path = "it's $(x)/-a b";
+        let quoted = q(path);
+        [
+            (ApplyStep::Guard, "rmu_guard".to_string()),
+            (
+                ApplyStep::MakeDir(path.into()),
+                format!("mkdir -p -- {quoted} || exit 1"),
+            ),
+            (
+                ApplyStep::Move(path.into()),
+                format!("mv -fT -- \"$S\"/{quoted} {quoted} || exit 1"),
+            ),
+            (
+                ApplyStep::Remove(path.into()),
+                format!("rm -f -- {quoted} || exit 1"),
+            ),
+            (
+                ApplyStep::DeleteSet(doc.clone()),
+                format!("rm -rf -- {DOC} {DOC}.* || exit 1"),
+            ),
+            (
+                ApplyStep::Done(doc),
+                format!("printf 'rmu-done %s\\n' {DOC}"),
+            ),
+        ]
+        .into_iter()
+        .for_each(|(step, line)| assert_eq!(render_step(&step), line));
+    }
+
+    #[test]
+    fn apply_script_orders_its_phases() {
         let page = DocFile::Page(PageId::new("p1").unwrap());
         let plan = ApplyPlan {
             docs: vec![
@@ -806,15 +846,20 @@ mod tests {
         // while xochitl runs, the staging checks (with the modes), a sync;
         // afterwards a sync, the time, the stats and the completion line.
         let running = format!("exit {EXIT_XOCHITL_RUNNING}; fi\n");
+        let cd = format!("cd {} || exit 9\n", q(&paths.xochitl_dir));
         let content = format!("rmu_staged {DOC}.content 7 && chmod 755 -- ");
         let metadata = format!("rmu_staged {DOC}.metadata 12\n");
         let page = format!("rmu_staged {DOC}/p1.rm 3\n");
         let steps = format!("\nsync\n{block}sync\n");
-        let stats = format!("stat -c {} -- ", q(STAT_FORMAT));
+        let stats = format!(
+            "stat -c {} -- {DOC}.content {DOC}.metadata {DOC}/p1.rm || exit 1\n",
+            q(STAT_FORMAT)
+        );
         let order = [
             "rmu_apply() {\nrmu_lock\nrmu_guard\n",
             "if systemctl is-active --quiet xochitl.service; then",
             &running,
+            &cd,
             "staging is not on the data filesystem",
             &content,
             &metadata,
@@ -906,13 +951,18 @@ mod tests {
     /// with BusyBox.
     #[cfg(target_os = "linux")]
     mod behaviour {
+        use std::fs;
+        use std::path::Path;
         use std::time::{Duration, Instant};
 
         use super::*;
-        use crate::hub::device::Tablet;
+        use crate::error::{Error, Result};
         use crate::hub::device::harness::Harness;
         use crate::hub::device::harness::local_ssh::on_both;
+        use crate::hub::device::{ApplyReport, HeldLock, Tablet};
         use crate::hub::model::XochitlPath;
+
+        const OTHER: &str = "bbbbbbbb-0000-4000-8000-000000000002";
 
         #[test]
         fn staging_does_not_wait_for_the_guard_flock() {
@@ -920,16 +970,130 @@ mod tests {
                 let t = harness.ssh_tablet();
                 let lock = t.acquire_lock(&request(), false).unwrap();
                 let file = XochitlPath::new(format!("{DOC}.metadata")).unwrap();
-                let mut holder = harness.hold_guard_flock("sleep 3");
+                let mut holder = harness.hold_guard_flock("exec sleep 10");
                 let started = Instant::now();
-                t.stage(&lock, std::slice::from_ref(&file), &mut |_, sink| {
+                let staged = t.stage(&lock, std::slice::from_ref(&file), &mut |_, sink| {
                     sink(2, &mut &b"{}"[..])
-                })
-                .unwrap();
+                });
                 let took = started.elapsed();
+                holder.kill().unwrap();
                 holder.wait().unwrap();
-                assert!(took < Duration::from_secs(2), "{took:?}");
+                staged.unwrap();
+                assert!(took < Duration::from_secs(8), "{took:?}");
                 assert_eq!(t.staged_files().unwrap().entries.len(), 1);
+            });
+        }
+
+        #[test]
+        fn staged_files_get_fresh_mtimes() {
+            on_both(true, |harness| {
+                let t = harness.ssh_tablet();
+                let lock = t.acquire_lock(&request(), false).unwrap();
+                let files: Vec<XochitlPath> = [format!("{DOC}.metadata"), format!("{DOC}/p1.rm")]
+                    .into_iter()
+                    .map(|path| XochitlPath::new(path).unwrap())
+                    .collect();
+                t.stage(&lock, &files, &mut |_, sink| sink(2, &mut &b"{}"[..]))
+                    .unwrap();
+                // The tar headers carry whole seconds; the staged files get
+                // the device's own (nanosecond) times, kept when moved.
+                let staged = t.staged_files().unwrap().entries;
+                assert_eq!(staged.len(), 2);
+                staged
+                    .iter()
+                    .for_each(|entry| assert!(entry.stat.fine_mtime(), "{entry:?}"));
+            });
+        }
+
+        /// Stage `{}` for the `.metadata` of `docs` and stop xochitl.
+        fn staged_metadata(t: &dyn Tablet, lock: &HeldLock, docs: &[&str]) -> Vec<DocApply> {
+            let files: Vec<XochitlPath> = docs
+                .iter()
+                .map(|doc| XochitlPath::new(format!("{doc}.metadata")).unwrap())
+                .collect();
+            t.stage(lock, &files, &mut |_, sink| sink(2, &mut &b"{}"[..]))
+                .unwrap();
+            t.arm_watchdog(lock, Duration::from_secs(600)).unwrap();
+            t.stop_xochitl(lock).unwrap();
+            docs.iter()
+                .map(|doc| DocApply::Write {
+                    doc: DocId::new(*doc).unwrap(),
+                    write: vec![StagedFile::regular(DocFile::Metadata, 2)],
+                    remove: vec![],
+                })
+                .collect()
+        }
+
+        /// An apply that failed with no document reported done.
+        fn failed_with_nothing_done(result: Result<ApplyReport>) {
+            match result {
+                Ok(report) => panic!("applied: {report:?}"),
+                Err(Error::HubDevice(DeviceError::ApplyIncomplete { applied, .. })) => {
+                    assert!(applied.is_empty(), "{applied:?}")
+                }
+                Err(_) => {}
+            }
+        }
+
+        #[test]
+        fn a_failing_step_stops_the_apply() {
+            on_both(true, |harness| {
+                let t = harness.ssh_tablet();
+                let lock = t.acquire_lock(&request(), false).unwrap();
+                let docs = staged_metadata(t, &lock, &[DOC, OTHER]);
+                // The first target is a non-empty directory: `mv -T` cannot
+                // replace it, and the apply stops there.
+                harness.put(&format!("{DOC}.metadata/keep"), b"x");
+                failed_with_nothing_done(t.apply(&lock, &ApplyPlan { docs }));
+                assert_eq!(harness.get(&format!("{DOC}.metadata/keep")).unwrap(), b"x");
+                assert!(harness.data_dir().join(format!("{DOC}.metadata")).is_dir());
+                assert_eq!(harness.get(&format!("{OTHER}.metadata")), None);
+            });
+        }
+
+        #[test]
+        fn a_staged_symlink_is_never_applied() {
+            on_both(true, |harness| {
+                let t = harness.ssh_tablet();
+                let lock = t.acquire_lock(&request(), false).unwrap();
+                let docs = staged_metadata(t, &lock, &[DOC]);
+                // Replaced by a symlink to a file of the planned size.
+                let paths = t.paths();
+                let target = Path::new(&paths.state_dir).join("elsewhere");
+                fs::write(&target, b"{}").unwrap();
+                let staged = Path::new(&paths.staging_dir(&lock)).join(format!("{DOC}.metadata"));
+                fs::remove_file(&staged).unwrap();
+                std::os::unix::fs::symlink(&target, &staged).unwrap();
+                failed_with_nothing_done(t.apply(&lock, &ApplyPlan { docs }));
+                let applied = harness.data_dir().join(format!("{DOC}.metadata"));
+                assert!(fs::symlink_metadata(applied).is_err());
+            });
+        }
+
+        #[test]
+        fn a_missing_data_dir_stops_the_apply_before_any_step() {
+            on_both(true, |harness| {
+                let t = harness.ssh_tablet();
+                let lock = t.acquire_lock(&request(), false).unwrap();
+                t.arm_watchdog(&lock, Duration::from_secs(600)).unwrap();
+                t.stop_xochitl(&lock).unwrap();
+                fs::remove_dir_all(harness.data_dir()).unwrap();
+                // A deletion that ran anywhere but the data dir would
+                // report its document done.
+                let plan = ApplyPlan {
+                    docs: vec![DocApply::Delete {
+                        doc: DocId::new(DOC).unwrap(),
+                    }],
+                };
+                let result = t.apply(&lock, &plan);
+                assert!(
+                    matches!(
+                        &result,
+                        Err(Error::HubDevice(DeviceError::ApplyIncomplete { applied, reason }))
+                            if applied.is_empty() && reason.starts_with("exit Some(9)")
+                    ),
+                    "{result:?}"
+                );
             });
         }
 
