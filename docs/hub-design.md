@@ -1801,7 +1801,11 @@ those need a second tablet (phase 2).
    `.pagedata` in three round trips, `.metadata` first. The sleep above
    cut it after the first: a folder xochitl would show, without
    `.content`. Write all three in one guarded script, `.metadata`
-   last, as apply orders its moves.
+   last, as apply orders its moves. Fixed: every new item (folders,
+   uploads' registration, bundle restores) is staged in a private
+   `.rmu-create-*` directory and renamed into place with `.metadata`
+   last, in one guarded round trip; a restore's tar is length-checked
+   before it is unpacked.
 3. **Wrong firmware version in `Rmu-Firmware` and `rmu status`.**
    firmware 3.28 has no `/usr/share/remarkable/update.conf`, so
    `status::parse_status` falls back to `/etc/os-release` `VERSION_ID`,
