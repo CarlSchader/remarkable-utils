@@ -1312,9 +1312,22 @@ impl<'a> Hub<'a> {
                 let _ = std::fs::remove_dir_all(&cache_path);
                 let _ = std::fs::remove_file(&lock_path);
                 if created {
-                    let _ = std::fs::remove_dir_all(local);
+                    remove_if_uninitialised(&self.git, local);
                 }
             })
+    }
+}
+
+/// Remove the repository `init` created at `path` after it failed, unless
+/// it has a `main` by now: a concurrent `init` of the same new path won
+/// the race, and that repository is its.
+fn remove_if_uninitialised(git: &Git, path: &Path) {
+    let initialised = git
+        .open(path)
+        .and_then(|repo| repo.rev_parse(store::MAIN))
+        .is_ok_and(|main| main.is_some());
+    if !initialised {
+        let _ = std::fs::remove_dir_all(path);
     }
 }
 
@@ -1329,6 +1342,46 @@ mod tests {
         assert_eq!(civil_date(1_794_182_400), "2026-11-09");
         assert_eq!(civil_date(1_794_268_799), "2026-11-09");
         assert_eq!(civil_date(-86_400), "1969-12-31");
+    }
+
+    #[test]
+    fn a_failed_init_removes_only_an_uninitialised_repository() {
+        let scratch = test_support::Scratch::new("init-cleanup");
+        let git = Git::new()
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", scratch.path());
+        let (won, empty) = (
+            scratch.path().join("won.git"),
+            scratch.path().join("empty.git"),
+        );
+        let repo = git.init_bare(&won, crate::git::ObjectFormat::Sha1).unwrap();
+        let mut writer = repo
+            .commit_writer(&crate::progress::NoProgress, None)
+            .unwrap();
+        writer
+            .add_bytes(
+                crate::hub::model::REPO_CONFIG_PATH,
+                FileMode::Regular,
+                b"{}",
+            )
+            .unwrap();
+        let signature = rmu_signature(0);
+        let commit = writer
+            .commit(&CommitMeta {
+                parents: Vec::new(),
+                author: signature.clone(),
+                committer: signature,
+                message: "init\n".to_string(),
+            })
+            .unwrap();
+        repo.update_ref(store::MAIN, &commit, None).unwrap();
+        git.init_bare(&empty, crate::git::ObjectFormat::Sha1)
+            .unwrap();
+        remove_if_uninitialised(&git, &won);
+        remove_if_uninitialised(&git, &empty);
+        assert!(won.exists(), "another init's repository was removed");
+        assert!(!empty.exists());
     }
 
     #[test]

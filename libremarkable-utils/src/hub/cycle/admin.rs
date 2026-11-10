@@ -75,7 +75,7 @@ impl Hub<'_> {
     /// lock. Documents are untouched; the staging directories go too. A
     /// pending journal is discarded with the state (a warning: a
     /// document an interrupted apply stopped inside stays as it is). With
-    /// `prune_ref`, the tablet's device ref is first deleted from origin
+    /// `prune_ref`, the tablet's device ref is then deleted from origin
     /// (the URL as for a sync), leased on the value just advertised; a
     /// failure there is a warning, and the ref can be deleted by hand.
     pub fn detach(&self, tablet: &dyn Tablet, prune_ref: bool) -> Result<DetachReport> {
@@ -85,6 +85,19 @@ impl Hub<'_> {
             s.arm()?;
             let state = s.tablet.read_state()?.ok_or(CycleError::NotAttached)?;
             let mut warnings = Vec::new();
+            if state.journal.is_some() {
+                warnings.push(Warning::JournalDiscarded);
+            }
+            if let Err(error) = s.tablet.clear_staging(s.lock()) {
+                warnings.push(Warning::StagingNotCleared {
+                    error: error.to_string(),
+                });
+            }
+            // The state first: a crash before the prune leaves a device
+            // ref nothing points at (prunable by hand), never a state
+            // whose device ref is gone (the next sync would stop on it).
+            self.progress.step("Forgetting the hub state");
+            s.tablet.remove_state(s.lock())?;
             let pruned = if prune_ref {
                 self.progress.step("Deleting the device ref from origin");
                 match self.prune_device_ref(&state) {
@@ -99,16 +112,6 @@ impl Hub<'_> {
             } else {
                 None
             };
-            if state.journal.is_some() {
-                warnings.push(Warning::JournalDiscarded);
-            }
-            if let Err(error) = s.tablet.clear_staging(s.lock()) {
-                warnings.push(Warning::StagingNotCleared {
-                    error: error.to_string(),
-                });
-            }
-            self.progress.step("Forgetting the hub state");
-            s.tablet.remove_state(s.lock())?;
             let report = DetachReport {
                 repo_id: state.repo_id,
                 device_id: state.device_id,
