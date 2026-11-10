@@ -268,7 +268,9 @@ its stored URL (see "History, restore and add").
                 with carry-forward
  6. start       reset-failed + start xochitl (UI back; network work
                 happens with it up, the watchdog re-armed before each
-                long step)
+                long step) — unless the sync is small: then xochitl
+                stays stopped through step 16 (see "One outage for a
+                small sync")
  7. backup      commit the snapshot (parents: base, previous device ref);
                 push the device ref; record device_ref on the tablet
  8. fetch       fetch origin main; check identity and ancestry
@@ -279,7 +281,8 @@ its stored URL (see "History, restore and add").
                 N times; nothing when the tablet already matches origin
                 or has no changes of its own
 12. stage       upload new and changed files into the staging directory
-13. stop        arm the watchdog; systemctl stop xochitl
+13. stop        arm the watchdog; systemctl stop xochitl (already
+                stopped in a small sync: re-arm only)
 14. apply       re-read changed metadata; verify; tree checks against the
                 live tablet; move staged files into place; device sync
 15. record      update base, overrides, manifest; clear the journal
@@ -289,7 +292,8 @@ its stored URL (see "History, restore and add").
 ```
 
 The UI is down only for reconcile + snapshot (4–5) and apply (14), not
-for network transfers. If the tablet is edited between 6 and 13, step
+for network transfers, except in a small sync, which keeps it down from
+3 to 16 for one outage. If the tablet is edited between 6 and 13, step
 14 notices: those documents are not overwritten, keep their snapshot
 version as a base override, and are picked up by the next sync.
 
@@ -411,8 +415,42 @@ while implementing it, beyond the steps above:
   than a whole first-clone upload (which would otherwise fire it on
   every attempt). Pushes and fetches are incremental, so one that
   outlasts the timeout is not repeated by the next run. Starts per
-  cycle: two (one when nothing is applied), plus one if the watchdog
-  fires, each after `reset-failed`.
+  cycle: two (one when nothing is applied, or for a small sync), plus
+  one if the watchdog fires, each after `reset-failed`.
+- **One outage for a small sync.** On the Paper Pro xochitl needs about
+  2.3 s after systemd reports it started, and on a sync that applies,
+  step 13 used to stop it 1.4–2 s after step 6 started it: one outage of
+  6–7 s, plus a start spent against the 4-in-600 s start limit. So when
+  a sync looks small, step 6 keeps xochitl stopped instead, and step 16
+  is its only start (`HubOptions::single_stop`, `SingleStop`):
+  - *Eligible* when, estimated after the read and before the merge
+    (`plan::network_estimate`, pure): origin changed documents since
+    their base that the tablet does not hold as origin does (at least
+    one: with nothing to apply, the push goes better with the UI up),
+    at most 32 of them, and at most 1 MiB to send in all: origin's blobs
+    the tablet lacks, the tablet's own new blobs (the device-ref push),
+    and the whole tablet version of documents both sides changed (a
+    conflict copy). About a second at the 1 MB/s measured over Wi-Fi and
+    a VPN. Origin unchanged since every base skips the estimate.
+  - *Checked again* against the actual plan before staging (same
+    limits); nothing to apply, or more, starts xochitl there and the run
+    goes on as the two-window cycle.
+  - *Bounded*: from the stop, a 10 s budget is checked after the
+    device-ref push, before each further push attempt, after the push
+    and before and after staging; once spent, xochitl is started and
+    the run goes on with two windows. While xochitl stays stopped, the
+    watchdog is armed (and re-armed before each long step) for 60 s, not
+    the run's timeout: a step that hangs between two checks brings the
+    UI back after that long, and, the watchdog having fired, the run
+    ends as after a crash (the journal covers it).
+  - *Unchanged*: the device-ref backup is pushed before any write, the
+    journal precedes the push, and step 14 still re-reads, verifies and
+    runs the live tree checks before the apply. The racy-entry reference
+    of the read is the first start after it: the apply's device time
+    when xochitl stays stopped to the end (step 16 starts it later), and
+    the step-14 re-read counts no coarse mtime as racy when nothing has
+    started xochitl since the read. `clone` and `backup` keep the
+    two-window cycle.
 - **A tablet that stops answering** (asleep, off the network) is
   `Error::Unreachable`: ssh gets a connect timeout and a keepalive (see
   `ssh.rs`), and every further try would wait for another timeout, so
@@ -1900,7 +1938,9 @@ To be handled in the implementation PRs named:
   the second start only adds start-limit budget and seconds of
   outage. When the staged upload is small (a size threshold), the cycle
   could keep xochitl stopped from step 3 through step 16 under the
-  armed watchdog, with one start instead of two.
+  armed watchdog, with one start instead of two. Done: "One outage for
+  a small sync"; the thresholds are a first guess from one tablet's
+  measurements, to revisit with more devices and links.
 - The four bugs listed under "Device validation results".
 
 ## Implementation plan

@@ -194,7 +194,9 @@ Things to know:
   the cloud. Unpair it first.
 - **The UI goes down briefly**, twice per sync: while the tablet is read
   and while changes are applied, each usually seconds; transfers happen
-  with the UI up. A watchdog on the tablet starts the UI again if the
+  with the UI up. A small sync (little to send and to apply) keeps it
+  down once instead, through its few seconds of network work, with one
+  start of the UI instead of two. A watchdog on the tablet starts the UI again if the
   computer disappears mid-sync (`--watchdog <secs>`, default 600).
 - **Conflicts never lose ink.** When the same document changed on two
   tablets in ways that cannot be merged, the tablet that syncs second

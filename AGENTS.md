@@ -198,9 +198,13 @@ This repository is **open source** (dual-licensed MIT OR Apache-2.0):
   stream), reading the tablet into `fast-import` (`cycle/snapshot.rs`),
   the **pure** decisions (`cycle/plan.rs`: version equivalence, the
   apply plan, verification, step-14 moved paths, tree and trash checks,
-  reconciliation verdicts and finish, the manifest; new decisions go
-  there, with tests), commit trailers (`cycle/message.rs`), the steps
-  (`cycle/steps.rs`: `sync`, `backup`, steps 1–6; its submodules
+  reconciliation verdicts and finish, the manifest, the single-stop
+  network estimate; new decisions go there, with tests), commit
+  trailers (`cycle/message.rs`), the steps (`cycle/steps.rs`: `sync`,
+  `backup`, steps 1–6, and whether a small sync keeps xochitl stopped
+  through step 16, `SingleStop`, with its budget checks; every cycle
+  rule holds in both shapes, so new crash scenarios run both, as
+  `for_both_cycles` does in `tests/hub_e2e.rs`; its submodules
   `clone`, `reconcile` (step 4), `push` (7–11) and `apply` (12–16)),
   the read-only commands (`cycle/inspect.rs`, which shares the sync's
   merge setup, `Hub::run_merge` in `cycle/merge_run.rs`) and
