@@ -127,3 +127,47 @@ pub fn write_script(path: &Path, body: &str) {
         path.display()
     );
 }
+
+/// A fabricated, valid PDF of `pages` blank pages (a classic
+/// cross-reference table, no streams): what `rmu hub add` tests feed the
+/// page counter.
+pub fn pdf(pages: usize) -> Vec<u8> {
+    let mut out = b"%PDF-1.4\n".to_vec();
+    let kids: Vec<String> = (0..pages).map(|i| format!("{} 0 R", i + 3)).collect();
+    let objects: Vec<String> = [
+        "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+        format!(
+            "<< /Type /Pages /Kids [{}] /Count {pages} >>",
+            kids.join(" ")
+        ),
+    ]
+    .into_iter()
+    .chain(
+        (0..pages).map(|_| "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".to_string()),
+    )
+    .collect();
+    let offsets: Vec<usize> = objects
+        .iter()
+        .enumerate()
+        .map(|(i, body)| {
+            let at = out.len();
+            out.extend_from_slice(format!("{} 0 obj\n{body}\nendobj\n", i + 1).as_bytes());
+            at
+        })
+        .collect();
+    let xref = out.len();
+    out.extend_from_slice(
+        format!("xref\n0 {}\n0000000000 65535 f\r\n", objects.len() + 1).as_bytes(),
+    );
+    offsets
+        .iter()
+        .for_each(|at| out.extend_from_slice(format!("{at:010} 00000 n\r\n").as_bytes()));
+    out.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+            objects.len() + 1
+        )
+        .as_bytes(),
+    );
+    out
+}

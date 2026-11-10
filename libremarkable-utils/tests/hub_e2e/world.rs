@@ -236,6 +236,26 @@ pub enum Kind {
     Pdf,
 }
 
+/// A computer without a tablet: its git, cache and options.
+pub struct DeskParts {
+    pub git: Git,
+    pub cache: PathBuf,
+    pub options: HubOptions,
+}
+
+impl DeskParts {
+    pub fn hub(self) -> Hub<'static> {
+        static PROGRESS: NoProgress = NoProgress;
+        Hub::new(
+            self.git,
+            self.cache,
+            LockRequest::for_this_process("desk-host"),
+            &PROGRESS,
+        )
+        .with_options(self.options)
+    }
+}
+
 /// The world (see the module docs).
 pub struct World {
     /// Everything lives here; removed on drop.
@@ -327,6 +347,33 @@ impl World {
             origin: Some(self.origin.clone()),
             ..options
         })
+    }
+
+    /// A hub on a computer that has no tablet (`log`, `restore`, `add`
+    /// through `--origin`), with a cache of its own.
+    pub fn desk(&self) -> Hub<'static> {
+        self.desk_parts().hub()
+    }
+
+    /// What [`World::desk`] is made of, to build it on another thread.
+    pub fn desk_parts(&self) -> DeskParts {
+        DeskParts {
+            git: self.git.clone(),
+            cache: self.root.join("desk").join("cache"),
+            options: HubOptions {
+                origin: Some(self.origin.clone()),
+                ..self.options.clone()
+            },
+        }
+    }
+
+    /// A fabricated PDF of `pages` blank pages on this computer.
+    pub fn pdf_file(&self, name: &str, pages: usize) -> PathBuf {
+        let dir = self.root.join("files");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        fs::write(&path, test_support::pdf(pages)).unwrap();
+        path
     }
 
     pub fn clone_tablet(&self, i: usize) -> Result<SyncReport> {

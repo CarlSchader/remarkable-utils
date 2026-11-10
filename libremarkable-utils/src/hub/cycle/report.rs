@@ -275,3 +275,217 @@ pub struct DetachReport {
     pub took_over: Option<TakeOver>,
     pub warnings: Vec<Warning>,
 }
+
+/// What kind of commit a history entry is, from its subject, parents
+/// and trailers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommitKind {
+    /// `rmu hub init`.
+    Init,
+    /// A sync's merge commit.
+    Sync,
+    /// A sync's snapshot that fast-forwarded `main`.
+    Snapshot,
+    /// `rmu hub restore`.
+    Restore,
+    /// `rmu hub add`.
+    Add,
+    /// Anything else (a commit made by hand or by another tool).
+    Other,
+}
+
+/// The device trailers of a commit (the tablet that synced, or the one
+/// given to `restore`/`add`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct CommitDevice {
+    pub name: Option<String>,
+    pub id: Option<String>,
+    pub model: Option<String>,
+    pub firmware: Option<String>,
+}
+
+/// A conflict copy recorded in a merge commit's trailers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ForkRecord {
+    pub original: DocId,
+    pub copy: DocId,
+}
+
+/// A restore recorded in a commit's trailers: `copy` is `original`'s
+/// version from commit `from`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RestoreRecord {
+    pub copy: DocId,
+    pub original: DocId,
+    pub from: Oid,
+}
+
+/// One entry of the library's history: a commit on `main`'s first-parent
+/// chain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LogEntry {
+    pub commit: Oid,
+    pub kind: CommitKind,
+    /// The commit's author (a device name, or `rmu`).
+    pub author: String,
+    /// The author time, in seconds since the epoch.
+    pub time: i64,
+    pub subject: String,
+    /// The device trailers, if the commit has any.
+    pub device: Option<CommitDevice>,
+    /// A merge's notes (its body).
+    pub notes: Vec<String>,
+    pub forks: Vec<ForkRecord>,
+    /// Deletions from origin made with `--allow-deletions`.
+    pub consented: Vec<DocId>,
+    pub restored: Vec<RestoreRecord>,
+    /// Documents this commit added, changed and deleted against its
+    /// first parent (folders included).
+    pub added: Vec<DocId>,
+    pub changed: Vec<DocId>,
+    pub deleted: Vec<DocId>,
+    /// The visible name of each of those documents: after the commit, or
+    /// before it for a deletion.
+    pub names: BTreeMap<DocId, String>,
+}
+
+/// The tablet a history was read with, and where it stands.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TabletBase {
+    pub device_id: DeviceId,
+    pub device_name: DeviceName,
+    /// Its default base (`log`), or the document's own base (a
+    /// document's log); `None` = the empty base.
+    pub base: Option<Oid>,
+    /// Documents with a base of their own.
+    pub overrides: usize,
+}
+
+/// `log`: the library's history, newest first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LogReport {
+    pub repo_id: RepoId,
+    pub origin: String,
+    pub main: Oid,
+    pub tablet: Option<TabletBase>,
+    pub entries: Vec<LogEntry>,
+    /// Older entries left out by the limit.
+    pub more: usize,
+}
+
+/// Where an item is: its parent (`""` root, `"trash"`, or a folder's
+/// UUID) and that folder's logical path (`/`, `/Books/Math`, `trash`,
+/// `trash/Old`; `?/...` where the chain breaks).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Place {
+    pub parent: String,
+    pub path: String,
+}
+
+/// What one commit did to one document.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DocEvent {
+    /// It appeared (again, after a deletion, if earlier entries say so).
+    Added {
+        name: Option<String>,
+        place: Place,
+    },
+    /// Its content changed (anything but `.metadata`).
+    Changed,
+    Renamed {
+        from: Option<String>,
+        to: Option<String>,
+    },
+    /// Moved to another folder (the trash included).
+    Moved {
+        from: Place,
+        to: Place,
+    },
+    Deleted,
+    /// A conflict copy was forked from it.
+    ForkedInto {
+        copy: DocId,
+    },
+    /// It is a conflict copy of `original`.
+    ForkOf {
+        original: DocId,
+    },
+    /// `restore` made a copy of one of its versions.
+    RestoredAs {
+        copy: DocId,
+        from: Oid,
+    },
+    /// `restore` made it from `original`'s version in commit `from`.
+    RestoredFrom {
+        original: DocId,
+        from: Oid,
+    },
+}
+
+/// One entry of a document's history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DocLogEntry {
+    pub commit: Oid,
+    pub kind: CommitKind,
+    pub author: String,
+    pub time: i64,
+    pub subject: String,
+    pub events: Vec<DocEvent>,
+    /// The document's subtree after the commit (`None`: absent), the
+    /// version `restore --at <commit>` brings back (for a deletion: the
+    /// version before it).
+    pub version: Option<Oid>,
+}
+
+/// A document's history, newest first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DocLogReport {
+    pub repo_id: RepoId,
+    pub origin: String,
+    pub main: Oid,
+    pub doc: DocId,
+    /// Its newest known name.
+    pub name: Option<String>,
+    /// Where it is on `main` (`None`: deleted).
+    pub place: Option<Place>,
+    pub tablet: Option<TabletBase>,
+    pub entries: Vec<DocLogEntry>,
+}
+
+/// What `restore` committed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RestoreReport {
+    pub original: DocId,
+    /// The new document.
+    pub copy: DocId,
+    pub name: String,
+    pub place: Place,
+    /// The commit `--at` named.
+    pub at: Oid,
+    /// The commit holding the version restored (`at` itself, or for a
+    /// document deleted by then, the last commit before the deletion).
+    pub from: Oid,
+    /// The commit pushed to `main`.
+    pub commit: Oid,
+    pub push_attempts: usize,
+}
+
+/// What `add` committed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AddReport {
+    pub doc: DocId,
+    pub name: String,
+    pub place: Place,
+    /// `pdf` or `epub`.
+    pub file_type: String,
+    pub bytes: u64,
+    /// The pages of the materialised page list; `None`: unmaterialised
+    /// (EPUBs, and PDFs whose page count could not be read), the first
+    /// open materialises it.
+    pub pages: Option<usize>,
+    /// The commit pushed to `main`.
+    pub commit: Oid,
+    pub push_attempts: usize,
+}

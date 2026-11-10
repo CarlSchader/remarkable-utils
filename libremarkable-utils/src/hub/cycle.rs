@@ -45,15 +45,19 @@
 //! connection is gone, the watchdog brings it back. The library never
 //! prints: progress goes to a [`Progress`], results come back as reports.
 
+mod add;
 mod admin;
 mod history;
 mod init;
 mod inspect;
+mod library;
+mod log;
 mod merge_run;
 mod message;
 mod origin;
 mod plan;
 mod report;
+mod restore;
 mod session;
 mod snapshot;
 mod steps;
@@ -80,9 +84,11 @@ use crate::hub::model::{
 use crate::progress::Progress;
 
 pub use self::report::{
-    BackupReport, DetachReport, DocChange, Downloaded, DryRunReport, InitReport, MainUpdate,
-    OpenConflict, ReadSummary, Reconciled, RemoteReport, SetUrlReport, StatusReport, SyncReport,
-    TakeOver, Warning,
+    AddReport, BackupReport, CommitDevice, CommitKind, DetachReport, DocChange, DocEvent,
+    DocLogEntry, DocLogReport, Downloaded, DryRunReport, ForkRecord, InitReport, LogEntry,
+    LogReport, MainUpdate, OpenConflict, Place, ReadSummary, Reconciled, RemoteReport,
+    RestoreRecord, RestoreReport, SetUrlReport, StatusReport, SyncReport, TabletBase, TakeOver,
+    Warning,
 };
 
 /// Errors of the sync cycle itself.
@@ -231,6 +237,42 @@ pub enum CycleError {
     /// Origin's `.rmu/hub.json` is missing or invalid.
     #[error("origin's repository configuration is unusable: {0}")]
     InvalidRepoConfig(String),
+
+    /// `log`, `restore` or `add` with neither an origin URL nor a tablet.
+    #[error("no origin: give --origin <url>, or reach a tablet attached to the hub")]
+    NoOrigin,
+
+    /// A UUID or path that names no document in `main`'s history.
+    #[error("no document '{0}' in origin's history")]
+    NotInHistory(String),
+
+    /// A `--at` that names no commit in the local cache.
+    #[error(
+        "unknown revision '{0}': give a commit id as `rmu hub log` prints it (abbreviated is fine), or main, main~N"
+    )]
+    UnknownRevision(String),
+
+    /// A `--at` commit that is not `main` or one of its ancestors (a
+    /// commit only on a device ref, say).
+    #[error("commit {0} is not in the history of origin's main")]
+    NotOnMain(Oid),
+
+    /// The document has no version at or before the `--at` commit.
+    #[error("document {doc} has no version at or before commit {at}")]
+    NoVersionAt { doc: DocId, at: Oid },
+
+    /// `add` of a file that is not a PDF or an EPUB.
+    #[error("rmu hub add takes .pdf and .epub files, not '{0}'")]
+    NotAddable(String),
+
+    /// `add` into a folder in the trash.
+    #[error("folder '{0}' is in the trash")]
+    FolderInTrash(String),
+
+    /// `add`: the folder went away (deleted, or moved to the trash) while
+    /// retrying the push.
+    #[error("folder '{0}' was deleted or moved to the trash on origin meanwhile; try again")]
+    FolderGone(String),
 }
 
 /// How a run behaves.
@@ -340,8 +382,9 @@ fn check_url(url: &str) -> Result<()> {
     }
 }
 
-/// Days since the epoch to a civil `yyyy-mm-dd` (proleptic Gregorian).
-fn civil_date(unix_secs: i64) -> String {
+/// The UTC date of a time in seconds since the epoch, `yyyy-mm-dd`
+/// (proleptic Gregorian).
+pub fn civil_date(unix_secs: i64) -> String {
     let days = unix_secs.div_euclid(86_400);
     let z = days + 719_468;
     let era = z.div_euclid(146_097);

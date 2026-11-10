@@ -48,11 +48,40 @@ impl OriginCtx {
         })
     }
 
+    /// A cache whose `main` was just fetched (by [`store::bootstrap_cache`]),
+    /// without fetching again; no device ref.
+    pub(super) fn fetched(cache: Cache, url: String, main: Oid) -> Result<Self> {
+        let store = Store::new(cache.repo.clone())?;
+        let config = store.repo_config(&main)?;
+        let rules = config.rules()?;
+        Ok(Self {
+            url,
+            cache,
+            store,
+            remote: Remote {
+                main: Some(main.clone()),
+                device: None,
+            },
+            main,
+            config,
+            rules,
+        })
+    }
+
     /// Fetch again (under the lock, at step 8, and to resolve a lost
     /// push acknowledgement): `main` may have moved, its `.rmu/hub.json`
     /// must not have changed.
     pub(super) fn refresh(&mut self, device: &DeviceId) -> Result<()> {
-        let remote = store::fetch(&self.cache.repo, &self.url, Some(device), None)?;
+        self.refresh_for(Some(device))
+    }
+
+    /// [`Self::refresh`] without a device ref (`restore`, `add`).
+    pub(super) fn refresh_main(&mut self) -> Result<()> {
+        self.refresh_for(None)
+    }
+
+    fn refresh_for(&mut self, device: Option<&DeviceId>) -> Result<()> {
+        let remote = store::fetch(&self.cache.repo, &self.url, device, None)?;
         let main = remote.main.clone().ok_or_else(|| CycleError::OriginEmpty {
             url: self.url.clone(),
         })?;
