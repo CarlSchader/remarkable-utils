@@ -1526,4 +1526,167 @@ mod tests {
         cache.insert(oid(9), 9, 100);
         assert_eq!(cache.get(&oid(9)), Some(9));
     }
+
+    /// A commit of `files` (path, mode, content); a gitlink's content is
+    /// the commit id it names.
+    fn commit_with_modes(repo: &Repo, files: &[(String, FileMode, Vec<u8>)]) -> Oid {
+        let mut writer = repo
+            .commit_writer(&crate::progress::NoProgress, None)
+            .unwrap();
+        files.iter().for_each(|(path, mode, data)| match mode {
+            FileMode::Gitlink => {
+                let oid: Oid = String::from_utf8(data.clone()).unwrap().parse().unwrap();
+                writer.add_existing(path.as_str(), *mode, &oid).unwrap();
+            }
+            _ => {
+                writer.add_bytes(path.as_str(), *mode, data).unwrap();
+            }
+        });
+        let who = Signature {
+            name: "Test".to_string(),
+            email: "test@example.invalid".to_string(),
+            time: 1_800_000_000,
+            offset_minutes: 0,
+        };
+        writer
+            .commit(&CommitMeta {
+                parents: Vec::new(),
+                author: who.clone(),
+                committer: who,
+                message: "test\n".to_string(),
+            })
+            .unwrap()
+    }
+
+    /// `tree_of` against the full `ls-tree -r` listing it is built from
+    /// by definition, in both object formats, on a tree with nested
+    /// pages, an executable, a symlink and a gitlink at mirrored names,
+    /// deep carried-forward paths, `.rmu/`, a blob at `docs/<uuid>` and
+    /// paths outside `docs/`.
+    #[test]
+    fn tree_of_agrees_with_a_full_tree_listing() {
+        [ObjectFormat::Sha1, ObjectFormat::Sha256]
+            .into_iter()
+            .for_each(|format| {
+                let scratch = Scratch::new("tree-of");
+                let git = hermetic(&scratch);
+                let repo = git
+                    .init_bare(&scratch.path().join("r.git"), format)
+                    .unwrap();
+                let (d1, d2, d3) = (doc(1), doc(2), doc(3));
+                let file = |path: String, mode: FileMode, data: &[u8]| (path, mode, data.to_vec());
+                let first = commit_with_modes(&repo, &[file("x".into(), FileMode::Regular, b"x")]);
+                let files = [
+                    file(".rmu/hub.json".into(), FileMode::Regular, b"{}"),
+                    file("README".into(), FileMode::Regular, b"hand-committed"),
+                    file(
+                        format!("docs/{d1}/metadata"),
+                        FileMode::Regular,
+                        b"{\"type\":\"DocumentType\"}",
+                    ),
+                    file(format!("docs/{d1}/content"), FileMode::Regular, b"{}"),
+                    file(
+                        format!("docs/{d1}/payload.pdf"),
+                        FileMode::Executable,
+                        b"%PDF",
+                    ),
+                    file(format!("docs/{d1}/pages/p1.rm"), FileMode::Regular, b"ink"),
+                    file(
+                        format!("docs/{d1}/pages/p1-metadata.json"),
+                        FileMode::Regular,
+                        b"{}",
+                    ),
+                    file(
+                        format!("docs/{d1}/template"),
+                        FileMode::Symlink,
+                        b"elsewhere",
+                    ),
+                    file(
+                        format!("docs/{d1}/pagedata"),
+                        FileMode::Gitlink,
+                        first.to_string().as_bytes(),
+                    ),
+                    file(
+                        format!("docs/{d1}/future/deep/thing.bin"),
+                        FileMode::Regular,
+                        b"x",
+                    ),
+                    file(format!("docs/{d2}/metadata"), FileMode::Regular, b"{}"),
+                    file(
+                        format!("docs/{d3}"),
+                        FileMode::Regular,
+                        b"a file, not a document",
+                    ),
+                    file("docs/not-a-uuid/metadata".into(), FileMode::Regular, b"{}"),
+                ];
+                let tip = commit_with_modes(&repo, &files);
+                let rules = MirrorRules::latest();
+                let listed =
+                    model::tree_listing(repo.ls_tree_recursive(tip.as_str()).unwrap()).unwrap();
+                let expected = rules.group_tree(listed).unwrap();
+                let store = Store::new(repo.clone()).unwrap();
+                assert_eq!(store.tree_of(rules, &tip).unwrap(), expected, "{format:?}");
+                assert_eq!(expected.to_listing().len(), files.len(), "{format:?}");
+                // Twice: from the tree cache the second time.
+                assert_eq!(store.tree_of(rules, &tip).unwrap(), expected, "{format:?}");
+            });
+    }
+
+    /// Timing of the whole-tree reads a sync makes (the base, then
+    /// `main`, which shares all but one document's subtree) on a
+    /// 1000-document repository. Run in release with `--ignored
+    /// --nocapture`.
+    #[test]
+    #[ignore]
+    fn tree_reads_scale_1000_documents() {
+        let scratch = Scratch::new("tree-scale");
+        let git = hermetic(&scratch);
+        let repo = git
+            .init_bare(&scratch.path().join("r.git"), ObjectFormat::Sha1)
+            .unwrap();
+        let files = |changed: u32| -> Vec<(String, FileMode, Vec<u8>)> {
+            (1..=1000u32)
+                .flat_map(|n| {
+                    let d = doc(n);
+                    let meta = if n == changed {
+                        "{\"v\":2}"
+                    } else {
+                        "{\"v\":1}"
+                    };
+                    [
+                        (format!("docs/{d}/metadata"), meta.as_bytes().to_vec()),
+                        (format!("docs/{d}/content"), b"{}".to_vec()),
+                        (
+                            format!("docs/{d}/payload.pdf"),
+                            format!("%PDF {n}").into_bytes(),
+                        ),
+                        (
+                            format!("docs/{d}/pages/a.rm"),
+                            format!("ink a {n}").into_bytes(),
+                        ),
+                        (
+                            format!("docs/{d}/pages/b.rm"),
+                            format!("ink b {n}").into_bytes(),
+                        ),
+                    ]
+                })
+                .map(|(path, data)| (path, FileMode::Regular, data))
+                .collect()
+        };
+        let base = commit_with_modes(&repo, &files(0));
+        let main = commit_with_modes(&repo, &files(7));
+        let rules = MirrorRules::latest();
+        let (best, docs) = (0..5)
+            .map(|_| {
+                let store = Store::new(repo.clone()).unwrap();
+                let started = Instant::now();
+                let docs = store.tree_of(rules, &base).unwrap().docs.len()
+                    + store.tree_of(rules, &main).unwrap().docs.len();
+                (started.elapsed(), docs)
+            })
+            .min_by_key(|(elapsed, _)| *elapsed)
+            .unwrap();
+        eprintln!("1000-document tree reads (base, then main): best of 5 {best:?}");
+        assert_eq!(docs, 2000);
+    }
 }
