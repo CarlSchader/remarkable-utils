@@ -762,9 +762,11 @@ mod tests {
 
     #[test]
     fn staging_checks_the_guard_without_holding_the_flock() {
-        let script = stage_command(&TabletPaths::default(), RUN, "/st/run");
-        assert!(script.contains("rmu_guard\nmkdir -p -- /st/run && cd /st/run && tar -xf - && find . -type f -exec touch -c -- {} +\n"));
-        assert!(!script.contains("rmu_lock\n"));
+        // Run in `behaviour::staging_does_not_wait_for_the_guard_flock`.
+        let staging = format!("{}/x", hostile().staging_root());
+        let script = stage_command(&hostile(), RUN, &staging);
+        assert!(script.contains("rmu_guard\n"));
+        assert_quoted_with(&script, &hostile(), &[&staging]);
         assert_quoted(&clear_staging_script(&hostile(), RUN), &hostile());
     }
 
@@ -792,53 +794,38 @@ mod tests {
             ],
         };
         let paths = TabletPaths::default();
-        let script = apply_script(
-            &paths,
-            RUN,
-            "/st/run",
-            &plan.steps().unwrap(),
-            &plan.staged(),
-        );
-        let body = script.split_once("rmu_apply() {\n").unwrap().1;
-        let lines: Vec<&str> = body.lines().collect();
-        assert_eq!(
-            lines,
-            vec![
-                "rmu_lock",
-                "rmu_guard",
-                "if systemctl is-active --quiet xochitl.service; then echo 'rmu: refusing to apply while xochitl is running' >&2; exit 81; fi",
-                "cd /home/root/.local/share/remarkable/xochitl || exit 9",
-                "S=/st/run",
-                "[ \"$(stat -c %d -- \"$S\")\" = \"$(stat -c %d -- .)\" ] || { echo 'rmu: staging is not on the data filesystem' >&2; exit 1; }",
-                "rmu_staged() {",
-                "[ -f \"$S/$1\" ] && [ ! -L \"$S/$1\" ] && [ \"$(wc -c < \"$S/$1\")\" -eq \"$2\" ] || { printf 'rmu: not staged as planned: %s\\n' \"$1\" >&2; exit 1; }",
-                "}",
-                &format!(
-                    "rmu_staged {DOC}.content 7 && chmod 755 -- \"$S\"/{DOC}.content || exit 1"
-                ),
-                &format!("rmu_staged {DOC}.metadata 12"),
-                &format!("rmu_staged {DOC}/p1.rm 3"),
-                "sync",
-                "rmu_guard",
-                &format!("mkdir -p -- {DOC} || exit 1"),
-                &format!("mv -fT -- \"$S\"/{DOC}/p1.rm {DOC}/p1.rm || exit 1"),
-                &format!("mv -fT -- \"$S\"/{DOC}.content {DOC}.content || exit 1"),
-                &format!("mv -fT -- \"$S\"/{DOC}.metadata {DOC}.metadata || exit 1"),
-                &format!("printf 'rmu-done %s\\n' {DOC}"),
-                "rmu_guard",
-                "rm -f -- bbbbbbbb-0000-4000-8000-000000000002.metadata || exit 1",
-                "rm -rf -- bbbbbbbb-0000-4000-8000-000000000002 bbbbbbbb-0000-4000-8000-000000000002.* || exit 1",
-                "printf 'rmu-done %s\\n' bbbbbbbb-0000-4000-8000-000000000002",
-                "sync",
-                "printf 'rmu-time %s\\n' \"$(date +%s)\"",
-                &format!(
-                    "stat -c '%f %s %Y %y %Z %z %i %n' -- {DOC}.content {DOC}.metadata {DOC}/p1.rm || exit 1"
-                ),
-                "printf 'rmu-complete\\n'",
-                "}",
-                "rmu_apply </dev/null",
-            ]
-        );
+        let steps = plan.steps().unwrap();
+        let script = apply_script(&paths, RUN, "/st/run", &steps, &plan.staged());
+        // The plan's steps (ordered by `ApplyPlan::steps`, run by the
+        // contract tests), as one block between the two syncs.
+        let block: String = steps
+            .iter()
+            .map(|step| format!("{}\n", render_step(step)))
+            .collect();
+        // Before anything changes: the guard under the flock, the refusal
+        // while xochitl runs, the staging checks (with the modes), a sync;
+        // afterwards a sync, the time, the stats and the completion line.
+        let running = format!("exit {EXIT_XOCHITL_RUNNING}; fi\n");
+        let content = format!("rmu_staged {DOC}.content 7 && chmod 755 -- ");
+        let metadata = format!("rmu_staged {DOC}.metadata 12\n");
+        let page = format!("rmu_staged {DOC}/p1.rm 3\n");
+        let steps = format!("\nsync\n{block}sync\n");
+        let stats = format!("stat -c {} -- ", q(STAT_FORMAT));
+        let order = [
+            "rmu_apply() {\nrmu_lock\nrmu_guard\n",
+            "if systemctl is-active --quiet xochitl.service; then",
+            &running,
+            "staging is not on the data filesystem",
+            &content,
+            &metadata,
+            &page,
+            &steps,
+            "printf 'rmu-time %s\\n'",
+            &stats,
+            "printf 'rmu-complete\\n'\n}\nrmu_apply </dev/null\n",
+        ]
+        .map(|needle| position(&script, needle));
+        assert!(order.is_sorted(), "{order:?} in:\n{script}");
         // The guard functions are defined before the body runs.
         assert!(script.starts_with("rmu_lock() {\n"));
     }
@@ -913,5 +900,79 @@ mod tests {
         );
         assert_eq!(applied_documents(&format!("rmu-done {DOC}")), vec![]);
         assert_eq!(applied_documents(""), vec![]);
+    }
+
+    /// The scripts run over the mock transport, with the host's tools and
+    /// with BusyBox.
+    #[cfg(target_os = "linux")]
+    mod behaviour {
+        use std::time::{Duration, Instant};
+
+        use super::*;
+        use crate::hub::device::Tablet;
+        use crate::hub::device::harness::Harness;
+        use crate::hub::device::harness::local_ssh::on_both;
+        use crate::hub::model::XochitlPath;
+
+        #[test]
+        fn staging_does_not_wait_for_the_guard_flock() {
+            on_both(true, |harness| {
+                let t = harness.ssh_tablet();
+                let lock = t.acquire_lock(&request(), false).unwrap();
+                let file = XochitlPath::new(format!("{DOC}.metadata")).unwrap();
+                let mut holder = harness.hold_guard_flock("sleep 3");
+                let started = Instant::now();
+                t.stage(&lock, std::slice::from_ref(&file), &mut |_, sink| {
+                    sink(2, &mut &b"{}"[..])
+                })
+                .unwrap();
+                let took = started.elapsed();
+                holder.wait().unwrap();
+                assert!(took < Duration::from_secs(2), "{took:?}");
+                assert_eq!(t.staged_files().unwrap().entries.len(), 1);
+            });
+        }
+
+        #[test]
+        fn a_deletion_takes_the_document_and_its_siblings_only() {
+            on_both(true, |harness| {
+                let t = harness.ssh_tablet();
+                let lock = t.acquire_lock(&request(), false).unwrap();
+                [
+                    format!("{DOC}.metadata"),
+                    format!("{DOC}.content"),
+                    format!("{DOC}.local"),
+                    format!("{DOC}.thumbnails/p1.png"),
+                    format!("{DOC}/p1.rm"),
+                    format!("{DOC}x.metadata"),
+                    format!("x{DOC}.content"),
+                ]
+                .iter()
+                .for_each(|path| harness.put(path, b"x"));
+                t.arm_watchdog(&lock, Duration::from_secs(600)).unwrap();
+                t.stop_xochitl(&lock).unwrap();
+                let plan = ApplyPlan {
+                    docs: vec![DocApply::Delete {
+                        doc: DocId::new(DOC).unwrap(),
+                    }],
+                };
+                assert_eq!(
+                    t.apply(&lock, &plan).unwrap().applied,
+                    vec![DocId::new(DOC).unwrap()]
+                );
+                t.start_xochitl(&lock).unwrap();
+                let left: Vec<String> = t
+                    .stat_all()
+                    .unwrap()
+                    .entries
+                    .into_iter()
+                    .map(|entry| entry.path)
+                    .collect();
+                assert_eq!(
+                    left,
+                    [format!("{DOC}x.metadata"), format!("x{DOC}.content")]
+                );
+            });
+        }
     }
 }

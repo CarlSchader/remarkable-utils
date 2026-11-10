@@ -532,34 +532,13 @@ mod tests {
     use crate::hub::device::scripts::fixtures::*;
 
     #[test]
-    fn guard_takes_the_flock_then_checks_marker_and_ownership() {
-        let paths = TabletPaths::default();
-        let fns = guard_fns(&paths, RUN);
-        // The directory is checked first: in ash a failed `exec`
-        // redirection exits the shell before any `||` runs.
-        assert!(fns.contains(
-            "rmu_lock() {\n[ -d /home/root/.local/share/rmu ] || { echo 'rmu: the hub state directory is gone' >&2; exit 76; }\n\
-             exec 9>>/home/root/.local/share/rmu/guard.flock\nn=0\nuntil flock -n 9; do\n\
-             n=$((n + 1)); [ \"$n\" -le 180 ] || { echo 'rmu: the tablet is busy with another hub operation' >&2; exit 78; }\n\
-             sleep 1\ndone\n}\n"
-        ));
-        assert!(fns.contains(&format!(
-            "grep -qxF 'run={RUN}' /home/root/.local/share/rmu/lock/owner 2>/dev/null || {{ echo 'rmu: the hub lock is not held by this run' >&2; exit 76; }}"
-        )));
-        assert!(fns.contains(
-            "if [ -e /home/root/.local/share/rmu/watchdog-fired ]; then echo 'rmu: the hub watchdog fired' >&2; exit 75; fi\nrmu_owned\n\
-             read -r rmu_boot < /proc/sys/kernel/random/boot_id || exit 1\n\
-             grep -qxF \"boot_id=$rmu_boot\" /home/root/.local/share/rmu/lock/owner 2>/dev/null || { echo 'rmu: the tablet rebooted since this run took its lock' >&2; exit 80; }\n"
-        ));
-        // A recorded pid must be a number above 1 before it is signalled.
-        assert!(fns.contains("case \"$1\" in ''|*[!0-9]*) return 1 ;; esac\n[ \"$1\" -gt 1 ]\n"));
-        // Wrapped in a function: nothing runs, the flock above all, before
-        // the whole script has arrived.
-        assert!(
-            guarded(&paths, RUN, "body")
-                .ends_with("rmu_main() {\nrmu_lock\nrmu_guard\nbody\n}\nrmu_main </dev/null\n")
-        );
-
+    fn guard_waits_a_bounded_time_and_quotes_everything() {
+        // What the guard does is run in `behaviour` below and in the
+        // contract tests; what no test can wait for is the bound on the
+        // `flock` wait.
+        let flock = take_flock(&TabletPaths::default());
+        assert!(flock.contains(&format!("[ \"$n\" -le {FLOCK_WAIT_SECS} ] ||")));
+        assert!(flock.contains(&format!("exit {EXIT_BUSY}; }}")));
         assert_quoted(&guarded(&hostile(), RUN, "true"), &hostile());
     }
 
@@ -653,31 +632,25 @@ mod tests {
     fn watchdog_systemd_variant() {
         let paths = TabletPaths::default();
         assert_eq!(watchdog_unit_name("tok"), "rmu-hub-watchdog-tok");
-        assert_eq!(
-            systemd_watchdog_command(&paths, 300, "rmu-hub-watchdog-tok"),
-            "systemd-run --quiet --collect --unit=rmu-hub-watchdog-tok --on-active=300s /bin/sh -c \
-             'true > /home/root/.local/share/rmu/watchdog-fired 2>/dev/null; systemctl reset-failed xochitl.service; systemctl start xochitl.service'"
-        );
+        // A transient timer running the fire command (which
+        // `the_systemd_watchdog_runs_the_fire_command` runs).
+        let command = systemd_watchdog_command(&paths, 300, "rmu-hub-watchdog-tok");
+        assert!(command.starts_with(
+            "systemd-run --quiet --collect --unit=rmu-hub-watchdog-tok --on-active=300s "
+        ));
+        assert!(command.ends_with(&format!(" /bin/sh -c {}", q(&fire_command(&paths)))));
     }
 
     #[test]
     fn watchdog_sleep_variant() {
-        let paths = TabletPaths::default();
-        assert_eq!(
-            sleep_watchdog_command(&paths, 90, "tok", RUN),
-            format!(
-                "command -v setsid >/dev/null 2>&1 || {{ echo 'rmu: neither systemd-run nor setsid is available for the watchdog' >&2; exit 1; }}\n\
-                 printf '%s\\n' tok > /home/root/.local/share/rmu/watchdog.token || exit 1\n\
-                 setsid sh -c 'sleep 90; t=; [ -f /home/root/.local/share/rmu/watchdog.token ] \
-                 && read -r t < /home/root/.local/share/rmu/watchdog.token; [ -z \"$t\" ] || [ \"$t\" = tok ] || exit 0; \
-                 rm -f -- /home/root/.local/share/rmu/watchdog.token /home/root/.local/share/rmu/watchdog.pid 2>/dev/null; \
-                 true > /home/root/.local/share/rmu/watchdog-fired 2>/dev/null; \
-                 systemctl reset-failed xochitl.service; systemctl start xochitl.service' </dev/null >/dev/null 2>&1 9>&- &\n\
-                 p=$!\n\
-                 kill -0 \"$p\" 2>/dev/null || {{ echo 'rmu: the watchdog sleeper did not start' >&2; exit 1; }}\n\
-                 printf '%s %s %s\\n' \"$p\" \"$boot\" {RUN} > /home/root/.local/share/rmu/watchdog.pid || exit 1\n"
-            )
-        );
+        // Run by the contract tests (`sleep_watchdog_fires_and_disarms`)
+        // and `the_sleep_watchdog_never_holds_the_guard_flock`; what they
+        // cannot bring about: no `setsid`, or a sleeper that dies at once.
+        let command = sleep_watchdog_command(&TabletPaths::default(), 90, "tok", RUN);
+        assert!(command.starts_with("command -v setsid >/dev/null 2>&1 || {"));
+        assert!(command.contains(
+            "kill -0 \"$p\" 2>/dev/null || { echo 'rmu: the watchdog sleeper did not start' >&2; exit 1; }"
+        ));
     }
 
     #[test]
@@ -768,15 +741,184 @@ mod tests {
     }
 
     #[test]
-    fn cloud_pairing_is_the_survey_one_liner_and_fails_closed() {
-        assert_eq!(
-            cloud_paired_script(&TabletPaths::default()),
-            "t=$(sed -n 's/^devicetoken=//p' /home/root/.config/remarkable/xochitl.conf) || { echo 'rmu: cannot read the xochitl configuration' >&2; exit 1; }\n\
-             printf '%s\\n' \"$t\" | grep -qvE '^(|@Invalid\\(\\)|@ByteArray\\(\\)|\"\")$' && echo true || echo false\n"
-        );
+    fn cloud_pairing_output_parses_and_paths_are_quoted() {
+        // The script itself runs in `detects_cloud_pairing_and_fails_closed`
+        // (contract tests), against every token form and a missing file.
         assert!(parse_bool("p", "true\n").unwrap());
         assert!(!parse_bool("p", "false\n").unwrap());
         assert!(parse_bool("p", "token=secret\n").is_err());
         assert_quoted(&cloud_paired_script(&hostile()), &hostile());
+    }
+
+    /// The scripts run over the mock transport, with the host's tools and
+    /// with BusyBox.
+    #[cfg(target_os = "linux")]
+    mod behaviour {
+        use std::fs;
+        use std::path::Path;
+        use std::process::Output;
+        use std::time::Duration;
+
+        use super::*;
+        use crate::hub::device::Tablet;
+        use crate::hub::device::harness::Harness;
+        use crate::hub::device::harness::local_ssh::{SshHarness, on_both};
+        use crate::ssh::shell_quote;
+
+        const OTHER_RUN: &str = "fedcba9876543210fedcba9876543210";
+
+        fn run(harness: &SshHarness, script: &str) -> Output {
+            harness
+                .ssh_tablet()
+                .session_for_tests()
+                .run_script(script)
+                .unwrap()
+        }
+
+        fn stdout(output: &Output) -> String {
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        }
+
+        #[test]
+        fn guard_refusals_come_in_order() {
+            on_both(true, |harness| {
+                let t = harness.ssh_tablet();
+                let paths = t.paths().clone();
+                let lock = t.acquire_lock(&request(), false).unwrap();
+                assert_eq!(lock.run(), RUN);
+                let check = |owner: &str, expected: i32| {
+                    let output = run(harness, &guarded(&paths, owner, "echo ran"));
+                    assert_eq!(output.status.code(), Some(expected), "{owner}: {output:?}");
+                    assert_eq!(stdout(&output) == "ran\n", expected == 0, "{output:?}");
+                };
+                check(RUN, 0);
+                check(OTHER_RUN, EXIT_LOCK_LOST);
+                // The watchdog marker comes before ownership...
+                fs::write(paths.watchdog_marker(), b"").unwrap();
+                check(RUN, EXIT_WATCHDOG_FIRED);
+                check(OTHER_RUN, EXIT_WATCHDOG_FIRED);
+                fs::remove_file(paths.watchdog_marker()).unwrap();
+                // ...and ownership before the boot id.
+                harness.reboot();
+                check(RUN, EXIT_REBOOTED);
+                check(OTHER_RUN, EXIT_LOCK_LOST);
+                // A lost state dir is a lost lock (not ash's exit on a failed
+                // `exec` redirection), and is not created again.
+                harness.wipe_state();
+                check(RUN, EXIT_LOCK_LOST);
+                assert!(!Path::new(&paths.state_dir).exists());
+            });
+        }
+
+        #[test]
+        fn only_numbers_above_one_count_as_process_groups() {
+            on_both(true, |harness| {
+                let script = format!(
+                    "{}for p in '' 0 1 -5 x 12a ' 3' 2 345; do if rmu_pid_ok \"$p\"; then echo \"[$p] y\"; else echo \"[$p] n\"; fi; done\n",
+                    guard_fns(harness.ssh_tablet().paths(), RUN)
+                );
+                assert_eq!(
+                    stdout(&run(harness, &script)),
+                    "[] n\n[0] n\n[1] n\n[-5] n\n[x] n\n[12a] n\n[ 3] n\n[2] y\n[345] y\n"
+                );
+            });
+        }
+
+        #[test]
+        fn a_truncated_script_runs_nothing() {
+            on_both(true, |harness| {
+                let paths = harness.ssh_tablet().paths().clone();
+                let effect = harness.data_dir().join("effect");
+                let script = guarded(
+                    &paths,
+                    RUN,
+                    &format!("true > {}", shell_quote(&effect.to_string_lossy())),
+                );
+                let flock = Path::new(&paths.guard_flock()).to_path_buf();
+                // Cut at every line boundary and inside the call's name.
+                // (Once the name has arrived, so has the whole body: the
+                // call then runs it, as the complete script would.)
+                let last = script.trim_end_matches('\n').rfind('\n').unwrap() + 1;
+                assert!(script[last..].starts_with("rmu_main "));
+                script
+                    .match_indices('\n')
+                    .map(|(at, _)| at + 1)
+                    .filter(|&at| at < last)
+                    .chain(last..last + "rmu_main".len())
+                    .for_each(|cut| {
+                        run(harness, &script[..cut]);
+                        assert!(
+                            !effect.exists() && !flock.exists(),
+                            "ran when cut at {cut}: {:?}",
+                            &script[..cut]
+                        );
+                    });
+                // Whole, it takes the flock (and is refused: there is no lock).
+                assert_eq!(run(harness, &script).status.code(), Some(EXIT_LOCK_LOST));
+                assert!(flock.exists());
+            });
+        }
+
+        #[test]
+        fn the_systemd_watchdog_runs_the_fire_command() {
+            on_both(true, |harness| {
+                let paths = harness.ssh_tablet().paths().clone();
+                let unit = watchdog_unit_name("tok");
+                let armed = run(harness, &systemd_watchdog_command(&paths, 300, &unit));
+                assert!(armed.status.success(), "{armed:?}");
+                let log = harness.systemd_run_log();
+                assert!(
+                    log.contains(&format!("--unit={unit} --on-active=300s")),
+                    "{log}"
+                );
+                assert!(
+                    run(harness, "systemctl stop xochitl.service")
+                        .status
+                        .success()
+                );
+                harness.fire_watchdog();
+                assert!(harness.running());
+                assert!(Path::new(&paths.watchdog_marker()).exists());
+                let log = harness.systemctl_log();
+                assert!(
+                    log.ends_with("reset-failed xochitl.service\nstart xochitl.service\n"),
+                    "{log}"
+                );
+                // Without the state dir the marker cannot be written; under
+                // ash a failed redirection on a special builtin would end
+                // the shell before the start.
+                harness.wipe_state();
+                assert!(
+                    run(harness, "systemctl stop xochitl.service")
+                        .status
+                        .success()
+                );
+                let fired = run(harness, &fire_command(&paths));
+                assert!(fired.status.success(), "{fired:?}");
+                assert!(harness.running());
+                assert!(harness.systemctl_log().ends_with(
+                    "stop xochitl.service\nreset-failed xochitl.service\nstart xochitl.service\n"
+                ));
+            });
+        }
+
+        #[test]
+        fn the_sleep_watchdog_never_holds_the_guard_flock() {
+            on_both(false, |harness| {
+                if !harness.has_tool("setsid") || !harness.has_tool("flock") {
+                    eprintln!("setsid or flock not available; skipping");
+                    return;
+                }
+                let t = harness.ssh_tablet();
+                let lock = t.acquire_lock(&request(), false).unwrap();
+                t.arm_watchdog(&lock, Duration::from_secs(60)).unwrap();
+                let probe = format!(
+                    "exec 9>>{}\nif flock -n 9; then echo free; else echo held; fi\n",
+                    shell_quote(&t.paths().guard_flock())
+                );
+                assert_eq!(stdout(&run(harness, &probe)), "free\n");
+                t.disarm_watchdog(&lock).unwrap();
+            });
+        }
     }
 }
