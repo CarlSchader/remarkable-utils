@@ -33,7 +33,7 @@ pub(super) struct HistoryIndex {
 
 fn incomplete(detail: String) -> Error {
     Error::GitOutput {
-        command: "rev-list".to_string(),
+        command: "rev-list/diff-tree (history index)".to_string(),
         detail,
     }
 }

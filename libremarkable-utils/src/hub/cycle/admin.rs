@@ -98,6 +98,11 @@ impl Hub<'_> {
             // whose device ref is gone (the next sync would stop on it).
             self.progress.step("Forgetting the hub state");
             s.tablet.remove_state(s.lock())?;
+            let _ = std::fs::remove_file(store::pre_read_path(
+                &self.cache_dir,
+                &state.repo_id,
+                Some(&state.device_id),
+            ));
             let pruned = if prune_ref {
                 self.progress.step("Deleting the device ref from origin");
                 match self.prune_device_ref(&state) {

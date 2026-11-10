@@ -1318,9 +1318,34 @@ fn first_parent_changes_of_a_merged_history() {
 fn checkpointed_blobs_survive_an_aborted_writer() {
     let sandbox = Sandbox::new();
     let cache = sandbox.init("cache.git");
+    let pack_dir = cache.git_dir().join("objects").join("pack");
+    let keeps = || {
+        std::fs::read_dir(&pack_dir)
+            .map(|entries| {
+                entries
+                    .filter(|entry| {
+                        entry.as_ref().is_ok_and(|entry| {
+                            entry.path().extension().is_some_and(|e| e == "keep")
+                        })
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
+    };
     let mut writer = cache.commit_writer(&NoProgress, None).unwrap();
     let kept = writer.write_blob("kept", 4, &mut &b"kept"[..]).unwrap();
+    // More objects than fast-import's unpack limit: the checkpoint writes
+    // a real (kept) pack instead of loose objects.
+    let many: Vec<Oid> = (0..150)
+        .map(|n| {
+            let data = format!("blob {n}");
+            writer
+                .write_blob("many", data.len() as u64, &mut data.as_bytes())
+                .unwrap()
+        })
+        .collect();
     writer.checkpoint().unwrap();
+    assert_eq!(keeps(), 1);
     writer.checkpoint().unwrap();
     let lost = writer.write_blob("lost", 4, &mut &b"lost"[..]).unwrap();
     // A reader cut part-way kills fast-import, as a cut download does.
@@ -1331,6 +1356,9 @@ fn checkpointed_blobs_survive_an_aborted_writer() {
     let sizes = cache.object_sizes([&kept, &lost]).unwrap();
     assert_eq!(sizes.get(&kept), Some(&4));
     assert!(!sizes.contains_key(&lost));
+    assert_eq!(cache.object_sizes(&many).unwrap().len(), many.len());
+    // The killed fast-import's `.keep` is gone: the pack can be repacked.
+    assert_eq!(keeps(), 0);
 }
 
 #[cfg(unix)]

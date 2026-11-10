@@ -31,7 +31,7 @@
 //!
 //! Requires git 2.30 or newer (`rev-parse --end-of-options`).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs;
@@ -698,8 +698,16 @@ impl Repo {
             return Ok(Vec::new());
         }
         let mut cmd = self.command("diff-tree");
-        cmd.args(["--stdin", "-t", "--root", "--no-renames", "-z", "--"])
-            .args(paths);
+        cmd.args([
+            "--stdin",
+            "--always",
+            "-t",
+            "--root",
+            "--no-renames",
+            "-z",
+            "--",
+        ])
+        .args(paths);
         let mut process = Process::spawn("diff-tree", &mut cmd)?;
         let mut stdin = process.child.stdin.take().expect("stdin was piped");
         let mut stdout = process.child.stdout.take().expect("stdout was piped");
@@ -709,6 +717,9 @@ impl Repo {
             let writer = scope.spawn(move || stdin.write_all(&request));
             let mut out = Vec::new();
             let read = stdout.read_to_end(&mut out);
+            // A failed read must not leave diff-tree blocked on a full
+            // pipe while the writer waits on it.
+            drop(stdout);
             (
                 writer
                     .join()
@@ -720,7 +731,23 @@ impl Repo {
         match (written, out, status) {
             (_, _, Err(error)) => Err(error),
             (Err(error), _, _) | (_, Err(error), _) => Err(error.into()),
-            (Ok(()), Ok(out), Ok(_)) => parse_diff_tree(&out),
+            (Ok(()), Ok(out), Ok(_)) => {
+                // `--always` lists every commit, changes or not: one that
+                // is missing was skipped (diff-tree reports a bad input
+                // line without failing), and would read as unchanged.
+                let parsed = parse_diff_tree(&out)?;
+                let listed = parsed.iter().map(|entry| &entry.commit);
+                if !listed.eq(commits.iter().map(|entry| &entry.commit)) {
+                    return Err(output_error(
+                        "diff-tree",
+                        "the output does not list every requested commit",
+                    ));
+                }
+                Ok(parsed
+                    .into_iter()
+                    .filter(|entry| !entry.changes.is_empty())
+                    .collect())
+            }
         }
     }
 
@@ -811,6 +838,9 @@ impl Repo {
             progress,
             transferred: 0,
             total,
+            pack_dir: self.git_dir.join("objects").join("pack"),
+            own_keeps: BTreeSet::new(),
+            finished: false,
         })
     }
 }
@@ -949,6 +979,25 @@ pub struct CommitWriter<'p> {
     progress: &'p dyn Progress,
     transferred: u64,
     total: Option<u64>,
+    /// `objects/pack`, and the `.keep` files this writer's checkpoints
+    /// created: fast-import removes them when it ends cleanly, and this
+    /// writer when it is aborted (a killed fast-import leaves them, and
+    /// git never repacks or prunes a kept pack).
+    pack_dir: PathBuf,
+    own_keeps: BTreeSet<PathBuf>,
+    finished: bool,
+}
+
+/// The `.keep` files in `dir`.
+fn keep_files(dir: &Path) -> BTreeSet<PathBuf> {
+    fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                .filter(|path| path.extension().is_some_and(|ext| ext == "keep"))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 enum DataRef {
@@ -1017,6 +1066,7 @@ impl CommitWriter<'_> {
     /// if this writer is aborted or dropped later. Returns once
     /// fast-import has done it. Fails on a writer that already failed.
     pub fn checkpoint(&mut self) -> Result<()> {
+        let before = keep_files(&self.pack_dir);
         self.write(b"checkpoint\nprogress rmu-checkpoint\n")?;
         let stdin = self.stdin.as_mut().ok_or_else(|| closed("fast-import"))?;
         let mut line = Vec::new();
@@ -1024,7 +1074,11 @@ impl CommitWriter<'_> {
             .flush()
             .and_then(|()| self.stdout.read_until(b'\n', &mut line))
         {
-            Ok(_) if line == b"progress rmu-checkpoint\n" => Ok(()),
+            Ok(_) if line == b"progress rmu-checkpoint\n" => {
+                let after = keep_files(&self.pack_dir);
+                self.own_keeps.extend(after.difference(&before).cloned());
+                Ok(())
+            }
             Ok(_) => Err(self.broken(io::ErrorKind::UnexpectedEof.into())),
             Err(error) => Err(self.broken(error)),
         }
@@ -1094,6 +1148,7 @@ impl CommitWriter<'_> {
         self.process.wait_checked()?;
         read?;
         let oid = parse_oid_line("fast-import", &line)?;
+        self.finished = true;
         self.progress.bytes_done();
         Ok(oid)
     }
@@ -1158,6 +1213,11 @@ impl Drop for CommitWriter<'_> {
     fn drop(&mut self) {
         self.abort();
         let _ = fs::remove_file(&self.crash_report);
+        if !self.finished {
+            self.own_keeps.iter().for_each(|keep| {
+                let _ = fs::remove_file(keep);
+            });
+        }
     }
 }
 

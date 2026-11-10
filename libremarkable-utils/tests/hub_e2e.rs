@@ -2938,23 +2938,82 @@ fn a_pre_read_cut_mid_file_keeps_its_checkpointed_files() {
 
 /// The run whose pre-read was cut fails before its stopped read (the
 /// connection is gone); the next run reuses what that pre-read saved,
-/// even when its own pre-read gets nothing.
+/// whether its own pre-read gets nothing (its download fails) or fails
+/// outright (its stat pass), which must not wipe what was saved. (Each
+/// scenario cuts its own copy of the world: a copy's files have new
+/// stats.)
 #[test]
 fn the_next_run_reuses_a_cut_pre_read() {
     let (template, files, options) = library_to_read(4);
     let lock = op_index(&template, 0, OpKind::AcquireLock, 1, |w| {
         w.clone_tablet(0).unwrap();
     });
-    let world = template.duplicate();
-    world.tablet(0).inject(Fault::CutDownloadInFile(6));
-    world.tablet(0).inject(Fault::DisconnectAtOp(lock));
-    assert!(clone_with(&world, options.clone()).is_err());
-    world.tablet(0).reconnect();
-    world.check_idle(0);
-    world.tablet(0).inject(Fault::FailDownloadAfter(0));
-    let report = clone_with(&world, options).unwrap();
-    assert_eq!(report.read.downloaded.files, files - 6, "{report:?}");
-    world.check();
+    let stat = op_index(&template, 0, OpKind::StatAll, 1, |w| {
+        w.clone_tablet(0).unwrap();
+    });
+    [
+        (Fault::FailDownloadAfter(0), "its download fails"),
+        (Fault::FailOp(stat), "its stat pass fails"),
+    ]
+    .into_iter()
+    .for_each(|(fault, what)| {
+        let world = template.duplicate();
+        world.tablet(0).inject(Fault::CutDownloadInFile(6));
+        world.tablet(0).inject(Fault::DisconnectAtOp(lock));
+        assert!(clone_with(&world, options.clone()).is_err());
+        world.tablet(0).reconnect();
+        world.check_idle(0);
+        world.tablet(0).inject(fault);
+        let report = clone_with(&world, options.clone()).unwrap();
+        assert_eq!(
+            report.read.downloaded.files,
+            files - 6,
+            "{what}: {report:?}"
+        );
+        world.check();
+    });
+}
+
+/// A first clone is cut during its stopped read, after a complete
+/// pre-read: the lock stays. Whether the next run finds it stale through
+/// the fired watchdog (it pre-reads again) or through a reboot (no
+/// pre-read: the boot id is not read before the lock), it reuses what the
+/// first pre-read saved and downloads nothing while xochitl is stopped.
+#[test]
+fn a_crashed_first_clone_reuses_its_pre_read() {
+    let (template, _, options) = library_to_read(3);
+    let stopped_read = op_index(&template, 0, OpKind::StatAll, 2, |w| {
+        w.clone_tablet(0).unwrap();
+    });
+    [true, false].into_iter().for_each(|watchdog| {
+        let world = template.duplicate();
+        let tablet = world.tablet(0);
+        tablet.inject(Fault::DisconnectAtOp(stopped_read));
+        assert!(clone_with(&world, options.clone()).is_err());
+        tablet.reconnect();
+        if watchdog {
+            assert!(tablet.fire_watchdog());
+        } else {
+            tablet.reboot();
+        }
+        let before = tablet.ops().len();
+        let report = clone_with(&world, options.clone()).unwrap();
+        let stat_passes = tablet.ops()[before..]
+            .iter()
+            .filter(|op| **op == OpKind::StatAll)
+            .count();
+        assert_eq!(
+            stat_passes,
+            if watchdog { 2 } else { 1 },
+            "watchdog {watchdog}"
+        );
+        assert_eq!(
+            report.read.downloaded.files, 0,
+            "watchdog {watchdog}: {report:?}"
+        );
+        assert!(report.took_over.is_some(), "{report:?}");
+        world.check();
+    });
 }
 
 /// A tablet another run holds is not read at all before the lock refuses

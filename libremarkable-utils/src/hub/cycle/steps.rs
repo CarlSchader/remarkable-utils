@@ -171,6 +171,16 @@ fn pending_journal(
     Ok(Some(Warning::JournalDiscarded))
 }
 
+/// What the stopped read may take as known besides the manifest: what
+/// earlier pre-reads saved at `saved`, then this run's pre-read (newer).
+/// Both are checked against the tablet's stat and the cache.
+fn saved_then_pre_read(saved: &std::path::Path, pre: &TabletRead) -> BTreeMap<XochitlPath, Known> {
+    snapshot::saved_known(&store::load_pre_read(saved))
+        .into_iter()
+        .chain(snapshot::pre_read_known(pre))
+        .collect()
+}
+
 /// String paths (from the pure helpers) as tablet paths.
 fn tablet_paths(paths: BTreeSet<String>) -> Result<BTreeSet<XochitlPath>> {
     paths
@@ -295,12 +305,12 @@ impl Hub<'_> {
                 .into());
             }
             pending_journal(before.as_ref(), &config.repo_id, &probe, &main)?;
+            let saved = store::pre_read_path(
+                &self.cache_dir,
+                &config.repo_id,
+                before.as_ref().map(|state| &state.device_id),
+            );
             let pre = if self.may_pre_read(s.tablet)? {
-                let saved = store::pre_read_path(
-                    &self.cache_dir,
-                    &config.repo_id,
-                    before.as_ref().map(|state| &state.device_id),
-                );
                 self.pre_read(
                     s.tablet,
                     rules,
@@ -347,7 +357,7 @@ impl Hub<'_> {
             let read = snapshot::read_tablet(
                 s.tablet,
                 rules,
-                &snapshot::pre_read_known(&pre),
+                &saved_then_pre_read(&saved, &pre),
                 &ctx.store,
                 snapshot::Sink::plain(&mut writer),
                 self.progress,
@@ -383,8 +393,12 @@ impl Hub<'_> {
             state.quarantine = tablet_only.quarantined.keys().cloned().collect();
             state.manifest = read_manifest(&read, started_at);
             // Attached from here on: an interrupted clone continues with
-            // `sync`.
+            // `sync`. What a pre-read saved before the tablet had a device
+            // id is its own no longer.
             s.write_state(&state)?;
+            if before.is_none() {
+                let _ = std::fs::remove_file(&saved);
+            }
             let prepared = Prepared {
                 origin: ctx,
                 state,
@@ -449,8 +463,12 @@ impl Hub<'_> {
             },
             self.progress,
             ReadMode::BestEffort,
-        )
-        .unwrap_or_default();
+        );
+        // A read that failed outright (its stat pass, say) read nothing:
+        // the saved progress stays as its last checkpoint left it.
+        let Ok(read) = read else {
+            return TabletRead::default();
+        };
         let time = unix_now();
         let committed = writer.commit(&CommitMeta {
             parents: Vec::new(),
@@ -464,11 +482,16 @@ impl Hub<'_> {
         read
     }
 
-    /// Whether to pre-read: not while another run holds the tablet lock
-    /// (unless it is being broken), since this run would most likely be
-    /// refused.
+    /// Whether to pre-read: not while another run holds the tablet lock,
+    /// since this run would be refused, unless the lock is stale (its
+    /// watchdog fired, as after a crash) or being broken. (A lock left by
+    /// a run the tablet rebooted under also goes stale, but telling needs
+    /// the boot id; such a run reads without a pre-read, from the saved
+    /// one.)
     fn may_pre_read(&self, tablet: &dyn Tablet) -> Result<bool> {
-        Ok(self.options.break_lock || tablet.lock_state()? == LockState::Free)
+        Ok(self.options.break_lock
+            || tablet.lock_state()? == LockState::Free
+            || tablet.watchdog_fired()?)
     }
 
     /// Steps 1–6 (with step 4 only if `reconcile`).
@@ -486,6 +509,7 @@ impl Hub<'_> {
         if s.tablet.cloud_paired()? {
             return Err(CycleError::CloudPaired.into());
         }
+        let saved = store::pre_read_path(&self.cache_dir, &first.repo_id, Some(&first.device_id));
         let pre = if self.may_pre_read(s.tablet)? {
             self.pre_read(
                 s.tablet,
@@ -493,7 +517,7 @@ impl Hub<'_> {
                 &first.manifest,
                 &origin.cache.repo,
                 &origin.store,
-                &store::pre_read_path(&self.cache_dir, &first.repo_id, Some(&first.device_id)),
+                &saved,
             )
         } else {
             TabletRead::default()
@@ -521,7 +545,7 @@ impl Hub<'_> {
         s.stop()?;
         let known: BTreeMap<XochitlPath, Known> = snapshot::known_from_manifest(&state.manifest)
             .into_iter()
-            .chain(snapshot::pre_read_known(&pre))
+            .chain(saved_then_pre_read(&saved, &pre))
             .collect();
         let mut writer = origin.cache.repo.commit_writer(self.progress, None)?;
         let mut read = snapshot::read_tablet(
