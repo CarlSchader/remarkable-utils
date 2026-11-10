@@ -40,7 +40,7 @@ pub struct DocumentCounts {
 pub struct SystemStatus {
     pub model: Option<String>,
     pub serial: Option<String>,
-    /// reMarkable software version (update.conf / os-release).
+    /// reMarkable software release (see [`firmware_version`]).
     pub os_version: Option<String>,
     /// Build identifier (`/etc/version`).
     pub os_build: Option<String>,
@@ -106,11 +106,9 @@ pub fn parse_status(marker: &str, output: &str) -> SystemStatus {
     );
 
     SystemStatus {
-        model: section("model").and_then(first_dt_string),
+        model: section("model").and_then(first_dt_string).map(model_name),
         serial: section("serial").and_then(first_dt_string),
-        os_version: section("update-conf")
-            .and_then(|body| key_value(body, "REMARKABLE_RELEASE_VERSION"))
-            .or_else(|| section("os-release").and_then(|body| key_value(body, "VERSION_ID"))),
+        os_version: firmware_version(section("os-release"), section("update-conf")),
         os_build: section("build").and_then(first_line),
         kernel,
         arch,
@@ -130,6 +128,31 @@ pub fn parse_status(marker: &str, output: &str) -> SystemStatus {
         xochitl: section("xochitl").and_then(first_line),
         documents: None,
     }
+}
+
+/// Publicly documented marketing names for device-tree model codenames.
+const MODEL_NAMES: &[(&str, &str)] = &[("reMarkable Ferrari", "reMarkable Paper Pro")];
+
+/// The model's marketing name if its codename is known; else as reported.
+fn model_name(model: String) -> String {
+    MODEL_NAMES
+        .iter()
+        .find(|(codename, _)| *codename == model)
+        .map_or(model, |(_, name)| name.to_string())
+}
+
+/// The reMarkable software release (e.g. `3.28.0.172`), from the bodies
+/// of `/etc/os-release` and `/usr/share/remarkable/update.conf`:
+/// os-release's `IMG_VERSION`, else update.conf's
+/// `REMARKABLE_RELEASE_VERSION`, else os-release's `VERSION_ID`. On
+/// firmware 3.28 (Paper Pro) `VERSION_ID` is the base OS version, not
+/// the release, and update.conf does not exist; older firmware and other
+/// models may have only the fallbacks. Pure.
+fn firmware_version(os_release: Option<&str>, update_conf: Option<&str>) -> Option<String> {
+    os_release
+        .and_then(|body| key_value(body, "IMG_VERSION"))
+        .or_else(|| update_conf.and_then(|body| key_value(body, "REMARKABLE_RELEASE_VERSION")))
+        .or_else(|| os_release.and_then(|body| key_value(body, "VERSION_ID")))
 }
 
 /// Count documents/folders (excluding trash) and trashed items.
@@ -366,14 +389,15 @@ mod tests {
     use super::*;
     use crate::xochitl::ItemKind;
 
-    /// A Paper-Pro-shaped fixture with a fabricated serial.
+    /// A Paper-Pro-shaped fixture (firmware 3.28: no update.conf) with
+    /// a fabricated serial.
     fn fixture() -> String {
         let m = "===M===";
         format!(
             "\n{m} model\nreMarkable Ferrari\u{0}\n\
              \n{m} serial\nRM100-000-00000\u{0}\u{0}\n\
-             \n{m} update-conf\n[General]\nREMARKABLE_RELEASE_VERSION=3.20.0.92\n\
-             \n{m} os-release\nID=codex\nVERSION_ID=\"3.20.0\"\n\
+             \n{m} update-conf\n\
+             \n{m} os-release\nID=codex\nVERSION_ID=5.8.203\nIMG_VERSION=\"3.28.0.172\"\n\
              \n{m} build\n20240915163045\n\
              \n{m} kernel\n6.1.36-rm\naarch64\n\
              \n{m} uptime\n279123.45 401234.00\n\
@@ -389,10 +413,10 @@ mod tests {
     #[test]
     fn parses_full_fixture() {
         let status = parse_status("===M===", &fixture());
-        assert_eq!(status.model.as_deref(), Some("reMarkable Ferrari"));
+        assert_eq!(status.model.as_deref(), Some("reMarkable Paper Pro"));
         // NUL padding stripped from device-tree strings.
         assert_eq!(status.serial.as_deref(), Some("RM100-000-00000"));
-        assert_eq!(status.os_version.as_deref(), Some("3.20.0.92"));
+        assert_eq!(status.os_version.as_deref(), Some("3.28.0.172"));
         assert_eq!(status.os_build.as_deref(), Some("20240915163045"));
         assert_eq!(status.kernel.as_deref(), Some("6.1.36-rm"));
         assert_eq!(status.arch.as_deref(), Some("aarch64"));
@@ -428,6 +452,60 @@ mod tests {
         let out = "\n===M=== os-release\nVERSION_ID=\"3.5.2\"\n";
         let status = parse_status("===M===", out);
         assert_eq!(status.os_version.as_deref(), Some("3.5.2"));
+    }
+
+    #[test]
+    fn firmware_prefers_img_version_then_update_conf_then_version_id() {
+        let os_release = "NAME=\"Codex Linux\"\nVERSION_ID=5.8.203\nIMG_VERSION=\"3.28.0.172\"\n";
+        let update_conf = "[General]\nREMARKABLE_RELEASE_VERSION=3.20.0.92\n";
+        // The release, never the base OS's VERSION_ID, even next to
+        // update.conf.
+        assert_eq!(
+            firmware_version(Some(os_release), None).as_deref(),
+            Some("3.28.0.172")
+        );
+        assert_eq!(
+            firmware_version(Some(os_release), Some(update_conf)).as_deref(),
+            Some("3.28.0.172")
+        );
+        // Without IMG_VERSION (or with it empty): update.conf, then
+        // VERSION_ID.
+        let older = "NAME=Codex\nVERSION_ID=\"3.5.2\"\nIMG_VERSION=\"\"\n";
+        assert_eq!(
+            firmware_version(Some(older), Some(update_conf)).as_deref(),
+            Some("3.20.0.92")
+        );
+        assert_eq!(
+            firmware_version(Some(older), None).as_deref(),
+            Some("3.5.2")
+        );
+        assert_eq!(
+            firmware_version(None, Some(update_conf)).as_deref(),
+            Some("3.20.0.92")
+        );
+        // A key that only ends with IMG_VERSION is not it.
+        assert_eq!(
+            firmware_version(Some("BUILD_IMG_VERSION=9\nVERSION_ID=1.0\n"), None).as_deref(),
+            Some("1.0")
+        );
+        assert_eq!(firmware_version(None, None), None);
+        assert_eq!(firmware_version(Some(""), Some("")), None);
+    }
+
+    #[test]
+    fn known_codenames_get_marketing_names() {
+        let model =
+            |name: &str| parse_status("===M===", &format!("\n===M=== model\n{name}\u{0}\n")).model;
+        assert_eq!(
+            model("reMarkable Ferrari").as_deref(),
+            Some("reMarkable Paper Pro")
+        );
+        // Unknown names (and the older models' own) are left as reported.
+        assert_eq!(model("reMarkable 2.0").as_deref(), Some("reMarkable 2.0"));
+        assert_eq!(
+            model("reMarkable Testarossa").as_deref(),
+            Some("reMarkable Testarossa")
+        );
     }
 
     #[test]
