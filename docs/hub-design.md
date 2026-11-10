@@ -3,7 +3,8 @@
 Status: **phase 1 implemented** (git plumbing, data model, merge
 engine, device layer, sync cycle with clone, backup, status and
 `--dry-run`, the `rmu hub` CLI, and the hub lock for other `rmu`
-commands); device validation is next (see "Implementation plan").
+commands) and **validated on one Paper Pro** (see "Device validation
+results"); the bugs found there are listed with the results.
 This document is the plan of record; update it as phases land and as
 device experiments confirm or refute its assumptions.
 
@@ -1337,7 +1338,8 @@ below):
    phase 2 can decide on renumbering. (Two-device behaviour needs a
    second tablet.)
 
-Needing writes (answered during device validation, with go-ahead):
+Needing writes (questions 5–7 **answered** during device validation;
+see "Device validation results" below):
 
 5. Does xochitl regenerate missing thumbnails and `.local` files?
 6. How long is the UI down for snapshot and apply on a real library? Is
@@ -1479,6 +1481,153 @@ differ, and renumbering would mean rewriting `.rm` files. It is avoided:
 Whether the author UUID is per tablet or per account, and what xochitl
 does with a merged `cPages.uuids`, needs a second tablet (question 7).
 
+### Device validation results
+
+Writes against the same reMarkable Paper Pro (firmware 3.28.0, not
+paired with the cloud, about 110 items), with the owner's go-ahead,
+after a full read-only backup of the data dir. The origin was a local
+bare repository; the tablet was reached over Wi-Fi through a VPN, not
+USB. Every write went into one fabricated scratch folder (one generated
+one-page PDF); origin-side changes were ordinary commits pushed to the
+bare repository by hand. Sequence: `init`, `clone`, a no-op `sync`;
+`rmu mkdir` + `rmu upload` into the scratch folder and a `sync` up; on
+origin a rename, a `sync` down; the owner opened the document, a `sync`
+up; on origin one inserted page, a `sync` down; the owner opened it
+again, a `sync`; on origin the document and folder deleted, a `sync`
+down. Every run exited 0 with the expected report: no quarantine, no
+forks, no deletion-guard refusal, no watchdog firing, no lock or
+journal left behind; afterwards the tablet's listing equalled the one
+from before the test and `status` was clean.
+
+**5. Thumbnails and `.local`.** xochitl creates both **lazily, when a
+document is opened**, not when it starts: the document arrived without
+either (as every document applied from origin does, since neither is
+mirrored), and after two xochitl restarts it still had none. On first
+open `.local` (`{"contentFormatVersion": 2}`) appeared at once and a
+thumbnail of the page shown about 12 s later; `.content` and
+`.metadata` were rewritten when the document was closed (the first-open
+materialisation, see "Device survey results"). Turning to the inserted
+blank page wrote no thumbnail for it. Nothing about the missing files
+was logged. A rename applied from origin did not touch thumbnails, and
+the deletion applied from origin removed `.local` and `.thumbnails/`
+with the rest. Not tested: deleting the thumbnails of a document that
+already had them (nothing in the hub does that).
+
+**6. Downtime and the start limit.** Times from the tablet's journal
+(`Stopping` to `Started` of `xochitl.service`; `rm-sync` stops about
+10 ms earlier and starts with it):
+
+| Run | Wall time | xochitl stopped |
+|---|---|---|
+| `clone` (109 documents, nothing to apply) | 729 s | 0.57 s |
+| no-op `sync` | 3.7 s | 0.52 s |
+| `sync` pushing two new items | 4.3 s | 0.52 s |
+| `sync` applying a rename | 6.7 s | 0.54 s + 1.14 s, 2.0 s apart |
+| `sync` after a read-only open (view state only) | 4.3 s | 0.58 s |
+| `sync` applying two deletions | 6.0 s | 0.60 s + 1.47 s, 1.4 s apart |
+
+- The snapshot window (steps 4–5) costs about half a second when
+  little changed; the apply window (step 14) 1.1–1.5 s for one or two
+  documents.
+- `xochitl.service` is `Type=simple`, so `Started` is only the process
+  start: xochitl's own start-up (waveforms, front light, orientation)
+  ends about 2.3 s later. The UI is therefore gone for about 3 s per
+  stop. On a sync that applies, step 13 stops xochitl 1.4–2 s after
+  step 6 started it, before it finished starting, so the user sees one
+  outage of about 6–7 s (from the snapshot's stop to the end of the
+  apply's start-up), not two short ones. See "Follow-ups from device
+  validation".
+- The clone's time was almost all step 1's pre-read: the whole library
+  (about 0.8 GB, 670 MB packed) downloaded while xochitl ran, at about
+  1 MB/s over Wi-Fi and the VPN. The stopped snapshot after it took
+  well under a second. A first clone is best done over USB.
+- Stopping xochitl is safe on the Paper Pro with encrypted storage:
+  `/home` stays mounted and readable while xochitl is stopped (every
+  snapshot read it in that window). Eleven hub stops, all clean.
+- The start limit (`StartLimitBurst=4` in 600 s) was never hit: four
+  starts within 80 s (one `rmu upload` restart and three hub starts) and
+  seven within about 11 minutes (the journal of the last three had
+  rotated away by the time it was read; the runs succeeded and the
+  xochitl process ids show no reboot), `NRestarts` stayed 0, `Result`
+  stayed `success`, and `OnFailure` never ran. `reset-failed` before every
+  start is sufficient.
+- Every armed watchdog timer was gone after each run (no
+  `rmu-hub-watchdog-*` unit left).
+- **The tablet sleeps under rmu.** It suspended about 20 minutes after
+  the owner last woke it even though rmu had run over SSH and restarted
+  xochitl twice in that time; neither keeps it awake. It went to sleep
+  in the middle of an `rmu mkdir`, which then hung (see below). The
+  owner should keep the tablet awake (and on power for a first clone).
+- Side effect seen in the journal, harmless: the tablet's SSH server
+  opens a login session per command, `user@0.service` fails on every
+  session (it did so before rmu ran, so the system already reported
+  `degraded`), and a burst of rmu's commands trips the start limit of
+  `user-runtime-dir@0.service` (5 in 10 s). That unit has no
+  `OnFailure`, and every command still ran.
+
+**7. A page list changed externally.** Accepted. On origin, one
+blank inserted page was added after the only PDF page of the
+(materialised) document: an entry without `redir`, a fresh random
+`id`, `idx` `"bb"` after `"ba"`, `template` `"Blank"`, registers as
+author `1` with counters above the existing ones, and `pageCount` 2;
+no `.rm` file. After the apply the document opened normally and showed
+the PDF page followed by a blank page. xochitl kept the entry verbatim
+(no register renumbered) and, when the owner turned to it, set
+`cPages.lastOpened` to the new page with counter `"1:2"`, below the
+entry's own `"1:3"`/`"1:4"`: counters are not one clock per document.
+The next sync pushed nothing (view state only) and quarantined nothing.
+Not tested: page lists merged from two tablets (different author
+UUIDs in `cPages.uuids`), deleted pages, or inserted pages with ink;
+those need a second tablet (phase 2).
+
+**Other observations.**
+
+- A device ref already holding the snapshot's tree was reused: the
+  `sync` that applied the rename pushed no new snapshot. The first
+  no-op `sync` after `clone` did push one, as designed: the clone's
+  snapshot (empty base) has no `.rmu/hub.json`, later snapshots carry
+  it forward from base.
+- When origin had not moved, `main` fast-forwarded to the snapshot
+  commit itself, so the tablet's raw view state of a document the owner
+  had only read (`lastOpened`, `lastModified`, a `cPages.lastOpened`
+  counter) reached `main` with the new items. Harmless: it merges as
+  view state.
+- Opening a document and turning a page moved `lastModified` (see
+  `notebook-data.md`), confirming that it must stay a derived field.
+- Between two steps the tablet's battery ran low and it powered off,
+  with no rmu run in progress; after the reboot it was still attached,
+  unlocked and clean, and the remaining steps ran normally.
+
+**Bugs found** (each to be fixed in its own PR):
+
+1. **rmu hangs when the tablet sleeps.** `ssh.rs` sets neither
+   `ConnectTimeout` nor `ServerAliveInterval`, so a tablet that
+   suspends mid-command (or is asleep) leaves rmu waiting forever with
+   no output; seen for more than five minutes on `rmu mkdir`. The
+   validation passed `-o ConnectTimeout=15 -o ServerAliveInterval=10
+   -o ServerAliveCountMax=3` on every command. Defaults must not
+   override the user's ssh config (ssh takes the first value it sees).
+2. **`rmu mkdir` is not atomic and writes the visible file first.**
+   `Client::create_folder_in` writes `.metadata`, `.content` and
+   `.pagedata` in three round trips, `.metadata` first. The sleep above
+   cut it after the first: a folder xochitl would show, without
+   `.content`. Write all three in one guarded script, `.metadata`
+   last, as apply orders its moves.
+3. **Wrong firmware version in `Rmu-Firmware` and `rmu status`.**
+   firmware 3.28 has no `/usr/share/remarkable/update.conf`, so
+   `status::parse_status` falls back to `/etc/os-release` `VERSION_ID`,
+   which is the base OS's version (`5.8.203`), not the reMarkable
+   release; that one is `IMG_VERSION` (`3.28.0.172`) in the same file.
+   `Rmu-Model` is the board codename (`reMarkable Ferrari`), which is
+   cosmetic.
+4. **View state counted as a change.** After the owner only opened a
+   document, `sync` reported `Documents: 1 changed on the tablet` next
+   to `already in sync with origin; nothing pushed`, and `status`
+   printed both `No changes on the tablet since its last sync` and `A
+   sync would merge: Documents: 1 changed on the tablet`. Nothing wrong
+   was written; the per-document summary counts the document as
+   changed by the tablet although the merged tree equals origin's.
+
 ## Decisions (confirmed by the owner)
 
 - The tablet that syncs second after a same-page conflict gets origin's
@@ -1540,6 +1689,16 @@ To be handled in the implementation PRs named:
   validation") using the device time of the step-6 start for step-5
   stats and the record time for post-write stats.
 
+## Follow-ups from device validation
+
+- **One outage per applying sync.** On a small apply, step 13 stops
+  xochitl before the step-6 start has finished (see question 6), so
+  the second start only adds start-limit budget and seconds of
+  outage. When the staged upload is small (a size threshold), the cycle
+  could keep xochitl stopped from step 3 through step 16 under the
+  armed watchdog, with one start instead of two.
+- The four bugs listed under "Device validation results".
+
 ## Implementation plan
 
 Each item is one reviewed PR; items on the same line run in parallel.
@@ -1573,7 +1732,8 @@ Each item is one reviewed PR; items on the same line run in parallel.
    every write with `hub::device::probe_script`, carried by the
    listing).
 8. **Device validation** on a real tablet (questions 5–7) and fixes.
-   Requires the owner's go-ahead.
+   Requires the owner's go-ahead (done on one Paper Pro: "Device
+   validation results"; the fixes are separate PRs).
 9. **Refactor checkpoint**: shared code between `sync` and `hub`
    (listing, stat passes, tar transfer), module sizes, naming.
 10. **Phase 2 page-level merge.**
