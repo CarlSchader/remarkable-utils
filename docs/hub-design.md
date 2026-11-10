@@ -345,10 +345,15 @@ while implementing it, beyond the steps above:
   version at a commit the index has needs no tree read. The ancestry
   check uses the index, or one `rev-list` of `main`, not a process per
   base. The cache reader's caches are bounded (commits by count, trees
-  by entries, JSON by bytes). Measured on a fake tablet, release build:
-  reattaching 1000 documents over 2400 commits takes 1.3 s and +21 MB
-  (it took 10.5 s and +239 MB with a tree read per commit and
-  document), base inference 0.29 s of it.
+  by entries, JSON by bytes). `clone` reads the repo id from a
+  depth-1 fetch of `main`'s tip into a temporary repository, then
+  fetches into the cache itself, so a reattach to a cache that exists
+  transfers only what is new. Measured on a fake tablet, release build,
+  local origin: reattaching 1000 documents over 2400 commits takes
+  1.1 s and +22 MB (10.5 s and +239 MB with a tree read per commit and
+  document): fetching the 2400 commits the cache lacked 0.25 s, base
+  inference 0.31 s, merge, push and apply 0.3 s; with a one-merge
+  history the same reattach takes 0.39 s.
 - **Pure work after the start.** Validation, carry-forward, and (for
   `clone`) base inference run after step 6; while xochitl is stopped
   only the stat pass and downloads (streamed into `fast-import`) happen.

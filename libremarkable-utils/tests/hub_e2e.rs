@@ -2885,6 +2885,14 @@ fn reattach_scale_nothing_matches() {
     scale(1000, 1200, &[true]);
 }
 
+/// The same library with a one-merge history: what a reattach costs
+/// without history (reading the tablet, the snapshot, the merge).
+#[test]
+#[ignore = "scale measurement; run in release with --ignored --nocapture"]
+fn reattach_scale_short_history() {
+    scale(1000, 1, &[false]);
+}
+
 // ---- resilient pre-read ----------------------------------------------------------------
 
 /// A tablet with `docs` notebooks of two pages, its mirrored file count,

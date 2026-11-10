@@ -452,6 +452,17 @@ impl Repo {
         run("fetch", &mut cmd).map(drop)
     }
 
+    /// [`Repo::fetch`] of the tips only (`--depth=1`), without history:
+    /// enough to read a file of a branch's newest commit.
+    pub fn fetch_tips(&self, url: &str, refspecs: &[&str]) -> Result<()> {
+        let mut cmd = self.command("fetch");
+        cmd.args(["--quiet", "--no-tags", "--no-prune", "--depth=1"])
+            .arg("--end-of-options")
+            .arg(url)
+            .args(refspecs);
+        run("fetch", &mut cmd).map(drop)
+    }
+
     /// Push commit `src` to the full remote ref `dst`.
     ///
     /// Without a lease, the remote accepts only a fast-forward (or a new

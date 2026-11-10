@@ -209,8 +209,10 @@ fn sweep_incoming(root: &Path) -> Result<()> {
 }
 
 /// For a first contact (`clone`), when the repo id is not known yet:
-/// fetch origin's `main` into a temporary repository, read its repo id,
-/// then make that the cache (or fetch from it into an existing cache).
+/// fetch only the tip of origin's `main` into a temporary repository and
+/// read its repo id there, then open (or create) that cache, take its
+/// lock and fetch `main` into it: incremental when the cache exists, so
+/// a reattach does not transfer the whole history again.
 pub(super) fn bootstrap_cache(git: &Git, root: &Path, url: &str) -> Result<(Cache, Oid)> {
     fs::create_dir_all(root)?;
     sweep_incoming(root)?;
@@ -218,51 +220,36 @@ pub(super) fn bootstrap_cache(git: &Git, root: &Path, url: &str) -> Result<(Cach
     let temp = root.join(format!("incoming-{token}.git"));
     let temp_lock = root.join(format!("incoming-{token}.lock"));
     let held = take_lock(&temp_lock)?;
+    let not_initialised = || CycleError::NotInitialised {
+        url: url.to_string(),
+    };
     let result = (|| {
         let probe = git.init_bare(&temp, ObjectFormat::Sha1)?;
         let refs = probe.ls_remote(url)?;
-        let main = refs
+        let format = refs
             .iter()
             .find(|reference| reference.name == MAIN)
-            .ok_or_else(|| CycleError::NotInitialised {
-                url: url.to_string(),
-            })?;
-        let probe = match main.oid.object_format() {
+            .ok_or_else(not_initialised)?
+            .oid
+            .object_format();
+        let probe = match format {
             ObjectFormat::Sha1 => probe,
             format => {
                 fs::remove_dir_all(&temp)?;
                 git.init_bare(&temp, format)?
             }
         };
-        probe.fetch(url, &[&format!("+{MAIN}:{LOCAL_MAIN}")], false)?;
-        let main = probe
-            .rev_parse(LOCAL_MAIN)?
-            .ok_or_else(|| CycleError::NotInitialised {
-                url: url.to_string(),
-            })?;
-        let config = Store::new(probe.clone())?.repo_config(&main)?;
+        probe.fetch_tips(url, &[&format!("+{MAIN}:{LOCAL_MAIN}")])?;
+        let tip = probe.rev_parse(LOCAL_MAIN)?.ok_or_else(not_initialised)?;
+        let config = Store::new(probe.clone())?.repo_config(&tip)?;
         let lock = take_lock(&lock_path(root, &config.repo_id))?;
-        let path = root.join(format!("{}.git", config.repo_id));
-        let format = main.object_format();
-        let repo = match git.open(&path) {
-            Ok(repo) if repo.object_format()? == format => {
-                repo.fetch(
-                    temp.to_str().ok_or_else(|| {
-                        Error::InvalidGitInput("cache path is not UTF-8".to_string())
-                    })?,
-                    &[&format!("+{LOCAL_MAIN}:{LOCAL_MAIN}")],
-                    false,
-                )?;
-                repo
-            }
-            _ => {
-                if path.exists() {
-                    fs::remove_dir_all(&path)?;
-                }
-                fs::rename(&temp, &path)?;
-                git.open(&path)?
-            }
-        };
+        let repo = open_or_create(git, &root.join(format!("{}.git", config.repo_id)), format)?;
+        repo.fetch(url, &[&format!("+{MAIN}:{LOCAL_MAIN}")], false)?;
+        let main = repo.rev_parse(LOCAL_MAIN)?.ok_or_else(not_initialised)?;
+        // Origin replaced between the two fetches: this is not that cache.
+        if Store::new(repo.clone())?.repo_config(&main)?.repo_id != config.repo_id {
+            return Err(CycleError::RepoConfigChanged.into());
+        }
         Ok((Cache { repo, _lock: lock }, main))
     })();
     if temp.exists() {
