@@ -599,12 +599,22 @@ fn tree_parent(items: &BTreeMap<DocId, TreeItem>, id: &DocId) -> Option<DocId> {
         .filter(|parent| items.contains_key(parent))
 }
 
+/// `start`, then its parents among `items`, toward the root: the walk
+/// the tree checks and rules share. It ends below the root, the trash or
+/// a parent that is not an item; on a cycle it stops after
+/// `items.len() + 1` steps, by which point it has repeated.
+fn ancestors<'a>(
+    items: &'a BTreeMap<DocId, TreeItem>,
+    start: &DocId,
+) -> impl Iterator<Item = DocId> + 'a {
+    std::iter::successors(Some(start.clone()), move |id| tree_parent(items, id))
+        .take(items.len() + 1)
+}
+
 /// The cycle reached by walking parents from `start`, rotated to begin
 /// at its smallest member.
 fn cycle_from(items: &BTreeMap<DocId, TreeItem>, start: &DocId) -> Option<Vec<DocId>> {
-    let walk: Vec<DocId> = std::iter::successors(Some(start.clone()), |id| tree_parent(items, id))
-        .take(items.len() + 1)
-        .collect();
+    let walk: Vec<DocId> = ancestors(items, start).collect();
     // The walk either ends (root, trash, missing parent) or repeats;
     // the cycle is what lies between the first repeat and its earlier
     // occurrence.
@@ -1651,9 +1661,7 @@ impl State {
 /// `start`'s path up to and including the nearest item (itself
 /// included) whose parent is the trash, if there is one.
 fn trash_path(items: &BTreeMap<DocId, TreeItem>, start: &DocId) -> Option<Vec<DocId>> {
-    let walk: Vec<DocId> = std::iter::successors(Some(start.clone()), |id| tree_parent(items, id))
-        .take(items.len() + 1)
-        .collect();
+    let walk: Vec<DocId> = ancestors(items, start).collect();
     let end = walk.iter().position(|id| {
         items
             .get(id)
@@ -1664,13 +1672,11 @@ fn trash_path(items: &BTreeMap<DocId, TreeItem>, start: &DocId) -> Option<Vec<Do
 
 /// Whether `start`'s path reaches the trash (no allocation).
 fn on_trash_path(items: &BTreeMap<DocId, TreeItem>, start: &DocId) -> bool {
-    std::iter::successors(Some(start.clone()), |id| tree_parent(items, id))
-        .take(items.len() + 1)
-        .any(|id| {
-            items
-                .get(&id)
-                .is_some_and(|item| item.parent == TRASH_PARENT)
-        })
+    ancestors(items, start).any(|id| {
+        items
+            .get(&id)
+            .is_some_and(|item| item.parent == TRASH_PARENT)
+    })
 }
 
 /// Whether `item` may be moved under `parent` without creating an
@@ -1681,9 +1687,7 @@ fn safe_parent(items: &BTreeMap<DocId, TreeItem>, item: &DocId, parent: &str) ->
             items
                 .get(&parent)
                 .is_some_and(|found| found.kind == Some(ItemKind::Folder))
-                && !std::iter::successors(Some(parent.clone()), |id| tree_parent(items, id))
-                    .take(items.len() + 1)
-                    .any(|ancestor| ancestor == *item)
+                && !ancestors(items, &parent).any(|ancestor| ancestor == *item)
         })
 }
 
