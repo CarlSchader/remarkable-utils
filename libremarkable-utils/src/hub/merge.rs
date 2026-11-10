@@ -464,24 +464,51 @@ pub struct MergeOutcome {
     pub guard: DeletionGuard,
 }
 
+impl Summary {
+    fn count(mut self, resolution: &Resolution) -> Self {
+        match resolution {
+            Resolution::Unchanged => self.unchanged += 1,
+            Resolution::Changed(Side::Ours) => self.changed_ours += 1,
+            Resolution::Changed(Side::Theirs) => self.changed_theirs += 1,
+            Resolution::Identical => self.identical += 1,
+            Resolution::Added(_) | Resolution::AddedBoth => self.added += 1,
+            Resolution::Deleted(_) => self.deleted += 1,
+            Resolution::Kept(_) => self.kept += 1,
+            Resolution::Merged => self.merged += 1,
+            Resolution::Forked { .. } | Resolution::ForkCopy { .. } => self.forked += 1,
+            Resolution::Resurrected => self.resurrected += 1,
+        }
+        self
+    }
+}
+
 impl MergeOutcome {
     pub fn summary(&self) -> Summary {
         self.resolutions
             .values()
-            .fold(Summary::default(), |mut summary, resolution| {
-                match resolution {
-                    Resolution::Unchanged => summary.unchanged += 1,
-                    Resolution::Changed(Side::Ours) => summary.changed_ours += 1,
-                    Resolution::Changed(Side::Theirs) => summary.changed_theirs += 1,
-                    Resolution::Identical => summary.identical += 1,
-                    Resolution::Added(_) | Resolution::AddedBoth => summary.added += 1,
-                    Resolution::Deleted(_) => summary.deleted += 1,
-                    Resolution::Kept(_) => summary.kept += 1,
-                    Resolution::Merged => summary.merged += 1,
-                    Resolution::Forked { .. } | Resolution::ForkCopy { .. } => summary.forked += 1,
-                    Resolution::Resurrected => summary.resurrected += 1,
-                }
-                summary
+            .fold(Summary::default(), Summary::count)
+    }
+
+    /// [`Self::summary`] as a sync reports it: a document changed on one
+    /// side, or identically on both, counts as unchanged when
+    /// `view_state_only` says its merged version differs from its base
+    /// only in view state and derived fields. The merge decides such
+    /// documents by blob ids, without reading them; the sync pushes and
+    /// applies nothing for them, and its reports must agree.
+    pub fn summary_with(
+        &self,
+        mut view_state_only: impl FnMut(&DocId) -> Result<bool>,
+    ) -> Result<Summary> {
+        self.resolutions
+            .iter()
+            .try_fold(Summary::default(), |summary, (doc, resolution)| {
+                let counted = match resolution {
+                    Resolution::Changed(_) | Resolution::Identical if view_state_only(doc)? => {
+                        &Resolution::Unchanged
+                    }
+                    other => other,
+                };
+                Ok(summary.count(counted))
             })
     }
 }
@@ -931,11 +958,11 @@ impl<'a> Ctx<'a> {
     /// table judges them.
     fn side_and_base_keys(&self, id: &DocId, sides: &Sides, side: Side) -> Result<(Keys, Keys)> {
         let opaque = self.opaque(id, sides)?;
+        let base_content = self.json(id, JsonFile::Content, sides.base)?;
         let base = match sides.base.filter(|base| base.is_present()) {
-            Some(base) => self.keys(id, base, None, opaque)?,
+            Some(base) => self.keys(id, base, base_content.as_deref(), opaque)?,
             None => Keys::empty(),
         };
-        let base_content = self.json(id, JsonFile::Content, sides.base)?;
         let keys = match sides.side(side).filter(|version| version.is_present()) {
             Some(version) => self.keys(id, version, base_content.as_deref(), opaque)?,
             None => Keys::empty(),
@@ -1068,8 +1095,10 @@ impl<'a> Ctx<'a> {
             Some(_) => (base_content.clone(), base_content.clone()),
             None => (Some(Rc::clone(&unopened)), Some(unopened)),
         };
+        // The base against itself: a list `rmu hub add` materialised reads
+        // as the empty list, as the sides' materialisations of it do.
         let kb = match base_present {
-            Some(base) => self.keys(id, base, None, opaque)?,
+            Some(base) => self.keys(id, base, base_content.as_deref(), opaque)?,
             None => Keys::empty(),
         };
         let ko = self.keys(id, ours, ours_ref.as_deref(), opaque)?;
@@ -1292,24 +1321,38 @@ fn register_value<'v>(entry: &'v Value, key: &str) -> Option<&'v Value> {
 /// Whether `side`'s page list is xochitl's first-open materialisation of
 /// `reference`'s empty one: one entry per PDF page, `redir` equal to the
 /// page's position in `idx` order, nothing inserted, deleted or
-/// templated, and no ink. (`has_ink` is belt-and-braces: `.rm` files are
-/// in the fork key anyway, so hiding the page list can never hide ink;
-/// it keeps this function faithful to the definition in the design.)
+/// templated, and no ink. A reference that is itself such a list, of the
+/// same length, counts as empty (a list `rmu hub add` wrote, materialised
+/// again by a tablet with ids of its own; `reference` may be `side`
+/// itself, so that list reads as empty too). (`has_ink` is
+/// belt-and-braces: `.rm` files are in the fork key anyway, so hiding the
+/// page list can never hide ink; it keeps this function faithful to the
+/// definition in the design.)
 fn trivially_materialised(reference: &Value, side: &Value, has_ink: bool) -> bool {
     let (Some(before), Some(after)) = (pages(reference), pages(side)) else {
         return false;
     };
-    if has_ink || !before.is_empty() || after.is_empty() {
+    let unopened =
+        before.is_empty() || (before.len() == after.len() && trivial_page_list(reference));
+    !has_ink && unopened && !after.is_empty() && trivial_page_list(side)
+}
+
+/// Whether a `.content`'s page list has the shape of a first-open
+/// materialisation: keys only `id`, `idx`, `redir` and the per-page view
+/// state, `redir` equal to the position in `idx` order, and a page count
+/// equal to `cPages.original` when that is set.
+fn trivial_page_list(content: &Value) -> bool {
+    let Some(pages) = pages(content) else {
         return false;
-    }
-    let only_known_keys = after.iter().all(|page| {
+    };
+    let only_known_keys = pages.iter().all(|page| {
         page.as_object().is_some_and(|entry| {
             entry
                 .keys()
                 .all(|key| MATERIALISED_PAGE_KEYS.contains(&key.as_str()))
         })
     });
-    let mut ordered: Vec<(&str, &str, Option<u64>)> = after
+    let mut ordered: Vec<(&str, &str, Option<u64>)> = pages
         .iter()
         .map(|page| {
             (
@@ -1326,9 +1369,10 @@ fn trivially_materialised(reference: &Value, side: &Value, has_ink: bool) -> boo
         .iter()
         .enumerate()
         .all(|(position, (_, _, redir))| *redir == Some(position as u64));
-    let original_matches = register_value(side.get("cPages").unwrap_or(&Value::Null), "original")
-        .and_then(Value::as_i64)
-        .is_none_or(|original| original == after.len() as i64);
+    let original_matches =
+        register_value(content.get("cPages").unwrap_or(&Value::Null), "original")
+            .and_then(Value::as_i64)
+            .is_none_or(|original| original == pages.len() as i64);
     only_known_keys && positional && original_matches
 }
 

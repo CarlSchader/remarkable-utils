@@ -1065,17 +1065,8 @@ fn fake_builder_seeds_files_state_and_device() {
 
 #[cfg(target_os = "linux")]
 mod ssh_tablet {
-    use super::super::harness::local_ssh::{SshHarness, Tools, busybox};
+    use super::super::harness::local_ssh::{SshHarness, Tools, busybox, on_both};
     use super::*;
-
-    /// Run `check` with the host's tools and, if available, BusyBox.
-    fn on_both(systemd_run: bool, check: impl Fn(&SshHarness)) {
-        check(&SshHarness::new(Tools::Host, systemd_run));
-        match busybox() {
-            Some(busybox) => check(&SshHarness::new(Tools::BusyBox(&busybox), systemd_run)),
-            None => eprintln!("RMU_TEST_BUSYBOX is not set; skipping the BusyBox run"),
-        }
-    }
 
     fn run_contract(tools: Tools<'_>, label: &str) {
         SCENARIOS.iter().for_each(|(name, scenario)| {

@@ -22,7 +22,7 @@ use super::{
 use crate::error::{Error, Result};
 use crate::git::{CommitMeta, CommitWriter, Oid, Repo};
 use crate::hub::device::{DeviceInfo, LockState, Tablet};
-use crate::hub::merge::MergeOutcome;
+use crate::hub::merge::{MergeOutcome, Summary};
 use crate::hub::model::{DocId, ManifestEntry, MirrorRules, RepoTree, TabletState, XochitlPath};
 
 pub(super) use self::push::device_ref;
@@ -47,6 +47,8 @@ struct Pushed {
     base: Oid,
     merged: RepoTree,
     outcome: MergeOutcome,
+    /// The merge's summary as reported (as `MergeRun::summary`).
+    summary: Summary,
     attempts: usize,
     names: BTreeMap<DocId, String>,
 }

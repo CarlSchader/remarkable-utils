@@ -271,7 +271,7 @@ impl Hub<'_> {
             changes,
             behind,
             open_conflicts,
-            summary: outcome.summary(),
+            summary: run.summary,
             guard: outcome.guard,
             names,
             notes: outcome.notes,

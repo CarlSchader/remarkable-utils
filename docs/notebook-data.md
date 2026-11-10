@@ -17,9 +17,9 @@ Every item (document or folder) is a UUID plus a flat set of files in
 | `<uuid>.pagedata`     | One template name per line, one line per page (may be empty/missing) |
 | `<uuid>.<fileType>`   | Document payload — **only for `pdf` and `epub`** |
 | `<uuid>/`             | Per-page stroke data: one `<page-id>.rm` file per inked page (+ `*-metadata.json` on older firmware) |
-| `<uuid>.thumbnails/`  | Page thumbnails, `<page-id>.png` (only for documents that have been opened) |
+| `<uuid>.thumbnails/`  | Page thumbnails, `<page-id>.png` (only for documents that have been opened; written lazily, see below) |
 | `<uuid>.highlights/`  | Smart-highlight JSON (annotated PDFs/EPUBs, newer firmware) |
-| `<uuid>.local`        | Device-local JSON, `{"contentFormatVersion": 2}` on firmware 3.28; one per document, none for folders |
+| `<uuid>.local`        | Device-local JSON, `{"contentFormatVersion": 2}` on firmware 3.28; one per opened document, none for folders |
 
 Plus one file that belongs to no item: `.tree`, a binary cloud-sync cache
 (it holds cloud account identifiers; it also exists on tablets that are not
@@ -161,6 +161,25 @@ id**, `original`, `uuids`, `pageCount`, `sizeInBytes`,
 `new: false` in `.metadata`. Two tablets opening the same imported PDF
 therefore produce different page lists for identical content.
 
+Thumbnails and `.local` are created lazily too. A document copied in by a
+tool has neither, and restarting xochitl does not create them. On first
+open (firmware 3.28) `.local` appears at once and a thumbnail of the page
+shown some seconds later; `.content` and `.metadata` are rewritten when
+the document is closed. A blank inserted page that was viewed got no
+thumbnail. Missing thumbnails and `.local` are therefore not an error, and
+tools need not copy them.
+
+### Page lists edited outside the tablet
+
+In a controlled test on firmware 3.28, xochitl accepted a page list
+edited on a computer: one inserted blank page (no `redir`, a fresh v4
+`id`, an `idx` sorting after the existing page, `template` `"Blank"`,
+registers as author `1`, `pageCount` updated, no `.rm` file) written while
+xochitl was stopped. The document opened normally with the extra page,
+and xochitl kept the entry verbatim. It later set `cPages.lastOpened`
+with counter `"1:2"` although the new entry used `"1:3"` and `"1:4"`:
+counters are per register, not one clock per document.
+
 ### What changes when a document is only read
 
 Evidence from a library of about a hundred items (file mtimes against the
@@ -174,6 +193,11 @@ timestamps inside the files; no before/after experiment):
   being read) and, in the observed cases, **does** move `lastModified`
   to the moment of the scroll, weeks after the last ink. One rewrite of
   both files without a `lastModified` bump was also seen.
+
+A controlled test confirmed it: opening a document and turning to another
+page, with no ink, moved `lastModified` to within seconds of `lastOpened`.
+The only `.content` change on another document opened the same way was the
+counter of `cPages.lastOpened` (its value unchanged).
 
 So `lastModified` is not a reliable "content changed" signal, and tools
 that compare documents must ignore it along with the reading-position
@@ -204,6 +228,10 @@ little-endian, so its rendering of the UUID differs from the string in
 and tombstone id uses author `1`; the built-in root and layer nodes use
 author `0`. A page file is therefore self-contained: its author table
 travels with it.
+
+The author UUID is a version-5 (name-based) UUID, the same in every
+document on the tablet, including one first opened weeks after the others,
+so it is derived from something stable rather than drawn per document.
 
 Rendering `.rm` to PDF/SVG is deliberately out of scope for now (see
 AGENTS.md); we move raw files instead.

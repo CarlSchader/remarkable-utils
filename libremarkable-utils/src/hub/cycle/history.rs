@@ -16,6 +16,18 @@ use crate::hub::model::DocId;
 
 const TREE_MODE: u32 = 0o040000;
 
+/// One document's change in one commit against its first parent: its
+/// subtree before and after (`None`: absent).
+pub(super) type DocStep<'a> = (&'a DocId, Option<&'a Oid>, Option<&'a Oid>);
+
+/// A commit of a first-parent chain and the documents its diff against
+/// its first parent changed, by id.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct ChainStep<'a> {
+    pub commit: &'a Oid,
+    pub changes: Vec<DocStep<'a>>,
+}
+
 /// See the module docs.
 #[derive(Debug)]
 pub(super) struct HistoryIndex {
@@ -29,6 +41,12 @@ pub(super) struct HistoryIndex {
     /// Per document, the commits whose diff touches it and its subtree
     /// there (`None`: absent), by position, newest first.
     touches: HashMap<DocId, Vec<(usize, Option<Oid>)>>,
+}
+
+/// A first-parent chain: its positions, newest first, and as a set.
+struct Chain {
+    order: Vec<usize>,
+    members: HashSet<usize>,
 }
 
 fn incomplete(detail: String) -> Error {
@@ -202,6 +220,87 @@ impl HistoryIndex {
             .collect()
     }
 
+    /// The first-parent chain from `from` (the tip or one of its
+    /// ancestors; `None` if the index lacks it), newest first, every
+    /// commit with the documents it changed against its first parent
+    /// (none for a commit that changed no document). A document's touches
+    /// on the chain, in order, are the versions it moved between: what it
+    /// held before a touch is what the next older touch set (absent
+    /// before the first).
+    pub fn chain(&self, from: &Oid) -> Option<Vec<ChainStep<'_>>> {
+        let chain = self.chain_positions(from)?;
+        let mut steps = self
+            .touches
+            .iter()
+            .flat_map(|(doc, touches)| self.steps_on(&chain, doc, touches))
+            .fold(
+                HashMap::<usize, Vec<DocStep<'_>>>::new(),
+                |mut steps, (at, step)| {
+                    steps.entry(at).or_default().push(step);
+                    steps
+                },
+            );
+        Some(
+            chain
+                .order
+                .iter()
+                .map(|at| {
+                    let mut changes = steps.remove(at).unwrap_or_default();
+                    changes.sort_by_key(|(doc, ..)| *doc);
+                    ChainStep {
+                        commit: &self.commits[*at],
+                        changes,
+                    }
+                })
+                .collect(),
+        )
+    }
+
+    /// `doc`'s changes on the first-parent chain from `from`, newest
+    /// first, with the commit making each (`None` if the index lacks
+    /// `from`).
+    pub fn doc_chain(&self, from: &Oid, doc: &DocId) -> Option<Vec<(&Oid, DocStep<'_>)>> {
+        let chain = self.chain_positions(from)?;
+        let touches = self.touches.get_key_value(doc);
+        Some(
+            touches
+                .map(|(doc, touches)| self.steps_on(&chain, doc, touches))
+                .into_iter()
+                .flatten()
+                .map(|(at, step)| (&self.commits[at], step))
+                .collect(),
+        )
+    }
+
+    fn chain_positions(&self, from: &Oid) -> Option<Chain> {
+        let start = *self.position.get(from)?;
+        let order: Vec<usize> =
+            std::iter::successors(Some(start), |&index| self.first_parent[index]).collect();
+        let members = order.iter().copied().collect();
+        Some(Chain { order, members })
+    }
+
+    /// A document's touches on `chain` as steps, newest first.
+    fn steps_on<'s>(
+        &'s self,
+        chain: &Chain,
+        doc: &'s DocId,
+        touches: &'s [(usize, Option<Oid>)],
+    ) -> Vec<(usize, DocStep<'s>)> {
+        let on: Vec<&(usize, Option<Oid>)> = touches
+            .iter()
+            .filter(|(at, _)| chain.members.contains(at))
+            .collect();
+        on.iter()
+            .enumerate()
+            .map(|(k, (at, after))| {
+                let before = on.get(k + 1).and_then(|(_, subtree)| subtree.as_ref());
+                (*at, (doc, before, after.as_ref()))
+            })
+            .filter(|(_, (_, before, after))| before != after)
+            .collect()
+    }
+
     /// `doc`'s versions along the tip's first-parent chain, newest first,
     /// one per stretch of commits holding it (`None`: absent).
     pub fn first_parent_versions(&self, doc: &DocId) -> Vec<Option<&Oid>> {
@@ -352,6 +451,64 @@ mod tests {
             vec![None, Some(&oid(200))]
         );
         assert!(index.first_parent_versions(&doc(3)).is_empty());
+    }
+
+    type OwnedStep = (DocId, Option<Oid>, Option<Oid>);
+
+    fn owned((doc, before, after): DocStep) -> OwnedStep {
+        (doc.clone(), before.cloned(), after.cloned())
+    }
+
+    #[test]
+    fn chains_list_each_commits_changes_with_before_and_after() {
+        let index = index();
+        let (d1, d2) = (doc(1), doc(2));
+        let v = |n: u32| Some(oid(n));
+        let chain: Vec<(Oid, Vec<OwnedStep>)> = index
+            .chain(&oid(9))
+            .unwrap()
+            .into_iter()
+            .map(|step| {
+                let changes = step.changes.into_iter().map(owned).collect();
+                (step.commit.clone(), changes)
+            })
+            .collect();
+        // The side commit 5 is not on the chain; 9 takes v500 over v700.
+        assert_eq!(
+            chain,
+            vec![
+                (oid(9), vec![(d1.clone(), v(700), v(500))]),
+                (oid(8), vec![(d2.clone(), v(200), None)]),
+                (oid(7), vec![(d1.clone(), v(100), v(700))]),
+                (
+                    oid(1),
+                    vec![(d1.clone(), None, v(100)), (d2.clone(), None, v(200))]
+                ),
+            ]
+        );
+        // From the side commit: its own chain (5, 1).
+        let side: Vec<&Oid> = index
+            .chain(&oid(5))
+            .unwrap()
+            .iter()
+            .map(|step| step.commit)
+            .collect();
+        assert_eq!(side, vec![&oid(5), &oid(1)]);
+        let doc_chain: Vec<(Oid, OwnedStep)> = index
+            .doc_chain(&oid(5), &d1)
+            .unwrap()
+            .into_iter()
+            .map(|(commit, step)| (commit.clone(), owned(step)))
+            .collect();
+        assert_eq!(
+            doc_chain,
+            vec![
+                (oid(5), (d1.clone(), v(100), v(500))),
+                (oid(1), (d1.clone(), None, v(100)))
+            ]
+        );
+        assert!(index.doc_chain(&oid(9), &doc(3)).unwrap().is_empty());
+        assert!(index.chain(&oid(6)).is_none());
     }
 
     #[test]

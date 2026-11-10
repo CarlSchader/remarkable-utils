@@ -21,6 +21,7 @@ use crate::hub::model::{TabletState, XochitlPath};
 use crate::progress::{NoProgress, Progress};
 use crate::ssh::SshSession;
 use crate::status;
+use crate::xochitl_service;
 
 /// The device layer over SSH.
 pub struct SshTablet {
@@ -96,13 +97,14 @@ fn guard_error(status: Option<i32>) -> Option<DeviceError> {
     }
 }
 
+/// [`ssh::checked`](crate::ssh::checked), with the guard's exit
+/// statuses as their typed errors.
 fn checked(output: Output) -> Result<Output> {
-    if output.status.success() {
-        return Ok(output);
-    }
-    Err(remote_error(&output))
+    map_guard(crate::ssh::checked(output))
 }
 
+/// [`ssh::failure`](crate::ssh::failure), or the guard's typed error for
+/// its exit statuses.
 fn remote_error(output: &Output) -> Error {
     guard_error(output.status.code()).map_or_else(|| crate::ssh::failure(output), Error::from)
 }
@@ -361,8 +363,10 @@ impl Tablet for SshTablet {
     }
 
     fn xochitl_active(&self) -> Result<bool> {
-        let output = self.session.run_script(scripts::IS_ACTIVE_SCRIPT)?;
-        let state = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let output = self
+            .session
+            .run_script(&format!("{}\n", xochitl_service::IS_ACTIVE))?;
+        let state = xochitl_service::state(&output.stdout);
         // `is-active` exits non-zero for every state but `active`; 255 is
         // ssh's own failure.
         if output.status.code() == Some(255) || state.is_empty() {
@@ -387,7 +391,7 @@ impl Tablet for SshTablet {
     }
 
     fn device_info(&self) -> Result<DeviceInfo> {
-        let marker = format!("===RMU:{}===", uuid::Uuid::new_v4().simple());
+        let marker = crate::marked::new_marker();
         let status =
             status::parse_status(&marker, &self.script_text(&status::status_script(&marker))?);
         Ok(DeviceInfo {
@@ -771,6 +775,39 @@ mod tests {
             stdout: stdout.as_bytes().to_vec(),
             stderr: stderr.as_bytes().to_vec(),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checked_maps_guard_statuses_and_keeps_others() {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(checked(output(0, "out", "")).unwrap().stdout, b"out");
+        assert!(matches!(
+            checked(output(EXIT_BUSY, "", "busy")),
+            Err(Error::HubDevice(DeviceError::Busy))
+        ));
+        assert!(matches!(
+            remote_error(&output(EXIT_REBOOTED, "", "")),
+            Error::HubDevice(DeviceError::Rebooted)
+        ));
+        assert!(matches!(
+            checked(output(2, "", " no such file \n")),
+            Err(Error::Remote { status: 2, stderr }) if stderr == "no such file"
+        ));
+        // Killed by a signal: no exit status.
+        let killed = Output {
+            status: std::process::ExitStatus::from_raw(9),
+            stdout: Vec::new(),
+            stderr: b"killed".to_vec(),
+        };
+        assert!(matches!(
+            remote_error(&killed),
+            Error::Remote { status: -1, .. }
+        ));
+        assert!(matches!(
+            checked(killed),
+            Err(Error::Remote { status: -1, stderr }) if stderr == "killed"
+        ));
     }
 
     #[cfg(unix)]

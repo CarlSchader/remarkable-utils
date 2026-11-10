@@ -159,14 +159,10 @@ impl SshSession {
 /// The error for a failed command: [`Error::Unreachable`] when ssh gave
 /// up on the tablet (see [`is_unreachable`]), else [`Error::Remote`].
 pub fn failure(output: &Output) -> Error {
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     if is_unreachable(output) {
-        return Error::Unreachable(stderr);
+        return Error::Unreachable(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
-    Error::Remote {
-        status: output.status.code().unwrap_or(-1),
-        stderr,
-    }
+    super::remote_error(output)
 }
 
 /// A multiplexed command whose master connection died exits 255 without

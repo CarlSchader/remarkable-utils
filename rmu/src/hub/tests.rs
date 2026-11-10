@@ -308,3 +308,191 @@ fn guard_refusal() -> Error {
         ]),
     })
 }
+
+// ---- history reports -----------------------------------------------------------
+
+use libremarkable_utils::hub::cycle::{
+    AddReport, CommitDevice, CommitKind, DocEvent, DocLogEntry, DocLogReport, ForkRecord, LogEntry,
+    LogReport, Place, RestoreRecord, RestoreReport, TabletBase,
+};
+
+/// 2026-11-09 14:03:20 UTC.
+const TIME: i64 = 1_794_232_800 + 3 * 60 + 20;
+
+fn tablet_base(base: Option<Oid>) -> TabletBase {
+    TabletBase {
+        device_id: device_id(),
+        device_name: DeviceName::new("Desk tablet").unwrap(),
+        base,
+        overrides: 2,
+    }
+}
+
+fn root() -> Place {
+    Place {
+        parent: String::new(),
+        path: "/".into(),
+    }
+}
+
+fn projects() -> Place {
+    Place {
+        parent: doc(40).to_string(),
+        path: "/Projects".into(),
+    }
+}
+
+fn log_entry(commit: char, kind: CommitKind) -> LogEntry {
+    LogEntry {
+        commit: oid(commit),
+        kind,
+        author: "rmu".into(),
+        time: TIME,
+        subject: "rmu hub: init".into(),
+        device: None,
+        notes: Vec::new(),
+        forks: Vec::new(),
+        consented: Vec::new(),
+        restored: Vec::new(),
+        added: Vec::new(),
+        changed: Vec::new(),
+        deleted: Vec::new(),
+        names: BTreeMap::new(),
+    }
+}
+
+fn log_report() -> LogReport {
+    let sync = LogEntry {
+        author: "Desk tablet".into(),
+        subject: "rmu hub: sync Desk tablet".into(),
+        device: Some(CommitDevice {
+            name: Some("Desk tablet".into()),
+            id: Some(device_id().to_string()),
+            model: Some("reMarkable Fake".into()),
+            firmware: Some("3.28.0".into()),
+        }),
+        notes: vec![
+            "8c1f0b9e-0000-4000-8000-000000000001: \"visibleName\" changed on both sides".into(),
+        ],
+        forks: vec![ForkRecord {
+            original: doc(1),
+            copy: doc(2),
+        }],
+        consented: vec![doc(3)],
+        added: vec![doc(2)],
+        changed: vec![doc(1)],
+        deleted: vec![doc(3)],
+        names: BTreeMap::from([
+            (doc(1), "Notes".to_string()),
+            (
+                doc(2),
+                "Notes (conflict Desk tablet 2026-11-09)".to_string(),
+            ),
+            (doc(3), "Old".to_string()),
+        ]),
+        ..log_entry('c', CommitKind::Sync)
+    };
+    let restore = LogEntry {
+        subject: "rmu hub: restore \"Old (restored 2026-11-09)\"".into(),
+        restored: vec![RestoreRecord {
+            copy: doc(4),
+            original: doc(3),
+            from: oid('b'),
+        }],
+        added: vec![doc(4)],
+        names: BTreeMap::from([
+            (doc(3), "Old".to_string()),
+            (doc(4), "Old (restored 2026-11-09)".to_string()),
+        ]),
+        ..log_entry('d', CommitKind::Restore)
+    };
+    LogReport {
+        repo_id: repo_id(),
+        origin: "ssh://git@example.invalid/library.git".into(),
+        main: oid('d'),
+        tablet: Some(tablet_base(Some(oid('c')))),
+        entries: vec![restore, sync, log_entry('a', CommitKind::Init)],
+        more: 5,
+    }
+}
+
+fn doc_log_report() -> DocLogReport {
+    let entry = |commit: char, events: Vec<DocEvent>| DocLogEntry {
+        commit: oid(commit),
+        kind: CommitKind::Sync,
+        author: "Desk tablet".into(),
+        time: TIME,
+        subject: "rmu hub: sync Desk tablet".into(),
+        events,
+        version: Some(oid('9')),
+    };
+    DocLogReport {
+        repo_id: repo_id(),
+        origin: "ssh://git@example.invalid/library.git".into(),
+        main: oid('d'),
+        doc: doc(1),
+        name: Some("Notes".into()),
+        place: Some(projects()),
+        tablet: Some(tablet_base(Some(oid('c')))),
+        entries: vec![
+            entry(
+                'd',
+                vec![DocEvent::Changed, DocEvent::ForkedInto { copy: doc(2) }],
+            ),
+            entry(
+                'c',
+                vec![
+                    DocEvent::Renamed {
+                        from: Some("Draft".into()),
+                        to: Some("Notes".into()),
+                    },
+                    DocEvent::Moved {
+                        from: root(),
+                        to: projects(),
+                    },
+                ],
+            ),
+            entry(
+                'b',
+                vec![DocEvent::RestoredAs {
+                    copy: doc(4),
+                    from: oid('a'),
+                }],
+            ),
+            entry(
+                'a',
+                vec![DocEvent::Added {
+                    name: Some("Draft".into()),
+                    place: root(),
+                }],
+            ),
+        ],
+    }
+}
+
+fn restore_report() -> RestoreReport {
+    RestoreReport {
+        original: doc(3),
+        original_name: "Old".into(),
+        copy: doc(4),
+        name: "Old (restored 2026-11-09)".into(),
+        place: projects(),
+        at: oid('d'),
+        from: oid('b'),
+        commit: oid('e'),
+        push_attempts: 2,
+    }
+}
+
+fn add_report(pages: Option<usize>) -> AddReport {
+    AddReport {
+        doc: doc(5),
+        name: "Report".into(),
+        place: root(),
+        file_type: "pdf".into(),
+        bytes: 2048,
+        pages,
+        commit: oid('f'),
+        push_attempts: 1,
+    }
+}

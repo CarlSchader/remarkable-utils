@@ -22,6 +22,7 @@
 //!   planners, executors (see `docs/sync-design.md`).
 //! - [`hub`] — `rmu hub`, git-backed multi-tablet sync (see
 //!   `docs/hub-design.md`); [`hub::model`] is its pure data model.
+//! - [`pdf`] — a minimal, conservative PDF page counter (pure).
 //! - [`status`] — device system state (model, firmware, CPU/RAM/disk,
 //!   battery), gathered in one round trip.
 //! - [`progress`] — observer trait for progress reporting; the
@@ -37,12 +38,16 @@ pub mod client;
 pub mod error;
 pub mod git;
 pub mod hub;
+mod marked;
+pub mod pdf;
 pub mod progress;
 mod relative_path;
 pub mod ssh;
 pub mod status;
 pub mod sync;
+mod xdg;
 pub mod xochitl;
+mod xochitl_service;
 
 pub use client::Client;
 pub use error::{Error, Result};
