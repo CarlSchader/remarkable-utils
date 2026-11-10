@@ -56,11 +56,13 @@ fn parses_every_subcommand() {
         HubCommand::Sync {
             dry_run,
             allow_deletions,
+            two_windows,
             run,
             origin,
         } => {
             assert!(!dry_run);
             assert!(allow_deletions);
+            assert!(!two_windows);
             assert_eq!(run, &RunArgs::default());
             assert_eq!(origin.origin.as_deref(), Some("laptop:lib.git"));
         }
@@ -204,6 +206,15 @@ fn options_follow_the_flags() {
     assert_eq!(sync.watchdog, Duration::from_secs(90));
     assert_eq!(sync.origin.as_deref(), Some("/o.git"));
 
+    // A small sync keeps xochitl stopped once, unless --two-windows.
+    assert!(sync.single_stop.is_some());
+    let two = options(&hub_args(&["sync", "--two-windows"]).command);
+    assert_eq!(two.single_stop, None);
+    assert_eq!(two.watchdog, HubOptions::default().watchdog);
+    assert_eq!(
+        parse_error(&["sync", "--two-windows", "--dry-run"]),
+        clap::error::ErrorKind::ArgumentConflict
+    );
     let status = options(&hub_args(&["status"]).command);
     assert_eq!(status, HubOptions::default());
     assert_eq!(
