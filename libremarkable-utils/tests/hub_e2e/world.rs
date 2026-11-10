@@ -131,7 +131,7 @@ impl Device {
         fs::write(self.tablet.paths().state_file(), state.to_json()).unwrap();
     }
 
-    fn file(&self, path: &str) -> Option<Vec<u8>> {
+    pub fn file(&self, path: &str) -> Option<Vec<u8>> {
         self.tablet.read_file(path)
     }
 
@@ -309,17 +309,25 @@ impl World {
     }
 
     /// A copy of this world in a new directory: origin, tablets (files,
-    /// hub state) and caches; ink bookkeeping included. The fakes start
-    /// fresh (xochitl running, a new boot id, no faults).
+    /// hub state) and caches; ink bookkeeping and options included. The
+    /// fakes start fresh (xochitl running, a new boot id, no faults).
     pub fn duplicate(&self) -> Self {
         let scratch = Scratch::new("hub-e2e");
         copy_dir(&self.root, scratch.path());
-        let copy = Self::at(scratch, self.devices.len(), false);
+        let mut copy = Self::at(scratch, self.devices.len(), false);
+        copy.options = self.options.clone();
         let inks = self.inks.lock().unwrap().clone();
         *copy.inks.lock().unwrap() = inks;
         let ids = *self.ids.lock().unwrap();
         *copy.ids.lock().unwrap() = ids;
         copy
+    }
+
+    /// This world with the two-window cycle only: every sync starts
+    /// xochitl after its read and stops it again to apply.
+    pub fn two_windows(mut self) -> Self {
+        self.options.single_stop = None;
+        self
     }
 
     pub fn device(&self, i: usize) -> &Device {

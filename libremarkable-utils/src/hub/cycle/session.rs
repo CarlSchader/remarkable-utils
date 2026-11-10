@@ -1,7 +1,7 @@
 //! The tablet side of one run: the lock, the watchdog, stopping and
 //! starting xochitl, and the error path that brings it back.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::origin::OriginCtx;
 use super::{Hub, TakeOver, Warning};
@@ -18,6 +18,11 @@ pub(super) struct Session<'t> {
     /// Set before a stop is attempted (its reply may be lost), cleared by
     /// a start that succeeded.
     pub(super) maybe_stopped: bool,
+    /// When the last stop was attempted.
+    stopped_at: Option<Instant>,
+    /// Keeping xochitl stopped past step 6 (single-stop): the watchdog
+    /// timeout meanwhile, cleared by a start.
+    deferred: Option<Duration>,
 }
 
 impl<'t> Session<'t> {
@@ -27,6 +32,8 @@ impl<'t> Session<'t> {
             watchdog,
             lock: None,
             maybe_stopped: false,
+            stopped_at: None,
+            deferred: None,
         }
     }
 
@@ -57,14 +64,19 @@ impl<'t> Session<'t> {
         self.lock.as_ref().expect("the lock is taken first")
     }
 
-    /// Arm (or re-arm) the watchdog.
+    /// Arm (or re-arm) the watchdog: for the run's timeout, or the
+    /// shorter one while xochitl stays stopped past step 6.
     pub(super) fn arm(&self) -> Result<()> {
-        self.tablet.arm_watchdog(self.lock(), self.watchdog)
+        let timeout = self
+            .deferred
+            .map_or(self.watchdog, |cap| cap.min(self.watchdog));
+        self.tablet.arm_watchdog(self.lock(), timeout)
     }
 
     pub(super) fn stop(&mut self) -> Result<()> {
         self.arm()?;
         self.maybe_stopped = true;
+        self.stopped_at = Some(Instant::now());
         self.tablet.stop_xochitl(self.lock())
     }
 
@@ -72,7 +84,25 @@ impl<'t> Session<'t> {
     pub(super) fn start(&mut self) -> Result<i64> {
         let time = self.tablet.start_xochitl(self.lock())?;
         self.maybe_stopped = false;
+        self.deferred = None;
         Ok(time)
+    }
+
+    /// Keep xochitl stopped past step 6, re-arming the watchdog for `cap`
+    /// now and at every later arming until the next start.
+    pub(super) fn defer_start(&mut self, cap: Duration) -> Result<()> {
+        self.deferred = Some(cap);
+        self.arm()
+    }
+
+    /// Whether xochitl is being kept stopped past step 6.
+    pub(super) fn deferring(&self) -> bool {
+        self.deferred.is_some() && self.maybe_stopped
+    }
+
+    /// How long ago xochitl was last stopped (zero if it never was).
+    pub(super) fn stopped_for(&self) -> Duration {
+        self.stopped_at.map_or(Duration::ZERO, |at| at.elapsed())
     }
 
     pub(super) fn write_state(&self, state: &TabletState) -> Result<()> {

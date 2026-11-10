@@ -1401,3 +1401,67 @@ fn a_partial_finish_checks_the_tree_with_the_users_own_metadata() {
         "{planned:?}"
     );
 }
+
+// ---- single stop ---------------------------------------------------------------------
+
+/// A document's files by blob: `(page n, blob n)` pairs plus metadata.
+fn files(meta: u32, pages: &[(u32, u32)]) -> BTreeMap<DocFile, Oid> {
+    std::iter::once((DocFile::Metadata, oid(meta)))
+        .chain(pages.iter().map(|(n, blob)| (page(*n), oid(*blob))))
+        .collect()
+}
+
+/// The same files as read, each `size` bytes.
+fn as_read(files: &BTreeMap<DocFile, Oid>, size: u64) -> BTreeMap<DocFile, (Oid, u64)> {
+    files
+        .iter()
+        .map(|(file, blob)| (file.clone(), (blob.clone(), size)))
+        .collect()
+}
+
+#[test]
+fn the_network_estimate_counts_what_origin_changed_and_the_tablet_lacks() {
+    let unchanged = files(1, &[(1, 2)]);
+    let renamed = files(3, &[(1, 2)]);
+    let inked = files(1, &[(1, 4)]);
+    let base = BTreeMap::from([
+        (doc(1), unchanged.clone()),
+        (doc(2), unchanged.clone()),
+        (doc(3), unchanged.clone()),
+    ]);
+    let tablet = |docs: &[(u32, &BTreeMap<DocFile, Oid>)]| -> BTreeMap<_, _> {
+        docs.iter()
+            .map(|(n, files)| (doc(*n), as_read(files, 100)))
+            .collect()
+    };
+    // Nothing changed anywhere: nothing to apply, nothing to push.
+    let same = tablet(&[(1, &unchanged), (2, &unchanged), (3, &unchanged)]);
+    assert_eq!(
+        network_estimate(&base, &same, &base),
+        NetworkEstimate::default()
+    );
+    // Origin renamed doc 1 and deleted doc 2: two documents to apply,
+    // only the new metadata to send (the page is on the tablet).
+    let origin = BTreeMap::from([(doc(1), renamed.clone()), (doc(3), unchanged.clone())]);
+    let estimate = network_estimate(&base, &same, &origin);
+    assert_eq!(estimate.apply_docs, 2);
+    assert_eq!(estimate.apply_blobs, BTreeSet::from([oid(3)]));
+    assert_eq!(estimate.tablet_bytes, 0);
+    // The tablet already holds origin's version: nothing to apply.
+    let caught_up = tablet(&[(1, &renamed), (3, &unchanged)]);
+    let estimate = network_estimate(&base, &caught_up, &origin);
+    assert_eq!(estimate.apply_docs, 0);
+    // The tablet inked doc 3 (only origin's change to apply), and added
+    // doc 4: the push sends the new page and the new document.
+    let busy = tablet(&[(1, &unchanged), (2, &unchanged), (3, &inked), (4, &renamed)]);
+    let estimate = network_estimate(&base, &busy, &origin);
+    assert_eq!(estimate.apply_docs, 2);
+    assert_eq!(estimate.tablet_bytes, 100 + 2 * 100);
+    // Both changed doc 1, differently: a conflict copy of the tablet's
+    // whole version may be staged too.
+    let both = tablet(&[(1, &inked), (2, &unchanged), (3, &unchanged)]);
+    let estimate = network_estimate(&base, &both, &origin);
+    assert_eq!(estimate.apply_docs, 2);
+    assert_eq!(estimate.apply_blobs, BTreeSet::from([oid(2), oid(3)]));
+    assert_eq!(estimate.tablet_bytes, 100 + 2 * 100, "push + copy");
+}

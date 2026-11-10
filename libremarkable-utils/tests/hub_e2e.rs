@@ -520,6 +520,9 @@ fn edits_during_the_sync_are_skipped_then_picked_up() {
 /// base, which holds the same version.
 fn edits_during_the_sync(own_change: bool) {
     let (base, lib) = two_tablets();
+    // Two windows: a single-stop sync never runs xochitl between its
+    // read and its apply, so nothing can be edited in between.
+    let base = base.two_windows();
     base.rename(1, &lib.notes, "Notes (renamed on B)");
     base.sync(1).unwrap();
     if own_change {
@@ -1004,6 +1007,15 @@ fn settle(world: &World) -> Vec<(libremarkable_utils::hub::model::DocId, String)
     world.conflicts()
 }
 
+/// Run `test` on the crash scenario and its clean run's [`Reference`],
+/// in both shapes of the cycle: the default (its apply is small, so
+/// xochitl stays stopped through the sync) and the two-window cycle.
+fn for_both_cycles(test: impl Fn(&World, &Reference)) {
+    [crash_template(), crash_template().two_windows()]
+        .iter()
+        .for_each(|template| test(template, &reference(template)));
+}
+
 /// What a clean run of the scenario ends with: A's op log, and the
 /// conflict copies after convergence.
 struct Reference {
@@ -1019,11 +1031,17 @@ fn reference(template: &World) -> Reference {
     assert!(!report.applied.is_empty());
     let ops = world.tablet(0).ops();
     let mutations = ops.iter().filter(|op| op.is_mutating()).count();
-    // Two starts per cycle (after the snapshot, after the apply), each
-    // after a stop with a fresh watchdog.
+    // The apply is small: one stop and one start, xochitl kept stopped
+    // through the sync. Two windows: a start after the snapshot and one
+    // after the apply, each after a stop with a fresh watchdog.
+    let windows = if template.options.single_stop.is_some() {
+        1
+    } else {
+        2
+    };
     let count = |kind: OpKind| ops.iter().filter(|op| **op == kind).count();
-    assert_eq!(count(OpKind::StartXochitl), 2, "{ops:?}");
-    assert_eq!(count(OpKind::StopXochitl), 2, "{ops:?}");
+    assert_eq!(count(OpKind::StartXochitl), windows, "{ops:?}");
+    assert_eq!(count(OpKind::StopXochitl), windows, "{ops:?}");
     assert_eq!(report.quarantined.len(), 3, "{report:?}");
     let again = world.sync(0).unwrap();
     assert!(
@@ -1099,15 +1117,15 @@ fn crash_with(template: &World, reference: &Reference, fault: Fault, what: &str)
 
 #[test]
 fn crash_before_every_operation() {
-    let template = crash_template();
-    let reference = reference(&template);
-    (1..=reference.ops.len()).for_each(|k| {
-        crash_with(
-            &template,
-            &reference,
-            Fault::DisconnectAtOp(k),
-            &format!("disconnect at op {k} ({:?})", reference.ops[k - 1]),
-        );
+    for_both_cycles(|template, reference| {
+        (1..=reference.ops.len()).for_each(|k| {
+            crash_with(
+                template,
+                reference,
+                Fault::DisconnectAtOp(k),
+                &format!("disconnect at op {k} ({:?})", reference.ops[k - 1]),
+            );
+        });
     });
 }
 
@@ -1167,23 +1185,23 @@ fn ended_asleep(
 /// the run ends promptly (see [`ended_asleep`]) and the next run recovers.
 #[test]
 fn tablet_asleep_at_every_operation() {
-    let template = crash_template();
-    let reference = reference(&template);
-    (1..=reference.ops.len()).for_each(|k| {
-        let what = format!("asleep at op {k} ({:?})", reference.ops[k - 1]);
-        let world = template.duplicate();
-        world.tablet(0).inject(Fault::SleepAtOp(k));
-        let result = world.sync(0);
-        world::no_contract_violation(&result);
-        ended_asleep(
-            &world,
-            0,
-            0,
-            k,
-            &result.map(|report| report.warnings),
-            &what,
-        );
-        recover(&world, &reference, &what);
+    for_both_cycles(|template, reference| {
+        (1..=reference.ops.len()).for_each(|k| {
+            let what = format!("asleep at op {k} ({:?})", reference.ops[k - 1]);
+            let world = template.duplicate();
+            world.tablet(0).inject(Fault::SleepAtOp(k));
+            let result = world.sync(0);
+            world::no_contract_violation(&result);
+            ended_asleep(
+                &world,
+                0,
+                0,
+                k,
+                &result.map(|report| report.warnings),
+                &what,
+            );
+            recover(&world, reference, &what);
+        });
     });
 }
 
@@ -1224,85 +1242,85 @@ fn status_and_dry_run_with_the_tablet_asleep() {
 
 #[test]
 fn crash_after_every_mutation_took_effect() {
-    let template = crash_template();
-    let reference = reference(&template);
-    (1..=reference.mutations).for_each(|m| {
-        crash_with(
-            &template,
-            &reference,
-            Fault::DisconnectAfter(m),
-            &format!("disconnect after mutation {m}"),
-        );
+    for_both_cycles(|template, reference| {
+        (1..=reference.mutations).for_each(|m| {
+            crash_with(
+                template,
+                reference,
+                Fault::DisconnectAfter(m),
+                &format!("disconnect after mutation {m}"),
+            );
+        });
     });
 }
 
 #[test]
 fn lost_acknowledgement_of_every_mutation() {
-    let template = crash_template();
-    let reference = reference(&template);
-    (1..=reference.mutations).for_each(|m| {
-        crash_with(
-            &template,
-            &reference,
-            Fault::LoseAck(m),
-            &format!("lost ack of mutation {m}"),
-        );
+    for_both_cycles(|template, reference| {
+        (1..=reference.mutations).for_each(|m| {
+            crash_with(
+                template,
+                reference,
+                Fault::LoseAck(m),
+                &format!("lost ack of mutation {m}"),
+            );
+        });
     });
 }
 
 #[test]
 fn failure_of_every_operation() {
-    let template = crash_template();
-    let reference = reference(&template);
-    (1..=reference.ops.len()).for_each(|k| {
-        crash_with(
-            &template,
-            &reference,
-            Fault::FailOp(k),
-            &format!("failure of op {k} ({:?})", reference.ops[k - 1]),
-        );
+    for_both_cycles(|template, reference| {
+        (1..=reference.ops.len()).for_each(|k| {
+            crash_with(
+                template,
+                reference,
+                Fault::FailOp(k),
+                &format!("failure of op {k} ({:?})", reference.ops[k - 1]),
+            );
+        });
     });
 }
 
 #[test]
 fn apply_killed_after_every_move() {
-    let template = crash_template();
-    let reference = reference(&template);
-    // Until the apply survives the kill point (it has fewer moves).
-    let completed = (0..200).find(|&k| {
-        let world = template.duplicate();
-        world.tablet(0).inject(Fault::KillApplyAfter(k));
-        let result = world.sync(0);
-        world::no_contract_violation(&result);
-        let survived = result.is_ok();
-        recover(
-            &world,
-            &reference,
-            &format!("apply killed after {k} move(s)"),
-        );
-        survived
+    for_both_cycles(|template, reference| {
+        // Until the apply survives the kill point (it has fewer moves).
+        let completed = (0..200).find(|&k| {
+            let world = template.duplicate();
+            world.tablet(0).inject(Fault::KillApplyAfter(k));
+            let result = world.sync(0);
+            world::no_contract_violation(&result);
+            let survived = result.is_ok();
+            recover(
+                &world,
+                reference,
+                &format!("apply killed after {k} move(s)"),
+            );
+            survived
+        });
+        assert!(completed.is_some_and(|k| k > 3), "{completed:?}");
     });
-    assert!(completed.is_some_and(|k| k > 3), "{completed:?}");
 }
 
 #[test]
 fn watchdog_fires_after_every_move() {
-    let template = crash_template();
-    let reference = reference(&template);
-    let completed = (1..200).find(|&k| {
-        let world = template.duplicate();
-        world.tablet(0).inject(Fault::FireWatchdogAfterMoves(k));
-        let result = world.sync(0);
-        world::no_contract_violation(&result);
-        let survived = result.is_ok();
-        recover(
-            &world,
-            &reference,
-            &format!("watchdog fired after {k} move(s)"),
-        );
-        survived
+    for_both_cycles(|template, reference| {
+        let completed = (1..200).find(|&k| {
+            let world = template.duplicate();
+            world.tablet(0).inject(Fault::FireWatchdogAfterMoves(k));
+            let result = world.sync(0);
+            world::no_contract_violation(&result);
+            let survived = result.is_ok();
+            recover(
+                &world,
+                reference,
+                &format!("watchdog fired after {k} move(s)"),
+            );
+            survived
+        });
+        assert!(completed.is_some_and(|k| k > 3), "{completed:?}");
     });
-    assert!(completed.is_some_and(|k| k > 3), "{completed:?}");
 }
 
 /// After an interrupted apply, the user writes in every notebook the
@@ -1310,40 +1328,40 @@ fn watchdog_fires_after_every_move() {
 /// conflict with it: the next run must not fork them.
 #[test]
 fn edits_after_an_interrupted_apply_are_not_conflicts() {
-    let template = crash_template();
-    let reference = reference(&template);
-    let record = op_index(&template, 0, OpKind::WriteState, 3, |w| {
-        w.sync(0).unwrap();
-    });
-    let faults = std::iter::once((
-        Fault::DisconnectAtOp(record),
-        "crash before the record".to_string(),
-    ))
-    .chain((0..12).map(|k| {
-        (
-            Fault::KillApplyAfter(k),
-            format!("apply killed after {k} move(s)"),
-        )
-    }));
-    faults.for_each(|(fault, what)| {
-        let world = template.duplicate();
-        world.tablet(0).inject(fault);
-        let _ = world.sync(0);
-        let tablet = world.tablet(0);
-        tablet.reconnect();
-        tablet.fire_watchdog();
-        let device = world.device(0);
-        device
-            .names()
-            .into_iter()
-            .filter(|(_, name)| name == "From B")
-            .for_each(|(doc, _)| {
-                let page = world.pages(0, &doc)[0].clone();
-                world.ink(0, &doc, &page);
-            });
-        world.sync(0).unwrap_or_else(|e| panic!("{what}: {e}"));
-        world.converge();
-        assert_eq!(world.conflicts(), reference.conflicts, "{what}");
+    for_both_cycles(|template, reference| {
+        let record = op_index(template, 0, OpKind::WriteState, 3, |w| {
+            w.sync(0).unwrap();
+        });
+        let faults = std::iter::once((
+            Fault::DisconnectAtOp(record),
+            "crash before the record".to_string(),
+        ))
+        .chain((0..12).map(|k| {
+            (
+                Fault::KillApplyAfter(k),
+                format!("apply killed after {k} move(s)"),
+            )
+        }));
+        faults.for_each(|(fault, what)| {
+            let world = template.duplicate();
+            world.tablet(0).inject(fault);
+            let _ = world.sync(0);
+            let tablet = world.tablet(0);
+            tablet.reconnect();
+            tablet.fire_watchdog();
+            let device = world.device(0);
+            device
+                .names()
+                .into_iter()
+                .filter(|(_, name)| name == "From B")
+                .for_each(|(doc, _)| {
+                    let page = world.pages(0, &doc)[0].clone();
+                    world.ink(0, &doc, &page);
+                });
+            world.sync(0).unwrap_or_else(|e| panic!("{what}: {e}"));
+            world.converge();
+            assert_eq!(world.conflicts(), reference.conflicts, "{what}");
+        });
     });
 }
 
@@ -1386,30 +1404,30 @@ fn crash_during_reconciliation(template: &World, reference: &Reference, first: F
 
 #[test]
 fn crash_during_reconciliation_after_a_killed_apply() {
-    let template = crash_template();
-    let reference = reference(&template);
-    let (kill, _) = kill_leaving_a_half_applied_document(&template);
-    crash_during_reconciliation(
-        &template,
-        &reference,
-        Fault::KillApplyAfter(kill),
-        &format!("apply killed after {kill} moves"),
-    );
+    for_both_cycles(|template, reference| {
+        let (kill, _) = kill_leaving_a_half_applied_document(template);
+        crash_during_reconciliation(
+            template,
+            reference,
+            Fault::KillApplyAfter(kill),
+            &format!("apply killed after {kill} moves"),
+        );
+    });
 }
 
 #[test]
 fn crash_during_reconciliation_after_an_unrecorded_apply() {
-    let template = crash_template();
-    let reference = reference(&template);
-    let record = op_index(&template, 0, OpKind::WriteState, 3, |w| {
-        w.sync(0).unwrap();
+    for_both_cycles(|template, reference| {
+        let record = op_index(template, 0, OpKind::WriteState, 3, |w| {
+            w.sync(0).unwrap();
+        });
+        crash_during_reconciliation(
+            template,
+            reference,
+            Fault::DisconnectAtOp(record),
+            "crash before the record",
+        );
     });
-    crash_during_reconciliation(
-        &template,
-        &reference,
-        Fault::DisconnectAtOp(record),
-        "crash before the record",
-    );
 }
 
 /// Reconciliation finished a document, then crashed before writing the
@@ -1418,32 +1436,32 @@ fn crash_during_reconciliation_after_an_unrecorded_apply() {
 /// conflict.
 #[test]
 fn an_edit_after_a_crashed_reconciliation_is_not_a_conflict() {
-    let template = crash_template();
-    let reference = reference(&template);
-    let (kill, finished) = kill_leaving_a_half_applied_document(&template);
-    let crashed = crashed_by(&template, Fault::KillApplyAfter(kill));
-    let written = op_index(&crashed, 0, OpKind::WriteState, 1, |w| {
-        w.sync(0).unwrap();
+    for_both_cycles(|template, reference| {
+        let (kill, finished) = kill_leaving_a_half_applied_document(template);
+        let crashed = crashed_by(template, Fault::KillApplyAfter(kill));
+        let written = op_index(&crashed, 0, OpKind::WriteState, 1, |w| {
+            w.sync(0).unwrap();
+        });
+        let world = crashed.duplicate();
+        world.tablet(0).inject(Fault::DisconnectAtOp(written));
+        assert!(world.sync(0).is_err());
+        world.tablet(0).reconnect();
+        world.tablet(0).fire_watchdog();
+        let inked = finished
+            .iter()
+            .filter_map(|doc| {
+                let page = world
+                    .device(0)
+                    .content(doc)
+                    .and_then(|content| world::pages_of(&content).first().cloned())?;
+                world.ink(0, doc, &page);
+                Some(doc)
+            })
+            .count();
+        assert!(inked > 0, "nothing to write in among {finished:?}");
+        world.sync(0).unwrap();
+        assert_eq!(settle(&world), reference.conflicts);
     });
-    let world = crashed.duplicate();
-    world.tablet(0).inject(Fault::DisconnectAtOp(written));
-    assert!(world.sync(0).is_err());
-    world.tablet(0).reconnect();
-    world.tablet(0).fire_watchdog();
-    let inked = finished
-        .iter()
-        .filter_map(|doc| {
-            let page = world
-                .device(0)
-                .content(doc)
-                .and_then(|content| world::pages_of(&content).first().cloned())?;
-            world.ink(0, doc, &page);
-            Some(doc)
-        })
-        .count();
-    assert!(inked > 0, "nothing to write in among {finished:?}");
-    world.sync(0).unwrap();
-    assert_eq!(settle(&world), reference.conflicts);
 }
 
 /// A copy of `template` after A's sync failed with `fault`, the
@@ -1461,17 +1479,17 @@ fn crashed_by(template: &World, fault: Fault) -> World {
 /// it must only shrink the pre-read, never fail the run.
 #[test]
 fn a_pre_read_cut_inside_a_file_only_shrinks_it() {
-    let template = crash_template();
-    let reference = reference(&template);
-    (0..3).for_each(|k| {
-        let world = template.duplicate();
-        // The next download is the pre-read's (a copied world's stats are
-        // all new).
-        world.tablet(0).inject(Fault::CutDownloadInFile(k));
-        world
-            .sync(0)
-            .unwrap_or_else(|e| panic!("pre-read cut inside file {}: {e}", k + 1));
-        assert_eq!(settle(&world), reference.conflicts);
+    for_both_cycles(|template, reference| {
+        (0..3).for_each(|k| {
+            let world = template.duplicate();
+            // The next download is the pre-read's (a copied world's stats are
+            // all new).
+            world.tablet(0).inject(Fault::CutDownloadInFile(k));
+            world
+                .sync(0)
+                .unwrap_or_else(|e| panic!("pre-read cut inside file {}: {e}", k + 1));
+            assert_eq!(settle(&world), reference.conflicts);
+        });
     });
 }
 
@@ -1852,6 +1870,9 @@ fn a_device_ref_that_does_not_continue_the_tablets_stops_the_sync() {
 #[test]
 fn a_folder_trashed_on_origin_spares_a_notebook_written_in_during_the_sync() {
     let (base, lib) = two_tablets();
+    // Two windows: a single-stop sync never runs xochitl between its
+    // read and its apply, so nothing can be edited in between.
+    let base = base.two_windows();
     // B trashes the folder holding the notes; while A's sync has the UI
     // up, the user writes in those notes on A.
     base.trash(1, &lib.folder);
@@ -2067,6 +2088,9 @@ fn crash_at_every_op_of_a_clone() {
 #[test]
 fn a_folder_deleted_on_origin_that_gained_a_child_during_the_sync_is_kept() {
     let (base, lib) = two_tablets();
+    // Two windows: a single-stop sync never runs xochitl between its
+    // read and its apply, so nothing can be edited in between.
+    let base = base.two_windows();
     let boxf = base.create(0, Kind::Folder, "Box", "");
     base.converge();
     base.delete(1, &boxf);
@@ -2514,6 +2538,9 @@ fn a_push_losing_every_attempt_stops_the_run() {
 #[test]
 fn a_skipped_original_skips_its_conflict_copy() {
     let (base, lib) = same_page_conflict();
+    // Two windows: a single-stop sync never runs xochitl between its
+    // read and its apply, so nothing can be edited in between.
+    let base = base.two_windows();
     let page = base.pages(1, &lib.notes)[1].clone();
     let stage = op_index(&base, 1, OpKind::Stage, 1, |w| {
         w.sync(1).unwrap();
@@ -4831,4 +4858,187 @@ fn a_restore_lands_while_a_tablet_edits_the_original() {
         assert_eq!(doc_ink(&world, i, &lib.notes), edited, "tablet {i}");
         assert_eq!(doc_ink(&world, i, &report.copy), old_ink, "tablet {i}");
     });
+}
+
+// ---- one outage for a small sync -------------------------------------------------
+
+use libremarkable_utils::hub::cycle::SingleStop;
+use std::time::Duration;
+
+/// How many times `kind` is in `ops`.
+fn count_ops(ops: &[OpKind], kind: OpKind) -> usize {
+    ops.iter().filter(|op| **op == kind).count()
+}
+
+/// Where `kind` first is in `ops`.
+fn first_op(ops: &[OpKind], kind: OpKind) -> usize {
+    ops.iter()
+        .position(|op| *op == kind)
+        .unwrap_or_else(|| panic!("no {kind:?} in {ops:?}"))
+}
+
+/// B renames the notes, for A to apply: a small sync.
+fn small_apply() -> (World, Library) {
+    let (world, lib) = two_tablets();
+    world.rename(1, &lib.notes, "Notes (renamed on B)");
+    world.sync(1).unwrap();
+    (world, lib)
+}
+
+/// A's sync from here, and its operations.
+fn sync_ops(world: &World) -> (libremarkable_utils::error::Result<SyncReport>, Vec<OpKind>) {
+    let start = world.tablet(0).ops().len();
+    let result = world.sync(0);
+    (result, world.tablet(0).ops()[start..].to_vec())
+}
+
+use libremarkable_utils::hub::cycle::SyncReport;
+
+/// A small apply: xochitl is stopped once (step 3) and started once
+/// (step 16). The journal still precedes staging, and the step-14 stat
+/// pass (verify, live tree checks) still runs before the apply, all
+/// with xochitl stopped and the watchdog armed throughout.
+#[test]
+fn a_small_sync_stops_xochitl_once() {
+    let (world, lib) = small_apply();
+    let (report, ops) = sync_ops(&world);
+    let report = report.unwrap();
+    assert_eq!(report.applied, vec![lib.notes.clone()], "{report:?}");
+    assert_eq!(count_ops(&ops, OpKind::StopXochitl), 1, "{ops:?}");
+    assert_eq!(count_ops(&ops, OpKind::StartXochitl), 1, "{ops:?}");
+    let (stop, apply, start) = (
+        first_op(&ops, OpKind::StopXochitl),
+        first_op(&ops, OpKind::Apply),
+        first_op(&ops, OpKind::StartXochitl),
+    );
+    assert!(stop < apply && apply < start, "{ops:?}");
+    let window = &ops[stop..start];
+    let journal = first_op(window, OpKind::WriteState);
+    let stage = first_op(window, OpKind::Stage);
+    let recheck = window[..apply - stop]
+        .iter()
+        .rposition(|op| *op == OpKind::StatAll)
+        .unwrap();
+    assert!(journal < stage && stage < recheck, "{window:?}");
+    assert!(world.tablet(0).is_running());
+    assert!(
+        world.tablet(0).watchdog_armed().is_none(),
+        "disarmed at the end"
+    );
+    world.converge();
+}
+
+/// The same sync, but with more to apply than a small sync may: the
+/// two-window cycle, xochitl started after the read and stopped again
+/// to apply. A big page from B (2 MiB, over the default 1 MiB) does
+/// that; so does a lower limit.
+#[test]
+fn a_large_sync_keeps_two_windows() {
+    let (world, _) = two_tablets();
+    let big = world.create(1, Kind::Notebook { pages: 1 }, "Big", "");
+    let page = world.pages(1, &big)[0].clone();
+    let path = format!("{big}/{page}.rm");
+    let mut bytes = world.device(1).file(&path).unwrap();
+    bytes.extend_from_slice(&vec![b'x'; 2 * 1024 * 1024]);
+    world.device(1).tablet.write_file(&path, &bytes).unwrap();
+    world.sync(1).unwrap();
+    let (report, ops) = sync_ops(&world);
+    assert_eq!(report.unwrap().applied, vec![big.clone()]);
+    assert_eq!(count_ops(&ops, OpKind::StopXochitl), 2, "{ops:?}");
+    assert_eq!(count_ops(&ops, OpKind::StartXochitl), 2, "{ops:?}");
+    // Staging with the UI up: between the two windows.
+    let starts: Vec<usize> = (0..ops.len())
+        .filter(|at| ops[*at] == OpKind::StartXochitl)
+        .collect();
+    let stage = first_op(&ops, OpKind::Stage);
+    assert!(starts[0] < stage, "{ops:?}");
+    world.converge();
+
+    let (mut world, _) = small_apply();
+    world.options.single_stop = Some(SingleStop {
+        max_bytes: 1,
+        ..SingleStop::default()
+    });
+    let (report, ops) = sync_ops(&world);
+    report.unwrap();
+    assert_eq!(count_ops(&ops, OpKind::StartXochitl), 2, "{ops:?}");
+    world.converge();
+}
+
+/// A small sync whose network steps run long (a slow link: the journal
+/// write takes longer than the budget) starts xochitl at the next check
+/// and goes on with two windows; it still converges.
+#[test]
+fn a_small_sync_that_runs_long_starts_xochitl() {
+    let (mut template, _) = small_apply();
+    template.options.single_stop = Some(SingleStop {
+        budget: Duration::from_millis(300),
+        ..SingleStop::default()
+    });
+    let (_, reference) = sync_ops(&template.duplicate());
+    let stop = first_op(&reference, OpKind::StopXochitl);
+    let journal = stop + first_op(&reference[stop..], OpKind::WriteState);
+    let world = template.duplicate();
+    world
+        .tablet(0)
+        .inject(Fault::SlowOp(journal + 1, Duration::from_millis(400)));
+    let (report, ops) = sync_ops(&world);
+    report.unwrap();
+    assert_eq!(count_ops(&ops, OpKind::StartXochitl), 2, "{ops:?}");
+    assert_eq!(count_ops(&ops, OpKind::StopXochitl), 2, "{ops:?}");
+    world.converge();
+}
+
+/// While xochitl is kept stopped, the watchdog is armed for the shorter
+/// single-stop timeout: a run that vanishes in its network steps leaves
+/// the UI down for at most that long, then the next run recovers.
+#[test]
+fn a_vanished_small_sync_is_bounded_by_the_shorter_watchdog() {
+    let (template, _) = small_apply();
+    let (_, reference) = sync_ops(&template.duplicate());
+    let stop = first_op(&reference, OpKind::StopXochitl);
+    let journal = stop + first_op(&reference[stop..], OpKind::WriteState);
+    let world = template.duplicate();
+    world.tablet(0).inject(Fault::DisconnectAtOp(journal + 1));
+    assert!(world.sync(0).is_err());
+    let tablet = world.tablet(0);
+    assert!(!tablet.is_running());
+    assert_eq!(
+        tablet.watchdog_armed(),
+        Some(SingleStop::default().watchdog),
+        "not the run's {:?}",
+        world.options.watchdog
+    );
+    tablet.reconnect();
+    tablet.fire_watchdog();
+    assert!(tablet.is_running());
+    world.sync(0).unwrap();
+    world.converge();
+}
+
+/// The estimate counts a conflicted document once; the plan applies it
+/// and its conflict copy. With room for one document, xochitl stays
+/// stopped through the merge, then is started before staging (the plan
+/// is more than a small sync may apply) and stopped again to apply.
+#[test]
+fn a_plan_larger_than_its_estimate_falls_back_to_two_windows() {
+    let (mut world, _) = same_page_conflict();
+    world.options.single_stop = Some(SingleStop {
+        max_docs: 1,
+        ..SingleStop::default()
+    });
+    let start = world.tablet(1).ops().len();
+    let report = world.sync(1).unwrap();
+    assert_eq!(report.forks.len(), 1, "{report:?}");
+    let ops = world.tablet(1).ops()[start..].to_vec();
+    assert_eq!(count_ops(&ops, OpKind::StartXochitl), 2, "{ops:?}");
+    let first_start = first_op(&ops, OpKind::StartXochitl);
+    let stop = first_op(&ops, OpKind::StopXochitl);
+    let journal = stop + first_op(&ops[stop..], OpKind::WriteState);
+    assert!(
+        journal < first_start,
+        "kept stopped through the merge: {ops:?}"
+    );
+    assert!(first_start < first_op(&ops, OpKind::Stage), "{ops:?}");
+    world.converge();
 }

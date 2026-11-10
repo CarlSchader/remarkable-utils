@@ -1235,6 +1235,99 @@ pub(super) fn removed(
         .collect()
 }
 
+// ---- single stop ---------------------------------------------------------------------
+
+/// What a sync would send over the network, estimated after the step-5
+/// read and before the merge, to decide whether xochitl may stay stopped
+/// through steps 7–12 ([`super::SingleStop`]).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct NetworkEstimate {
+    /// Documents the apply would write or delete: those origin changed
+    /// since the base and the tablet does not hold as origin does.
+    pub apply_docs: usize,
+    /// Origin's blobs those documents need that the tablet lacks (their
+    /// sizes are in the local cache).
+    pub apply_blobs: BTreeSet<Oid>,
+    /// Bytes of the tablet's own: files of documents it changed whose
+    /// blobs the base lacks (the device-ref push), plus the whole tablet
+    /// version of documents both sides changed (a conflict copy is
+    /// staged).
+    pub tablet_bytes: u64,
+}
+
+/// The [`NetworkEstimate`] from the base, the tablet as read (each file's
+/// blob and size) and origin's `main`, per document, by blob ids. An
+/// estimate, not the plan: view state, the tree rules and the merge's own
+/// decisions can only make the apply smaller or add a conflict copy,
+/// which is counted. Pure.
+pub(super) fn network_estimate(
+    base: &BTreeMap<DocId, BTreeMap<DocFile, Oid>>,
+    tablet: &BTreeMap<DocId, BTreeMap<DocFile, (Oid, u64)>>,
+    origin: &BTreeMap<DocId, BTreeMap<DocFile, Oid>>,
+) -> NetworkEstimate {
+    let blobs = |files: Option<&BTreeMap<DocFile, (Oid, u64)>>| -> BTreeMap<DocFile, Oid> {
+        files
+            .into_iter()
+            .flatten()
+            .map(|(file, (blob, _))| (file.clone(), blob.clone()))
+            .collect()
+    };
+    let none = BTreeMap::new();
+    let changed_by_tablet = |doc: &DocId| blobs(tablet.get(doc)) != *base.get(doc).unwrap_or(&none);
+    let to_apply: Vec<&DocId> = base
+        .keys()
+        .chain(origin.keys())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter(|doc| {
+            let theirs = origin.get(*doc).unwrap_or(&none);
+            theirs != base.get(*doc).unwrap_or(&none) && *theirs != blobs(tablet.get(*doc))
+        })
+        .collect();
+    let apply_blobs = to_apply
+        .iter()
+        .filter_map(|doc| origin.get(*doc).map(|files| (doc, files)))
+        .flat_map(|(doc, files)| {
+            let held: BTreeSet<Oid> = blobs(tablet.get(*doc)).into_values().collect();
+            files
+                .values()
+                .filter(move |blob| !held.contains(*blob))
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let size = |files: &BTreeMap<DocFile, (Oid, u64)>, keep: &dyn Fn(&Oid) -> bool| -> u64 {
+        files
+            .values()
+            .filter(|(blob, _)| keep(blob))
+            .map(|(_, size)| size)
+            .sum()
+    };
+    let pushed: u64 = tablet
+        .iter()
+        .filter(|(doc, _)| changed_by_tablet(doc))
+        .map(|(doc, files)| {
+            let based: BTreeSet<&Oid> = base
+                .get(doc)
+                .into_iter()
+                .flat_map(BTreeMap::values)
+                .collect();
+            size(files, &|blob| !based.contains(blob))
+        })
+        .sum();
+    let copies: u64 = to_apply
+        .iter()
+        .filter(|doc| changed_by_tablet(doc))
+        .filter_map(|doc| tablet.get(*doc))
+        .map(|files| size(files, &|_| true))
+        .sum();
+    NetworkEstimate {
+        apply_docs: to_apply.len(),
+        apply_blobs,
+        tablet_bytes: pushed + copies,
+    }
+}
+
 // ---- the manifest --------------------------------------------------------------------
 
 /// What the manifest is recorded from.

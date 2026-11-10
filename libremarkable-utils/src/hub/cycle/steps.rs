@@ -8,6 +8,7 @@ mod clone;
 mod push;
 mod reconcile;
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::origin::{OriginCtx, virtual_base};
@@ -23,7 +24,9 @@ use crate::error::{Error, Result};
 use crate::git::{CommitMeta, CommitWriter, Oid, Repo};
 use crate::hub::device::{DeviceInfo, LockState, Tablet};
 use crate::hub::merge::{MergeOutcome, Summary};
-use crate::hub::model::{DocId, ManifestEntry, MirrorRules, RepoTree, TabletState, XochitlPath};
+use crate::hub::model::{
+    DocFile, DocId, ManifestEntry, MirrorRules, RepoTree, TabletState, XochitlPath,
+};
 
 pub(super) use self::push::device_ref;
 
@@ -34,8 +37,11 @@ struct Prepared<'p> {
     read: TabletRead,
     /// Holds every blob the reads streamed; it becomes the snapshot.
     writer: Option<CommitWriter<'p>>,
-    /// Device time of the step-6 start (racy-entry reference).
-    started_at: i64,
+    /// Device time of the first start after the read (racy-entry
+    /// reference); `None` while xochitl has not been started since (a
+    /// single-stop sync, until its step 16). Set by whichever step
+    /// starts xochitl first.
+    started_at: Cell<Option<i64>>,
     info: DeviceInfo,
     took_over: Option<TakeOver>,
     reconciled: Option<Reconciled>,
@@ -62,6 +68,31 @@ fn read_manifest(read: &TabletRead, started_at: i64) -> BTreeMap<XochitlPath, Ma
         written: &BTreeMap::new(),
         removed: &BTreeSet::new(),
         written_reference_ns: 0,
+    })
+}
+
+/// Each document's files by blob.
+fn doc_blobs(tree: &RepoTree) -> BTreeMap<DocId, BTreeMap<DocFile, Oid>> {
+    tree.docs
+        .iter()
+        .map(|(doc, version)| {
+            let files = version
+                .files
+                .iter()
+                .map(|(file, entry)| (file.clone(), entry.id.clone()))
+                .collect();
+            (doc.clone(), files)
+        })
+        .collect()
+}
+
+/// Each document's files as read: blob and size.
+fn read_blobs(read: &TabletRead) -> BTreeMap<DocId, BTreeMap<DocFile, (Oid, u64)>> {
+    read.files.values().fold(BTreeMap::new(), |mut docs, read| {
+        docs.entry(read.file.doc.clone())
+            .or_insert_with(BTreeMap::new)
+            .insert(read.file.file.clone(), (read.blob.clone(), read.stat.size));
+        docs
     })
 }
 
@@ -93,11 +124,12 @@ impl Hub<'_> {
     pub fn backup(&self, tablet: &dyn Tablet) -> Result<BackupReport> {
         let (mut report, warnings) = self.session(tablet, |s| {
             let mut p = self.prepare(s, false)?;
+            self.start_xochitl(s, &p)?;
             let base_tree = virtual_base(&p.origin.store, p.origin.rules, &p.state)?;
             let snapshot = snapshot::build(p.origin.rules, &p.read, &base_tree)?;
             self.progress.step("Backing up the tablet to origin");
             let (commit, pushed) = self.backup_snapshot(s, &mut p, &snapshot)?;
-            p.state.manifest = read_manifest(&p.read, p.started_at);
+            p.state.manifest = read_manifest(&p.read, p.started_at.get().expect("started"));
             p.state.quarantine = snapshot.quarantined.keys().cloned().collect();
             s.write_state(&p.state)?;
             let report = BackupReport {
@@ -193,7 +225,83 @@ impl Hub<'_> {
             || tablet.watchdog_fired()?)
     }
 
-    /// Steps 1–6 (with step 4 only if `reconcile`).
+    /// Step 6: start xochitl; the device time is the read's racy-entry
+    /// reference.
+    fn start_xochitl(&self, s: &mut Session, p: &Prepared) -> Result<()> {
+        self.progress.step("Starting xochitl");
+        p.started_at.set(Some(s.start()?));
+        Ok(())
+    }
+
+    /// Step 6 of a sync: start xochitl, or keep it stopped through step
+    /// 16 when the sync looks small ([`super::SingleStop`]), so the user
+    /// sees one outage and xochitl gets one start.
+    fn start_or_defer(&self, s: &mut Session, p: &Prepared) -> Result<()> {
+        match self.options.single_stop {
+            Some(limits) if self.single_stop_fits(s, p)? => {
+                self.progress.step("Keeping xochitl stopped: a small sync");
+                s.defer_start(limits.watchdog)
+            }
+            _ => self.start_xochitl(s, p),
+        }
+    }
+
+    /// Whether a sync may keep xochitl stopped: something to apply, and
+    /// little to send (the estimate, [`plan::network_estimate`]), with
+    /// budget left. The trees it compares are only read when origin moved
+    /// (otherwise that pure work waits for the start, as always).
+    fn single_stop_fits(&self, s: &Session, p: &Prepared) -> Result<bool> {
+        let Some(limits) = self.options.single_stop else {
+            return Ok(false);
+        };
+        // Origin unchanged since every document's base: nothing to apply,
+        // and the push goes better with the UI up.
+        let unchanged =
+            p.state.base.as_ref() == Some(&p.origin.main) && p.state.base_overrides.is_empty();
+        if unchanged || s.stopped_for() >= limits.budget {
+            return Ok(false);
+        }
+        let store = &p.origin.store;
+        let base_tree = virtual_base(store, p.origin.rules, &p.state)?;
+        let theirs = store.tree_of(p.origin.rules, &p.origin.main)?;
+        let estimate = plan::network_estimate(
+            &doc_blobs(&base_tree),
+            &read_blobs(&p.read),
+            &doc_blobs(&theirs),
+        );
+        if estimate.apply_docs == 0 || estimate.apply_docs > limits.max_docs {
+            return Ok(false);
+        }
+        let apply_bytes: u64 = store
+            .repo
+            .object_sizes(&estimate.apply_blobs)?
+            .values()
+            .sum();
+        Ok(estimate.tablet_bytes + apply_bytes <= limits.max_bytes)
+    }
+
+    /// While xochitl is kept stopped: start it now (`why`, for the
+    /// progress line), the run going on as the two-window cycle.
+    fn end_single_stop(&self, s: &mut Session, p: &Prepared, why: &str) -> Result<()> {
+        if s.deferring() {
+            self.progress.step(&format!("Starting xochitl: {why}"));
+            p.started_at.set(Some(s.start()?));
+        }
+        Ok(())
+    }
+
+    /// While xochitl is kept stopped: start it once the budget is spent.
+    fn check_single_stop(&self, s: &mut Session, p: &Prepared) -> Result<()> {
+        match self.options.single_stop {
+            Some(limits) if s.deferring() && s.stopped_for() >= limits.budget => {
+                self.end_single_stop(s, p, "the sync is taking long")
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Steps 1–5 (with step 4 only if `reconcile`); xochitl is left
+    /// stopped, for the caller's step 6.
     fn prepare<'p>(&'p self, s: &mut Session, reconcile: bool) -> Result<Prepared<'p>> {
         self.progress.step("Checking origin");
         let first = s.tablet.read_state()?.ok_or(CycleError::NotAttached)?;
@@ -281,28 +389,29 @@ impl Hub<'_> {
             }
             None => None,
         };
-        self.progress.step("Starting xochitl");
-        let started_at = s.start()?;
         Ok(Prepared {
             origin,
             state,
             read,
             writer: Some(writer),
-            started_at,
+            started_at: Cell::new(None),
             info,
             took_over,
             reconciled,
         })
     }
 
-    /// Steps 7–16; the origin handed back for maintenance.
+    /// Steps 6–16; the origin handed back for maintenance.
     fn integrate(&self, s: &mut Session, mut p: Prepared) -> Result<(SyncReport, OriginCtx)> {
         let rules = p.origin.rules;
+        self.start_or_defer(s, &p)?;
         let base_tree = virtual_base(&p.origin.store, rules, &p.state)?;
         let snapshot = snapshot::build(rules, &p.read, &base_tree)?;
         self.progress.step("Backing up the tablet to origin");
         let (snapshot_commit, _) = self.backup_snapshot(s, &mut p, &snapshot)?;
+        self.check_single_stop(s, &p)?;
         let pushed = self.merge_and_push(s, &mut p, &snapshot, &base_tree, &snapshot_commit)?;
+        self.check_single_stop(s, &p)?;
         self.apply_and_record(s, p, &snapshot, &snapshot_commit, pushed)
     }
 }
