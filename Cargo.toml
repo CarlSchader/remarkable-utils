@@ -27,4 +27,6 @@ rpassword = "7"
 rustix = { version = "1", features = ["event"] }
 indicatif = "0.18"
 tar = "0.4"
+# Already in the tree through zip (pure-Rust zlib-rs backend): PDF streams.
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 zip = { version = "8", default-features = false, features = ["deflate"] }
