@@ -337,6 +337,43 @@ fn the_restart_checks_too() {
     assert!(!tablets.restarted());
 }
 
+/// Tablet to tablet, the refused restart names the side it wrote to
+/// ("tablet:/Books" is side B).
+#[test]
+fn a_refused_restart_names_the_side() {
+    let tablets = Tablets::new();
+    ["tablet", "other"].iter().for_each(|host| {
+        tablets.put_folder(host, FOLDER, "Books");
+    });
+    tablets.put_document_in(
+        "other",
+        "8c1f0b9e-0000-4000-8000-000000000003",
+        "From other",
+        FOLDER,
+    );
+    let record = owner_record(BOOT_ID);
+    let output = tablets.rmu_env(
+        &[
+            "--quiet",
+            "sync",
+            "--remote-kind",
+            "remarkable",
+            "other:/Books",
+            "tablet:/Books",
+        ],
+        &[
+            ("MOCK_LOCK_WHEN", "systemctl restart"),
+            ("MOCK_LOCK_RECORD", &record),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        stderr(&output),
+        NOT_RESTARTED.replace("changes were written", "sync wrote changes to side B")
+    );
+    assert!(!tablets.restarted());
+}
+
 /// A refused restart after writes, as `main` prints it.
 const NOT_RESTARTED: &str = "Error: changes were written, but xochitl was not restarted: an rmu \
      hub run now holds the tablet (pid 7 on other-computer, started 5 min ago). A hub sync \

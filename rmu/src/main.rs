@@ -313,10 +313,7 @@ fn run_regular(cli: &Cli, progress: Arc<dyn Progress>) -> Result<()> {
                 "note: xochitl not restarted (--no-restart); changes appear after restart",
             );
         } else {
-            restart_after_writes(
-                &client,
-                "changes were written, but restarting xochitl failed",
-            )?;
+            restart_after_writes(&client, "changes were written")?;
         }
     }
     Ok(())
@@ -709,16 +706,10 @@ fn run_docs_sync(
 
     if !cli.no_restart {
         if outcome.modified_a {
-            restart_after_writes(
-                &client_a,
-                "sync wrote changes to side A, but restarting xochitl failed",
-            )?;
+            restart_after_writes(&client_a, "sync wrote changes to side A")?;
         }
         if outcome.modified_b {
-            restart_after_writes(
-                &client_b,
-                "sync wrote changes to side B, but restarting xochitl failed",
-            )?;
+            restart_after_writes(&client_b, "sync wrote changes to side B")?;
         }
     } else if outcome.modified_a || outcome.modified_b {
         info(
@@ -855,7 +846,7 @@ fn run_device_sync(
                 "note: xochitl not restarted (--no-restart); changes appear after restart",
             );
         } else {
-            restart_after_writes(client, "sync wrote changes, but restarting xochitl failed")?;
+            restart_after_writes(client, "sync wrote changes")?;
         }
     }
     Ok(())
@@ -1032,10 +1023,11 @@ fn warn_if_hub_attached(cli: &Cli, client: &Client, tablet: &str, deletes: bool)
     }
 }
 
-/// Restart xochitl after writes. A hub run that took the tablet since
-/// keeps it an error (xochitl must reload what was written), with what
-/// to do about it.
-fn restart_after_writes(client: &Client, context: &'static str) -> Result<()> {
+/// Restart xochitl after writes (`written` says which: "changes were
+/// written", "sync wrote changes to side A", ...). A hub run that took
+/// the tablet since keeps it an error (xochitl must reload what was
+/// written), with what to do about it.
+fn restart_after_writes(client: &Client, written: &str) -> Result<()> {
     match client.restart_xochitl() {
         Err(libremarkable_utils::Error::HubLocked(owner)) => {
             let owner = owner.map_or_else(
@@ -1043,12 +1035,12 @@ fn restart_after_writes(client: &Client, context: &'static str) -> Result<()> {
                 |owner| owner.to_string(),
             );
             Err(anyhow::anyhow!(
-                "changes were written, but xochitl was not restarted: an rmu hub run now holds \
-                 the tablet ({owner}). A hub sync restarts xochitl when it finishes; otherwise run \
-                 `rmu restart` once the lock is free"
+                "{written}, but xochitl was not restarted: an rmu hub run now holds the tablet \
+                 ({owner}). A hub sync restarts xochitl when it finishes; otherwise run `rmu \
+                 restart` once the lock is free"
             ))
         }
-        other => other.context(context),
+        other => other.with_context(|| format!("{written}, but restarting xochitl failed")),
     }
 }
 

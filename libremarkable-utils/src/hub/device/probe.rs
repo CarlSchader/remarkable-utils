@@ -175,15 +175,21 @@ fn version_command(paths: &TabletPaths) -> String {
 
 /// Print the probe's sections, each `\n<marker> <name>\n` then its body.
 /// Read-only, and it never exits, so it can precede another script.
+///
+/// The record's version is computed **before** the record is read: a
+/// takeover in between then shows in the record judged (a live one is
+/// held), and any later change in the version the guard compares. The
+/// other order would judge an old stale record and carry a new live
+/// record's version, and the guard would pass under a live lock.
 pub fn probe_script(paths: &TabletPaths, marker: &str) -> String {
     let marker = shell_quote(marker);
     let section = |name: &str| format!("printf '\\n%s %s\\n' {marker} {name}\n");
     format!(
-        "{lock}if [ -d {lock_dir} ]; then printf 'held\\n'; cat -- {owner} 2>/dev/null; else printf 'free\\n'; fi\n\
+        "{version}if [ -d {lock_dir} ]; then {version_of}; fi\n\
+         {lock}if [ -d {lock_dir} ]; then printf 'held\\n'; cat -- {owner} 2>/dev/null; else printf 'free\\n'; fi\n\
          {boot}cat -- {boot_id} 2>/dev/null\n\
          {fired}if [ -e {fired_marker} ]; then echo true; else echo false; fi\n\
-         {attached}if [ -e {state} ]; then echo true; else echo false; fi\n\
-         {version}if [ -d {lock_dir} ]; then {version_of}; fi\n",
+         {attached}if [ -e {state} ]; then echo true; else echo false; fi\n",
         version = section(VERSION),
         version_of = version_command(paths),
         lock = section(LOCK),
@@ -498,6 +504,92 @@ mod tests {
         assert_eq!(run(&stale), (Some(EXIT_HUB_LOCK_CHANGED), false));
         std::fs::remove_dir_all(state.join("lock")).unwrap();
         assert_eq!(run(&stale), (Some(0), true));
+    }
+
+    /// A takeover while the probe runs: a `cat` shim turns the stale
+    /// owner record into a live one right before the probe's second read
+    /// of it. Whichever read sees the takeover, the look must not judge a
+    /// stale record while carrying the live record's version (the guard
+    /// would then pass under a live lock): the write must not land.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_takeover_during_the_probe_never_lets_a_write_through() {
+        let scratch = super::super::harness::Scratch::new("probe-race");
+        let state = scratch.0.join("state");
+        std::fs::create_dir_all(state.join("lock")).unwrap();
+        let owner = state.join("lock/owner");
+        std::fs::write(&owner, owner_record("an-earlier-boot")).unwrap();
+        let boot = scratch.0.join("boot");
+        std::fs::write(&boot, format!("{BOOT_ID}\n")).unwrap();
+        let live = scratch.0.join("live");
+        std::fs::write(&live, owner_record(BOOT_ID)).unwrap();
+        let paths = TabletPaths {
+            boot_id: boot.display().to_string(),
+            ..paths(&state.display().to_string())
+        };
+        let real_cat = std::env::var_os("PATH")
+            .iter()
+            .flat_map(std::env::split_paths)
+            .map(|dir| dir.join("cat"))
+            .find(|candidate| candidate.is_file())
+            .expect("cat on PATH");
+        let shims = scratch.0.join("shims");
+        std::fs::create_dir_all(&shims).unwrap();
+        test_support::write_script(
+            &shims.join("cat"),
+            &format!(
+                "for a do last=$a; done\n\
+                 if [ \"$last\" = {owner} ]; then\n\
+                 n=0; read -r n < {count} 2>/dev/null; n=$((n + 1)); echo \"$n\" > {count}\n\
+                 if [ \"$n\" = 2 ]; then {real} {live} > {owner}; fi\n\
+                 fi\n\
+                 exec {real} \"$@\"\n",
+                owner = shell_quote(&owner.display().to_string()),
+                count = shell_quote(&scratch.0.join("count").display().to_string()),
+                real = shell_quote(&real_cat.display().to_string()),
+                live = shell_quote(&live.display().to_string()),
+            ),
+        );
+        let path = std::env::join_paths(
+            std::iter::once(shims.clone())
+                .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+        )
+        .unwrap();
+        let out = std::process::Command::new("sh")
+            .args(["-c", &probe_script(&paths, MARKER)])
+            .env("PATH", &path)
+            .output()
+            .unwrap();
+        let probe = parse_probe(MARKER, &String::from_utf8_lossy(&out.stdout)).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(scratch.0.join("count"))
+                .unwrap()
+                .trim(),
+            "2",
+            "the shim saw both reads"
+        );
+        // Hashed first, then read: the record judged is the live one.
+        assert!(
+            matches!(probe.hub_lock(), HubLock::Held(Some(_))),
+            "{probe:?}"
+        );
+        if let Some(guard) = probe.write_guard(&paths) {
+            let target = scratch.0.join("written");
+            let status = std::process::Command::new("sh")
+                .args([
+                    "-c",
+                    &format!(
+                        "{guard}: > {}\n",
+                        shell_quote(&target.display().to_string())
+                    ),
+                ])
+                .status()
+                .unwrap();
+            assert!(
+                !status.success() && !target.exists(),
+                "written under a live lock"
+            );
+        }
     }
 
     /// The guard waits for the hub's guard `flock`: a write cannot land
