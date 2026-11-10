@@ -1,11 +1,14 @@
-//! `--json` output: the library's reports as they serialise, with a
-//! top-level `command` naming the subcommand (`init` also carries the
-//! `origin` it initialised). The layout is the reports' own (see
-//! `libremarkable_utils::hub::cycle`): documents by id (`rmu ls --json`
-//! maps ids to names), enums tagged by `kind` (`state` for the lock).
-//! Errors are `{"error": {"kind", "exit_code", "message", …}}`, with the
-//! documents for the deletion guard. Fields are only ever added; the
-//! tests pin each command's top-level fields.
+//! `--json` output, schema 1: the library's reports as they serialise,
+//! with a top-level `schema` and `command` naming the subcommand (`init`
+//! also carries the `origin` it initialised). The layout is the reports'
+//! own (see `libremarkable_utils::hub::cycle`): documents by id, enums
+//! tagged by `kind` (`state` for the lock). Errors are `{"schema",
+//! "error": {"kind", "exit_code", "message"}}`, plus `from_origin`,
+//! `from_tablet` and `empty_snapshot` for the deletion guard.
+//!
+//! **Unstable until device validation**: names will be settled then
+//! (and `schema` bumped). Until then, golden tests pin every shape, so
+//! a change in the library shows up here.
 
 use libremarkable_utils::Error;
 use libremarkable_utils::hub::cycle::{CycleError, InitReport};
@@ -15,9 +18,13 @@ use serde_json::Value;
 
 use super::{Failure, Report};
 
+/// The `schema` of every JSON object `rmu hub` prints.
+pub const SCHEMA: u32 = 1;
+
 /// A report with the command that produced it.
 #[derive(Serialize)]
 struct Tagged<'a, T: Serialize> {
+    schema: u32,
     command: &'static str,
     #[serde(flatten)]
     report: &'a T,
@@ -31,7 +38,11 @@ struct InitJson<'a> {
 }
 
 fn tagged<T: Serialize>(command: &'static str, report: &T) -> serde_json::Result<Value> {
-    serde_json::to_value(Tagged { command, report })
+    serde_json::to_value(Tagged {
+        schema: SCHEMA,
+        command,
+        report,
+    })
 }
 
 /// The JSON for a report.
@@ -65,8 +76,9 @@ pub fn error(failure: Failure, message: &str, error: Option<&Error>) -> Value {
         _ => None,
     };
     serde_json::to_value(ErrorJson {
+        schema: SCHEMA,
         error: ErrorBody {
-            kind: failure.kind(),
+            kind: failure,
             exit_code: failure.code(),
             message: message.to_string(),
             details,
@@ -77,12 +89,13 @@ pub fn error(failure: Failure, message: &str, error: Option<&Error>) -> Value {
 
 #[derive(Serialize)]
 struct ErrorJson<'a> {
+    schema: u32,
     error: ErrorBody<'a>,
 }
 
 #[derive(Serialize)]
 struct ErrorBody<'a> {
-    kind: &'static str,
+    kind: Failure,
     exit_code: u8,
     message: String,
     #[serde(flatten, skip_serializing_if = "Option::is_none")]

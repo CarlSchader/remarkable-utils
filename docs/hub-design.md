@@ -2,10 +2,10 @@
 
 Status: **phase 1 implemented** (git plumbing, data model, merge
 engine, device layer, sync cycle with clone, backup, status and
-`--dry-run`, and the `rmu hub` CLI); device validation is next (see
-"Implementation plan"). This document is the plan of record; update it
-as phases land and as device experiments confirm or refute its
-assumptions.
+`--dry-run`, and the `rmu hub` CLI); the hub lock for other `rmu`
+commands and device validation are next (see "Implementation plan").
+This document is the plan of record; update it as phases land and as
+device experiments confirm or refute its assumptions.
 
 ## Goal
 
@@ -1379,10 +1379,17 @@ Each item is one reviewed PR; items on the same line run in parallel.
 6. **CLI** (`init`, `clone`, `sync`, `backup`, `status`, `--dry-run`,
    `remote`, `detach`), output discipline, progress; README and
    AGENTS.md module map (done: `rmu/src/hub.rs`, exit statuses and
-   `--json` in `rmu hub --help` and the README).
-7. **Device validation** on a real tablet (questions 5–7) and fixes.
+   `--json` in `rmu hub --help` and the README; `--json` stays unstable
+   until device validation, item 8).
+7. **Hub lock for other rmu commands**: the other mutating `rmu`
+   commands (`upload`, `mv`, `rm`, `rename`, `sync`, `restart`) refuse
+   while the hub lock is held, and `rmu sync` warns when its target
+   tablet is attached to a hub (fresh-UUID copies would become
+   duplicates in the library); see "Watchdog and lock". Touches the
+   shared `Client`, so it is its own PR.
+8. **Device validation** on a real tablet (questions 5–7) and fixes.
    Requires the owner's go-ahead.
-8. **Refactor checkpoint**: shared code between `sync` and `hub`
+9. **Refactor checkpoint**: shared code between `sync` and `hub`
    (listing, stat passes, tar transfer), module sizes, naming.
-9. **Phase 2 page-level merge.**
-10. **`log`, `restore`, `add`.**
+10. **Phase 2 page-level merge.**
+11. **`log`, `restore`, `add`.**

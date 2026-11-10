@@ -187,9 +187,16 @@ impl World {
     }
 
     fn rmu_in(&self, dir: &Path, args: &[&str]) -> Output {
+        self.rmu_full(dir, &[], args)
+    }
+
+    /// `rmu --host tablet --no-multiplex <globals> hub <args>` in `dir`.
+    fn rmu_full(&self, dir: &Path, globals: &[&str], args: &[&str]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_rmu"))
             .current_dir(dir)
-            .args(["--host", "tablet", "--no-multiplex", "hub"])
+            .args(["--host", "tablet", "--no-multiplex"])
+            .args(globals)
+            .arg("hub")
             .args(args)
             .env("PATH", self.scratch.mock_path())
             .env("MOCK_TOOLS", self.scratch.join("tools"))
@@ -216,8 +223,11 @@ impl World {
     }
 
     fn put_pdf(&self, n: u64, name: &str) -> String {
+        self.put_pdf_in(&self.xochitl(), n, name)
+    }
+
+    fn put_pdf_in(&self, dir: &Path, n: u64, name: &str) -> String {
         let id = format!("8c1f0b9e-0000-4000-8000-{n:012x}");
-        let dir = self.xochitl();
         fs::write(
             dir.join(format!("{id}.metadata")),
             json!({"parent": "", "type": "DocumentType", "visibleName": name}).to_string(),
@@ -406,6 +416,14 @@ fn exit_codes(busybox: Option<&Path>) {
     let origin = world.origin();
     world.put_pdf(1, "Paper one");
     assert_eq!(code(&world.rmu(&["sync", "--dry-run", "--break-lock"])), 2);
+    let output = world.rmu_full(&world.scratch.join("home"), &["--no-restart"], &["sync"]);
+    assert_eq!(code(&output), 2);
+    assert!(
+        stderr(&output).contains("--no-restart does not apply to rmu hub"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(world.ssh_log().is_empty(), "refused before connecting");
 
     let output = world.rmu(&["status"]);
     assert_eq!(code(&output), 1, "not attached");
@@ -452,4 +470,39 @@ fn exit_codes(busybox: Option<&Path>) {
     let output = world.rmu(&["sync"]);
     assert_eq!(code(&output), 6, "{}", stderr(&output));
     assert!(world.running());
+}
+
+#[test]
+fn a_custom_xochitl_dir_over_ssh() {
+    tool_sets()
+        .iter()
+        .for_each(|busybox| custom_xochitl_dir(busybox.as_deref()));
+}
+
+/// `--xochitl-dir` reaches every tablet script (the default stays empty).
+fn custom_xochitl_dir(busybox: Option<&Path>) {
+    let world = World::new(busybox);
+    let origin = world.origin();
+    let custom = world.device().join("custom xochitl");
+    fs::create_dir_all(&custom).unwrap();
+    let id = world.put_pdf_in(&custom, 1, "Paper one");
+    let custom_arg = custom.display().to_string();
+    let globals = ["--xochitl-dir", custom_arg.as_str()];
+    let home = world.scratch.join("home");
+    world.json(&["init", &origin]);
+    let output = world.rmu_full(&home, &globals, &["clone", &origin, "--json"]);
+    assert_success(&output);
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["summary"]["added"], 1, "{value}");
+    assert_eq!(fs::read_dir(world.xochitl()).unwrap().count(), 0);
+    let output = world.rmu_full(&home, &globals, &["status"]);
+    assert_success(&output);
+    assert!(output.stdout.is_empty(), "no changes");
+    world.put_pdf_in(&custom, 2, "Paper two");
+    let output = world.rmu_full(&home, &globals, &["status"]);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        format!("A 8c1f0b9e-0000-4000-8000-{:012x}\n", 2)
+    );
+    assert!(custom.join(format!("{id}.pdf")).exists());
 }

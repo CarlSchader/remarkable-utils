@@ -18,6 +18,7 @@ mod tests;
 
 use std::collections::BTreeMap;
 use std::io::{IsTerminal, Write};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -33,34 +34,49 @@ use libremarkable_utils::hub::device::{DeviceError, LockRequest, SshTablet, Tabl
 use libremarkable_utils::hub::model::{DeviceName, DocId, XochitlPath};
 use libremarkable_utils::progress::Progress;
 use libremarkable_utils::ssh::SshSession;
+use serde::Serialize;
 use serde_json::Value;
 
 /// Appended to the help of `rmu hub` and its subcommands.
 pub const AFTER_HELP: &str = "\
 Exit status:
   0  success
-  1  error
+  1  error; worth retrying as is when origin kept moving, or the tablet's
+     state or origin's configuration changed during the run
   2  invalid arguments
   3  the deletion guard refused: the sync would delete many documents;
      origin's main and the tablet were left unchanged (the tablet's backup
      was pushed); rerun with --allow-deletions if that is intended
-  4  the tablet is locked or busy with another rmu hub run (if that run
-     is gone, --break-lock takes the lock over)
-  5  origin does not match the tablet: it was rewound or replaced, or
-     another tablet uses this device id (`rmu hub clone --reattach`
-     attaches the tablet to it deliberately), or it was emptied (`rmu hub
-     init` it again first)
+  4  the tablet is locked or busy with another rmu hub run, or the local
+     cache with another run on this computer (retry later; if a tablet
+     run is gone, --break-lock takes its lock over)
+  5  origin does not match the tablet: rewound or replaced, or another
+     tablet uses this device id (`rmu hub clone --reattach` attaches the
+     tablet to it deliberately); or origin lost its main branch (check the
+     URL, then restore origin from a backup or a computer's cache: the
+     error says how)
   6  the tablet is paired with the reMarkable cloud (unpair it first)
   7  an interrupted sync must be finished first: run `rmu hub sync`
 
 Output: stdout carries the result only: a summary on a terminal, JSON
 with --json, otherwise plain ids (the summary then goes to stderr).
-Progress, warnings and error details go to stderr.";
+Progress, warnings and error details go to stderr.
+
+JSON (\"schema\": 1) is unstable until the hub is validated on devices.
+Errors are {\"schema\": 1, \"error\": {\"kind\", \"exit_code\", \"message\"}};
+kind is error, deletions_need_consent (adds from_origin, from_tablet and
+empty_snapshot), lock_held, origin_mismatch, cloud_paired or
+journal_pending.";
+
+/// Why `--no-restart` is refused for `rmu hub`.
+pub const NO_RESTART_REFUSED: &str = "--no-restart does not apply to rmu hub: it stops and \
+     restarts xochitl itself, with a watchdog on the tablet";
 
 /// `rmu hub …`.
 #[derive(Args, Debug)]
 pub struct HubArgs {
     /// Print the result (or the error) as JSON on stdout, for scripts
+    /// (unstable until device validation; see below)
     #[arg(long, global = true)]
     pub json: bool,
 
@@ -101,7 +117,7 @@ pub enum HubCommand {
     Sync {
         /// Show what a sync would do, without stopping xochitl, taking
         /// the lock or pushing anything (best effort)
-        #[arg(long, conflicts_with = "break_lock")]
+        #[arg(long, conflicts_with_all = ["break_lock", "watchdog"])]
         dry_run: bool,
         /// Allow a sync that deletes many documents (from origin or from
         /// the tablet); the consent is recorded in the merge commit
@@ -144,7 +160,7 @@ pub enum HubCommand {
         #[arg(long)]
         prune_ref: bool,
         #[command(flatten)]
-        run: RunArgs,
+        lock: LockArg,
         #[command(flatten)]
         origin: OriginArg,
     },
@@ -159,11 +175,21 @@ pub enum RemoteAction {
         /// The new local path or git URL
         url: String,
         #[command(flatten)]
-        run: RunArgs,
+        lock: LockArg,
     },
 }
 
-/// Flags of the commands that lock the tablet (and may stop xochitl).
+/// `--break-lock` alone, for the commands that lock the tablet without
+/// stopping xochitl.
+#[derive(Args, Debug, Clone, Default, PartialEq, Eq)]
+pub struct LockArg {
+    /// Take over the tablet's hub lock even if it does not look stale;
+    /// only when you are sure no other rmu hub run is still working on it
+    #[arg(long)]
+    pub break_lock: bool,
+}
+
+/// Flags of the commands that lock the tablet and stop xochitl.
 #[derive(Args, Debug, Clone, PartialEq, Eq)]
 pub struct RunArgs {
     /// Take over the tablet's hub lock even if it does not look stale;
@@ -223,8 +249,10 @@ pub enum Report {
     Detach(DetachReport),
 }
 
-/// Why a command failed, as an exit status (see [`AFTER_HELP`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Why a command failed, as an exit status (see [`AFTER_HELP`]); it
+/// serialises as the `kind` of a `--json` error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Failure {
     Error,
     DeletionsNeedConsent,
@@ -240,7 +268,8 @@ impl Failure {
             Error::HubCycle(CycleError::DeletionsNeedConsent { .. }) => Self::DeletionsNeedConsent,
             Error::HubDevice(
                 DeviceError::Locked(_) | DeviceError::LockContended | DeviceError::Busy,
-            ) => Self::LockHeld,
+            )
+            | Error::HubCycle(CycleError::CacheBusy(_)) => Self::LockHeld,
             Error::HubCycle(
                 CycleError::OriginRewound { .. }
                 | CycleError::RepoMismatch { .. }
@@ -261,18 +290,6 @@ impl Failure {
             Self::OriginMismatch => 5,
             Self::CloudPaired => 6,
             Self::JournalPending => 7,
-        }
-    }
-
-    /// The `kind` of a `--json` error.
-    pub fn kind(self) -> &'static str {
-        match self {
-            Self::Error => "error",
-            Self::DeletionsNeedConsent => "deletions_need_consent",
-            Self::LockHeld => "lock_held",
-            Self::OriginMismatch => "origin_mismatch",
-            Self::CloudPaired => "cloud_paired",
-            Self::JournalPending => "journal_pending",
         }
     }
 }
@@ -353,14 +370,18 @@ pub fn options(command: &HubCommand) -> HubOptions {
             origin: url,
         } => origin(url),
         HubCommand::Remote {
-            action: Some(RemoteAction::SetUrl { run: args, .. }),
+            action: Some(RemoteAction::SetUrl { lock, .. }),
             ..
-        } => run(args, HubOptions::default()),
+        } => HubOptions {
+            break_lock: lock.break_lock,
+            ..HubOptions::default()
+        },
         HubCommand::Detach {
-            run: args,
-            origin: url,
-            ..
-        } => run(args, origin(url)),
+            lock, origin: url, ..
+        } => HubOptions {
+            break_lock: lock.break_lock,
+            ..origin(url)
+        },
     }
 }
 
@@ -404,14 +425,11 @@ pub fn run(
     // Setup failures (no cache directory, no ssh session) are errors too.
     let setup_error = |error: anyhow::Error| {
         if output == Output::Json {
-            println!(
+            let value = json::error(Failure::Error, &format!("{error:#}"), None);
+            let _ = writeln!(
+                std::io::stdout().lock(),
                 "{}",
-                serde_json::to_string_pretty(&json::error(
-                    Failure::Error,
-                    &format!("{error:#}"),
-                    None
-                ))
-                .expect("errors serialise")
+                serde_json::to_string_pretty(&value).expect("errors serialise")
             );
         }
         error
@@ -422,7 +440,7 @@ pub fn run(
         .map_err(setup_error)?;
     let hub = Hub::new(
         Git::new().interactive(interactive),
-        cache,
+        cache.clone(),
         LockRequest::for_this_process(host_name()),
         &*env.progress,
     )
@@ -444,9 +462,12 @@ pub fn run(
     env.progress.finished();
     finish(
         result,
-        tablet,
-        output,
-        env.quiet,
+        &OutputContext {
+            tablet,
+            cache_dir: Some(&cache),
+            output,
+            quiet: env.quiet,
+        },
         &mut std::io::stdout().lock(),
         &mut std::io::stderr().lock(),
     )
@@ -518,60 +539,58 @@ pub fn lookup_names(tablet: &dyn Tablet, docs: &[DocId]) -> render::Names {
         .unwrap_or_default()
 }
 
+/// What [`finish`] needs besides the result.
+pub struct OutputContext<'a> {
+    /// For names (every command but `init`).
+    pub tablet: Option<&'a dyn Tablet>,
+    /// Where local caches live (for recovery instructions).
+    pub cache_dir: Option<&'a Path>,
+    pub output: Output,
+    pub quiet: bool,
+}
+
 /// Write a command's result, or its error's details, and turn the error
-/// into one `main` reports (its exit status from [`exit_code`]).
+/// into one `main` reports (its exit status from [`exit_code`]). Once
+/// the command succeeded, a closed stdout (`| head`) is not an error.
 pub fn finish(
     result: libremarkable_utils::Result<Report>,
-    tablet: Option<&dyn Tablet>,
-    output: Output,
-    quiet: bool,
+    context: &OutputContext<'_>,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<()> {
     let names = |docs: Vec<DocId>| {
-        tablet
+        context
+            .tablet
             .map(|tablet| lookup_names(tablet, &docs))
             .unwrap_or_default()
     };
     match result {
         Ok(report) => {
-            let print = |out: &mut dyn Write, lines: &[String]| {
-                lines.iter().try_for_each(|line| writeln!(out, "{line}"))
-            };
-            match output {
-                Output::Json => {
-                    writeln!(
-                        stdout,
-                        "{}",
-                        serde_json::to_string_pretty(&json::report(&report))?
-                    )?;
-                    if !quiet {
-                        print(stderr, &render::warnings(&report))?;
-                    }
-                }
-                Output::Human => {
-                    let names = names(render::named_docs(&report));
-                    print(stdout, &render::human(&report, &names))?;
-                }
-                Output::Plain => {
-                    print(stdout, &render::plain(&report))?;
-                    if !quiet {
-                        let names = names(render::named_docs(&report));
-                        print(stderr, &render::human(&report, &names))?;
-                    }
-                }
+            let written = write_report(&report, context, &names, stdout, stderr);
+            match written {
+                Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+                other => Ok(other?),
             }
-            Ok(())
         }
         Err(error) => {
             // Best effort: a failed write must not replace the error (and
             // its exit status).
             let failure = Failure::of(&error);
-            let details = render::error_details(&error, &names(render::error_docs(&error)));
+            let details = render::error_details(
+                &error,
+                &render::ErrorContext {
+                    names: names(render::error_docs(&error)),
+                    repo_id: context
+                        .tablet
+                        .and_then(|tablet| tablet.read_state().ok().flatten())
+                        .map(|state| state.repo_id),
+                    cache_dir: context.cache_dir.map(Path::to_path_buf),
+                },
+            );
             let _ = details
                 .iter()
                 .try_for_each(|line| writeln!(stderr, "{line}"));
-            if output == Output::Json {
+            if context.output == Output::Json {
                 let value = json::error(failure, &error.to_string(), Some(&error));
                 let _ = writeln!(
                     stdout,
@@ -582,4 +601,38 @@ pub fn finish(
             Err(error.into())
         }
     }
+}
+
+fn write_report(
+    report: &Report,
+    context: &OutputContext<'_>,
+    names: &dyn Fn(Vec<DocId>) -> render::Names,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> std::io::Result<()> {
+    let print = |out: &mut dyn Write, lines: &[String]| {
+        lines.iter().try_for_each(|line| writeln!(out, "{line}"))
+    };
+    match context.output {
+        Output::Json => {
+            let value =
+                serde_json::to_string_pretty(&json::report(report)).expect("reports serialise");
+            writeln!(stdout, "{value}")?;
+            if !context.quiet {
+                print(stderr, &render::warnings(report))?;
+            }
+        }
+        Output::Human => {
+            let names = names(render::named_docs(report));
+            print(stdout, &render::human(report, &names))?;
+        }
+        Output::Plain => {
+            print(stdout, &render::plain(report))?;
+            if !context.quiet {
+                let names = names(render::named_docs(report));
+                print(stderr, &render::human(report, &names))?;
+            }
+        }
+    }
+    Ok(())
 }

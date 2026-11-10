@@ -228,7 +228,7 @@ fn main() -> ExitCode {
     // Must run before argument parsing: ssh re-executes this binary as
     // an askpass helper when password auth is in use.
     maybe_run_askpass();
-    let cli = Cli::parse();
+    let cli = parse_cli(std::env::args_os()).unwrap_or_else(|error| error.exit());
 
     // Progress bars only when stderr is a terminal and not --quiet.
     let progress: Arc<dyn Progress> = if cli.quiet || !std::io::stderr().is_terminal() {
@@ -263,6 +263,24 @@ fn main() -> ExitCode {
             })
         }
     }
+}
+
+/// Parse the command line, with the checks clap cannot express: global
+/// flags that do not apply to a subcommand are refused, not ignored.
+fn parse_cli<I, T>(args: I) -> std::result::Result<Cli, clap::Error>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+{
+    let cli = Cli::try_parse_from(args)?;
+    if cli.no_restart && matches!(cli.command, Command::Hub(_)) {
+        use clap::CommandFactory;
+        return Err(Cli::command().error(
+            clap::error::ErrorKind::ArgumentConflict,
+            hub::NO_RESTART_REFUSED,
+        ));
+    }
+    Ok(cli)
 }
 
 /// Build a session for a destination string (`host` or `user@host`).

@@ -195,6 +195,11 @@ Things to know:
 - **Every state is recoverable**: every sync is a git commit on origin,
   and every tablet's own state is backed up to its own ref on origin
   (`refs/rmu/devices/<id>`) before anything is merged.
+- **Leave the tablet alone during a hub sync**: don't run other `rmu`
+  write commands (`upload`, `mv`, `rm`, `rename`, `sync`, `restart`)
+  against it while `rmu hub` is working on it. (The hub skips what
+  changes under it rather than overwrite it; making those commands wait
+  for the hub's lock is planned.)
 
 Recovery:
 
@@ -212,26 +217,70 @@ Recovery:
   versions that match origin's history fast-forward, the rest merge as
   new. A tablet whose hub state was lost or detached attaches with a
   plain `rmu hub clone <origin>` the same way.
+- *Origin lost its `main` branch* (emptied, or the wrong URL): first
+  check the URL (`rmu hub remote`, `--origin`). Then restore origin from
+  a backup, or from the local cache of the computer that synced most
+  recently: a bare repository at `~/.cache/rmu/hub/<repo-id>.git`
+  (`$XDG_CACHE_HOME/rmu/hub/...`) holding origin's `main` as
+  `refs/remotes/origin/main`. The error prints the exact command:
 
-Every `rmu hub` command prints a summary on a terminal and JSON with
-`--json`: the command's report as the library defines it, plus a
-`command` field (fields are only ever added), or `{"error": {"kind",
-"exit_code", "message"}}`. When stdout is not a terminal it prints plain
-results instead, and the summary goes to stderr: the repository id for
-`init`, the commit the tablet is at for `clone` and `sync`, the backup
-commit for `backup`, `A`/`M`/`D <id>` per change for `status`,
-`write`/`delete <id>` per document for `sync --dry-run`, the stored URL
-for `remote`, and the deleted ref for `detach --prune-ref`. Exit
-statuses:
+  ```sh
+  git --git-dir ~/.cache/rmu/hub/<repo-id>.git push <origin> refs/remotes/origin/main:refs/heads/main
+  ```
+
+  Running `rmu hub init` on it again is a last resort: it starts a new
+  repository, so every tablet then needs `clone --reattach` and the old
+  history stays behind.
+- *Getting a deleted document back*: its files stay in origin's history.
+  Restore commands are planned; until then, git finds them:
+
+  ```sh
+  # the commits that deleted documents, and the documents' ids
+  git --git-dir ~/library.git log --diff-filter=D --name-only --format='%h %ad %s' -- 'docs/*/metadata'
+  git --git-dir ~/library.git show <commit>^:docs/<id>/metadata     # its name ("visibleName")
+  git --git-dir ~/library.git show <commit>^:docs/<id>/payload.pdf > recovered.pdf
+  rmu upload recovered.pdf                                          # the PDF, without annotations
+  ```
+
+  Handwriting (notebooks, annotations) is in the same commit
+  (`git --git-dir ~/library.git ls-tree -r <commit>^ docs/<id>`); bringing
+  it back onto a tablet needs the planned restore command.
+
+Every `rmu hub` command prints a summary on a terminal. When stdout is
+not a terminal it prints plain results instead, and the summary goes to
+stderr: the repository id for `init`, the commit the tablet is at for
+`clone` and `sync`, the backup commit for `backup`, `A`/`M`/`D <id>` per
+change for `status`, `write`/`delete <id>` per document for
+`sync --dry-run`, the stored URL for `remote`, and the deleted ref for
+`detach --prune-ref`.
+
+With `--json` it prints JSON instead. **The JSON format is unstable
+until the hub has been validated on devices**: field names may still
+change (`"schema"` will then be bumped). Today (`"schema": 1`) a result
+is the command's report as the library serialises it, plus `schema` and
+`command` (`init`, `clone`, `sync`, `sync --dry-run`, `backup`,
+`status`, `remote`, `remote set-url`, `detach`). An error is:
+
+```json
+{"schema": 1, "error": {"kind": "lock_held", "exit_code": 4, "message": "..."}}
+```
+
+with `kind` one of `error`, `deletions_need_consent`, `lock_held`,
+`origin_mismatch`, `cloud_paired` and `journal_pending`. A
+`deletions_need_consent` error also carries `from_origin` and
+`from_tablet` (document ids) and `empty_snapshot` (the tablet looked
+empty).
+
+Exit statuses:
 
 | Status | Meaning                                                           |
 |--------|-------------------------------------------------------------------|
 | 0      | success                                                           |
-| 1      | error                                                             |
+| 1      | error (worth retrying as is when origin kept moving, or the tablet's state or origin's configuration changed during the run) |
 | 2      | invalid arguments                                                 |
 | 3      | the deletion guard refused (see `--allow-deletions`)              |
-| 4      | the tablet is locked or busy (see `--break-lock`)                 |
-| 5      | origin does not match the tablet (see `clone --reattach`)         |
+| 4      | the tablet is locked or busy, or this computer's cache is in use by another run (see `--break-lock`) |
+| 5      | origin does not match the tablet (see `clone --reattach`), or lost its `main` (see Recovery) |
 | 6      | the tablet is paired with the reMarkable cloud                    |
 | 7      | an interrupted sync must be finished first (`rmu hub sync`)       |
 

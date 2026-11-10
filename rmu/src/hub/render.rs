@@ -6,6 +6,7 @@
 //! conflict copies, skipped and quarantined documents, notes, deletions.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 
 use indicatif::HumanBytes;
 use libremarkable_utils::Error;
@@ -16,7 +17,7 @@ use libremarkable_utils::hub::cycle::{
 };
 use libremarkable_utils::hub::device::{LockOwner, LockState, StaleReason};
 use libremarkable_utils::hub::merge::{DeletionGuard, Fork, Note, NoteKind, Summary};
-use libremarkable_utils::hub::model::DocId;
+use libremarkable_utils::hub::model::{DocId, RepoId};
 
 use super::Report;
 
@@ -25,6 +26,11 @@ pub type Names = BTreeMap<DocId, String>;
 
 /// Entries shown per list; the rest are counted.
 pub const LIST_LIMIT: usize = 20;
+
+/// Up to this many documents written to the tablet are listed by name
+/// (so a document coming back, say, does not go unnoticed); more are
+/// counted.
+pub const NAMED_UPDATES: usize = 10;
 
 /// A document for humans: `"Name" (id)`, or the id alone.
 fn label(names: &Names, doc: &DocId) -> String {
@@ -38,17 +44,36 @@ fn short(commit: &Oid) -> &str {
     &commit.as_str()[..12.min(commit.as_str().len())]
 }
 
+/// Entries indented and capped at [`LIST_LIMIT`], the rest counted.
+fn capped(entries: Vec<String>) -> Vec<String> {
+    let more = entries.len().saturating_sub(LIST_LIMIT);
+    entries
+        .into_iter()
+        .take(LIST_LIMIT)
+        .map(|entry| format!("  {entry}"))
+        .chain((more > 0).then(|| format!("  ... and {more} more")))
+        .collect()
+}
+
 /// A titled list: `Title (n):` and indented entries, capped.
 fn list(lines: &mut Vec<String>, title: &str, entries: Vec<String>) {
     if entries.is_empty() {
         return;
     }
     lines.push(format!("{title} ({}):", entries.len()));
-    let shown = entries.len().min(LIST_LIMIT);
-    lines.extend(entries[..shown].iter().map(|entry| format!("  {entry}")));
-    if entries.len() > shown {
-        lines.push(format!("  ... and {} more", entries.len() - shown));
-    }
+    lines.extend(capped(entries));
+}
+
+/// Control characters escaped (`\u{1b}`, `\n`, ...): names and reasons
+/// arrive from other tablets through origin, and must not drive the
+/// terminal.
+pub fn escape_controls(text: &str) -> String {
+    text.chars()
+        .flat_map(|c| match c.is_control() {
+            true => c.escape_default().collect::<Vec<_>>(),
+            false => vec![c],
+        })
+        .collect()
 }
 
 /// The documents of a list the summary shows (named first).
@@ -63,7 +88,12 @@ pub fn named_docs(report: &Report) -> Vec<DocId> {
             Vec::new()
         }
         Report::Clone(report) | Report::Sync(report) => {
+            let updates = match report.applied.len() <= NAMED_UPDATES {
+                true => report.applied.as_slice(),
+                false => &[],
+            };
             shown(report.forks.iter().map(|f| &f.original))
+                .chain(updates)
                 .chain(shown(&report.skipped))
                 .chain(shown(report.quarantined.keys()))
                 .chain(shown(report.notes.iter().map(|note| &note.doc)))
@@ -92,7 +122,7 @@ fn status_docs(report: &StatusReport) -> impl Iterator<Item = &DocId> {
 
 /// The human summary of a report.
 pub fn human(report: &Report, names: &Names) -> Vec<String> {
-    match report {
+    let lines = match report {
         Report::Init { origin, report } => vec![
             format!("Initialised origin {origin}"),
             format!(
@@ -111,7 +141,8 @@ pub fn human(report: &Report, names: &Names) -> Vec<String> {
         Report::Remote(report) => remote(report),
         Report::SetUrl(report) => set_url(report),
         Report::Detach(report) => detach(report),
-    }
+    };
+    lines.iter().map(|line| escape_controls(line)).collect()
 }
 
 /// Plain stdout when it is not a terminal: the ids a script wants.
@@ -178,23 +209,28 @@ fn docs(count: usize) -> String {
     plural(count, "document", "documents")
 }
 
-fn read_line(read: &ReadSummary) -> String {
-    let mut line = format!(
-        "Read {} ({}) from the tablet",
-        plural(read.downloaded.files, "file", "files"),
-        HumanBytes(read.downloaded.bytes)
-    );
-    if read.unmirrored > 0 {
-        line.push_str(&format!(
-            "; {} not mirrored (thumbnails, caches, unknown files)",
+/// What reading the tablet took; nothing when there is nothing to say.
+fn read_lines(read: &ReadSummary) -> Vec<String> {
+    let downloaded = (read.downloaded.files > 0).then(|| {
+        format!(
+            "{} ({}) read while the tablet's UI was down",
+            plural(read.downloaded.files, "file", "files"),
+            HumanBytes(read.downloaded.bytes)
+        )
+    });
+    let unmirrored = (read.unmirrored > 0).then(|| {
+        format!(
+            "{} on the tablet but not mirrored (thumbnails, caches, unknown files)",
             plural(read.unmirrored, "file stays", "files stay")
-        ));
-    }
-    line
+        )
+    });
+    downloaded.into_iter().chain(unmirrored).collect()
 }
 
 /// The merge's resolutions, without the unchanged documents.
-fn summary_line(summary: &Summary) -> Option<String> {
+/// `forks`: the conflict copies made (the summary counts each fork's
+/// original and copy).
+fn summary_line(summary: &Summary, forks: usize) -> Option<String> {
     let parts: Vec<String> = [
         (summary.changed_ours, "changed on the tablet"),
         (summary.changed_theirs, "changed on origin"),
@@ -203,7 +239,7 @@ fn summary_line(summary: &Summary) -> Option<String> {
         (summary.deleted, "deleted"),
         (summary.kept, "kept over a deletion"),
         (summary.merged, "merged"),
-        (summary.forked, "forked"),
+        (forks, "forked"),
         (summary.resurrected, "restored from history"),
     ]
     .into_iter()
@@ -358,10 +394,34 @@ fn deletions(
     }
 }
 
+/// How long ago, roughly (`None` for a time in the future: clocks
+/// differ between computers).
+pub fn age(seconds_ago: i64) -> Option<String> {
+    let s = u64::try_from(seconds_ago).ok()?;
+    Some(match s {
+        0..90 => format!("{s} s ago"),
+        90..5_400 => format!("{} min ago", s / 60),
+        5_400..172_800 => format!("{} h ago", s / 3_600),
+        _ => format!("{} days ago", s / 86_400),
+    })
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+}
+
 fn owner_text(owner: &Option<LockOwner>) -> String {
-    owner
-        .as_ref()
-        .map_or_else(|| "unknown owner".to_string(), ToString::to_string)
+    owner.as_ref().map_or_else(
+        || "an unknown owner".to_string(),
+        |owner| {
+            let started = i64::try_from(owner.started_unix).unwrap_or(i64::MAX);
+            let when = age(unix_now().saturating_sub(started))
+                .unwrap_or_else(|| format!("at unix time {started}"));
+            format!("pid {} on {}, started {when}", owner.pid, owner.host)
+        },
+    )
 }
 
 fn took_over(lines: &mut Vec<String>, took_over: &Option<TakeOver>) {
@@ -434,18 +494,23 @@ fn sync(report: &SyncReport, names: &Names, verb: &str) -> Vec<String> {
         short(&report.base),
         short(&report.snapshot)
     ));
-    lines.push(match report.applied.len() {
-        0 => "Nothing to change on the tablet".to_string(),
-        n => format!("Updated {} on the tablet", docs(n)),
-    });
-    lines.push(read_line(&report.read));
+    match report.applied.len() {
+        0 => lines.push("Nothing to change on the tablet".to_string()),
+        n if n <= NAMED_UPDATES => list(
+            &mut lines,
+            "Updated on the tablet",
+            report.applied.iter().map(|doc| label(names, doc)).collect(),
+        ),
+        n => lines.push(format!("Updated {} on the tablet", docs(n))),
+    }
+    lines.extend(read_lines(&report.read));
     if !report.inferred.is_empty() {
         lines.push(format!(
             "{} matched a version in origin's history and took it as their base",
             docs(report.inferred.len())
         ));
     }
-    lines.extend(summary_line(&report.summary));
+    lines.extend(summary_line(&report.summary, report.forks.len()));
     lines.push(format!(
         "Deletions: {} from origin, {} from the tablet",
         report.deletions.from_origin.len(),
@@ -458,6 +523,11 @@ fn sync(report: &SyncReport, names: &Names, verb: &str) -> Vec<String> {
             .count()
     ));
     forks(&mut lines, "Conflict copies", &report.forks, names);
+    if !report.forks.is_empty() {
+        lines.push(
+            "Compare each copy with its original; rename or delete the copy to close it".into(),
+        );
+    }
     list(
         &mut lines,
         "Skipped: changed on the tablet during the sync, or would break its folder tree (the next sync picks them up)",
@@ -484,7 +554,7 @@ fn backup(report: &BackupReport, names: &Names) -> Vec<String> {
             short(&report.snapshot)
         ),
     }];
-    lines.push(read_line(&report.read));
+    lines.extend(read_lines(&report.read));
     quarantined(&mut lines, &report.quarantined, names);
     orphans(&mut lines, &report.orphans);
     took_over(&mut lines, &report.took_over);
@@ -498,7 +568,11 @@ fn status(report: &StatusReport, names: &Names) -> Vec<String> {
         format!("Origin {} (repository {})", report.origin, report.repo_id),
         match &report.lock {
             LockState::Free => "Lock: free".to_string(),
-            LockState::Held(owner) => format!("Lock: held by {}", owner_text(owner)),
+            LockState::Held(owner) => format!(
+                "Lock: held by {}; if that run is gone (its computer crashed or was closed), \
+                 `rmu hub sync --break-lock` takes the lock over",
+                owner_text(owner)
+            ),
         },
     ];
     if report.journal_pending {
@@ -514,11 +588,7 @@ fn status(report: &StatusReport, names: &Names) -> Vec<String> {
     let entries = changes(report)
         .map(|(doc, change)| format!("{:<9}{}", change_word(change), label(names, doc)))
         .collect::<Vec<_>>();
-    let shown = entries.len().min(LIST_LIMIT);
-    lines.extend(entries[..shown].iter().map(|entry| format!("  {entry}")));
-    if entries.len() > shown {
-        lines.push(format!("  ... and {} more", entries.len() - shown));
-    }
+    lines.extend(capped(entries));
     lines.push(match report.behind {
         0 => "The tablet has everything on origin".to_string(),
         n => format!(
@@ -544,7 +614,10 @@ fn status(report: &StatusReport, names: &Names) -> Vec<String> {
     );
     quarantined(&mut lines, &report.quarantined, names);
     orphans(&mut lines, &report.orphans);
-    lines.extend(summary_line(&report.summary).map(|line| format!("A sync would merge: {line}")));
+    lines.extend(
+        summary_line(&report.summary, report.forks.len())
+            .map(|line| format!("A sync would merge: {line}")),
+    );
     forks(
         &mut lines,
         "A sync would create conflict copies",
@@ -576,11 +649,7 @@ fn dry_run(report: &DryRunReport, names: &Names) -> Vec<String> {
                 .map(|doc| format!("delete  {}", label(names, doc))),
         )
         .collect();
-    let shown = entries.len().min(LIST_LIMIT);
-    lines.extend(entries[..shown].iter().map(|entry| format!("  {entry}")));
-    if entries.len() > shown {
-        lines.push(format!("  ... and {} more", entries.len() - shown));
-    }
+    lines.extend(capped(entries));
     lines.push(match report.would_push {
         true => "It would push to origin".to_string(),
         false => "It would not push anything to origin".to_string(),
@@ -643,33 +712,78 @@ pub fn error_docs(error: &Error) -> Vec<DocId> {
     }
 }
 
+/// What error details can draw on besides the error.
+#[derive(Debug, Default)]
+pub struct ErrorContext {
+    pub names: Names,
+    /// The tablet's repository, if its state could be read.
+    pub repo_id: Option<RepoId>,
+    /// Where local caches live.
+    pub cache_dir: Option<PathBuf>,
+}
+
 /// Details printed to stderr before the error itself (never suppressed
-/// by `--quiet`): what the deletion guard refused.
-pub fn error_details(error: &Error, names: &Names) -> Vec<String> {
-    let mut lines = Vec::new();
-    if let Error::HubCycle(CycleError::DeletionsNeedConsent {
-        from_origin,
-        from_tablet,
-        empty_snapshot,
-    }) = error
-    {
-        if *empty_snapshot {
+/// by `--quiet`): what the deletion guard refused, and how to recover
+/// from an origin that does not match the tablet.
+pub fn error_details(error: &Error, context: &ErrorContext) -> Vec<String> {
+    let lines = match error {
+        Error::HubCycle(CycleError::DeletionsNeedConsent {
+            from_origin,
+            from_tablet,
+            empty_snapshot,
+        }) => {
+            let mut lines = Vec::new();
+            if *empty_snapshot {
+                lines.push(
+                    "The tablet looks empty, but its last sync was not: a sync would delete the library"
+                        .to_string(),
+                );
+            }
+            let labels =
+                |docs: &[DocId]| docs.iter().map(|doc| label(&context.names, doc)).collect();
+            list(&mut lines, "Would delete from origin", labels(from_origin));
+            list(
+                &mut lines,
+                "Would delete from the tablet",
+                labels(from_tablet),
+            );
             lines.push(
-                "The tablet looks empty, but its last sync was not: a sync would delete the library"
+                "If these deletions are intended, rerun with --allow-deletions; `rmu hub sync --dry-run` shows the whole plan"
                     .to_string(),
             );
+            lines
         }
-        let labels = |docs: &[DocId]| docs.iter().map(|doc| label(names, doc)).collect();
-        list(&mut lines, "Would delete from origin", labels(from_origin));
-        list(
-            &mut lines,
-            "Would delete from the tablet",
-            labels(from_tablet),
-        );
-        lines.push(
-            "If these deletions are intended, rerun with --allow-deletions; `rmu hub sync --dry-run` shows the whole plan"
-                .to_string(),
-        );
-    }
-    lines
+        Error::HubCycle(CycleError::OriginEmpty { url }) => origin_empty(url, context),
+        Error::HubCycle(CycleError::DeviceRefConflict { .. }) => vec![
+            "This tablet's backups on origin were written by another tablet with the same device id (a copied hub state, say).".to_string(),
+            "`rmu hub clone <origin> --reattach` gives this tablet a fresh start on origin, keeping its documents.".to_string(),
+        ],
+        _ => Vec::new(),
+    };
+    lines.iter().map(|line| escape_controls(line)).collect()
+}
+
+/// Recovery from an origin without `main`: never re-`init` first, which
+/// makes a new repository and strands every tablet.
+fn origin_empty(url: &str, context: &ErrorContext) -> Vec<String> {
+    let cache = match (&context.cache_dir, &context.repo_id) {
+        (Some(dir), Some(repo)) => dir.join(format!("{repo}.git")).display().to_string(),
+        (Some(dir), None) => dir.join("<repo-id>.git").display().to_string(),
+        _ => "$XDG_CACHE_HOME/rmu/hub/<repo-id>.git".to_string(),
+    };
+    vec![
+        format!("Origin {url} has no main branch. To recover:"),
+        "  1. Check the URL: it is the one stored on the tablet (`rmu hub remote`), or --origin."
+            .to_string(),
+        "  2. Restore origin from a backup, or from the local cache of the computer that synced"
+            .to_string(),
+        "     most recently (a bare repository; origin's main is refs/remotes/origin/main):"
+            .to_string(),
+        format!(
+            "       git --git-dir '{cache}' push '{url}' refs/remotes/origin/main:refs/heads/main"
+        ),
+        "  3. Only as a last resort: `rmu hub init` origin again and `rmu hub clone <origin> --reattach`"
+            .to_string(),
+        "     every tablet; that starts a new repository without the old history.".to_string(),
+    ]
 }
