@@ -388,8 +388,9 @@ pub struct SyncReport {
     pub update: MainUpdate,
     /// The snapshot commit, on the device ref (pushed at step 7, unless
     /// the device ref already held the same tree and its head is reused).
-    /// For [`MainUpdate::Pulled`] and [`MainUpdate::UpToDate`] it is not
-    /// on `main`.
+    /// For [`MainUpdate::Pulled`] and [`MainUpdate::UpToDate`] this run
+    /// did not merge it into `main` (a reused head may be there from an
+    /// earlier merge).
     pub snapshot: Oid,
     /// The commit the tablet now agrees with.
     pub base: Oid,
@@ -1322,7 +1323,10 @@ impl<'a> Hub<'a> {
 
 /// Remove the repository `init` created at `path` after it failed, unless
 /// it has a `main` by now: a concurrent `init` of the same new path won
-/// the race, and that repository is its.
+/// the race, and that repository is its. (A winner whose push lands
+/// between this check and the removal still loses its repository; two
+/// `init`s of one new path at the same instant are not otherwise
+/// guarded.)
 fn remove_if_uninitialised(git: &Git, path: &Path) {
     let initialised = git
         .open(path)

@@ -1137,3 +1137,111 @@ fn reconciliation_judges_and_finishes_a_partly_applied_edited_document() {
     };
     assert_eq!(verdicts(&journaled).unwrap()[&doc(1)], Verdict::Other);
 }
+
+#[test]
+fn a_pending_removal_is_finished_and_the_users_change_kept() {
+    // The merge removes page 2 (and so changes `.content`); the apply
+    // wrote page 1 and `.content`, then died before removing page 2; the
+    // user then renamed the notebook.
+    let mut blobs = Blobs::default();
+    let snapshot = notebook(&mut blobs, "Diary", "", &[(1, 10), (2, 20)]);
+    let merge = notebook(&mut blobs, "Diary", "", &[(1, 11)]);
+    let renamed = blobs.json(metadata("Diary (A)", "", "DocumentType"));
+    let tablet: BTreeMap<DocFile, Oid> = [
+        (DocFile::Metadata, renamed.clone()),
+        (DocFile::Content, merge.files[&DocFile::Content].id.clone()),
+        (page(1), oid(11)),
+        (page(2), oid(20)),
+    ]
+    .into();
+    let target = partial_target(
+        rules(),
+        &doc(1),
+        Some(&merge),
+        Some(&snapshot),
+        &tablet,
+        &BTreeSet::new(),
+        &blobs.0,
+    )
+    .unwrap()
+    .expect("finishable");
+    assert!(!target.files.contains_key(&page(2)));
+    assert_eq!(target.files[&DocFile::Metadata].id, renamed);
+    // The user inked page 2 meanwhile: removing it would lose that.
+    let mut inked = tablet.clone();
+    inked.insert(page(2), oid(21));
+    assert!(
+        partial_target(
+            rules(),
+            &doc(1),
+            Some(&merge),
+            Some(&snapshot),
+            &inked,
+            &BTreeSet::new(),
+            &blobs.0,
+        )
+        .unwrap()
+        .is_none()
+    );
+}
+
+#[test]
+fn a_partial_finish_the_live_tree_refuses_is_kept() {
+    // The merge moves the notebook into folder 4 (its `.metadata`,
+    // pending) and changes page 2 (written); the user inked page 1, which
+    // the merge leaves alone. Folder 4 is gone from the tablet: finishing
+    // would orphan the notebook, so it is skipped (kept at the snapshot).
+    let mut blobs = Blobs::default();
+    let snapshot = notebook(&mut blobs, "One", "", &[(1, 10), (2, 20)]);
+    let merge = notebook(&mut blobs, "One", doc(4).as_str(), &[(1, 10), (2, 21)]);
+    let tablet: BTreeMap<DocId, BTreeMap<DocFile, Oid>> = [(
+        doc(1),
+        [
+            (
+                DocFile::Metadata,
+                snapshot.files[&DocFile::Metadata].id.clone(),
+            ),
+            (
+                DocFile::Content,
+                snapshot.files[&DocFile::Content].id.clone(),
+            ),
+            (page(1), oid(12)),
+            (page(2), oid(21)),
+        ]
+        .into(),
+    )]
+    .into();
+    let merge_tree = RepoTree {
+        docs: [(doc(1), merge)].into(),
+        extra: Default::default(),
+    };
+    let snapshot_tree = RepoTree {
+        docs: [(doc(1), snapshot)].into(),
+        extra: Default::default(),
+    };
+    let staged = [StagedRun {
+        planned: [doc(1)].into(),
+        pending: [DocFile::Metadata.xochitl_path(&doc(1))].into(),
+    }];
+    let journaled = Journaled {
+        rules: rules(),
+        merge: &merge_tree,
+        snapshot: &snapshot_tree,
+        tablet: &tablet,
+        staged: &staged,
+        forks: &[],
+        json: &blobs.0,
+    };
+    let judged = verdicts(&journaled).unwrap();
+    assert_eq!(judged[&doc(1)], Verdict::Partial);
+    let (planned, skipped) = finish(&Finish {
+        journaled: &journaled,
+        verdicts: &judged,
+        local: &BTreeMap::new(),
+        current: &[(doc(1), item("", false))].into(),
+        merged: &[(doc(1), item(doc(4).as_str(), false))].into(),
+    })
+    .unwrap();
+    assert!(planned.is_empty(), "{planned:?}");
+    assert_eq!(skipped, [doc(1)].into());
+}

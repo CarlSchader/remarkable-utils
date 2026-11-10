@@ -319,12 +319,18 @@ while implementing it, beyond the steps above:
   its `fast-import` about every 64 MiB (`HubOptions::pre_read_checkpoint`)
   and saves what is durable (each file's stat and blob) next to the
   cache, so a cut — even mid-file, which ends the `fast-import` — loses
-  at most that much: in this run, and in the next, whose pre-read counts
-  the saved files as known (checked like any other entry). A tablet the
-  run would refuse anyway is not read: the pairing check (and, for
-  `clone`, the attached and pending-journal checks) run read-only first,
-  and a tablet whose lock another run holds gets no pre-read (unless
-  the lock is being broken). Step 5 reads **before** step 4 decides:
+  at most that much plus the file being read: in this run, and in the
+  next, whose pre-read and stopped read both count the saved files as
+  known (checked like any other entry; a pre-read that fails outright
+  keeps what was saved). A killed `fast-import` leaves `.keep` files on
+  the packs its checkpoints wrote; the writer removes them, so git can
+  repack. A tablet the run would refuse anyway is not read: the pairing
+  check (and, for `clone`, the attached and pending-journal checks) run
+  read-only first, and a tablet whose lock another run holds gets no
+  pre-read unless the lock is stale by its fired watchdog or is being
+  broken (a lock gone stale by a reboot cannot be told apart before
+  locking; that run reads from what earlier pre-reads saved). Step 5
+  reads **before** step 4 decides:
   reconciliation judges the files just read, and a document it finishes
   is read again. `status` and `--dry-run` read the same way, with the
   second read also while xochitl runs (retried once if a file changes

@@ -750,6 +750,142 @@ impl History for StoreHistory<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::git::{CommitMeta, FileMode, Signature};
+    use test_support::Scratch;
+
+    fn doc(n: u32) -> DocId {
+        DocId::new(format!("8c1f0b9e-0000-4000-8000-{n:012x}")).unwrap()
+    }
+
+    /// A commit whose tree is exactly `files` (path, content).
+    fn commit(repo: &Repo, parents: &[&Oid], files: &[(String, &str)]) -> Oid {
+        let mut writer = repo
+            .commit_writer(&crate::progress::NoProgress, None)
+            .unwrap();
+        files.iter().for_each(|(path, data)| {
+            writer
+                .add_bytes(path.as_str(), FileMode::Regular, data.as_bytes())
+                .unwrap();
+        });
+        let who = Signature {
+            name: "Test".to_string(),
+            email: "test@example.invalid".to_string(),
+            time: 1_800_000_000,
+            offset_minutes: 0,
+        };
+        writer
+            .commit(&CommitMeta {
+                parents: parents.iter().map(|&parent| parent.clone()).collect(),
+                author: who.clone(),
+                committer: who,
+                message: "test\n".to_string(),
+            })
+            .unwrap()
+    }
+
+    /// `docs/<doc>`'s subtree in `commit`, by a full tree listing.
+    fn listed(repo: &Repo, commit: &Oid, doc: &DocId) -> Option<Oid> {
+        let path = format!("docs/{doc}");
+        repo.ls_tree_recursive(commit.as_str())
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.path == path.as_bytes() && entry.kind == ObjectKind::Tree)
+            .map(|entry| entry.oid)
+    }
+
+    /// The history index against full tree reads, on a history with a
+    /// root adding documents, a deletion and a re-add of the same
+    /// subtree, a blob at `docs/<uuid>` turning into a tree and back, and
+    /// a merge taking the side branch's version.
+    #[test]
+    fn the_history_index_agrees_with_tree_reads() {
+        let scratch = Scratch::new("history-index");
+        let git = crate::git::Git::new()
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", scratch.path());
+        let repo = git
+            .init_bare(&scratch.path().join("r.git"), ObjectFormat::Sha1)
+            .unwrap();
+        let (d1, d2, d3) = (doc(1), doc(2), doc(3));
+        let meta = |d: &DocId, v: &'static str| (format!("docs/{d}/metadata"), v);
+        let blob = |d: &DocId, v: &'static str| (format!("docs/{d}"), v);
+        let root = commit(&repo, &[], &[meta(&d1, "1"), meta(&d2, "2")]);
+        let a = commit(&repo, &[&root], &[meta(&d1, "1a")]);
+        let b = commit(
+            &repo,
+            &[&a],
+            &[meta(&d1, "1a"), meta(&d2, "2"), blob(&d3, "x")],
+        );
+        let side = commit(
+            &repo,
+            &[&root],
+            &[meta(&d1, "1s"), meta(&d2, "2"), meta(&d3, "3")],
+        );
+        let merge = commit(
+            &repo,
+            &[&b, &side],
+            &[meta(&d1, "1s"), meta(&d2, "2"), meta(&d3, "3")],
+        );
+        let tip = commit(&repo, &[&merge], &[meta(&d2, "2"), blob(&d3, "y")]);
+        let store = Store::new(repo.clone()).unwrap();
+        let index = store.history(&tip).unwrap();
+        let commits = repo.rev_list_topo(&[tip.as_str()]).unwrap();
+        let chain = repo.rev_list(&[tip.as_str()], true).unwrap();
+        [&d1, &d2, &d3, &doc(4)].into_iter().for_each(|d| {
+            let truth: Vec<Option<Oid>> = commits.iter().map(|c| listed(&repo, c, d)).collect();
+            commits.iter().zip(&truth).for_each(|(c, expected)| {
+                assert_eq!(
+                    index.subtree_at(c, d),
+                    Some(expected.as_ref()),
+                    "{d} at {c}"
+                );
+                assert_eq!(&store.doc_subtree(c, d).unwrap(), expected, "{d} at {c}");
+            });
+            // Each distinct version (absent included) at its newest holder.
+            let mut seen = std::collections::HashSet::new();
+            let versions: Vec<(&Oid, Option<&Oid>)> = commits
+                .iter()
+                .zip(&truth)
+                .filter(|(_, version)| seen.insert(*version))
+                .map(|(c, version)| (c, version.as_ref()))
+                .collect();
+            assert_eq!(index.versions(d), versions, "{d}");
+            // The first-parent chain's present versions, newest first, one
+            // per stretch.
+            let (stretches, _) = chain.iter().map(|c| listed(&repo, c, d)).fold(
+                (Vec::new(), None::<Option<Oid>>),
+                |(mut out, previous), version| {
+                    if previous.as_ref() != Some(&version) {
+                        out.extend(version.clone());
+                    }
+                    (out, Some(version))
+                },
+            );
+            let indexed: Vec<Oid> = index
+                .first_parent_versions(d)
+                .into_iter()
+                .flatten()
+                .cloned()
+                .collect();
+            assert_eq!(indexed, stretches, "{d}");
+        });
+        // The ancestry check: from the index of `tip`, and for another
+        // tip from one rev-list (the index stays `tip`'s).
+        assert!(store.is_ancestor(&side, &tip).unwrap());
+        assert!(!store.is_ancestor(&tip, &merge).unwrap());
+        assert!(store.is_ancestor(&root, &a).unwrap());
+        assert!(!store.is_ancestor(&side, &a).unwrap());
+        let unknown: Oid = "f".repeat(40).parse().unwrap();
+        assert!(!store.is_ancestor(&unknown, &tip).unwrap());
+        assert!(!store.is_ancestor(&unknown, &a).unwrap());
+        // A subtree at a commit the index lacks is read from its trees.
+        let detached = commit(&repo, &[], &[meta(&d1, "z")]);
+        assert_eq!(
+            store.doc_subtree(&detached, &d1).unwrap(),
+            listed(&repo, &detached, &d1)
+        );
+    }
 
     fn oid(n: u32) -> Oid {
         format!("{n:040x}").parse().unwrap()
