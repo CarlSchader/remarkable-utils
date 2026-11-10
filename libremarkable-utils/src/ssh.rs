@@ -13,7 +13,13 @@
 //!
 //! Connections are multiplexed via `ControlMaster` by default so one
 //! logical operation (which may issue several ssh commands) only
-//! authenticates once.
+//! authenticates once; rmu opens the master itself (see `master`).
+//!
+//! A sleeping or unreachable tablet must not hang a run: where ssh would
+//! use its built-in `ConnectTimeout` and `ServerAliveInterval` (none),
+//! rmu adds its own ([`TIMEOUT_DEFAULTS`]; how it decides, and what it
+//! cannot tell apart, is in `master`). ssh giving up on the tablet is
+//! [`Error::Unreachable`].
 //!
 //! Streaming diagnostics are drained concurrently. On Unix, once the direct
 //! child exits, readers collect only the bytes already queued, without waiting
@@ -26,6 +32,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::{Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 
 #[cfg(unix)]
@@ -40,6 +47,11 @@ use std::{
 
 use crate::error::{Error, Result};
 use crate::progress::{NoProgress, Progress};
+
+mod master;
+
+use master::{Master, explain_from_master_log};
+pub use master::{TIMEOUT_DEFAULTS, failure, is_unreachable, timeout_defaults};
 
 /// Default hostname of a reMarkable tablet when connected over USB.
 pub const DEFAULT_USB_HOST: &str = "10.11.99.1";
@@ -91,6 +103,10 @@ pub struct SshOptions {
     pub auth: Auth,
     /// Multiplex connections via ControlMaster (recommended).
     pub multiplex: bool,
+    /// Add rmu's [`TIMEOUT_DEFAULTS`] where ssh's built-in values would
+    /// apply; `false` leaves timeouts to the user's ssh config and
+    /// `extra_options` alone.
+    pub default_timeouts: bool,
 }
 
 impl Default for SshOptions {
@@ -102,6 +118,7 @@ impl Default for SshOptions {
             extra_options: Vec::new(),
             auth: Auth::Default,
             multiplex: true,
+            default_timeouts: true,
         }
     }
 }
@@ -113,6 +130,10 @@ pub struct SshSession {
     opts: SshOptions,
     askpass_exe: Option<PathBuf>,
     control_dir: Option<PathBuf>,
+    /// [`timeout_defaults`] for this destination, decided on first use.
+    defaults: OnceLock<Vec<String>>,
+    /// Serialises opening the master.
+    master: Mutex<Master>,
     #[cfg(test)]
     ssh_exe: Option<PathBuf>,
 }
@@ -132,6 +153,8 @@ impl SshSession {
             opts,
             askpass_exe,
             control_dir,
+            defaults: OnceLock::new(),
+            master: Mutex::new(Master::OnDemand),
             #[cfg(test)]
             ssh_exe: None,
         })
@@ -153,8 +176,9 @@ impl SshSession {
         self.opts.port
     }
 
-    /// ssh invocation with all options and env set, but no destination.
-    fn base_command(&self) -> Command {
+    /// ssh with the user's own options (port, identity, `-o`): they come
+    /// first, so they win over everything rmu adds.
+    fn user_command(&self) -> Command {
         let mut cmd = Command::new("ssh");
         #[cfg(test)]
         if let Some(exe) = &self.ssh_exe {
@@ -169,10 +193,20 @@ impl SshSession {
         self.opts.extra_options.iter().for_each(|opt| {
             cmd.arg("-o").arg(opt);
         });
-        if let Some(dir) = &self.control_dir {
+        cmd
+    }
+
+    /// ssh invocation with all options and env set, but no destination.
+    fn base_command(&self) -> Command {
+        let mut cmd = self.user_command();
+        self.timeout_options().iter().for_each(|opt| {
+            cmd.arg("-o").arg(opt);
+        });
+        if let Some((socket, _)) = self.master_paths() {
             cmd.arg("-o").arg("ControlMaster=auto");
+            // One destination per session, so a fixed name will do.
             cmd.arg("-o")
-                .arg(format!("ControlPath={}/cm-%C", dir.display()));
+                .arg(format!("ControlPath={}", socket.display()));
             cmd.arg("-o").arg("ControlPersist=30");
         }
         if let (Auth::Password(password), Some(exe)) = (&self.opts.auth, &self.askpass_exe) {
@@ -194,16 +228,36 @@ impl SshSession {
         cmd
     }
 
-    fn command(&self, remote_cmd: &str) -> Command {
+    fn command(&self, remote_cmd: &str) -> Result<Command> {
+        self.ensure_master()?;
         let mut cmd = self.base_command();
         cmd.arg("--").arg(self.target()).arg(remote_cmd);
-        cmd
+        Ok(cmd)
+    }
+
+    /// A streaming command, its failure explained by the master's log.
+    fn spawn(
+        &self,
+        remote_cmd: &str,
+        with_stdin: bool,
+        drain_stdout: bool,
+    ) -> Result<StreamingChild> {
+        let mut child =
+            StreamingChild::spawn_io(&mut self.command(remote_cmd)?, with_stdin, drain_stdout)?;
+        child.master_log = self.master_log();
+        Ok(child)
     }
 
     /// Run a remote command, capturing output. Does not fail on
-    /// non-zero exit; callers inspect the status.
+    /// non-zero exit, callers inspect the status (see [`failure`]),
+    /// except when ssh gave up on the tablet: [`Error::Unreachable`].
     pub fn run(&self, remote_cmd: &str) -> Result<Output> {
-        Ok(self.command(remote_cmd).stdin(Stdio::null()).output()?)
+        let mut output = self.command(remote_cmd)?.stdin(Stdio::null()).output()?;
+        explain_from_master_log(&mut output, self.master_log().as_deref());
+        if is_unreachable(&output) {
+            return Err(failure(&output));
+        }
+        Ok(output)
     }
 
     /// Run a remote command and return stdout; non-zero exit is an error.
@@ -226,7 +280,7 @@ impl SshSession {
         total: Option<u64>,
         progress: &dyn Progress,
     ) -> Result<Vec<u8>> {
-        let mut child = StreamingChild::spawn(&mut self.command(remote_cmd), false)?;
+        let mut child = self.spawn(remote_cmd, false, false)?;
         let mut data = Vec::new();
         let transfer = {
             let mut stdout = child.child.stdout.take().expect("stdout was piped");
@@ -245,7 +299,7 @@ impl SshSession {
         data: &[u8],
         progress: &dyn Progress,
     ) -> Result<()> {
-        let mut child = StreamingChild::spawn(&mut self.command(remote_cmd), true)?;
+        let mut child = self.spawn(remote_cmd, true, true)?;
         let transfer = {
             let mut stdin = child.child.stdin.take().expect("stdin was piped");
             let mut reader = data;
@@ -324,8 +378,9 @@ impl SshSession {
         progress: &dyn Progress,
         pre_commit: &str,
     ) -> Result<()> {
-        let mut child = StreamingChild::spawn(
-            &mut self.command(&staged_write_command(remote_path, total, pre_commit)),
+        let mut child = self.spawn(
+            &staged_write_command(remote_path, total, pre_commit),
+            true,
             true,
         )?;
         let copied = {
@@ -352,8 +407,8 @@ impl SshSession {
         total: Option<u64>,
         progress: &dyn Progress,
     ) -> Result<()> {
-        download_to_local(
-            &mut self.command(&format!("cat {}", shell_quote(remote_path))),
+        download_with(
+            || self.spawn(&format!("cat {}", shell_quote(remote_path)), false, false),
             local,
             total,
             progress,
@@ -367,7 +422,7 @@ impl SshSession {
     /// to send the script is an error only if the remote exited zero
     /// (otherwise its status and stderr say more).
     pub fn run_script(&self, script: &str) -> Result<Output> {
-        let mut child = StreamingChild::spawn(&mut self.command("sh -s"), true)?;
+        let mut child = self.spawn("sh -s", true, true)?;
         let sent = {
             let mut stdin = child.child.stdin.take().expect("stdin was piped");
             stdin.write_all(script.as_bytes())
@@ -398,7 +453,7 @@ impl SshSession {
         remote_cmd: &str,
         write: impl FnOnce(&mut dyn Write) -> Result<T>,
     ) -> Result<(T, Output)> {
-        let mut child = StreamingChild::spawn(&mut self.command(remote_cmd), true)?;
+        let mut child = self.spawn(remote_cmd, true, true)?;
         let written = {
             let mut stdin = child.child.stdin.take().expect("stdin was piped");
             write(&mut stdin)
@@ -425,7 +480,7 @@ impl SshSession {
         input: Vec<u8>,
         progress: &'p dyn Progress,
     ) -> Result<RemoteStream<'p>> {
-        let mut child = StreamingChild::spawn_io(&mut self.command(remote_cmd), true, false)?;
+        let mut child = self.spawn(remote_cmd, true, false)?;
         let stdout = child.child.stdout.take().expect("stdout was piped");
         let mut stdin = child.child.stdin.take().expect("stdin was piped");
         let feeder = thread::Builder::new().spawn(move || stdin.write_all(&input))?;
@@ -541,8 +596,9 @@ impl Drop for DownloadTemp {
     }
 }
 
-fn download_to_local(
-    command: &mut Command,
+/// Download the stdout of the command `spawn` starts to `local`.
+fn download_with(
+    spawn: impl FnOnce() -> Result<StreamingChild>,
     local: &Path,
     total: Option<u64>,
     progress: &dyn Progress,
@@ -553,7 +609,7 @@ fn download_to_local(
         Err(error) => return Err(error.into()),
     };
     let mut temp = DownloadTemp::new(local)?;
-    let mut child = StreamingChild::spawn(command, false)?;
+    let mut child = spawn()?;
     let transfer = {
         let mut stdout = child.child.stdout.take().expect("stdout was piped");
         copy_with_progress(&mut stdout, &mut temp.file, total, progress)
@@ -572,7 +628,10 @@ fn download_to_local(
 
 impl Drop for SshSession {
     fn drop(&mut self) {
-        if self.control_dir.is_some() {
+        if self
+            .master_paths()
+            .is_some_and(|(socket, _)| socket.exists())
+        {
             // Best-effort teardown of the multiplexing master.
             let _ = self
                 .base_command()
@@ -641,13 +700,11 @@ struct StreamingChild {
     stdout: Option<JoinHandle<std::io::Result<Vec<u8>>>>,
     reaped: bool,
     cancellation: DrainCancellation,
+    /// The multiplexing master's log (see [`explain_from_master_log`]).
+    master_log: Option<PathBuf>,
 }
 
 impl StreamingChild {
-    fn spawn(command: &mut Command, with_stdin: bool) -> std::io::Result<Self> {
-        Self::spawn_io(command, with_stdin, with_stdin)
-    }
-
     /// `drain_stdout = false` leaves stdout to the caller (downloads).
     fn spawn_io(
         command: &mut Command,
@@ -670,6 +727,7 @@ impl StreamingChild {
             stdout: None,
             reaped: false,
             cancellation,
+            master_log: None,
         };
         // Fallible thread creation leaves cleanup to the guard too.
         stream.stderr = Some(drain_pipe(
@@ -709,11 +767,13 @@ impl StreamingChild {
         self.cancellation.child_exited();
         let stderr = join_pipe(self.stderr.take())?;
         let stdout = join_pipe(self.stdout.take())?;
-        Ok(Output {
+        let mut output = Output {
             status,
             stdout,
             stderr,
-        })
+        };
+        explain_from_master_log(&mut output, self.master_log.as_deref());
+        Ok(output)
     }
 }
 
@@ -925,11 +985,13 @@ pub(crate) fn checked(output: Output) -> Result<Output> {
     if output.status.success() {
         return Ok(output);
     }
-    Err(remote_error(&output))
+    Err(failure(&output))
 }
 
 /// A failed remote command as [`Error::Remote`]: its exit status (-1
-/// without one, e.g. killed by a signal) and its trimmed stderr.
+/// without one, e.g. killed by a signal) and its trimmed stderr. Use
+/// [`failure`] for a command's outcome: it tells a tablet that did not
+/// answer apart.
 pub(crate) fn remote_error(output: &Output) -> Error {
     Error::Remote {
         status: output.status.code().unwrap_or(-1),
@@ -1012,6 +1074,21 @@ mod tests {
             fn drop(&mut self) {
                 fs::remove_dir_all(&self.0).unwrap();
             }
+        }
+
+        /// The download path every session download takes, from `command`.
+        fn download_to_local(
+            command: &mut Command,
+            local: &Path,
+            total: Option<u64>,
+            progress: &dyn Progress,
+        ) -> Result<()> {
+            download_with(
+                || Ok(StreamingChild::spawn_io(command, false, false)?),
+                local,
+                total,
+                progress,
+            )
         }
 
         // Inject only the subprocess command, exercising the same download

@@ -2180,6 +2180,41 @@ fn append_dir_deletes(
 }
 
 /// `sub` (a dir or file path) is strictly below directory `dir`.
+/// Re-key every archive entry under the moved `from_dir` to `to_dir`,
+/// refreshing local stamps from the files' new homes with `stat` (a
+/// failed stat keeps the old ones), except that a host that stopped
+/// answering ends it: each further entry would wait for another timeout.
+fn rekey_moved_entries(
+    state: &mut SyncState,
+    from_dir: &str,
+    to_dir: &str,
+    stat: impl Fn(&str) -> Result<(u64, i64)>,
+) -> Result<()> {
+    let moved_keys: Vec<String> = state
+        .entries
+        .keys()
+        .filter(|key| path_under(from_dir, key))
+        .cloned()
+        .collect();
+    moved_keys.into_iter().try_for_each(|old_key| {
+        let sub = old_key
+            .strip_prefix(&format!("{from_dir}/"))
+            .expect("filtered on prefix");
+        let new_key = join_rel(to_dir, sub);
+        let stamp = match stat(&new_key) {
+            Err(error @ Error::Unreachable(_)) => return Err(error),
+            other => other.ok(),
+        };
+        let mut entry = state.entries.remove(&old_key).expect("key listed");
+        if let Some((size, mtime)) = stamp {
+            entry.local_size = size;
+            entry.local_mtime_ms = mtime;
+        }
+        state.entries.insert(new_key, entry);
+        Ok(())
+    })
+}
+
 fn path_under(dir: &str, sub: &str) -> bool {
     sub.len() > dir.len() && sub.starts_with(dir) && sub.as_bytes()[dir.len()] == b'/'
 }
@@ -2935,29 +2970,7 @@ pub fn execute(
                         (new_dir, folder_uuid)
                     })
                     .collect();
-                // Re-key every archive entry under the moved prefix,
-                // refreshing local stamps from the files' new homes.
-                let moved_keys: Vec<String> = state
-                    .entries
-                    .keys()
-                    .filter(|key| path_under(from_dir, key))
-                    .cloned()
-                    .collect();
-                moved_keys
-                    .into_iter()
-                    .try_for_each(|old_key| -> Result<()> {
-                        let mut entry = state.entries.remove(&old_key).expect("key listed");
-                        let sub = old_key
-                            .strip_prefix(&format!("{from_dir}/"))
-                            .expect("filtered on prefix");
-                        let new_key = join_rel(to_dir, sub);
-                        if let Ok((size, mtime)) = fs_side.stat(&new_key) {
-                            entry.local_size = size;
-                            entry.local_mtime_ms = mtime;
-                        }
-                        state.entries.insert(new_key, entry);
-                        Ok(())
-                    })?;
+                rekey_moved_entries(state, from_dir, to_dir, |path| fs_side.stat(path))?;
                 state.save(state_path)?;
                 outcome.moved_folders += 1;
                 outcome.modified_remote = true;
@@ -4097,6 +4110,39 @@ mod tests {
     fn with_hash(mut entry: LocalEntry, hash: &str) -> LocalEntry {
         entry.hash = Some(hash.to_string());
         entry
+    }
+
+    #[test]
+    fn rekeying_a_moved_folder_stops_at_an_unanswering_host() {
+        let state = || SyncState {
+            entries: ["a/x.pdf", "a/sub/y.pdf", "b/z.pdf"]
+                .iter()
+                .map(|key| (key.to_string(), entry("u", DocKind::Pdf, 1, 2, 3)))
+                .collect(),
+            ..SyncState::default()
+        };
+        let keys = |state: &SyncState| state.entries.keys().cloned().collect::<Vec<_>>();
+        // A failed stat keeps the old stamps; a good one refreshes them.
+        let mut moved = state();
+        rekey_moved_entries(&mut moved, "a", "c", |path| match path {
+            "c/x.pdf" => Ok((10, 20)),
+            _ => Err(Error::PathNotFound(path.to_string())),
+        })
+        .unwrap();
+        assert_eq!(keys(&moved), ["b/z.pdf", "c/sub/y.pdf", "c/x.pdf"]);
+        assert_eq!(moved.entries["c/x.pdf"].local_size, 10);
+        assert_eq!(moved.entries["c/sub/y.pdf"].local_size, 1);
+        // An unanswering host: one stat, then the error.
+        let calls = std::cell::Cell::new(0);
+        let mut asleep = state();
+        let result = rekey_moved_entries(&mut asleep, "a", "c", |_| {
+            calls.set(calls.get() + 1);
+            Err(Error::Unreachable(
+                "Timeout, server host not responding.".into(),
+            ))
+        });
+        assert!(matches!(result, Err(Error::Unreachable(_))));
+        assert_eq!(calls.get(), 1);
     }
 
     fn entry(uuid: &str, kind: DocKind, size: u64, mtime: i64, remote: i64) -> StateEntry {

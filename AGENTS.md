@@ -53,7 +53,26 @@ This repository is **open source** (dual-licensed MIT OR Apache-2.0):
 - `ssh.rs` — subprocess transport around the system `ssh` binary. No SSH
   library is linked, deliberately: users get ssh config/keys/agent for
   free and the crate stays free of native deps (the dev shell is
-  `mkShellNoCC`). Connections are multiplexed via ControlMaster. Password
+  `mkShellNoCC`). Connections are multiplexed via ControlMaster: rmu
+  opens the master itself (`-f -N`, again if it ended) with its log in
+  the session's control directory, since a dead master's clients exit
+  255 without a word; a failed open is remembered (`Master`), so later
+  commands connect themselves. Timeouts: `ConnectTimeout` and
+  `ServerAliveInterval` get rmu's defaults (`TIMEOUT_DEFAULTS`) only
+  where `ssh -G` reports ssh's built-in value and the user's `-o` does
+  not set them (user options always come first). `ssh -G` cannot tell a
+  config line that sets the built-in value from none, so such a line is
+  overridden: a documented limit, with the user's `-o` and
+  `--no-ssh-defaults`/`RMU_NO_SSH_DEFAULTS=1`
+  (`SshOptions::default_timeouts`) as the ways out; keep the docs
+  honest about it. The master and timeout code is `ssh/master.rs`. ssh
+  giving up on the tablet is `Error::Unreachable` (`ssh::failure`; `rmu
+  hub` exit status 8); code must not retry or fall back after it, since
+  each try waits for another timeout. The one further try allowed is the
+  hub's error path's first step while it holds the lock (`Session::abort`;
+  taking the lock does not retry it either), and `Fault::SleepAtOp`
+  matrices pin that bound for sync, clone, backup, status and dry-run.
+  Long hub syncs need the tablet kept awake. Password
   auth re-executes the current binary as an `SSH_ASKPASS` helper
   (`maybe_run_askpass` must be called first thing in `main`); the
   password travels via environment, never argv. Large scripts go over

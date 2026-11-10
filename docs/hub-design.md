@@ -325,7 +325,8 @@ while implementing it, beyond the steps above:
   at most that much plus the file being read: in this run, and in the
   next, whose pre-read and stopped read both count the saved files as
   known (checked like any other entry; a pre-read that fails outright
-  keeps what was saved). The saved file is the tablet's: keyed by its
+  keeps what was saved, and the run goes on without it, unless the tablet
+  stopped answering: see below). The saved file is the tablet's: keyed by its
   device id, or before it has one by where this computer reaches it
   (`Tablet::destination`, the SSH destination and port). A killed
   `fast-import` leaves `.keep` files on the packs its checkpoints wrote;
@@ -341,7 +342,7 @@ while implementing it, beyond the steps above:
   reconciliation judges the files just read, and a document it finishes
   is read again. `status` and `--dry-run` read the same way, with the
   second read also while xochitl runs (retried once if a file changes
-  while read).
+  while read, never after the tablet stopped answering).
 - **The history index.** Searches over origin's history go through an
   index of which subtree of each document (`docs/<uuid>`) every ancestor
   of `main` holds. It is built from one `rev-list --topo-order --parents`,
@@ -412,6 +413,18 @@ while implementing it, beyond the steps above:
   outlasts the timeout is not repeated by the next run. Starts per
   cycle: two (one when nothing is applied), plus one if the watchdog
   fires, each after `reset-failed`.
+- **A tablet that stops answering** (asleep, off the network) is
+  `Error::Unreachable`: ssh gets a connect timeout and a keepalive (see
+  `ssh.rs`), and every further try would wait for another timeout, so
+  nothing retries it. The pre-read, otherwise best effort, ends the run
+  on it, and so do a failed staging cleanup before step 16 and the lock
+  (which otherwise retries once to adopt a lock whose acknowledgement
+  was lost). The error path stops at its first unanswered step: xochitl
+  comes back with the watchdog, and the lock goes stale when it fires.
+  A lock taken but not yet guarded by a watchdog, or left after the
+  final disarm, needs `--break-lock` (or a reboot), as after a crash.
+  `rmu hub` exits with status 8. Keep the tablet awake during long
+  syncs.
 - **Updating `main`.** If the merge result is origin's tree and every
   document of the snapshot is equivalent to origin's (`.metadata`/
   `.content` compared normalised, other files by blob), nothing is
@@ -1777,6 +1790,12 @@ those need a second tablet (phase 2).
    validation passed `-o ConnectTimeout=15 -o ServerAliveInterval=10
    -o ServerAliveCountMax=3` on every command. Defaults must not
    override the user's ssh config (ssh takes the first value it sees).
+   Fixed: `ConnectTimeout=15` and `ServerAliveInterval=10` are added
+   where `ssh -G` reports ssh's built-in values and the user's `-o` does
+   not set them (a config line setting the built-in value looks unset:
+   `-o` or `--no-ssh-defaults` keeps it); a tablet that stops answering
+   is `Error::Unreachable` (`rmu hub` exit status 8) and nothing retries
+   it (see "A tablet that stops answering" above).
 2. **`rmu mkdir` is not atomic and writes the visible file first.**
    `Client::create_folder_in` writes `.metadata`, `.content` and
    `.pagedata` in three round trips, `.metadata` first. The sleep above
@@ -1789,7 +1808,9 @@ those need a second tablet (phase 2).
    which is the base OS's version (`5.8.203`), not the reMarkable
    release; that one is `IMG_VERSION` (`3.28.0.172`) in the same file.
    `Rmu-Model` is the board codename (`reMarkable Ferrari`), which is
-   cosmetic.
+   cosmetic. Fixed: `IMG_VERSION` first, then update.conf, then
+   `VERSION_ID`; `reMarkable Ferrari` is shown as `reMarkable Paper Pro`
+   (reMarkable's documented code name).
 4. **View state counted as a change.** After the owner only opened a
    document, `sync` reported `Documents: 1 changed on the tablet` next
    to `already in sync with origin; nothing pushed`, and `status`

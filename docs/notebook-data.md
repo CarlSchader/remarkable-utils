@@ -276,6 +276,21 @@ stream one tar into `tar -x` in the data dir.
   tablet. On firmware 3.28 (Paper Pro) the unit allows 4 starts per 600 s
   and has `OnFailure=remarkable-fail.service emergency.target`, which is
   the mechanism behind that reboot.
+- **Login sessions per ssh channel.** During a hub sync on a Paper Pro
+  (firmware 3.28) reached over Tailscale, every rmu command showed up
+  as a new login session (about 10 per second), enough to trip
+  `user-runtime-dir@0.service`'s start limit; harmless otherwise. rmu
+  does multiplex: a local OpenSSH server saw a whole `rmu hub sync`
+  arrive as one authenticated connection carrying each command as a
+  channel. OpenSSH's server opens its PAM session once per connection,
+  so per-command login sessions come from a server that starts a login
+  per channel instead; Tailscale SSH, for one, runs each session through
+  `login`. If that is the path, plain ssh to the tablet's own server (at
+  its tailnet address) should avoid it; nothing in rmu needs to change.
+  To tell: `ssh -v` prints the server's version banner (which server
+  answers), and `loginctl list-sessions` on the tablet shows the
+  sessions while a sync runs. This cause is inferred, not yet checked on
+  a tablet.
 - **Cloud sync** is a separate service, `rm-sync.service`, enabled and
   running whether or not the tablet is paired; it is `BindsTo=`/`PartOf=`
   `xochitl.service`, so it stops and starts with xochitl. Pairing state

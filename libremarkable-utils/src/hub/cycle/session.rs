@@ -32,7 +32,10 @@ impl<'t> Session<'t> {
 
     /// Take the lock, retrying once with the same request after a
     /// failure that may have been a lost acknowledgement (the retry then
-    /// adopts the lock).
+    /// adopts the lock). Not after the tablet stopped answering: the
+    /// retry would wait for another timeout. A lock taken then stays
+    /// until `--break-lock` (or a reboot), as after a crash between the
+    /// lock and the first watchdog.
     pub(super) fn acquire(
         &mut self,
         request: &LockRequest,
@@ -85,14 +88,16 @@ impl<'t> Session<'t> {
             return Vec::new();
         };
         let disarm = self.tablet.disarm_watchdog(&lock).err();
-        let release = self.tablet.release_lock(&lock).err();
+        // A tablet that stopped answering would not answer the release.
+        let release = match &disarm {
+            Some(error @ Error::Unreachable(_)) => Some(format!("not tried: {error}")),
+            _ => self.tablet.release_lock(&lock).err().map(|e| e.to_string()),
+        };
         [
             disarm.map(|e| Warning::DisarmFailed {
                 error: e.to_string(),
             }),
-            release.map(|e| Warning::ReleaseFailed {
-                error: e.to_string(),
-            }),
+            release.map(|error| Warning::ReleaseFailed { error }),
         ]
         .into_iter()
         .flatten()
@@ -102,27 +107,40 @@ impl<'t> Session<'t> {
     /// The error path: bring xochitl back if this run may have stopped
     /// it, disarm only once it runs, release the lock. Everything is best
     /// effort; with the connection gone the watchdog brings xochitl back.
+    /// A tablet that stopped answering ends it: every further try would
+    /// only wait for another timeout.
     fn abort(&mut self) {
         let Some(lock) = self.lock.take() else {
             return;
         };
-        let running = !self.maybe_stopped || self.tablet.start_xochitl(&lock).is_ok();
-        if running {
-            let _ = self.tablet.disarm_watchdog(&lock);
+        let gone = |result: &Result<()>| matches!(result, Err(Error::Unreachable(_)));
+        let start = self
+            .maybe_stopped
+            .then(|| self.tablet.start_xochitl(&lock).map(drop));
+        if start.as_ref().is_some_and(gone) {
+            return;
+        }
+        let disarm = start
+            .is_none_or(|start| start.is_ok())
+            .then(|| self.tablet.disarm_watchdog(&lock));
+        if disarm.as_ref().is_some_and(gone) {
+            return;
         }
         let _ = self.tablet.release_lock(&lock);
     }
 }
 
+/// A failure the same request may get past (see [`Session::acquire`]).
 fn is_transport(error: &Error) -> bool {
     !matches!(
         error,
-        Error::HubDevice(
-            DeviceError::Locked(_)
-                | DeviceError::LockContended
-                | DeviceError::Busy
-                | DeviceError::InvalidRequest(_)
-        )
+        Error::Unreachable(_)
+            | Error::HubDevice(
+                DeviceError::Locked(_)
+                    | DeviceError::LockContended
+                    | DeviceError::Busy
+                    | DeviceError::InvalidRequest(_)
+            )
     )
 }
 

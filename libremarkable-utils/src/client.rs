@@ -106,10 +106,13 @@ impl Client {
     /// library stops re-reading thousands of JSONs. Any cache problem
     /// falls back to the full fetch.
     pub fn list_items(&self) -> Result<Vec<Item>> {
-        if let Some(cache_path) = &self.listing_cache
-            && let Ok(items) = self.list_items_incremental(cache_path)
-        {
-            return Ok(items);
+        if let Some(cache_path) = &self.listing_cache {
+            match self.list_items_incremental(cache_path) {
+                Ok(items) => return Ok(items),
+                // The full listing would only wait for another timeout.
+                Err(error @ Error::Unreachable(_)) => return Err(error),
+                Err(_) => {}
+            }
         }
         self.list_items_full()
     }

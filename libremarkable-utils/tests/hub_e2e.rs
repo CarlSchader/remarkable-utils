@@ -1111,6 +1111,117 @@ fn crash_before_every_operation() {
     });
 }
 
+/// A run with `Fault::SleepAtOp(k)` injected when tablet `i` had done
+/// `start` operations, its warnings if it succeeded: it ended saying the
+/// tablet did not answer, with no further try (each would wait for a
+/// timeout) except the error path's first step when the run held the
+/// lock, or, asleep after the run's last change, succeeded with only the
+/// lock left behind and no further try at all.
+fn ended_asleep(
+    world: &World,
+    i: usize,
+    start: usize,
+    k: usize,
+    result: &libremarkable_utils::error::Result<Vec<Warning>>,
+    what: &str,
+) {
+    use libremarkable_utils::error::Error;
+    use libremarkable_utils::hub::device::DeviceError;
+    let ops = world.tablet(i).ops();
+    let after = ops.len() - start - k;
+    // Every operation before the k-th was answered.
+    let answered = &ops[start..start + k - 1];
+    let held = answered
+        .iter()
+        .rposition(|op| *op == OpKind::AcquireLock)
+        .is_some_and(|at| !answered[at..].contains(&OpKind::ReleaseLock));
+    let error_path = usize::from(held);
+    let limit = match result {
+        Err(Error::Unreachable(_)) => error_path,
+        // An apply's failure is always `ApplyIncomplete`, saying why.
+        Err(Error::HubDevice(DeviceError::ApplyIncomplete { reason, .. }))
+            if reason.contains("did not answer") =>
+        {
+            error_path
+        }
+        Ok(warnings)
+            if warnings.iter().any(|warning| {
+                matches!(
+                    warning,
+                    Warning::DisarmFailed { .. } | Warning::ReleaseFailed { .. }
+                )
+            }) =>
+        {
+            0
+        }
+        other => panic!("{what}: {other:?}"),
+    };
+    assert!(
+        after <= limit,
+        "{what}: {after} operation(s) after the last answer: {:?}",
+        &ops[start..]
+    );
+}
+
+/// The tablet stops answering (falls asleep) at any operation of a sync:
+/// the run ends promptly (see [`ended_asleep`]) and the next run recovers.
+#[test]
+fn tablet_asleep_at_every_operation() {
+    let template = crash_template();
+    let reference = reference(&template);
+    (1..=reference.ops.len()).for_each(|k| {
+        let what = format!("asleep at op {k} ({:?})", reference.ops[k - 1]);
+        let world = template.duplicate();
+        world.tablet(0).inject(Fault::SleepAtOp(k));
+        let result = world.sync(0);
+        world::no_contract_violation(&result);
+        ended_asleep(
+            &world,
+            0,
+            0,
+            k,
+            &result.map(|report| report.warnings),
+            &what,
+        );
+        recover(&world, &reference, &what);
+    });
+}
+
+/// `status` and `--dry-run` with the tablet asleep at any of their
+/// operations: no retry of the read.
+#[test]
+fn status_and_dry_run_with_the_tablet_asleep() {
+    let (template, lib) = two_tablets();
+    let page = template.pages(0, &lib.notes)[0].clone();
+    template.ink(0, &lib.notes, &page);
+    let count = |dry: bool| {
+        let world = template.duplicate();
+        let start = world.tablet(0).ops().len();
+        if dry {
+            world.dry_run(0).map(drop).unwrap();
+        } else {
+            world.status(0).map(drop).unwrap();
+        }
+        world.tablet(0).ops().len() - start
+    };
+    [false, true].into_iter().for_each(|dry| {
+        (1..=count(dry)).for_each(|k| {
+            let world = template.duplicate();
+            let start = world.tablet(0).ops().len();
+            world.tablet(0).inject(Fault::SleepAtOp(k));
+            let result = if dry {
+                world.dry_run(0).map(|_| Vec::new())
+            } else {
+                world.status(0).map(|_| Vec::new())
+            };
+            let what = format!("dry run {dry}: asleep at op {k}");
+            ended_asleep(&world, 0, start, k, &result, &what);
+            world.tablet(0).reconnect();
+            world.converge();
+        });
+    });
+}
+
 #[test]
 fn crash_after_every_mutation_took_effect() {
     let template = crash_template();
@@ -1929,6 +2040,25 @@ fn crash_at_every_op_of_a_clone() {
         world.converge();
         assert_eq!(world.conflicts(), reference, "{what}");
     });
+    (1..=ops.len()).for_each(|k| {
+        let world = template.duplicate();
+        let start = world.tablet(1).ops().len();
+        world.tablet(1).inject(Fault::SleepAtOp(k));
+        let result = world.clone_tablet(1);
+        world::no_contract_violation(&result);
+        let what = format!("clone: asleep at op {k} ({:?})", ops[k - 1]);
+        ended_asleep(
+            &world,
+            1,
+            start,
+            k,
+            &result.map(|report| report.warnings),
+            &what,
+        );
+        recover_clone(&world, &what);
+        world.converge();
+        assert_eq!(world.conflicts(), reference, "{what}");
+    });
 }
 
 /// B deletes an empty folder; while A's sync has the UI up, A's user
@@ -2550,14 +2680,35 @@ fn crash_at_every_op_of_a_backup() {
             (
                 Fault::DisconnectAtOp(k),
                 format!("disconnect at op {k} ({:?})", ops[k - 1]),
+                None,
             )
         })
-        .chain((1..=mutations).map(|m| (Fault::LoseAck(m), format!("lost ack of mutation {m}"))));
-    faults.for_each(|(fault, what)| {
+        .chain(
+            (1..=mutations).map(|m| (Fault::LoseAck(m), format!("lost ack of mutation {m}"), None)),
+        )
+        .chain((1..=ops.len()).map(|k| {
+            (
+                Fault::SleepAtOp(k),
+                format!("asleep at op {k} ({:?})", ops[k - 1]),
+                Some(k),
+            )
+        }));
+    faults.for_each(|(fault, what, asleep_at)| {
         let world = template.duplicate();
+        let start = world.tablet(0).ops().len();
         world.tablet(0).inject(fault);
         let result = world.backup(0);
         world::no_contract_violation(&result);
+        if let Some(k) = asleep_at {
+            let warnings = result.as_ref().map(|report| report.warnings.clone());
+            let warnings = warnings.map_err(|error| match error {
+                libremarkable_utils::error::Error::Unreachable(detail) => {
+                    libremarkable_utils::error::Error::Unreachable(detail.clone())
+                }
+                other => panic!("{what}: {other}"),
+            });
+            ended_asleep(&world, 0, start, k, &warnings, &what);
+        }
         let tablet = world.tablet(0);
         tablet.reconnect();
         let armed = tablet.watchdog_armed().is_some();
