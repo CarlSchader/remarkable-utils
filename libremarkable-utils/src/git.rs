@@ -672,7 +672,9 @@ impl Repo {
     }
 
     /// Every entry below `treeish` (a commit or tree), trees included,
-    /// parent trees before their contents.
+    /// parent trees before their contents. The hub's store reads trees
+    /// through `cat-file` ([`parse_tree`]); this is the reference listing
+    /// its tests compare against (both give canonical modes).
     pub fn ls_tree_recursive(&self, treeish: &str) -> Result<Vec<TreeEntry>> {
         let mut cmd = self.command("ls-tree");
         cmd.args(["-r", "-t", "-z", "--long", "--end-of-options", treeish]);
@@ -1780,8 +1782,8 @@ fn canon_mode(mode: u32) -> u32 {
 }
 
 /// Parse a raw tree object (`<octal mode> SP <name> NUL <binary id>` per
-/// entry) into entries named by their bare names. Modes are canonical
-/// ([`canon_mode`]), as git reports them. Sizes are not part of a tree
+/// entry) into entries named by their bare names. Modes are canonical,
+/// as git reports them (`100664` reads as `100644`, and so on). Sizes are not part of a tree
 /// object (`None`); the kind follows from the mode.
 pub fn parse_tree(data: &[u8], format: ObjectFormat) -> Result<Vec<TreeEntry>> {
     let id_len = match format {
