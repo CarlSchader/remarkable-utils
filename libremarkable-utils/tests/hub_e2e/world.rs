@@ -857,6 +857,23 @@ pub fn commit_repo_config(git: &Git, origin: &str, bytes: &[u8]) -> Oid {
     commit
 }
 
+/// Run the git CLI hermetically (what a user does by hand); it must
+/// succeed.
+pub fn git_cli(root: &Path, args: &[&str]) {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("HOME", root.join("home"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 /// Append `rounds` updates to origin's `main` in one `fast-import`
 /// stream. Each is a merge whose first parent is the previous `main` and
 /// whose second is a side commit off it (as a merged device-ref snapshot

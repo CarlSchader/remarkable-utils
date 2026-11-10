@@ -1,6 +1,7 @@
 //! `remote` and `detach`: the tablet's attachment, without a sync. Both
 //! leave xochitl running and never touch documents.
 
+use super::steps::device_ref;
 use super::store;
 use super::{
     CycleError, DetachReport, Hub, OriginCtx, RemoteReport, SetUrlReport, Warning, check_url,
@@ -31,18 +32,21 @@ impl Hub<'_> {
 
     /// `rmu hub remote set-url <url>`: store `url` as the tablet's origin,
     /// under the lock. `url` must hold the tablet's repository (its repo
-    /// id, a `main` with every base of the tablet in its history): a
-    /// wrong URL is refused here, not at the next sync.
-    /// [`super::HubOptions::origin`] does not apply.
+    /// id, a `main` with every base of the tablet in its history, and the
+    /// device ref the tablet recorded, continuing it), checked before the
+    /// lock and again under it (a sync from another computer in between
+    /// may have moved the bases): a wrong URL is refused here, not at the
+    /// next sync. [`super::HubOptions::origin`] does not apply.
     pub fn set_remote_url(&self, tablet: &dyn Tablet, url: &str) -> Result<SetUrlReport> {
         check_url(url)?;
         let (mut report, warnings) = self.session(tablet, |s| {
             self.progress.step("Checking origin");
             let first = s.tablet.read_state()?.ok_or(CycleError::NotAttached)?;
             let (cache, refs) = store::open_cache(&self.git, &self.cache_dir, &first.repo_id, url)?;
-            let origin =
+            let mut origin =
                 OriginCtx::new(cache, url.to_string(), Some(&first.device_id), Some(refs))?;
             origin.check(&first)?;
+            device_ref(&origin, &first)?;
             self.progress.step("Locking the tablet");
             let took_over = s.acquire(&self.request, self.options.break_lock)?;
             s.arm()?;
@@ -50,6 +54,9 @@ impl Hub<'_> {
             if state.repo_id != first.repo_id || state.device_id != first.device_id {
                 return Err(CycleError::StateChanged.into());
             }
+            origin.refresh(&state.device_id)?;
+            origin.check(&state)?;
+            device_ref(&origin, &state)?;
             let previous = std::mem::replace(&mut state.origin, url.to_string());
             s.write_state(&state)?;
             let report = SetUrlReport {

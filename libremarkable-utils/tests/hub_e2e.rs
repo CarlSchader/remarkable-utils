@@ -3015,3 +3015,80 @@ fn reattach_after_a_rewind_discards_a_journal_origin_lost() {
     world.repair(0);
     world.converge();
 }
+
+/// Origin moved with `git clone --bare`, which copies no `refs/rmu/*`:
+/// `set-url` refuses it with a message that says so (the next sync would
+/// otherwise stop on the missing device ref), and accepts it once the
+/// device refs are copied too.
+#[test]
+fn set_url_refuses_an_origin_moved_without_its_device_refs() {
+    let (world, notes, _) = two_notebooks();
+    let hub = hub_without_origin(&world, 0);
+    let moved = world.root.join("moved.git");
+    let moved_url = moved.to_str().unwrap().to_string();
+    world::git_cli(
+        &world.root,
+        &["clone", "-q", "--bare", &world.origin, &moved_url],
+    );
+    let result = hub.set_remote_url(world.tablet(0), &moved_url);
+    assert!(
+        matches!(&result, Err(e) if is_cycle(e, |e| matches!(e, CycleError::DeviceRefMissing { .. }))),
+        "{result:?}"
+    );
+    assert!(result.unwrap_err().to_string().contains("refs/rmu/*"));
+    assert_eq!(world.device(0).state().unwrap().origin, world.origin);
+    world.check_idle(0);
+    world::git_cli(
+        &world.root,
+        &[
+            &format!("--git-dir={}", world.origin),
+            "push",
+            "-q",
+            &moved_url,
+            "refs/rmu/*:refs/rmu/*",
+        ],
+    );
+    hub.set_remote_url(world.tablet(0), &moved_url).unwrap();
+    let page = world.pages(0, &notes)[0].clone();
+    world.ink(0, &notes, &page);
+    hub.sync(world.tablet(0)).unwrap();
+}
+
+/// Between `set-url`'s first check and its lock, another computer syncs
+/// the tablet to the old origin: its new base is not in the new URL's
+/// history. Checked again under the lock, the URL is refused rather than
+/// stored for the next sync to stop on.
+#[test]
+fn set_url_checks_the_bases_again_under_the_lock() {
+    let (base, notes, _) = two_notebooks();
+    let moved = |world: &World| world.root.join("moved.git").to_str().unwrap().to_string();
+    world::git_cli(
+        &base.root,
+        &["clone", "-q", "--mirror", &base.origin, &moved(&base)],
+    );
+    let page = base.pages(0, &notes)[0].clone();
+    base.ink(0, &notes, &page);
+    let lock = op_index(&base, 0, OpKind::AcquireLock, 1, |w| {
+        hub_without_origin(w, 0)
+            .set_remote_url(w.tablet(0), &moved(w))
+            .unwrap();
+    });
+    let world = base.duplicate();
+    let elsewhere = world.root.join("computer-x").join("cache");
+    world.tablet(0).inject(Fault::EditBefore(
+        lock,
+        other_computer(&world, 0, Some(elsewhere), |hub, tablet, _| {
+            let report = hub.sync(tablet).unwrap();
+            assert_ne!(report.update, MainUpdate::UpToDate);
+        }),
+    ));
+    // (A copied world's tablet still stores the template's origin URL.)
+    let stored = world.device(0).state().unwrap().origin;
+    let result = hub_without_origin(&world, 0).set_remote_url(world.tablet(0), &moved(&world));
+    assert!(
+        matches!(&result, Err(e) if is_cycle(e, |e| matches!(e, CycleError::OriginRewound { .. }))),
+        "{result:?}"
+    );
+    assert_eq!(world.device(0).state().unwrap().origin, stored);
+    world.check_idle(0);
+}

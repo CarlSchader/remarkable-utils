@@ -133,15 +133,22 @@ pub enum CycleError {
     )]
     OriginRewound { base: Oid },
 
-    /// The device ref moved in a way this tablet did not.
+    /// The device ref was rewritten or replaced: it does not continue
+    /// the snapshots this tablet recorded.
     #[error(
-        "origin's device ref {reference} ({remote}) does not continue the snapshot history recorded on the tablet ({recorded}): another tablet may use this device id; stopping"
+        "origin's device ref {reference} ({remote}) does not continue the snapshot history recorded on the tablet ({recorded}): it was rewritten or replaced; stopping (`rmu hub clone --reattach` starts the tablet's snapshot history afresh)"
     )]
     DeviceRefConflict {
         reference: String,
         recorded: String,
         remote: String,
     },
+
+    /// Origin lacks the device ref the tablet recorded pushing.
+    #[error(
+        "origin has no device ref {reference}, though the tablet recorded pushing snapshot {recorded} to it: origin was probably moved or copied without its `refs/rmu/*` (copy them too, e.g. `git push <new origin> 'refs/rmu/*:refs/rmu/*'`); stopping (`rmu hub clone --reattach` starts the tablet's snapshot history afresh)"
+    )]
+    DeviceRefMissing { reference: String, recorded: Oid },
 
     /// The deletion guard.
     #[error(

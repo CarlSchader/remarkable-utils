@@ -35,9 +35,13 @@ const STAGE_BATCH_BYTES: u64 = 64 * 1024 * 1024;
 
 /// The device ref to push to, its current head (the snapshot's second
 /// parent) and the lease. A head that does not continue the recorded
-/// one means another tablet uses this device id (see "Device ref
+/// one (rewritten or replaced), or none where one was recorded (origin
+/// moved without `refs/rmu/*`), stops the run (see "Device ref
 /// bookkeeping"); `clone --reattach` is the way out.
-fn device_ref(origin: &OriginCtx, state: &TabletState) -> Result<(String, Option<Oid>, Expected)> {
+pub(super) fn device_ref(
+    origin: &OriginCtx,
+    state: &TabletState,
+) -> Result<(String, Option<Oid>, Expected)> {
     let [primary, _] = store::device_ref_names(&state.device_id);
     let conflict = |reference: &str, remote: String| -> Error {
         CycleError::DeviceRefConflict {
@@ -52,7 +56,11 @@ fn device_ref(origin: &OriginCtx, state: &TabletState) -> Result<(String, Option
     };
     match (&state.device_ref, &origin.remote.device) {
         (None, None) => Ok((primary, None, Expected::Absent)),
-        (Some(_), None) => Err(conflict(&primary, "absent".to_string())),
+        (Some(recorded), None) => Err(CycleError::DeviceRefMissing {
+            reference: primary,
+            recorded: recorded.clone(),
+        }
+        .into()),
         // A first push whose recording was lost (device ids are random
         // per clone, and a clone never reuses another tablet's state).
         (None, Some(remote)) => Ok((
