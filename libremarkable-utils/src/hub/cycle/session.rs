@@ -32,7 +32,10 @@ impl<'t> Session<'t> {
 
     /// Take the lock, retrying once with the same request after a
     /// failure that may have been a lost acknowledgement (the retry then
-    /// adopts the lock).
+    /// adopts the lock). Not after the tablet stopped answering: the
+    /// retry would wait for another timeout. A lock taken then stays
+    /// until `--break-lock` (or a reboot), as after a crash between the
+    /// lock and the first watchdog.
     pub(super) fn acquire(
         &mut self,
         request: &LockRequest,
@@ -127,15 +130,17 @@ impl<'t> Session<'t> {
     }
 }
 
+/// A failure the same request may get past (see [`Session::acquire`]).
 fn is_transport(error: &Error) -> bool {
     !matches!(
         error,
-        Error::HubDevice(
-            DeviceError::Locked(_)
-                | DeviceError::LockContended
-                | DeviceError::Busy
-                | DeviceError::InvalidRequest(_)
-        )
+        Error::Unreachable(_)
+            | Error::HubDevice(
+                DeviceError::Locked(_)
+                    | DeviceError::LockContended
+                    | DeviceError::Busy
+                    | DeviceError::InvalidRequest(_)
+            )
     )
 }
 

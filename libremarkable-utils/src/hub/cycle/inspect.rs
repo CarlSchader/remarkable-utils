@@ -19,7 +19,7 @@ use super::{
     CycleError, DocChange, DryRunReport, Hub, OpenConflict, StatusReport, commit_tree,
     quarantine_report, read_summary, tablet_versions,
 };
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::git::Oid;
 use crate::hub::device::Tablet;
 use crate::hub::model::{
@@ -163,8 +163,12 @@ impl Hub<'_> {
             )?;
             Ok(read)
         };
-        // A file xochitl changed while it was read: once more.
-        attempt().or_else(|_| attempt())
+        // A file xochitl changed while it was read: once more. Not after
+        // the tablet stopped answering: that try would only time out too.
+        attempt().or_else(|error| match error {
+            Error::Unreachable(_) => Err(error),
+            _ => attempt(),
+        })
     }
 
     fn inspect(&self, tablet: &dyn Tablet) -> Result<(StatusReport, DryPlan)> {

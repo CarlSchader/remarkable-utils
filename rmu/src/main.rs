@@ -34,6 +34,9 @@ use libremarkable_utils::xochitl::{self, Item, XOCHITL_DATA_DIR};
 /// `--password-file` is given.
 const PASSWORD_ENV: &str = "RMU_SSH_PASSWORD";
 
+/// Set to `1` for the same as `--no-ssh-defaults`.
+const NO_SSH_DEFAULTS_ENV: &str = "RMU_NO_SSH_DEFAULTS";
+
 #[derive(Parser)]
 #[command(
     name = "rmu",
@@ -82,6 +85,12 @@ struct Cli {
     /// Disable SSH connection multiplexing
     #[arg(long, global = true)]
     no_multiplex: bool,
+
+    /// Do not add rmu's ssh timeouts (ConnectTimeout=15,
+    /// ServerAliveInterval=10) where your ssh config leaves ssh's built-in
+    /// values; also RMU_NO_SSH_DEFAULTS=1. A -o option always wins
+    #[arg(long, global = true)]
+    no_ssh_defaults: bool,
 
     /// Suppress progress bars and status messages on stderr
     #[arg(short, long, global = true)]
@@ -294,6 +303,8 @@ fn make_session(cli: &Cli, destination: &str) -> Result<SshSession> {
         extra_options: cli.ssh_option.clone(),
         auth,
         multiplex: !cli.no_multiplex,
+        default_timeouts: !(cli.no_ssh_defaults
+            || std::env::var_os(NO_SSH_DEFAULTS_ENV).is_some_and(|value| value == "1")),
     })?)
 }
 

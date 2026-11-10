@@ -130,7 +130,10 @@ pub fn parse_status(marker: &str, output: &str) -> SystemStatus {
     }
 }
 
-/// Publicly documented marketing names for device-tree model codenames.
+/// Marketing names for device-tree model codenames, as reMarkable
+/// documents them ("Product code names",
+/// <https://developer.remarkable.com/documentation/sdk>). Others
+/// (`chiappa`, `tatsu`) join once their device-tree strings are known.
 const MODEL_NAMES: &[(&str, &str)] = &[("reMarkable Ferrari", "reMarkable Paper Pro")];
 
 /// The model's marketing name if its codename is known; else as reported.

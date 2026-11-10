@@ -310,6 +310,7 @@ Exit statuses:
 | 5      | origin does not match the tablet (see `clone --reattach`), or lost its `main` (see Recovery) |
 | 6      | the tablet is paired with the reMarkable cloud                    |
 | 7      | an interrupted sync must be finished first (`rmu hub sync` against the current origin; `detach --force` discards it) |
+| 8      | the tablet did not answer (asleep or off the network): wake it and run the command again |
 
 See `docs/hub-design.md` for the full design.
 
@@ -345,12 +346,19 @@ uuid=$(rmu -q upload ./sample.pdf)
 
 - *"The tablet did not answer; is it asleep?"*: the tablet is asleep,
   off the network, or (over Wi-Fi or a VPN) its address changed. Wake
-  it and try again; keep it awake until long commands finish. rmu gives
-  ssh a 15 s `ConnectTimeout` and a keepalive (`ServerAliveInterval=10`,
-  so a tablet that stops answering mid-command is noticed within about
-  40 s), but only where neither your ssh config nor your `-o` options
-  set them: `rmu -o ConnectTimeout=60 ls`, or the same in
-  `~/.ssh/config`, wins.
+  it and try again; keep it awake until long commands finish (`rmu hub`
+  exits with status 8 then).
+- *rmu's ssh timeouts*: rmu gives ssh a 15 s `ConnectTimeout` and a
+  keepalive (`ServerAliveInterval=10`, so a tablet that stops answering
+  mid-command is noticed within about 40 s) where ssh would use its
+  built-in values (no timeout, no keepalive). Other values in
+  `~/.ssh/config` and your own `-o` options win (`rmu -o
+  ConnectTimeout=60 ls`). One limit: rmu reads the effective values with
+  `ssh -G`, which cannot tell a config line that sets the built-in value
+  (`ServerAliveInterval 0`, `ConnectTimeout none`) from no line, so rmu
+  adds its own then. To keep ssh's, pass it with `-o` (`rmu -o
+  ServerAliveInterval=0 …`), or turn rmu's defaults off with
+  `--no-ssh-defaults` or `RMU_NO_SSH_DEFAULTS=1`.
 - *Many login sessions on the tablet*: rmu sends every command of a run
   over one multiplexed ssh connection (disable with `--no-multiplex`).
   An ssh server that starts a login session per command channel rather

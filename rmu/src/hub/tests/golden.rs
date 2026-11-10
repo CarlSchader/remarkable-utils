@@ -587,6 +587,15 @@ fn guard_refusal_json() {
     );
 }
 
+/// The tablet did not answer.
+#[test]
+fn unreachable_error_json() {
+    let error = Error::Unreachable("Timeout, server tablet not responding.".to_string());
+    let value = json::error(Failure::of(&error), &error.to_string(), Some(&error));
+    assert_eq!(value["error"]["kind"], "unreachable");
+    assert_eq!(value["error"]["exit_code"], 8);
+}
+
 /// Any other error.
 #[test]
 fn other_error_json() {
