@@ -22,6 +22,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, TryLockError};
 use std::io::Read;
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -678,6 +679,14 @@ impl<V: Clone> Bounded<V> {
 /// of its parsed size ([`PARSED_JSON_FACTOR`] times its source bytes).
 const COMMIT_CACHE: usize = 16 * 1024;
 const TREE_CACHE: usize = 256 * 1024;
+
+/// The trees of one level of a walk, each with its path.
+type Level = Vec<(Oid, Vec<u8>)>;
+
+/// Deepest tree nesting the store walks: git's own default bound
+/// (`core.maxTreeDepth`, git 2.44), which `ls-tree` enforced for `tree_of`
+/// before the store read whole trees itself.
+const MAX_TREE_DEPTH: usize = 4096;
 const JSON_CACHE: usize = 64 * 1024 * 1024;
 
 /// A parsed `serde_json::Value` takes about this many times its source
@@ -842,22 +851,100 @@ impl Store {
             .map(|entry| entry.oid))
     }
 
-    /// Every non-tree entry below tree `oid`, paths prefixed.
-    fn walk(&self, oid: &Oid, prefix: &[u8]) -> Result<Vec<TreeEntry>> {
-        self.tree(oid)?
-            .iter()
-            .map(|entry| {
-                let path = [prefix, b"/", &entry.path].concat();
-                match entry.kind {
-                    ObjectKind::Tree => self.walk(&entry.oid, &path),
-                    _ => Ok(vec![TreeEntry {
-                        path,
-                        ..entry.clone()
-                    }]),
+    /// Read the trees among `oids` the cache does not have, in one
+    /// pipelined batch, into the cache. Fewer than two are left to
+    /// [`Self::tree`], which reads one as cheaply.
+    fn prefetch_trees<'o>(&self, oids: impl ExactSizeIterator<Item = &'o Oid>) -> Result<()> {
+        if oids.len() < 2 {
+            return Ok(());
+        }
+        let missing: Vec<Oid> = {
+            let mut trees = self.trees.borrow_mut();
+            oids.into_iter()
+                .filter(|oid| trees.get(oid).is_none())
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect()
+        };
+        if missing.len() < 2 {
+            return Ok(());
+        }
+        let objects = self.with_cat(|cat| cat.read_many(&missing))?;
+        missing
+            .into_iter()
+            .zip(objects)
+            .try_for_each(|(oid, object)| match object {
+                Some((ObjectKind::Tree, data)) => {
+                    let entries = Rc::new(git::parse_tree(&data, self.format)?);
+                    let weight = entries.len() + 1;
+                    self.trees.borrow_mut().insert(oid, entries, weight);
+                    Ok(())
                 }
+                Some((found, _)) => Err(Error::GitOutput {
+                    command: "cat-file".into(),
+                    detail: format!("{oid} is a {found:?}, expected a {:?}", ObjectKind::Tree),
+                }),
+                None => Err(CycleError::MissingObject(oid).into()),
             })
-            .collect::<Result<Vec<_>>>()
-            .map(|nested| nested.into_iter().flatten().collect())
+    }
+
+    /// Every non-tree entry below tree `oid`, paths prefixed (`prefix/…`;
+    /// none for an empty prefix): the one way the store reads trees. Raw
+    /// tree objects through the cache's `cat-file`, cached, a level at a
+    /// time (one pipelined batch per level, not a round trip per tree),
+    /// at most [`MAX_TREE_DEPTH`] levels below `oid`.
+    fn walk(&self, oid: &Oid, prefix: &[u8]) -> Result<Vec<TreeEntry>> {
+        self.walk_to_depth(oid, prefix, MAX_TREE_DEPTH)
+    }
+
+    /// [`Self::walk`], refusing trees nested more than `max` levels below
+    /// `oid` ([`CycleError::TreeTooDeep`]).
+    fn walk_to_depth(&self, oid: &Oid, prefix: &[u8], max: usize) -> Result<Vec<TreeEntry>> {
+        let start = (vec![(oid.clone(), prefix.to_vec())], Vec::new());
+        let walked = (0..=max).try_fold(start, |(level, files), _| {
+            if level.is_empty() {
+                return ControlFlow::Break(Ok(files));
+            }
+            match self.next_level(&level, files) {
+                Ok(next) => ControlFlow::Continue(next),
+                Err(error) => ControlFlow::Break(Err(error)),
+            }
+        });
+        match walked {
+            ControlFlow::Break(result) => result,
+            ControlFlow::Continue((level, files)) if level.is_empty() => Ok(files),
+            ControlFlow::Continue(_) => Err(CycleError::TreeTooDeep {
+                tree: oid.clone(),
+                max,
+            }
+            .into()),
+        }
+    }
+
+    /// The trees one level below `level`, and `files` with the level's
+    /// non-tree entries added.
+    fn next_level(&self, level: &Level, files: Vec<TreeEntry>) -> Result<(Level, Vec<TreeEntry>)> {
+        self.prefetch_trees(level.iter().map(|(oid, _)| oid))?;
+        level.iter().try_fold(
+            (Vec::new(), files),
+            |(mut next, mut files), (oid, prefix)| {
+                self.tree(oid)?.iter().for_each(|entry| {
+                    let path = match prefix.as_slice() {
+                        [] => entry.path.clone(),
+                        _ => [prefix.as_slice(), b"/", &entry.path].concat(),
+                    };
+                    match entry.kind {
+                        ObjectKind::Tree => next.push((entry.oid.clone(), path)),
+                        _ => files.push(TreeEntry {
+                            path,
+                            ..entry.clone()
+                        }),
+                    }
+                });
+                Ok::<_, Error>((next, files))
+            },
+        )
     }
 
     /// The document version held by subtree `oid` of `docs/<doc>`.
@@ -884,7 +971,8 @@ impl Store {
 
     /// The whole tree of `commit`, grouped by document.
     pub fn tree_of(&self, rules: &MirrorRules, commit: &Oid) -> Result<RepoTree> {
-        let listing = model::tree_listing(self.repo.ls_tree_recursive(commit.as_str())?)?;
+        let root = self.commit(commit)?.tree.clone();
+        let listing = model::tree_listing(self.walk(&root, b"")?)?;
         Ok(rules.group_tree(listing)?)
     }
 
@@ -1525,5 +1613,311 @@ mod tests {
         // An entry heavier than the capacity is still cached alone.
         cache.insert(oid(9), 9, 100);
         assert_eq!(cache.get(&oid(9)), Some(9));
+    }
+
+    /// A commit of `files` (path, mode, content); a gitlink's content is
+    /// the commit id it names.
+    fn commit_with_modes(repo: &Repo, files: &[(String, FileMode, Vec<u8>)]) -> Oid {
+        let mut writer = repo
+            .commit_writer(&crate::progress::NoProgress, None)
+            .unwrap();
+        files.iter().for_each(|(path, mode, data)| match mode {
+            FileMode::Gitlink => {
+                let oid: Oid = String::from_utf8(data.clone()).unwrap().parse().unwrap();
+                writer.add_existing(path.as_str(), *mode, &oid).unwrap();
+            }
+            _ => {
+                writer.add_bytes(path.as_str(), *mode, data).unwrap();
+            }
+        });
+        let who = Signature {
+            name: "Test".to_string(),
+            email: "test@example.invalid".to_string(),
+            time: 1_800_000_000,
+            offset_minutes: 0,
+        };
+        writer
+            .commit(&CommitMeta {
+                parents: Vec::new(),
+                author: who.clone(),
+                committer: who,
+                message: "test\n".to_string(),
+            })
+            .unwrap()
+    }
+
+    /// Run `git` on `repo` (hermetically, with an identity), `stdin` in;
+    /// its stdout, trimmed (lossily decoded: ids and mode text are ASCII).
+    fn raw_git(scratch: &Scratch, repo: &Repo, args: &[&str], stdin: &[u8]) -> String {
+        use std::io::Write;
+        let mut child = std::process::Command::new("git")
+            .arg("--git-dir")
+            .arg(repo.git_dir())
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_COUNT", "0")
+            .env("HOME", scratch.path())
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.invalid")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(stdin).unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "git {args:?}");
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// A commit of a tree written as given (`--literally`: modes git no
+    /// longer writes but old trees hold), from entries `(mode, name, id)`
+    /// in git's order.
+    fn literal_tree(scratch: &Scratch, repo: &Repo, entries: &[(&str, &str, &str)]) -> String {
+        let raw: Vec<u8> = entries
+            .iter()
+            .flat_map(|(mode, name, id)| {
+                let binary = (0..id.len())
+                    .step_by(2)
+                    .map(|i| u8::from_str_radix(&id[i..i + 2], 16).unwrap());
+                format!("{mode} {name}\0")
+                    .into_bytes()
+                    .into_iter()
+                    .chain(binary)
+            })
+            .collect();
+        raw_git(
+            scratch,
+            repo,
+            &["hash-object", "-t", "tree", "--literally", "-w", "--stdin"],
+            &raw,
+        )
+    }
+
+    /// The walk goes as deep as its bound and refuses anything deeper
+    /// (typed, never a stack overflow: it holds one level at a time).
+    #[test]
+    fn walks_stop_at_their_depth_bound() {
+        let scratch = Scratch::new("tree-depth");
+        let git = hermetic(&scratch);
+        let repo = git
+            .init_bare(&scratch.path().join("r.git"), ObjectFormat::Sha1)
+            .unwrap();
+        // Five trees below the root: a, b, c, d, e.
+        let tip = commit(&repo, &[], &[("a/b/c/d/e/f".to_string(), "deep")]);
+        let store = Store::new(repo.clone()).unwrap();
+        let root = store.commit(&tip).unwrap().tree.clone();
+        let paths = |entries: Vec<TreeEntry>| -> Vec<Vec<u8>> {
+            entries.into_iter().map(|entry| entry.path).collect()
+        };
+        assert_eq!(
+            paths(store.walk_to_depth(&root, b"", 5).unwrap()),
+            [b"a/b/c/d/e/f".to_vec()]
+        );
+        assert_eq!(
+            paths(store.walk_to_depth(&root, b"x", 5).unwrap()),
+            [b"x/a/b/c/d/e/f".to_vec()]
+        );
+        assert!(matches!(
+            store.walk_to_depth(&root, b"", 4),
+            Err(Error::HubCycle(CycleError::TreeTooDeep { max: 4, .. }))
+        ));
+        assert_eq!(
+            paths(store.walk(&root, b"").unwrap()),
+            [b"a/b/c/d/e/f".to_vec()]
+        );
+    }
+
+    /// `tree_of` reads historic modes (`100664`, `100775`, kept in old
+    /// trees and only warned about by `fsck`) as `ls-tree` reports them,
+    /// outside `docs/` and inside a document's subtree alike.
+    #[test]
+    fn tree_of_reads_historic_modes_as_git_reports_them() {
+        [ObjectFormat::Sha1, ObjectFormat::Sha256]
+            .into_iter()
+            .for_each(|format| {
+                let scratch = Scratch::new("tree-of-modes");
+                let git = hermetic(&scratch);
+                let repo = git
+                    .init_bare(&scratch.path().join("r.git"), format)
+                    .unwrap();
+                let blob =
+                    |data: &[u8]| raw_git(&scratch, &repo, &["hash-object", "-w", "--stdin"], data);
+                let (metadata, data) = (blob(b"{\"type\":\"DocumentType\"}"), blob(b"x"));
+                let d = doc(1).to_string();
+                let subtree = literal_tree(
+                    &scratch,
+                    &repo,
+                    &[
+                        ("100664", "extra.txt", &data),
+                        ("100644", "metadata", &metadata),
+                    ],
+                );
+                let docs = literal_tree(&scratch, &repo, &[("40000", &d, &subtree)]);
+                let root = literal_tree(
+                    &scratch,
+                    &repo,
+                    &[
+                        ("100664", "README", &data),
+                        ("40000", "docs", &docs),
+                        ("100775", "tool", &data),
+                    ],
+                );
+                let tip: Oid = raw_git(&scratch, &repo, &["commit-tree", &root, "-m", "old"], b"")
+                    .parse()
+                    .unwrap();
+                // The tree really holds the historic modes.
+                let raw = raw_git(&scratch, &repo, &["cat-file", "tree", &root], b"");
+                assert!(raw.contains("100664 README") && raw.contains("100775 tool"));
+                let rules = MirrorRules::latest();
+                let listed =
+                    model::tree_listing(repo.ls_tree_recursive(tip.as_str()).unwrap()).unwrap();
+                let store = Store::new(repo.clone()).unwrap();
+                let tree = store.tree_of(rules, &tip).unwrap();
+                assert_eq!(tree, rules.group_tree(listed).unwrap(), "{format:?}");
+                assert_eq!(tree.extra["README"].mode, FileMode::Regular);
+                assert_eq!(tree.extra["tool"].mode, FileMode::Executable);
+                let version = store.version_at(rules, &tip, &doc(1)).unwrap().unwrap();
+                assert_eq!(version.other["extra.txt"].mode, FileMode::Regular);
+            });
+    }
+
+    /// `tree_of` against the full `ls-tree -r` listing it is built from
+    /// by definition, in both object formats, on a tree with nested
+    /// pages, an executable, a symlink and a gitlink at mirrored names,
+    /// deep carried-forward paths, `.rmu/`, a blob at `docs/<uuid>` and
+    /// paths outside `docs/`.
+    #[test]
+    fn tree_of_agrees_with_a_full_tree_listing() {
+        [ObjectFormat::Sha1, ObjectFormat::Sha256]
+            .into_iter()
+            .for_each(|format| {
+                let scratch = Scratch::new("tree-of");
+                let git = hermetic(&scratch);
+                let repo = git
+                    .init_bare(&scratch.path().join("r.git"), format)
+                    .unwrap();
+                let (d1, d2, d3) = (doc(1), doc(2), doc(3));
+                let file = |path: String, mode: FileMode, data: &[u8]| (path, mode, data.to_vec());
+                let first = commit_with_modes(&repo, &[file("x".into(), FileMode::Regular, b"x")]);
+                let files = [
+                    file(".rmu/hub.json".into(), FileMode::Regular, b"{}"),
+                    file("README".into(), FileMode::Regular, b"hand-committed"),
+                    file(
+                        format!("docs/{d1}/metadata"),
+                        FileMode::Regular,
+                        b"{\"type\":\"DocumentType\"}",
+                    ),
+                    file(format!("docs/{d1}/content"), FileMode::Regular, b"{}"),
+                    file(
+                        format!("docs/{d1}/payload.pdf"),
+                        FileMode::Executable,
+                        b"%PDF",
+                    ),
+                    file(format!("docs/{d1}/pages/p1.rm"), FileMode::Regular, b"ink"),
+                    file(
+                        format!("docs/{d1}/pages/p1-metadata.json"),
+                        FileMode::Regular,
+                        b"{}",
+                    ),
+                    file(
+                        format!("docs/{d1}/template"),
+                        FileMode::Symlink,
+                        b"elsewhere",
+                    ),
+                    file(
+                        format!("docs/{d1}/pagedata"),
+                        FileMode::Gitlink,
+                        first.to_string().as_bytes(),
+                    ),
+                    file(
+                        format!("docs/{d1}/future/deep/thing.bin"),
+                        FileMode::Regular,
+                        b"x",
+                    ),
+                    file(format!("docs/{d2}/metadata"), FileMode::Regular, b"{}"),
+                    file(
+                        format!("docs/{d3}"),
+                        FileMode::Regular,
+                        b"a file, not a document",
+                    ),
+                    file("docs/not-a-uuid/metadata".into(), FileMode::Regular, b"{}"),
+                ];
+                let tip = commit_with_modes(&repo, &files);
+                let rules = MirrorRules::latest();
+                let listed =
+                    model::tree_listing(repo.ls_tree_recursive(tip.as_str()).unwrap()).unwrap();
+                let expected = rules.group_tree(listed).unwrap();
+                let store = Store::new(repo.clone()).unwrap();
+                assert_eq!(store.tree_of(rules, &tip).unwrap(), expected, "{format:?}");
+                assert_eq!(expected.to_listing().len(), files.len(), "{format:?}");
+                // Twice: from the tree cache the second time.
+                assert_eq!(store.tree_of(rules, &tip).unwrap(), expected, "{format:?}");
+            });
+    }
+
+    /// Timing of the whole-tree reads a sync makes (the base, then
+    /// `main`, which shares all but one document's subtree) on a
+    /// 1000-document repository. Run in release with `--ignored
+    /// --nocapture`.
+    #[test]
+    #[ignore]
+    fn tree_reads_scale_1000_documents() {
+        let scratch = Scratch::new("tree-scale");
+        let git = hermetic(&scratch);
+        let repo = git
+            .init_bare(&scratch.path().join("r.git"), ObjectFormat::Sha1)
+            .unwrap();
+        let files = |changed: u32| -> Vec<(String, FileMode, Vec<u8>)> {
+            (1..=1000u32)
+                .flat_map(|n| {
+                    let d = doc(n);
+                    let meta = if n == changed {
+                        "{\"v\":2}"
+                    } else {
+                        "{\"v\":1}"
+                    };
+                    [
+                        (format!("docs/{d}/metadata"), meta.as_bytes().to_vec()),
+                        (format!("docs/{d}/content"), b"{}".to_vec()),
+                        (
+                            format!("docs/{d}/payload.pdf"),
+                            format!("%PDF {n}").into_bytes(),
+                        ),
+                        (
+                            format!("docs/{d}/pages/a.rm"),
+                            format!("ink a {n}").into_bytes(),
+                        ),
+                        (
+                            format!("docs/{d}/pages/b.rm"),
+                            format!("ink b {n}").into_bytes(),
+                        ),
+                    ]
+                })
+                .map(|(path, data)| (path, FileMode::Regular, data))
+                .collect()
+        };
+        let base = commit_with_modes(&repo, &files(0));
+        let main = commit_with_modes(&repo, &files(7));
+        let rules = MirrorRules::latest();
+        let runs: Vec<(Duration, Duration)> = (0..5)
+            .map(|_| {
+                let store = Store::new(repo.clone()).unwrap();
+                let started = Instant::now();
+                assert_eq!(store.tree_of(rules, &base).unwrap().docs.len(), 1000);
+                let first = started.elapsed();
+                assert_eq!(store.tree_of(rules, &main).unwrap().docs.len(), 1000);
+                (first, started.elapsed() - first)
+            })
+            .collect();
+        let best =
+            |pick: fn(&(Duration, Duration)) -> Duration| runs.iter().map(pick).min().unwrap();
+        eprintln!(
+            "1000-document tree reads, best of 5: base {:?}, then main {:?}",
+            best(|run| run.0),
+            best(|run| run.1)
+        );
     }
 }
