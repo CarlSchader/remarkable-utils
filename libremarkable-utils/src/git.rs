@@ -904,14 +904,73 @@ pub struct ObjectReader<'a> {
     pub size: u64,
 }
 
+/// A whole object as [`CatFile::read`] returns it.
+pub type RawObject = (ObjectKind, Vec<u8>);
+
+/// Requests [`CatFile::read_many`] sends before reading answers: at most
+/// about 8 KiB of ids, below any pipe's buffer, so sending never waits for
+/// git while git waits for its answers to be read.
+const READ_MANY_CHUNK: usize = 128;
+
 impl CatFile {
     /// Look up `oid`; `None` if the repository does not have it.
     pub fn object(&mut self, oid: &Oid) -> Result<Option<ObjectReader<'_>>> {
         self.skip_pending()?;
+        self.send(&format!("{oid}\n"))?;
+        Ok(self.header(oid)?.map(|(kind, size)| ObjectReader {
+            cat: self,
+            kind,
+            size,
+        }))
+    }
+
+    /// Read whole objects, as [`Self::read`] does for each of `oids`, in
+    /// order, with the requests pipelined ([`READ_MANY_CHUNK`] at a time):
+    /// a round trip per chunk, not per object.
+    pub fn read_many(&mut self, oids: &[Oid]) -> Result<Vec<Option<RawObject>>> {
+        self.skip_pending()?;
+        oids.chunks(READ_MANY_CHUNK).try_fold(
+            Vec::with_capacity(oids.len()),
+            |mut objects, chunk| {
+                self.send(
+                    &chunk
+                        .iter()
+                        .map(|oid| format!("{oid}\n"))
+                        .collect::<String>(),
+                )?;
+                chunk.iter().try_for_each(|oid| {
+                    self.skip_pending()?;
+                    let object = self
+                        .header(oid)?
+                        .map(|(kind, size)| -> Result<_> {
+                            let mut data = Vec::with_capacity(size.try_into().unwrap_or(0));
+                            ObjectReader {
+                                cat: self,
+                                kind,
+                                size,
+                            }
+                            .read_to_end(&mut data)?;
+                            Ok((kind, data))
+                        })
+                        .transpose()?;
+                    objects.push(object);
+                    Ok::<_, Error>(())
+                })?;
+                Ok(objects)
+            },
+        )
+    }
+
+    fn send(&mut self, requests: &str) -> Result<()> {
         let stdin = self.stdin.as_mut().ok_or_else(|| closed("cat-file"))?;
-        if let Err(error) = stdin.write_all(format!("{oid}\n").as_bytes()) {
-            return Err(self.broken(error));
-        }
+        stdin
+            .write_all(requests.as_bytes())
+            .map_err(|error| self.broken(error))
+    }
+
+    /// The answer header for `oid` (requested already): its kind and size,
+    /// with the body pending; `None` if it is missing.
+    fn header(&mut self, oid: &Oid) -> Result<Option<(ObjectKind, u64)>> {
         let mut line = Vec::new();
         match self.stdout.read_until(b'\n', &mut line) {
             Ok(_) if line.ends_with(b"\n") => {}
@@ -926,11 +985,7 @@ impl CatFile {
                 size,
             } if found == *oid => {
                 self.pending = Some(size);
-                Ok(Some(ObjectReader {
-                    cat: self,
-                    kind,
-                    size,
-                }))
+                Ok(Some((kind, size)))
             }
             BatchHeader::Found { oid: found, .. } => Err(Error::GitOutput {
                 command: "cat-file".into(),

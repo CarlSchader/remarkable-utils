@@ -842,22 +842,79 @@ impl Store {
             .map(|entry| entry.oid))
     }
 
-    /// Every non-tree entry below tree `oid`, paths prefixed.
-    fn walk(&self, oid: &Oid, prefix: &[u8]) -> Result<Vec<TreeEntry>> {
-        self.tree(oid)?
-            .iter()
-            .map(|entry| {
-                let path = [prefix, b"/", &entry.path].concat();
-                match entry.kind {
-                    ObjectKind::Tree => self.walk(&entry.oid, &path),
-                    _ => Ok(vec![TreeEntry {
-                        path,
-                        ..entry.clone()
-                    }]),
+    /// Read the trees among `oids` the cache does not have, in one
+    /// pipelined batch, into the cache.
+    fn prefetch_trees<'o>(&self, oids: impl IntoIterator<Item = &'o Oid>) -> Result<()> {
+        let missing: Vec<Oid> = {
+            let mut trees = self.trees.borrow_mut();
+            oids.into_iter()
+                .filter(|oid| trees.get(oid).is_none())
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect()
+        };
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let objects = self.with_cat(|cat| cat.read_many(&missing))?;
+        missing
+            .into_iter()
+            .zip(objects)
+            .try_for_each(|(oid, object)| match object {
+                Some((ObjectKind::Tree, data)) => {
+                    let entries = Rc::new(git::parse_tree(&data, self.format)?);
+                    let weight = entries.len() + 1;
+                    self.trees.borrow_mut().insert(oid, entries, weight);
+                    Ok(())
                 }
+                Some((found, _)) => Err(Error::GitOutput {
+                    command: "cat-file".into(),
+                    detail: format!("{oid} is a {found:?}, expected a {:?}", ObjectKind::Tree),
+                }),
+                None => Err(CycleError::MissingObject(oid).into()),
             })
-            .collect::<Result<Vec<_>>>()
-            .map(|nested| nested.into_iter().flatten().collect())
+    }
+
+    /// Every non-tree entry below tree `oid`, paths prefixed (`prefix/…`;
+    /// none for an empty prefix): the one way the store reads trees. Raw
+    /// tree objects through the cache's `cat-file`, cached, a level at a
+    /// time (one pipelined batch per level, not a round trip per tree).
+    fn walk(&self, oid: &Oid, prefix: &[u8]) -> Result<Vec<TreeEntry>> {
+        self.walk_levels(vec![(oid.clone(), prefix.to_vec())], Vec::new())
+    }
+
+    /// [`Self::walk`] from the trees of one level (each with its path),
+    /// adding to `files`.
+    fn walk_levels(
+        &self,
+        level: Vec<(Oid, Vec<u8>)>,
+        files: Vec<TreeEntry>,
+    ) -> Result<Vec<TreeEntry>> {
+        if level.is_empty() {
+            return Ok(files);
+        }
+        self.prefetch_trees(level.iter().map(|(oid, _)| oid))?;
+        let (next, files) = level.iter().try_fold(
+            (Vec::new(), files),
+            |(mut next, mut files), (oid, prefix)| {
+                self.tree(oid)?.iter().for_each(|entry| {
+                    let path = match prefix.as_slice() {
+                        [] => entry.path.clone(),
+                        _ => [prefix.as_slice(), b"/", &entry.path].concat(),
+                    };
+                    match entry.kind {
+                        ObjectKind::Tree => next.push((entry.oid.clone(), path)),
+                        _ => files.push(TreeEntry {
+                            path,
+                            ..entry.clone()
+                        }),
+                    }
+                });
+                Ok::<_, Error>((next, files))
+            },
+        )?;
+        self.walk_levels(next, files)
     }
 
     /// The document version held by subtree `oid` of `docs/<doc>`.
@@ -884,7 +941,8 @@ impl Store {
 
     /// The whole tree of `commit`, grouped by document.
     pub fn tree_of(&self, rules: &MirrorRules, commit: &Oid) -> Result<RepoTree> {
-        let listing = model::tree_listing(self.repo.ls_tree_recursive(commit.as_str())?)?;
+        let root = self.commit(commit)?.tree.clone();
+        let listing = model::tree_listing(self.walk(&root, b"")?)?;
         Ok(rules.group_tree(listing)?)
     }
 
@@ -1676,17 +1734,22 @@ mod tests {
         let base = commit_with_modes(&repo, &files(0));
         let main = commit_with_modes(&repo, &files(7));
         let rules = MirrorRules::latest();
-        let (best, docs) = (0..5)
+        let runs: Vec<(Duration, Duration)> = (0..5)
             .map(|_| {
                 let store = Store::new(repo.clone()).unwrap();
                 let started = Instant::now();
-                let docs = store.tree_of(rules, &base).unwrap().docs.len()
-                    + store.tree_of(rules, &main).unwrap().docs.len();
-                (started.elapsed(), docs)
+                assert_eq!(store.tree_of(rules, &base).unwrap().docs.len(), 1000);
+                let first = started.elapsed();
+                assert_eq!(store.tree_of(rules, &main).unwrap().docs.len(), 1000);
+                (first, started.elapsed() - first)
             })
-            .min_by_key(|(elapsed, _)| *elapsed)
-            .unwrap();
-        eprintln!("1000-document tree reads (base, then main): best of 5 {best:?}");
-        assert_eq!(docs, 2000);
+            .collect();
+        let best =
+            |pick: fn(&(Duration, Duration)) -> Duration| runs.iter().map(pick).min().unwrap();
+        eprintln!(
+            "1000-document tree reads, best of 5: base {:?}, then main {:?}",
+            best(|run| run.0),
+            best(|run| run.1)
+        );
     }
 }
