@@ -53,7 +53,17 @@ This repository is **open source** (dual-licensed MIT OR Apache-2.0):
 - `ssh.rs` — subprocess transport around the system `ssh` binary. No SSH
   library is linked, deliberately: users get ssh config/keys/agent for
   free and the crate stays free of native deps (the dev shell is
-  `mkShellNoCC`). Connections are multiplexed via ControlMaster. Password
+  `mkShellNoCC`). Connections are multiplexed via ControlMaster: rmu
+  opens the master itself (`-f -N`, again if it ended) with its log in
+  the session's control directory, since a dead master's clients exit
+  255 without a word. Timeouts: `ConnectTimeout` and
+  `ServerAliveInterval` get rmu's defaults (`TIMEOUT_DEFAULTS`) only
+  where `ssh -G` reports ssh's built-in value and the user's `-o` does
+  not set them; never override the user's ssh config. ssh giving up on
+  the tablet is `Error::Unreachable` (`ssh::failure`); code must not
+  retry or fall back after it (each try waits for another timeout: the
+  hub's error path stops there, and `Fault::SleepAtOp` tests it). Long
+  hub syncs need the tablet kept awake. Password
   auth re-executes the current binary as an `SSH_ASKPASS` helper
   (`maybe_run_askpass` must be called first thing in `main`); the
   password travels via environment, never argv. Large scripts go over

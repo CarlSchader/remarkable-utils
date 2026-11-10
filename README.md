@@ -206,8 +206,12 @@ Things to know:
 
 Recovery:
 
-- *Interrupted sync* (cable pulled, laptop closed): run `rmu hub sync`
-  again; it works out what the interrupted run did and carries on.
+- *Interrupted sync* (cable pulled, laptop closed, tablet asleep): run
+  `rmu hub sync` again; it works out what the interrupted run did and
+  carries on. Keep the tablet awake during a long sync (the first clone
+  of a large library, say): a tablet that falls asleep mid-run ends it
+  with "the tablet did not answer", its lock left until the watchdog
+  fires (xochitl comes back with it).
 - *"The tablet is locked"*: another sync is running, or one died. A lock
   goes stale by itself once the tablet reboots or the watchdog fires;
   otherwise `--break-lock` takes it over once you are sure no other run
@@ -336,6 +340,22 @@ this work cleanly:
 open "$(rmu download Books/Physics)"
 uuid=$(rmu -q upload ./sample.pdf)
 ```
+
+### Troubleshooting
+
+- *"The tablet did not answer; is it asleep?"*: the tablet is asleep,
+  off the network, or (over Wi-Fi or a VPN) its address changed. Wake
+  it and try again; keep it awake until long commands finish. rmu gives
+  ssh a 15 s `ConnectTimeout` and a keepalive (`ServerAliveInterval=10`,
+  so a tablet that stops answering mid-command is noticed within about
+  40 s), but only where neither your ssh config nor your `-o` options
+  set them: `rmu -o ConnectTimeout=60 ls`, or the same in
+  `~/.ssh/config`, wins.
+- *Many login sessions on the tablet*: rmu sends every command of a run
+  over one multiplexed ssh connection (disable with `--no-multiplex`).
+  An ssh server that starts a login session per command channel rather
+  than per connection still shows one per command; see
+  `docs/notebook-data.md`.
 
 ## Layout
 
