@@ -2780,3 +2780,98 @@ fn reports_serialise_to_json() {
     .unwrap();
     assert_eq!(warning["kind"], "mixed_model");
 }
+
+// ---- scale ----------------------------------------------------------------------------
+
+/// `docs` notebooks cloned from tablet 0, then `rounds` merges on origin
+/// each renaming one of them (round-robin), then the tablet's state lost.
+fn long_history(
+    docs: usize,
+    rounds: usize,
+) -> (World, Vec<libremarkable_utils::hub::model::DocId>) {
+    let world = World::new(1);
+    let ids: Vec<_> = (0..docs)
+        .map(|k| world.create(0, Kind::Notebook { pages: 1 }, &format!("Doc {k}"), ""))
+        .collect();
+    world.clone_tablet(0).unwrap();
+    let metadata: Vec<serde_json::Value> = ids
+        .iter()
+        .map(|doc| world.device(0).metadata(doc).unwrap())
+        .collect();
+    world::append_history(&world.root, &world.origin, rounds, |round| {
+        let k = round % docs;
+        let mut renamed = metadata[k].clone();
+        renamed["visibleName"] = serde_json::json!(format!("Doc {k} (round {round})"));
+        vec![(
+            format!("docs/{}/metadata", ids[k]),
+            serde_json::to_vec_pretty(&renamed).unwrap(),
+        )]
+    });
+    std::fs::remove_dir_all(world.device(0).tablet.state_dir()).unwrap();
+    (world, ids)
+}
+
+/// Reattach after a long history: every document's version is one origin
+/// had long ago (`renamed = false`), or none (the tablet renamed every
+/// document after losing its state). Returns the reattach's wall time and
+/// peak RSS growth.
+fn reattach_at_scale(
+    template: &World,
+    ids: &[libremarkable_utils::hub::model::DocId],
+    renamed: bool,
+) -> (std::time::Duration, Option<u64>) {
+    let world = template.duplicate();
+    if renamed {
+        ids.iter()
+            .enumerate()
+            .for_each(|(k, doc)| world.rename(0, doc, &format!("Doc {k} (tablet)")));
+    }
+    let before = world::peak_rss_kib(true);
+    let started = std::time::Instant::now();
+    let report = world.reattach(0).unwrap();
+    let took = started.elapsed();
+    let grew = world::peak_rss_kib(false)
+        .zip(before)
+        .map(|(after, before)| after.saturating_sub(before));
+    let expected = if renamed { 0 } else { ids.len() };
+    assert_eq!(report.inferred.len(), expected, "{:?}", report.update);
+    (took, grew)
+}
+
+fn scale(docs: usize, rounds: usize, scenarios: &[bool]) {
+    let (template, ids) = long_history(docs, rounds);
+    scenarios.iter().for_each(|&renamed| {
+        let (took, grew) = reattach_at_scale(&template, &ids, renamed);
+        eprintln!(
+            "reattach, {docs} docs, {rounds} merges ({} commits), {}: {took:.2?}, peak RSS +{} KiB",
+            2 * rounds,
+            if renamed {
+                "nothing matches"
+            } else {
+                "old versions match"
+            },
+            grew.map_or("?".to_string(), |kib| kib.to_string()),
+        );
+    });
+}
+
+#[test]
+fn reattach_after_a_long_history_infers_every_base() {
+    scale(100, 150, &[false, true]);
+}
+
+// The measurements quoted in the PR, one process each (peak RSS is per
+// process): `cargo test --release -p libremarkable-utils --test hub_e2e
+// -- --ignored --nocapture reattach_scale_<scenario>`.
+
+#[test]
+#[ignore = "scale measurement; run in release with --ignored --nocapture"]
+fn reattach_scale_old_versions_match() {
+    scale(1000, 1200, &[false]);
+}
+
+#[test]
+#[ignore = "scale measurement; run in release with --ignored --nocapture"]
+fn reattach_scale_nothing_matches() {
+    scale(1000, 1200, &[true]);
+}
