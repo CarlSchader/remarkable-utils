@@ -230,13 +230,18 @@ Recovery:
   a backup, or from the local cache of the computer that synced most
   recently: a bare repository at `~/.cache/rmu/hub/<repo-id>.git`
   (`$XDG_CACHE_HOME/rmu/hub/...`) holding origin's `main` as
-  `refs/remotes/origin/main`. The error prints the exact command:
+  `refs/remotes/origin/main`. Then restore the tablets' backups (their
+  device refs) from every computer that syncs a tablet: each cache holds
+  the backups of the tablets it syncs, as `refs/remotes/origin/devices/*`.
+  The error prints the exact commands:
 
   ```sh
   git --git-dir ~/.cache/rmu/hub/<repo-id>.git push <origin> refs/remotes/origin/main:refs/heads/main
+  git --git-dir ~/.cache/rmu/hub/<repo-id>.git push <origin> 'refs/remotes/origin/devices/*:refs/rmu/devices/*'
   ```
 
-  Running `rmu hub init` on it again is a last resort: it starts a new
+  A tablet whose backups are not restored stops with exit 5 at its next
+  sync and needs `rmu hub clone <origin> --reattach`. Running `rmu hub init` on it again is a last resort: it starts a new
   repository, so every tablet then needs `clone --reattach` and the old
   history stays behind.
 - *Getting a deleted document back*: its files stay in origin's history.

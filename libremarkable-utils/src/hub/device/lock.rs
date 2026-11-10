@@ -83,14 +83,33 @@ pub struct LockOwner {
     pub boot_id: String,
 }
 
+/// "pid 4242 on laptop, started 3 min ago": `started` is the owner
+/// computer's clock, so a time ahead of this one is shown as is.
 impl fmt::Display for LockOwner {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "pid {} on {}, started at unix time {}",
-            self.pid, self.host, self.started_unix
-        )
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let started = i64::try_from(self.started_unix).unwrap_or(i64::MAX);
+        let ago = i64::try_from(now)
+            .unwrap_or(i64::MAX)
+            .saturating_sub(started);
+        let when = describe_age(ago).unwrap_or_else(|| format!("at unix time {started}"));
+        write!(f, "pid {} on {}, started {when}", self.pid, self.host)
     }
+}
+
+/// How long ago, roughly ("5 s ago", "10 min ago", "2 h ago", "3 days
+/// ago"); `None` for a time in the future (clocks differ between
+/// computers).
+pub fn describe_age(seconds_ago: i64) -> Option<String> {
+    let s = u64::try_from(seconds_ago).ok()?;
+    Some(match s {
+        0..90 => format!("{s} s ago"),
+        90..5_400 => format!("{} min ago", s / 60),
+        5_400..172_800 => format!("{} h ago", s / 3_600),
+        _ => format!("{} days ago", s / 86_400),
+    })
 }
 
 /// The lock as seen without taking it (`status`, and the other mutating
@@ -340,6 +359,38 @@ pub fn parse_owner(text: &str) -> Option<LockOwner> {
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    fn ages() {
+        assert_eq!(describe_age(5).as_deref(), Some("5 s ago"));
+        assert_eq!(describe_age(600).as_deref(), Some("10 min ago"));
+        assert_eq!(describe_age(7_200).as_deref(), Some("2 h ago"));
+        assert_eq!(describe_age(3 * 86_400).as_deref(), Some("3 days ago"));
+        assert_eq!(describe_age(-10), None, "a clock ahead of this one");
+    }
+
+    #[test]
+    fn owners_show_their_age() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let owner = |started_unix| LockOwner {
+            run: "0".repeat(32),
+            host: "laptop".into(),
+            pid: 4242,
+            started_unix,
+            boot_id: "b".into(),
+        };
+        assert_eq!(
+            owner(now - 600).to_string(),
+            "pid 4242 on laptop, started 10 min ago"
+        );
+        assert_eq!(
+            owner(now + 86_400).to_string(),
+            format!("pid 4242 on laptop, started at unix time {}", now + 86_400)
+        );
+    }
 
     const RUN: &str = "0123456789abcdef0123456789abcdef";
     const BOOT: &str = "6f1d3c2a-0000-4000-8000-00000000b007";
