@@ -30,8 +30,9 @@ impl ListingEntry {
 /// A flat, recursive tree listing: repository path → entry.
 pub type TreeListing = BTreeMap<String, ListingEntry>;
 
-/// Build a [`TreeListing`] from a raw recursive listing
-/// ([`git::Repo::ls_tree_recursive`]). This is the one place where git's
+/// Build a [`TreeListing`] from a raw recursive listing (the store's walk
+/// over raw tree objects, or [`git::Repo::ls_tree_recursive`]: both give
+/// git's canonical modes). This is the one place where git's
 /// byte paths become the model's string paths: a non-UTF-8 path is
 /// refused ([`ModelError::NonUtf8Path`]), never converted lossily, since
 /// a renamed carried-forward path would in effect be deleted. Tree

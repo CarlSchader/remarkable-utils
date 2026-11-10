@@ -3117,3 +3117,102 @@ fn unchanged_is_the_per_document_tables_no_change() {
     // Never for an absent side.
     assert!(!unchanged(rules, &u(1), &base, &DocVersion::default(), &lib.blobs).unwrap());
 }
+
+/// Timing of a 1000-document merge with every kind of change: ink on
+/// both sides (forks where both inked), renames, moves, deletions
+/// against edits, and folders trashed on each side above edited
+/// documents. Run in release with `--ignored --nocapture`; it prints the
+/// best of twenty runs and a fingerprint of the outcome (equal
+/// fingerprints: an identical merge).
+#[test]
+#[ignore]
+fn merge_scale_1000_documents() {
+    let mut lib = Lib::default();
+    let folder = |n: u32| D::folder(&format!("F{n}"), "");
+    let folders: Vec<(u32, D)> = (1..=40).map(|n| (n, folder(n))).collect();
+    let documents: Vec<(u32, D)> = (101..=1060u32)
+        .map(|n| {
+            let parent = if n % 9 == 0 {
+                String::new()
+            } else {
+                u(1 + n % 40).to_string()
+            };
+            let doc = if n % 2 == 1 {
+                D::notebook(&format!("N{n}"), &parent, 2, "base")
+            } else {
+                D::pdf(&format!("P{n}"), &parent, 2)
+            };
+            (n, doc)
+        })
+        .collect();
+    let edit = |docs: &[(u32, D)], change: &dyn Fn(u32, D) -> Option<D>| -> Vec<(u32, D)> {
+        docs.iter()
+            .filter_map(|(n, d)| change(*n, d.clone()).map(|d| (*n, d)))
+            .collect()
+    };
+    let ours_folders = edit(&folders, &|n, d| Some(if n == 39 { d.trash() } else { d }));
+    let ours_documents = edit(&documents, &|n, d| {
+        let d = if n % 3 == 0 {
+            d.ink(1, &format!("tablet {n}"))
+        } else {
+            d
+        };
+        Some(if n % 10 == 0 {
+            d.move_to(u(1 + (n + 1) % 40).as_str())
+        } else {
+            d
+        })
+    });
+    let theirs_folders = edit(&folders, &|n, d| Some(if n == 40 { d.trash() } else { d }));
+    let theirs_documents = edit(&documents, &|n, d| {
+        if n % 50 == 0 {
+            return None;
+        }
+        let d = if n % 5 == 0 {
+            d.rename(&format!("R{n}"))
+        } else {
+            d
+        };
+        Some(if n % 7 == 0 {
+            d.ink(2, &format!("origin {n}"))
+        } else {
+            d
+        })
+    });
+    let base: Vec<(u32, &D)> = refs(&folders).into_iter().chain(refs(&documents)).collect();
+    let ours: Vec<(u32, &D)> = refs(&ours_folders)
+        .into_iter()
+        .chain(refs(&ours_documents))
+        .collect();
+    let theirs: Vec<(u32, &D)> = refs(&theirs_folders)
+        .into_iter()
+        .chain(refs(&theirs_documents))
+        .collect();
+    let (b, o, t) = three(&mut lib, &base, &ours, &theirs);
+    let merge = || {
+        Run {
+            allow: true,
+            ..Run::default()
+        }
+        .go(&lib, &b, &o, &t)
+        .unwrap()
+    };
+    let (best, outcome) = (0..20)
+        .map(|_| {
+            let started = std::time::Instant::now();
+            let outcome = merge();
+            (started.elapsed(), outcome)
+        })
+        .min_by_key(|(elapsed, _)| *elapsed)
+        .unwrap();
+    let fingerprint = format!("{:x}", Sha256::digest(format!("{outcome:?}")));
+    eprintln!(
+        "1000-document merge: best of 20 {best:?}; {} documents, {} forks, {} notes; outcome {}",
+        outcome.docs.len(),
+        outcome.forks.len(),
+        outcome.notes.len(),
+        &fingerprint[..16]
+    );
+    assert_eq!(base.len(), 1000);
+    assert!(!outcome.forks.is_empty() && !outcome.notes.is_empty());
+}

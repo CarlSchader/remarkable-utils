@@ -203,6 +203,14 @@ pub enum FileMode {
 }
 
 impl FileMode {
+    /// Every mode git writes for a non-tree entry.
+    pub const ALL: [FileMode; 4] = [
+        Self::Regular,
+        Self::Executable,
+        Self::Symlink,
+        Self::Gitlink,
+    ];
+
     /// The mode as git writes it in trees.
     pub fn bits(self) -> u32 {
         match self {
@@ -216,14 +224,7 @@ impl FileMode {
     /// The mode for a [`TreeEntry::mode`], unless it is a tree (or a
     /// mode git does not write).
     pub fn from_bits(mode: u32) -> Option<Self> {
-        [
-            Self::Regular,
-            Self::Executable,
-            Self::Symlink,
-            Self::Gitlink,
-        ]
-        .into_iter()
-        .find(|m| m.bits() == mode)
+        Self::ALL.into_iter().find(|m| m.bits() == mode)
     }
 
     /// Regular or executable: content that can be written to a file.
@@ -671,7 +672,9 @@ impl Repo {
     }
 
     /// Every entry below `treeish` (a commit or tree), trees included,
-    /// parent trees before their contents.
+    /// parent trees before their contents. The hub's store reads trees
+    /// through `cat-file` ([`parse_tree`]); this is the reference listing
+    /// its tests compare against (both give canonical modes).
     pub fn ls_tree_recursive(&self, treeish: &str) -> Result<Vec<TreeEntry>> {
         let mut cmd = self.command("ls-tree");
         cmd.args(["-r", "-t", "-z", "--long", "--end-of-options", treeish]);
@@ -904,14 +907,87 @@ pub struct ObjectReader<'a> {
     pub size: u64,
 }
 
+/// A whole object as [`CatFile::read`] returns it.
+pub type RawObject = (ObjectKind, Vec<u8>);
+
+/// Bytes of requests [`CatFile::read_many`] sends before reading answers:
+/// half of a one-page (4 KiB) pipe, the smallest a kernel gives (Linux
+/// when a user is over its pipe-page allowance, BSDs under memory
+/// pressure). The whole chunk fits in git's stdin pipe even if git has
+/// read none of it, so the write completes before git answers anything,
+/// and git, blocked writing answers, never waits on us still writing.
+const READ_MANY_REQUEST_BYTES: usize = 2048;
+
+/// Ids per [`CatFile::read_many`] chunk for request lines of `line`
+/// bytes (id and newline): 49 SHA-1 or 31 SHA-256 ids.
+fn read_many_chunk(line: usize) -> usize {
+    (READ_MANY_REQUEST_BYTES / line.max(1)).max(1)
+}
+
 impl CatFile {
     /// Look up `oid`; `None` if the repository does not have it.
     pub fn object(&mut self, oid: &Oid) -> Result<Option<ObjectReader<'_>>> {
         self.skip_pending()?;
+        self.send(&format!("{oid}\n"))?;
+        Ok(self.header(oid)?.map(|(kind, size)| ObjectReader {
+            cat: self,
+            kind,
+            size,
+        }))
+    }
+
+    /// Read whole objects, as [`Self::read`] does for each of `oids`, in
+    /// order, with the requests pipelined (in chunks small enough for any
+    /// pipe buffer): a round trip per chunk, not per object.
+    pub fn read_many(&mut self, oids: &[Oid]) -> Result<Vec<Option<RawObject>>> {
+        let line = oids.iter().map(|oid| oid.as_str().len() + 1).max();
+        oids.chunks(read_many_chunk(line.unwrap_or(1))).try_fold(
+            Vec::with_capacity(oids.len()),
+            |mut objects, chunk| {
+                self.send(
+                    &chunk
+                        .iter()
+                        .map(|oid| format!("{oid}\n"))
+                        .collect::<String>(),
+                )?;
+                chunk.iter().try_for_each(|oid| {
+                    // Before each answer, the rest of the previous object
+                    // (one half-read before this call included): the
+                    // answers follow it on stdout. Sending first is safe:
+                    // the chunk fits in the stdin pipe even while git is
+                    // blocked writing that rest.
+                    self.skip_pending()?;
+                    let object = self
+                        .header(oid)?
+                        .map(|(kind, size)| -> Result<_> {
+                            let mut data = Vec::with_capacity(size.try_into().unwrap_or(0));
+                            ObjectReader {
+                                cat: self,
+                                kind,
+                                size,
+                            }
+                            .read_to_end(&mut data)?;
+                            Ok((kind, data))
+                        })
+                        .transpose()?;
+                    objects.push(object);
+                    Ok::<_, Error>(())
+                })?;
+                Ok(objects)
+            },
+        )
+    }
+
+    fn send(&mut self, requests: &str) -> Result<()> {
         let stdin = self.stdin.as_mut().ok_or_else(|| closed("cat-file"))?;
-        if let Err(error) = stdin.write_all(format!("{oid}\n").as_bytes()) {
-            return Err(self.broken(error));
-        }
+        stdin
+            .write_all(requests.as_bytes())
+            .map_err(|error| self.broken(error))
+    }
+
+    /// The answer header for `oid` (requested already): its kind and size,
+    /// with the body pending; `None` if it is missing.
+    fn header(&mut self, oid: &Oid) -> Result<Option<(ObjectKind, u64)>> {
         let mut line = Vec::new();
         match self.stdout.read_until(b'\n', &mut line) {
             Ok(_) if line.ends_with(b"\n") => {}
@@ -926,11 +1002,7 @@ impl CatFile {
                 size,
             } if found == *oid => {
                 self.pending = Some(size);
-                Ok(Some(ObjectReader {
-                    cat: self,
-                    kind,
-                    size,
-                }))
+                Ok(Some((kind, size)))
             }
             BatchHeader::Found { oid: found, .. } => Err(Error::GitOutput {
                 command: "cat-file".into(),
@@ -1694,9 +1766,25 @@ pub fn parse_commit(data: &[u8]) -> Result<CommitObject> {
     })
 }
 
+/// A stored tree-entry mode as git reports it (its `canon_mode`, applied
+/// by `ls-tree`, `diff-tree` and `fast-import` alike): a regular file is
+/// `100644` or `100755` by its owner-execute bit (old trees hold `100664`
+/// or `100775`, which `fsck` only warns about), a symlink `120000`, a
+/// directory `040000`, anything else a gitlink.
+fn canon_mode(mode: u32) -> u32 {
+    match mode & 0o170000 {
+        0o100000 if mode & 0o100 != 0 => 0o100755,
+        0o100000 => 0o100644,
+        0o120000 => 0o120000,
+        0o040000 => 0o040000,
+        _ => 0o160000,
+    }
+}
+
 /// Parse a raw tree object (`<octal mode> SP <name> NUL <binary id>` per
-/// entry) into entries named by their bare names. Sizes are not part of
-/// a tree object (`None`); the kind follows from the mode.
+/// entry) into entries named by their bare names. Modes are canonical,
+/// as git reports them (`100664` reads as `100644`, and so on). Sizes are not part of a tree
+/// object (`None`); the kind follows from the mode.
 pub fn parse_tree(data: &[u8], format: ObjectFormat) -> Result<Vec<TreeEntry>> {
     let id_len = match format {
         ObjectFormat::Sha1 => 20,
@@ -1712,6 +1800,7 @@ pub fn parse_tree(data: &[u8], format: ObjectFormat) -> Result<Vec<TreeEntry>> {
             .and_then(|mode| std::str::from_utf8(mode).ok())
             .and_then(|mode| u32::from_str_radix(mode, 8).ok())
             .filter(|_| space < nul)
+            .map(canon_mode)
             .ok_or_else(malformed)?;
         let name = &rest[space + 1..nul];
         let id = rest.get(nul + 1..nul + 1 + id_len).ok_or_else(malformed)?;
@@ -1987,6 +2076,15 @@ mod tests {
         ]
         .into_iter()
         .for_each(|mode| assert_eq!(FileMode::from_bits(mode.bits()), Some(mode)));
+        assert_eq!(
+            FileMode::ALL,
+            [
+                FileMode::Regular,
+                FileMode::Executable,
+                FileMode::Symlink,
+                FileMode::Gitlink
+            ]
+        );
         assert_eq!(FileMode::from_bits(0o160000), Some(FileMode::Gitlink));
         assert_eq!(FileMode::from_bits(0o040000), None);
         assert_eq!(FileMode::from_bits(0o100664), None);
@@ -2588,6 +2686,42 @@ mod tests {
         });
         // A SHA-1 tree read as SHA-256 runs out of id bytes.
         assert!(parse_tree(&entry("100644", b"f", A), ObjectFormat::Sha256).is_err());
+    }
+
+    #[test]
+    fn read_many_chunks_fit_in_half_a_page() {
+        assert_eq!(read_many_chunk(41), 49);
+        assert_eq!(read_many_chunk(65), 31);
+        [41, 65, 1, 5000].into_iter().for_each(|line| {
+            let chunk = read_many_chunk(line);
+            assert!(chunk >= 1 && (chunk == 1 || chunk * line <= 2048), "{line}");
+        });
+        assert_eq!(read_many_chunk(0), 2048);
+    }
+
+    #[test]
+    fn tree_modes_are_canonical_as_git_reports_them() {
+        let binary: Vec<u8> = (0..A.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&A[i..i + 2], 16).unwrap())
+            .collect();
+        [
+            ("100664", 0o100644, ObjectKind::Blob),
+            ("100600", 0o100644, ObjectKind::Blob),
+            ("100775", 0o100755, ObjectKind::Blob),
+            ("100700", 0o100755, ObjectKind::Blob),
+            ("120777", 0o120000, ObjectKind::Blob),
+            ("40755", 0o040000, ObjectKind::Tree),
+            ("160755", 0o160000, ObjectKind::Commit),
+            // No file type at all: git takes it for a gitlink.
+            ("644", 0o160000, ObjectKind::Commit),
+        ]
+        .into_iter()
+        .for_each(|(stored, mode, kind)| {
+            let raw = [stored.as_bytes(), b" f\0", &binary].concat();
+            let entries = parse_tree(&raw, ObjectFormat::Sha1).unwrap();
+            assert_eq!((entries[0].mode, entries[0].kind), (mode, kind), "{stored}");
+        });
     }
 
     #[test]

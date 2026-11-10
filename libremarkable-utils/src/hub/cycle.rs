@@ -239,6 +239,13 @@ pub enum CycleError {
     #[error("origin's repository configuration is unusable: {0}")]
     InvalidRepoConfig(String),
 
+    /// A tree nested deeper than git's own default bound
+    /// (`core.maxTreeDepth`): refused rather than walked.
+    #[error(
+        "tree {tree} in the local cache is nested deeper than {max} levels; refusing to read it"
+    )]
+    TreeTooDeep { tree: Oid, max: usize },
+
     /// `log`, `restore` or `add` with neither an origin URL nor a tablet.
     #[error("no origin: give --origin <url>, or reach a tablet attached to the hub")]
     NoOrigin,

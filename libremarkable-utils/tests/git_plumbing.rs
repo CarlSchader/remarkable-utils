@@ -1477,3 +1477,67 @@ fn refs_deleted_counted_and_borrowed_objects_repacked_in() {
     borrower.delete_ref("refs/remotes/origin/main").unwrap();
     assert!(!borrower.has_refs().unwrap());
 }
+
+/// `read_many` answers exactly as `read` does for each id, in order:
+/// present and missing objects, repeats, several kinds, more ids than one
+/// pipelined chunk holds, a large blob, and a half-read object before it;
+/// the process stays usable afterwards. In both object formats.
+#[test]
+fn cat_file_read_many_matches_read() {
+    [ObjectFormat::Sha1, ObjectFormat::Sha256]
+        .into_iter()
+        .for_each(read_many_matches_read);
+}
+
+fn read_many_matches_read(format: ObjectFormat) {
+    let sandbox = Sandbox::new();
+    let cache = sandbox
+        .git()
+        .init_bare(&sandbox.path("cache.git"), format)
+        .unwrap();
+    let mut writer = cache.commit_writer(&NoProgress, None).unwrap();
+    let blobs: Vec<Oid> = (0..300)
+        .map(|n| {
+            writer
+                .add_bytes(
+                    format!("docs/{n}/metadata"),
+                    FileMode::Regular,
+                    format!("{n}\n").as_bytes(),
+                )
+                .unwrap()
+        })
+        .collect();
+    let big = vec![b'x'; 300_000];
+    let big_oid = writer
+        .add_bytes("payload.pdf", FileMode::Regular, &big)
+        .unwrap();
+    let commit = writer.commit(&meta(&[], "many\n")).unwrap();
+    let trees: Vec<Oid> = cache
+        .ls_tree_recursive(commit.as_str())
+        .unwrap()
+        .into_iter()
+        .filter(|entry| entry.kind == ObjectKind::Tree)
+        .map(|entry| entry.oid)
+        .collect();
+    let missing: Oid = "0".repeat(commit.as_str().len()).parse().unwrap();
+    let oids: Vec<Oid> = blobs
+        .iter()
+        .chain(&trees)
+        .chain([&commit, &missing, &big_oid, &blobs[0], &missing])
+        .cloned()
+        .collect();
+    assert!(oids.len() > 400);
+    let mut cat = cache.cat_file().unwrap();
+    let expected: Vec<_> = oids.iter().map(|oid| cat.read(oid).unwrap()).collect();
+    // A half-read object first: the batch skips its rest.
+    let mut half = cat.object(&big_oid).unwrap().unwrap();
+    let mut some = [0u8; 10];
+    half.read_exact(&mut some).unwrap();
+    assert_eq!(cat.read_many(&oids).unwrap(), expected);
+    assert_eq!(cat.read_many(&[]).unwrap(), vec![]);
+    assert_eq!(
+        cat.read(&blobs[7]).unwrap(),
+        Some((ObjectKind::Blob, b"7\n".to_vec()))
+    );
+    cat.finish().unwrap();
+}
