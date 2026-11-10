@@ -322,7 +322,8 @@ while implementing it, beyond the steps above:
   at most that much plus the file being read: in this run, and in the
   next, whose pre-read and stopped read both count the saved files as
   known (checked like any other entry; a pre-read that fails outright
-  keeps what was saved). The saved file is the tablet's: keyed by its
+  keeps what was saved, and the run goes on without it, unless the tablet
+  stopped answering: see below). The saved file is the tablet's: keyed by its
   device id, or before it has one by where this computer reaches it
   (`Tablet::destination`, the SSH destination and port). A killed
   `fast-import` leaves `.keep` files on the packs its checkpoints wrote;
@@ -338,7 +339,7 @@ while implementing it, beyond the steps above:
   reconciliation judges the files just read, and a document it finishes
   is read again. `status` and `--dry-run` read the same way, with the
   second read also while xochitl runs (retried once if a file changes
-  while read).
+  while read, never after the tablet stopped answering).
 - **The history index.** Searches over origin's history go through an
   index of which subtree of each document (`docs/<uuid>`) every ancestor
   of `main` holds. It is built from one `rev-list --topo-order --parents`,
@@ -409,6 +410,18 @@ while implementing it, beyond the steps above:
   outlasts the timeout is not repeated by the next run. Starts per
   cycle: two (one when nothing is applied), plus one if the watchdog
   fires, each after `reset-failed`.
+- **A tablet that stops answering** (asleep, off the network) is
+  `Error::Unreachable`: ssh gets a connect timeout and a keepalive (see
+  `ssh.rs`), and every further try would wait for another timeout, so
+  nothing retries it. The pre-read, otherwise best effort, ends the run
+  on it, and so do a failed staging cleanup before step 16 and the lock
+  (which otherwise retries once to adopt a lock whose acknowledgement
+  was lost). The error path stops at its first unanswered step: xochitl
+  comes back with the watchdog, and the lock goes stale when it fires.
+  A lock taken but not yet guarded by a watchdog, or left after the
+  final disarm, needs `--break-lock` (or a reboot), as after a crash.
+  `rmu hub` exits with status 8. Keep the tablet awake during long
+  syncs.
 - **Updating `main`.** If the merge result is origin's tree and every
   document of the snapshot is equivalent to origin's (`.metadata`/
   `.content` compared normalised, other files by blob), nothing is

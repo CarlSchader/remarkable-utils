@@ -259,6 +259,10 @@ stream one tar into `tar -x` in the data dir.
   per channel instead; Tailscale SSH, for one, runs each session through
   `login`. If that is the path, plain ssh to the tablet's own server (at
   its tailnet address) should avoid it; nothing in rmu needs to change.
+  To tell: `ssh -v` prints the server's version banner (which server
+  answers), and `loginctl list-sessions` on the tablet shows the
+  sessions while a sync runs. This cause is inferred, not yet checked on
+  a tablet.
 - **Cloud sync** is a separate service, `rm-sync.service`, enabled and
   running whether or not the tablet is paired; it is `BindsTo=`/`PartOf=`
   `xochitl.service`, so it stops and starts with xochitl. Pairing state
