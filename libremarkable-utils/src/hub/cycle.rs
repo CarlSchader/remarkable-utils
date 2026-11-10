@@ -216,6 +216,9 @@ pub struct HubOptions {
     pub origin: Option<String>,
     /// The date in fork names, `yyyy-mm-dd`; today (UTC) if `None`.
     pub date: Option<String>,
+    /// The pre-read checkpoints its local writes about every this many
+    /// bytes, so a connection cut loses at most that much progress.
+    pub pre_read_checkpoint: u64,
 }
 
 impl Default for HubOptions {
@@ -228,6 +231,7 @@ impl Default for HubOptions {
             thresholds: GuardThresholds::default(),
             origin: None,
             date: None,
+            pre_read_checkpoint: 64 * 1024 * 1024,
         }
     }
 }

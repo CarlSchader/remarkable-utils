@@ -15,7 +15,7 @@
 //! [`History`].
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, TryLockError};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -70,6 +70,41 @@ pub(super) struct Remote {
     pub main: Option<Oid>,
     /// The device ref, as fetched.
     pub device: Option<RemoteRef>,
+}
+
+/// Where the last pre-read of a tablet (`device`, or `None` before it has
+/// a device id) against the cache of `repo_id` keeps what it read: next
+/// to the cache, under its `flock`.
+pub(super) fn pre_read_path(root: &Path, repo_id: &RepoId, device: Option<&DeviceId>) -> PathBuf {
+    let tablet = device.map_or_else(|| "new".to_string(), ToString::to_string);
+    root.join(format!("{repo_id}.pre-read-{tablet}.json"))
+}
+
+/// A saved pre-read (see [`save_pre_read`]); empty if there is none or
+/// it is unreadable (it is only a hint: every entry is checked against
+/// the tablet's stat and the cache before use).
+pub(super) fn load_pre_read(path: &Path) -> BTreeMap<model::XochitlPath, model::ManifestEntry> {
+    fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+/// Keep what a pre-read read (each file's stat and blob), replacing the
+/// last one atomically. Best effort.
+pub(super) fn save_pre_read(
+    path: &Path,
+    entries: &BTreeMap<model::XochitlPath, model::ManifestEntry>,
+) {
+    let temp = path.with_extension("json.tmp");
+    let _ = serde_json::to_vec(entries)
+        .map_err(io_error)
+        .and_then(|bytes| fs::write(&temp, bytes))
+        .and_then(|()| fs::rename(&temp, path));
+}
+
+fn io_error(error: serde_json::Error) -> std::io::Error {
+    std::io::Error::other(error)
 }
 
 /// The local cache, held under its `flock` for as long as this lives.

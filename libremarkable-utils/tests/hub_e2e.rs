@@ -530,6 +530,15 @@ fn guards_refuse_paired_attached_and_unattached_tablets() {
     assert!(tablet.is_running());
     assert!(!Path::new(&tablet.paths().lock_dir()).exists());
     assert!(!is_locked(&error));
+    // Refused before reading: nothing was downloaded.
+    assert!(
+        !tablet
+            .ops()
+            .iter()
+            .any(|op| matches!(op, OpKind::StatAll | OpKind::Download)),
+        "{:?}",
+        tablet.ops()
+    );
 }
 
 use libremarkable_utils::hub::device::OpKind;
@@ -2874,4 +2883,98 @@ fn reattach_scale_old_versions_match() {
 #[ignore = "scale measurement; run in release with --ignored --nocapture"]
 fn reattach_scale_nothing_matches() {
     scale(1000, 1200, &[true]);
+}
+
+// ---- resilient pre-read ----------------------------------------------------------------
+
+/// A tablet with `docs` notebooks of two pages, its mirrored file count,
+/// and options that checkpoint the pre-read after every file.
+fn library_to_read(docs: usize) -> (World, usize, HubOptions) {
+    let world = World::new(1);
+    (0..docs).for_each(|k| {
+        world.create(0, Kind::Notebook { pages: 2 }, &format!("Doc {k}"), "");
+    });
+    let files = world
+        .device(0)
+        .docs()
+        .values()
+        .map(|files| files.len())
+        .sum();
+    let options = HubOptions {
+        pre_read_checkpoint: 1,
+        ..world.options.clone()
+    };
+    (world, files, options)
+}
+
+fn clone_with(
+    world: &World,
+    options: HubOptions,
+) -> libremarkable_utils::error::Result<libremarkable_utils::hub::cycle::SyncReport> {
+    let name = libremarkable_utils::hub::model::DeviceName::new("Tablet A").unwrap();
+    world
+        .hub_with(0, options)
+        .clone_tablet(world.tablet(0), &world.origin, Some(name), false)
+}
+
+/// The pre-read of a first clone is cut inside its seventh file (a page,
+/// so the cut ends the `fast-import` it streams into): the six before
+/// were checkpointed, so the stopped read downloads only the rest.
+/// Without checkpoints the cut loses the whole pre-read.
+#[test]
+fn a_pre_read_cut_mid_file_keeps_its_checkpointed_files() {
+    let (template, files, options) = library_to_read(4);
+    let world = template.duplicate();
+    world.tablet(0).inject(Fault::CutDownloadInFile(6));
+    let report = clone_with(&world, options).unwrap();
+    assert_eq!(report.read.downloaded.files, files - 6, "{report:?}");
+    world.check();
+    // The default (64 MiB) checkpoints nothing in so small a library.
+    let world = template.duplicate();
+    world.tablet(0).inject(Fault::CutDownloadInFile(6));
+    let report = world.clone_tablet(0).unwrap();
+    assert_eq!(report.read.downloaded.files, files, "{report:?}");
+}
+
+/// The run whose pre-read was cut fails before its stopped read (the
+/// connection is gone); the next run reuses what that pre-read saved,
+/// even when its own pre-read gets nothing.
+#[test]
+fn the_next_run_reuses_a_cut_pre_read() {
+    let (template, files, options) = library_to_read(4);
+    let lock = op_index(&template, 0, OpKind::AcquireLock, 1, |w| {
+        w.clone_tablet(0).unwrap();
+    });
+    let world = template.duplicate();
+    world.tablet(0).inject(Fault::CutDownloadInFile(6));
+    world.tablet(0).inject(Fault::DisconnectAtOp(lock));
+    assert!(clone_with(&world, options.clone()).is_err());
+    world.tablet(0).reconnect();
+    world.check_idle(0);
+    world.tablet(0).inject(Fault::FailDownloadAfter(0));
+    let report = clone_with(&world, options).unwrap();
+    assert_eq!(report.read.downloaded.files, files - 6, "{report:?}");
+    world.check();
+}
+
+/// A tablet another run holds is not read at all before the lock refuses
+/// this run.
+#[test]
+fn a_locked_tablet_gets_no_pre_read() {
+    let (world, _, _) = two_notebooks();
+    let other = libremarkable_utils::hub::device::LockRequest::for_this_process("other-host");
+    let tablet = world.tablet(0);
+    let held =
+        libremarkable_utils::hub::device::Tablet::acquire_lock(tablet, &other, false).unwrap();
+    let before = tablet.ops().len();
+    let result = world.sync(0);
+    assert!(matches!(&result, Err(e) if is_locked(e)), "{result:?}");
+    let ops = tablet.ops()[before..].to_vec();
+    assert!(
+        !ops.iter()
+            .any(|op| matches!(op, OpKind::StatAll | OpKind::Download)),
+        "{ops:?}"
+    );
+    libremarkable_utils::hub::device::Tablet::release_lock(tablet, &held).unwrap();
+    world.sync(0).unwrap();
 }

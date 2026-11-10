@@ -126,9 +126,10 @@ impl Hub<'_> {
         let pre = self.pre_read(
             tablet,
             origin.rules,
-            &snapshot::known_from_manifest(&state.manifest),
+            &state.manifest,
             &origin.cache.repo,
             &origin.store,
+            &store::pre_read_path(&self.cache_dir, &state.repo_id, Some(&state.device_id)),
         );
         let known = snapshot::known_from_manifest(&state.manifest)
             .into_iter()
@@ -141,7 +142,7 @@ impl Hub<'_> {
                 origin.rules,
                 &known,
                 &origin.store,
-                &mut writer,
+                snapshot::Sink::plain(&mut writer),
                 self.progress,
                 ReadMode::Strict,
             )?;

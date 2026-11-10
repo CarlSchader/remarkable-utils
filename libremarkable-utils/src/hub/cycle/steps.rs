@@ -18,7 +18,7 @@ use super::{
 use crate::error::{Error, Result};
 use crate::git::{CommitMeta, Expected, Oid, Repo};
 use crate::hub::device::{
-    ApplyPlan, DeviceError, DeviceInfo, DocApply, StagedFile, StatEntry, Tablet,
+    ApplyPlan, DeviceError, DeviceInfo, DocApply, LockState, StagedFile, StatEntry, Tablet,
 };
 use crate::hub::merge::{self, BlobSource, TreeItem};
 use crate::hub::model::{
@@ -251,7 +251,35 @@ impl Hub<'_> {
             let probe = Store::new(cache.repo.clone())?;
             let config = probe.repo_config(&main)?;
             let rules = config.rules()?;
-            let pre = self.pre_read(s.tablet, rules, &BTreeMap::new(), &cache.repo, &probe);
+            // Read-only refusals first, so a tablet that would be refused
+            // under the lock gets no (full) pre-read; checked again there.
+            if s.tablet.cloud_paired()? {
+                return Err(CycleError::CloudPaired.into());
+            }
+            let before = s.tablet.read_state()?;
+            if let Some(existing) = before.as_ref().filter(|_| !reattach) {
+                return Err(CycleError::AlreadyAttached {
+                    repo_id: existing.repo_id.clone(),
+                }
+                .into());
+            }
+            let pre = if self.may_pre_read(s.tablet)? {
+                let saved = store::pre_read_path(
+                    &self.cache_dir,
+                    &config.repo_id,
+                    before.as_ref().map(|state| &state.device_id),
+                );
+                self.pre_read(
+                    s.tablet,
+                    rules,
+                    &BTreeMap::new(),
+                    &cache.repo,
+                    &probe,
+                    &saved,
+                )
+            } else {
+                TabletRead::default()
+            };
             drop(probe);
             self.progress.step("Locking the tablet");
             let took_over = s.acquire(&self.request, self.options.break_lock)?;
@@ -296,7 +324,7 @@ impl Hub<'_> {
                 rules,
                 &snapshot::pre_read_known(&pre),
                 &ctx.store,
-                &mut writer,
+                snapshot::Sink::plain(&mut writer),
                 self.progress,
                 ReadMode::Strict,
             )?;
@@ -355,38 +383,66 @@ impl Hub<'_> {
     /// need none), into a commit of its own that nothing points at: the
     /// stopped read then downloads only files whose stat moved since, so
     /// the UI is down for seconds even when the tablet has gigabytes of
-    /// new data. Any failure (a download cut, even mid-file, which ends
-    /// the `fast-import` it streamed into) only makes it smaller, down to
-    /// nothing.
+    /// new data. `fast-import` is checkpointed about every
+    /// [`super::HubOptions::pre_read_checkpoint`] bytes and what is
+    /// durable is saved at `saved`, so a cut (even mid-file, which ends
+    /// the `fast-import`) loses at most that much, in this run and the
+    /// next: the files an earlier pre-read saved count as known too.
+    /// Every entry is checked against the tablet's stat (nanosecond
+    /// mtimes only) and the cache before the stopped read trusts it.
     pub(super) fn pre_read(
         &self,
         tablet: &dyn Tablet,
         rules: &MirrorRules,
-        known: &BTreeMap<XochitlPath, Known>,
+        manifest: &BTreeMap<XochitlPath, ManifestEntry>,
         repo: &Repo,
         store: &Store,
+        saved: &std::path::Path,
     ) -> TabletRead {
-        let attempt = || -> Result<TabletRead> {
-            let mut writer = repo.commit_writer(self.progress, None)?;
-            let read = snapshot::read_tablet(
-                tablet,
-                rules,
-                known,
-                store,
-                &mut writer,
-                self.progress,
-                ReadMode::BestEffort,
-            )?;
-            let time = unix_now();
-            writer.commit(&CommitMeta {
-                parents: Vec::new(),
-                author: rmu_signature(time),
-                committer: rmu_signature(time),
-                message: "rmu hub: pre-read (not pushed)\n".to_string(),
-            })?;
-            Ok(read)
+        let known: BTreeMap<XochitlPath, Known> = snapshot::known_from_manifest(manifest)
+            .into_iter()
+            .chain(snapshot::saved_known(&store::load_pre_read(saved)))
+            .collect();
+        let mut save = |entries: &BTreeMap<XochitlPath, ManifestEntry>| {
+            store::save_pre_read(saved, entries);
         };
-        attempt().unwrap_or_default()
+        let Ok(mut writer) = repo.commit_writer(self.progress, None) else {
+            return TabletRead::default();
+        };
+        let read = snapshot::read_tablet(
+            tablet,
+            rules,
+            &known,
+            store,
+            snapshot::Sink {
+                writer: &mut writer,
+                checkpoints: Some(snapshot::Checkpoints {
+                    every: self.options.pre_read_checkpoint.max(1),
+                    save: &mut save,
+                }),
+            },
+            self.progress,
+            ReadMode::BestEffort,
+        )
+        .unwrap_or_default();
+        let time = unix_now();
+        let committed = writer.commit(&CommitMeta {
+            parents: Vec::new(),
+            author: rmu_signature(time),
+            committer: rmu_signature(time),
+            message: "rmu hub: pre-read (not pushed)\n".to_string(),
+        });
+        if committed.is_ok() {
+            save(&read.manifest_entries());
+        }
+        read
+    }
+
+    /// Whether to pre-read: not while another run holds the tablet lock
+    /// (unless it is being broken), since this run would most likely be
+    /// refused.
+    fn may_pre_read(&self, tablet: &dyn Tablet) -> Result<bool> {
+        Ok(self.options.break_lock || tablet.lock_state()? == LockState::Free)
     }
 
     /// Steps 1–6 (with step 4 only if `reconcile`).
@@ -398,13 +454,24 @@ impl Hub<'_> {
         let mut origin = OriginCtx::new(cache, url, Some(&first.device_id), Some(refs))?;
         origin.check(&first)?;
         let rules = origin.rules;
-        let pre = self.pre_read(
-            s.tablet,
-            rules,
-            &snapshot::known_from_manifest(&first.manifest),
-            &origin.cache.repo,
-            &origin.store,
-        );
+        // Read-only refusals first (checked again under the lock): a
+        // paired tablet is refused, and a locked one is not downloaded in
+        // full for nothing.
+        if s.tablet.cloud_paired()? {
+            return Err(CycleError::CloudPaired.into());
+        }
+        let pre = if self.may_pre_read(s.tablet)? {
+            self.pre_read(
+                s.tablet,
+                rules,
+                &first.manifest,
+                &origin.cache.repo,
+                &origin.store,
+                &store::pre_read_path(&self.cache_dir, &first.repo_id, Some(&first.device_id)),
+            )
+        } else {
+            TabletRead::default()
+        };
         self.progress.step("Locking the tablet");
         let took_over = s.acquire(&self.request, self.options.break_lock)?;
         s.arm()?;
@@ -436,7 +503,7 @@ impl Hub<'_> {
             rules,
             &known,
             &origin.store,
-            &mut writer,
+            snapshot::Sink::plain(&mut writer),
             self.progress,
             ReadMode::Strict,
         )?;
@@ -452,7 +519,7 @@ impl Hub<'_> {
                         rules,
                         &read.as_known(),
                         &origin.store,
-                        &mut writer,
+                        snapshot::Sink::plain(&mut writer),
                         self.progress,
                         ReadMode::Strict,
                     )?;

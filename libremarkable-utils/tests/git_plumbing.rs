@@ -1315,6 +1315,26 @@ fn first_parent_changes_of_a_merged_history() {
 
 #[cfg(unix)]
 #[test]
+fn checkpointed_blobs_survive_an_aborted_writer() {
+    let sandbox = Sandbox::new();
+    let cache = sandbox.init("cache.git");
+    let mut writer = cache.commit_writer(&NoProgress, None).unwrap();
+    let kept = writer.write_blob("kept", 4, &mut &b"kept"[..]).unwrap();
+    writer.checkpoint().unwrap();
+    writer.checkpoint().unwrap();
+    let lost = writer.write_blob("lost", 4, &mut &b"lost"[..]).unwrap();
+    // A reader cut part-way kills fast-import, as a cut download does.
+    let cut = writer.write_blob("cut", 10, &mut &b"cut"[..]);
+    assert!(cut.is_err());
+    assert!(writer.checkpoint().is_err());
+    drop(writer);
+    let sizes = cache.object_sizes([&kept, &lost]).unwrap();
+    assert_eq!(sizes.get(&kept), Some(&4));
+    assert!(!sizes.contains_key(&lost));
+}
+
+#[cfg(unix)]
+#[test]
 fn deleting_a_remote_ref_is_leased() {
     let sandbox = Sandbox::new();
     let origin = sandbox.init("origin.git");

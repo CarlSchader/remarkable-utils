@@ -1012,6 +1012,24 @@ impl CommitWriter<'_> {
         Ok((mark, oid))
     }
 
+    /// Make every object written so far durable: fast-import closes its
+    /// pack (`checkpoint`), so those objects stay in the repository even
+    /// if this writer is aborted or dropped later. Returns once
+    /// fast-import has done it. Fails on a writer that already failed.
+    pub fn checkpoint(&mut self) -> Result<()> {
+        self.write(b"checkpoint\nprogress rmu-checkpoint\n")?;
+        let stdin = self.stdin.as_mut().ok_or_else(|| closed("fast-import"))?;
+        let mut line = Vec::new();
+        match stdin
+            .flush()
+            .and_then(|()| self.stdout.read_until(b'\n', &mut line))
+        {
+            Ok(_) if line == b"progress rmu-checkpoint\n" => Ok(()),
+            Ok(_) => Err(self.broken(io::ErrorKind::UnexpectedEof.into())),
+            Err(error) => Err(self.broken(error)),
+        }
+    }
+
     /// [`Self::add_blob`] for content already in memory.
     pub fn add_bytes(
         &mut self,
