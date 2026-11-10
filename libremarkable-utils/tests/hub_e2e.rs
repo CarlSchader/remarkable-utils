@@ -3092,3 +3092,103 @@ fn set_url_checks_the_bases_again_under_the_lock() {
     assert_eq!(world.device(0).state().unwrap().origin, stored);
     world.check_idle(0);
 }
+
+// ---- half-applied documents edited before the next run ----------------------------
+
+/// A pull-only run (B renamed the notes, inked the diary, renamed the
+/// paper, added a notebook) crashed at every operation and apply move;
+/// before the next run A's user inks the notes and renames the diary.
+/// Both sides' changes must survive with no conflict copy: a base that
+/// is too new would revert B's rename of the notes (A's files still have
+/// the old name), one that is too old would fork.
+#[test]
+fn a_pull_only_run_crashed_then_edited() {
+    crashed_then_edited(false);
+}
+
+#[test]
+fn a_merge_run_crashed_then_edited() {
+    crashed_then_edited(true);
+}
+
+fn crashed_then_edited(own_change: bool) {
+    let (template, lib) = two_tablets();
+    if own_change {
+        template.rename(0, &lib.sketch, "Sketch (A)");
+    }
+    let page = template.pages(1, &lib.diary)[0].clone();
+    template.ink(1, &lib.diary, &page);
+    template.rename(1, &lib.notes, "Notes (B)");
+    template.rename(1, &lib.paper, "Paper (B)");
+    template.create(
+        1,
+        Kind::Notebook { pages: 1 },
+        "From B",
+        lib.folder.as_str(),
+    );
+    template.sync(1).unwrap();
+    let clean = template.duplicate();
+    let before = clean.tablet(0).ops().len();
+    let update = clean.sync(0).unwrap().update;
+    assert_eq!(update == MainUpdate::Pulled, !own_change, "{update:?}");
+    let ops = clean.tablet(0).ops()[before..].to_vec();
+    let faults = (1..=ops.len())
+        .map(|k| {
+            (
+                Fault::DisconnectAtOp(k),
+                format!("disconnect at op {k} ({:?})", ops[k - 1]),
+            )
+        })
+        .chain((0..14).map(|k| (Fault::KillApplyAfter(k), format!("apply killed after {k}"))));
+    let mut failures = Vec::new();
+    faults.for_each(|(fault, what)| {
+        let world = template.duplicate();
+        world.tablet(0).inject(fault);
+        let _ = world.sync(0);
+        let tablet = world.tablet(0);
+        tablet.reconnect();
+        if tablet.watchdog_armed().is_some() {
+            tablet.fire_watchdog();
+        }
+        let notes_page = world.pages(0, &lib.notes)[0].clone();
+        world.ink(0, &lib.notes, &notes_page);
+        world.rename(0, &lib.diary, "Diary (A)");
+        let next = world.sync(0);
+        if let Err(error) = &next {
+            if is_locked(error) {
+                world
+                    .sync_with(
+                        0,
+                        HubOptions {
+                            break_lock: true,
+                            ..world.options.clone()
+                        },
+                    )
+                    .unwrap_or_else(|e| panic!("{what}: {e}"));
+            } else {
+                panic!("{what}: {error}");
+            }
+        }
+        world.converge();
+        let name = |doc: &libremarkable_utils::hub::model::DocId| {
+            world.device(1).metadata(doc).unwrap()["visibleName"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let got = (name(&lib.notes), name(&lib.diary), name(&lib.paper));
+        let expected = (
+            "Notes (B)".to_string(),
+            "Diary (A)".to_string(),
+            "Paper (B)".to_string(),
+        );
+        if got != expected || !world.conflicts().is_empty() {
+            let reconciled = format!("{:?}", next.as_ref().ok().map(|r| r.reconciled.clone()));
+            failures.push(format!(
+                "{what}: {got:?}, conflicts {:?}, reconciled {reconciled}",
+                world.conflicts()
+            ));
+        }
+    });
+    assert!(failures.is_empty(), "{failures:#?}");
+}

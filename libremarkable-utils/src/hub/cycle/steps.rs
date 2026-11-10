@@ -627,7 +627,7 @@ impl Hub<'_> {
         let json = Overlay::read(read, store);
         let tablet = read.doc_files();
         let forks = message::forks(&message::trailers(&store.commit(&journal.merge)?.message));
-        let verdicts = plan::verdicts(&plan::Journaled {
+        let journaled = plan::Journaled {
             rules,
             merge: &merge_tree,
             snapshot: &snapshot_tree,
@@ -635,18 +635,15 @@ impl Hub<'_> {
             staged: &staged,
             forks: &forks,
             json: &json,
-        })?;
+        };
+        let verdicts = plan::verdicts(&journaled)?;
         // The step-14 tree checks, against the tablet as just read.
         let (finish, skipped) = plan::finish(&plan::Finish {
-            rules,
+            journaled: &journaled,
             verdicts: &verdicts,
-            merge: &merge_tree,
-            tablet: &tablet,
             local: &read.local_json(),
             current: &read.items(),
             merged: &tree_items(&merge_tree, &json)?,
-            forks: &forks,
-            json: &json,
         })?;
         let finished: Vec<DocId> = finish.iter().map(|planned| planned.doc.clone()).collect();
         if !finish.is_empty() {

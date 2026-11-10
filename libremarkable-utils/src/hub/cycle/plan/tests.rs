@@ -948,17 +948,23 @@ fn reconciliation_finishes_mixed_documents_the_live_tree_allows() {
         (doc(5), item("", false)),
     ]
     .into();
+    let snapshot = RepoTree::default();
     let run = |forks: &[(DocId, DocId)]| {
-        let (planned, skipped) = finish(&Finish {
+        let journaled = Journaled {
             rules: rules(),
-            verdicts: &verdicts,
             merge: &merge,
+            snapshot: &snapshot,
             tablet: &tablet,
+            staged: &[],
+            forks,
+            json: &blobs.0,
+        };
+        let (planned, skipped) = finish(&Finish {
+            journaled: &journaled,
+            verdicts: &verdicts,
             local: &BTreeMap::new(),
             current: &current,
             merged: &merged,
-            forks,
-            json: &blobs.0,
         })
         .unwrap();
         let planned: Vec<DocId> = planned.into_iter().map(|entry| entry.doc).collect();
@@ -970,4 +976,164 @@ fn reconciliation_finishes_mixed_documents_the_live_tree_allows() {
         run(&[(doc(1), doc(5))]),
         (Vec::new(), [doc(1), doc(2), doc(5)].into())
     );
+}
+
+/// The diary: the merge brings B's ink on page 1 and a new page 2 (so
+/// its `.content` changes too); the apply moved both pages, then died
+/// before `.content`; the user then renamed the diary (a `.metadata` the
+/// merge leaves alone).
+struct HalfApplied {
+    blobs: Blobs,
+    merge: DocVersion,
+    snapshot: DocVersion,
+    tablet: BTreeMap<DocFile, Oid>,
+    pending: BTreeSet<String>,
+}
+
+fn half_applied() -> HalfApplied {
+    let mut blobs = Blobs::default();
+    let snapshot = notebook(&mut blobs, "Diary", "", &[(1, 10)]);
+    let merge = notebook(&mut blobs, "Diary", "", &[(1, 11), (2, 20)]);
+    let renamed = blobs.json(metadata("Diary (A)", "", "DocumentType"));
+    let tablet: BTreeMap<DocFile, Oid> = [
+        (DocFile::Metadata, renamed),
+        (
+            DocFile::Content,
+            snapshot.files[&DocFile::Content].id.clone(),
+        ),
+        (page(1), oid(11)),
+        (page(2), oid(20)),
+    ]
+    .into();
+    let pending = [DocFile::Content.xochitl_path(&doc(1))].into();
+    HalfApplied {
+        blobs,
+        merge,
+        snapshot,
+        tablet,
+        pending,
+    }
+}
+
+impl HalfApplied {
+    fn target(&self) -> Option<DocVersion> {
+        partial_target(
+            rules(),
+            &doc(1),
+            Some(&self.merge),
+            Some(&self.snapshot),
+            &self.tablet,
+            &self.pending,
+            &self.blobs.0,
+        )
+        .unwrap()
+    }
+}
+
+#[test]
+fn a_half_applied_document_the_user_changed_is_finished_file_by_file() {
+    let case = half_applied();
+    let target = case.target().expect("finishable");
+    // The pending `.content` from the merge, the user's `.metadata`, the
+    // pages as the apply wrote them.
+    assert_eq!(
+        target.files[&DocFile::Content],
+        case.merge.files[&DocFile::Content]
+    );
+    assert_eq!(
+        target.files[&DocFile::Metadata].id,
+        case.tablet[&DocFile::Metadata]
+    );
+    assert_eq!(target.files[&page(1)].id, oid(11));
+    assert_eq!(target.files[&page(2)].id, oid(20));
+    // The user inked page 1 after the apply wrote it: on top, kept.
+    let mut inked = half_applied();
+    inked.tablet.insert(page(1), oid(12));
+    assert_eq!(inked.target().unwrap().files[&page(1)].id, oid(12));
+}
+
+#[test]
+fn only_a_started_unconflicted_apply_is_finished_file_by_file() {
+    // Nothing written yet: the snapshot base merges the user's rename.
+    let mut untouched = half_applied();
+    untouched.tablet.insert(page(1), oid(10));
+    untouched.tablet.remove(&page(2));
+    untouched
+        .pending
+        .extend([page(1).xochitl_path(&doc(1)), page(2).xochitl_path(&doc(1))]);
+    assert!(untouched.target().is_none());
+    // The user changed a file whose write is still pending: a conflict.
+    let mut conflict = half_applied();
+    let edited = conflict.blobs.json(content(&["p1", "p9"]));
+    conflict.tablet.insert(DocFile::Content, edited);
+    assert!(conflict.target().is_none());
+    // Moved (no longer staged), then changed by the user: on top.
+    let mut moved = half_applied();
+    moved.pending.clear();
+    let edited = moved.blobs.json(content(&["p1", "p9"]));
+    moved.tablet.insert(DocFile::Content, edited);
+    assert!(moved.target().is_none(), "nothing left pending");
+    // Nothing pending: `apply_finished` covers it.
+    let mut done = half_applied();
+    done.tablet.insert(
+        DocFile::Content,
+        done.merge.files[&DocFile::Content].id.clone(),
+    );
+    assert!(done.target().is_none());
+}
+
+#[test]
+fn reconciliation_judges_and_finishes_a_partly_applied_edited_document() {
+    let case = half_applied();
+    let merge = RepoTree {
+        docs: [(doc(1), case.merge.clone())].into(),
+        extra: Default::default(),
+    };
+    let snapshot = RepoTree {
+        docs: [(doc(1), case.snapshot.clone())].into(),
+        extra: Default::default(),
+    };
+    let tablet = [(doc(1), case.tablet.clone())].into();
+    let staged = [StagedRun {
+        planned: [doc(1)].into(),
+        pending: case.pending.clone(),
+    }];
+    let journaled = Journaled {
+        rules: rules(),
+        merge: &merge,
+        snapshot: &snapshot,
+        tablet: &tablet,
+        staged: &staged,
+        forks: &[],
+        json: &case.blobs.0,
+    };
+    let judged = verdicts(&journaled).unwrap();
+    assert_eq!(judged[&doc(1)], Verdict::Partial);
+    let (planned, skipped) = finish(&Finish {
+        journaled: &journaled,
+        verdicts: &judged,
+        local: &BTreeMap::new(),
+        current: &[(doc(1), item("", false))].into(),
+        merged: &[(doc(1), item("", false))].into(),
+    })
+    .unwrap();
+    assert!(skipped.is_empty());
+    let [entry] = planned.as_slice() else {
+        panic!("{planned:?}")
+    };
+    let Change::Write { writes, removes } = &entry.change else {
+        panic!("{entry:?}")
+    };
+    // Only the pending file: never the user's `.metadata`.
+    assert_eq!(
+        writes.iter().map(|write| &write.file).collect::<Vec<_>>(),
+        vec![&DocFile::Content]
+    );
+    assert!(removes.is_empty());
+    // Without the staging evidence, no run planned it: left as it is.
+    let journaled = Journaled {
+        staged: &[],
+        ..journaled
+    };
+    assert_eq!(verdicts(&journaled).unwrap()[&doc(1)], Verdict::Other);
 }
