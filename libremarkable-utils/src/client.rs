@@ -1091,13 +1091,11 @@ impl Client {
     /// data dir in one guarded round trip (see [`create_files_script`]).
     fn create_files(&self, files: &[(String, String)], dirs: &[String]) -> Result<()> {
         self.write(|guard| {
-            let output = self
-                .session
-                .run_script(&create_files_script(&self.dir, files, dirs, guard))?;
-            if !output.status.success() {
-                return Err(crate::ssh::failure(&output));
-            }
-            Ok(())
+            crate::ssh::checked(
+                self.session
+                    .run_script(&create_files_script(&self.dir, files, dirs, guard))?,
+            )
+            .map(drop)
         })
     }
 
