@@ -857,14 +857,18 @@ pub fn commit_repo_config(git: &Git, origin: &str, bytes: &[u8]) -> Oid {
     commit
 }
 
-/// Run the git CLI hermetically (what a user does by hand); it must
-/// succeed.
-pub fn git_cli(root: &Path, args: &[&str]) {
+/// Run the git CLI hermetically (what a user does by hand, with a
+/// fabricated identity); it must succeed. Its output, trimmed.
+pub fn git_cli(root: &Path, args: &[&str]) -> String {
     let output = std::process::Command::new("git")
         .args(args)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("HOME", root.join("home"))
+        .env("GIT_AUTHOR_NAME", "Admin")
+        .env("GIT_AUTHOR_EMAIL", "admin@example.invalid")
+        .env("GIT_COMMITTER_NAME", "Admin")
+        .env("GIT_COMMITTER_EMAIL", "admin@example.invalid")
         .output()
         .unwrap();
     assert!(
@@ -872,6 +876,7 @@ pub fn git_cli(root: &Path, args: &[&str]) {
         "git {args:?}: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
 /// Append `rounds` updates to origin's `main` in one `fast-import`

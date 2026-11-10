@@ -3192,3 +3192,71 @@ fn crashed_then_edited(own_change: bool) {
     });
     assert!(failures.is_empty(), "{failures:#?}");
 }
+
+// ---- small gaps -------------------------------------------------------------------------
+
+/// A's own version of the notes exists only in its merged snapshot (its
+/// ink merged with B's rename, the merge's second parent): its apply is
+/// killed, its state lost, and B inks on top. Inference over every
+/// ancestor of `main` finds that snapshot; over first parents only it
+/// would find nothing and fork.
+#[test]
+fn reattach_matches_a_version_only_in_a_merged_snapshot() {
+    let (world, notes, _) = two_notebooks();
+    let page = world.pages(0, &notes)[0].clone();
+    world.ink(0, &notes, &page);
+    world.rename(1, &notes, "Notes (B)");
+    world.sync(1).unwrap();
+    world.tablet(0).inject(Fault::KillApplyAfter(0));
+    assert!(world.sync(0).is_err());
+    let snapshot = world.device(0).state().unwrap().journal.unwrap().snapshot;
+    world.tablet(0).reconnect();
+    world.tablet(0).fire_watchdog();
+    std::fs::remove_dir_all(world.device(0).tablet.state_dir()).unwrap();
+    world.sync(1).unwrap();
+    world.ink(1, &notes, &page);
+    world.sync(1).unwrap();
+    let report = world.reattach(0).unwrap();
+    assert_eq!(report.inferred.get(&notes), Some(&snapshot), "{report:?}");
+    assert!(report.forks.is_empty(), "{report:?}");
+    world.converge();
+    assert!(world.conflicts().is_empty());
+}
+
+/// A fork recorded by two commits on `main` (its trailer repeated) is one
+/// open conflict copy.
+#[test]
+fn an_open_conflict_recorded_twice_is_listed_once() {
+    let (world, lib) = same_page_conflict();
+    let report = world.sync(1).unwrap();
+    let fork = report.forks[0].clone();
+    world.converge();
+    let git_dir = format!("--git-dir={}", world.origin);
+    let main = world::git_cli(&world.root, &[&git_dir, "rev-parse", "refs/heads/main"]);
+    let again = world::git_cli(
+        &world.root,
+        &[
+            &git_dir,
+            "commit-tree",
+            &format!("{main}^{{tree}}"),
+            "-p",
+            &main,
+            "-m",
+            &format!("re-recorded\n\nRmu-Fork: {} {}", lib.notes, fork.copy),
+        ],
+    );
+    world::git_cli(
+        &world.root,
+        &[&git_dir, "update-ref", "refs/heads/main", &again],
+    );
+    let status = world.status(1).unwrap();
+    assert_eq!(
+        status
+            .open_conflicts
+            .iter()
+            .map(|conflict| &conflict.copy)
+            .collect::<Vec<_>>(),
+        vec![&fork.copy],
+        "{status:?}"
+    );
+}
