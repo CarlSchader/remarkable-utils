@@ -1,11 +1,11 @@
 //! `remote` and `detach`: the tablet's attachment, without a sync. Both
 //! leave xochitl running and never touch documents.
 
+use super::origin::OriginCtx;
 use super::steps::device_ref;
 use super::store;
 use super::{
-    CycleError, DetachOptions, DetachReport, Hub, OriginCtx, RemoteReport, SetUrlReport, Warning,
-    check_url,
+    CycleError, DetachOptions, DetachReport, Hub, RemoteReport, SetUrlReport, Warning, check_url,
 };
 use crate::error::Result;
 use crate::hub::device::Tablet;

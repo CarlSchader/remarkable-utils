@@ -1,0 +1,170 @@
+//! The tablet side of one run: the lock, the watchdog, stopping and
+//! starting xochitl, and the error path that brings it back.
+
+use std::time::Duration;
+
+use super::origin::OriginCtx;
+use super::{Hub, TakeOver, Warning};
+use crate::error::{Error, Result};
+use crate::hub::device::{DeviceError, HeldLock, LockRequest, Tablet};
+use crate::hub::model::TabletState;
+
+/// The tablet side of one run: the lock, whether xochitl may be stopped,
+/// and the error path that brings it back.
+pub(super) struct Session<'t> {
+    pub(super) tablet: &'t dyn Tablet,
+    watchdog: Duration,
+    lock: Option<HeldLock>,
+    /// Set before a stop is attempted (its reply may be lost), cleared by
+    /// a start that succeeded.
+    pub(super) maybe_stopped: bool,
+}
+
+impl<'t> Session<'t> {
+    fn new(tablet: &'t dyn Tablet, watchdog: Duration) -> Self {
+        Self {
+            tablet,
+            watchdog,
+            lock: None,
+            maybe_stopped: false,
+        }
+    }
+
+    /// Take the lock, retrying once with the same request after a
+    /// failure that may have been a lost acknowledgement (the retry then
+    /// adopts the lock).
+    pub(super) fn acquire(
+        &mut self,
+        request: &LockRequest,
+        break_lock: bool,
+    ) -> Result<Option<TakeOver>> {
+        let lock = match self.tablet.acquire_lock(request, break_lock) {
+            Err(error) if is_transport(&error) => self.tablet.acquire_lock(request, break_lock)?,
+            other => other?,
+        };
+        let took_over = lock.took_over().map(|(owner, reason)| TakeOver {
+            previous: owner.cloned(),
+            reason,
+        });
+        self.lock = Some(lock);
+        Ok(took_over)
+    }
+
+    pub(super) fn lock(&self) -> &HeldLock {
+        self.lock.as_ref().expect("the lock is taken first")
+    }
+
+    /// Arm (or re-arm) the watchdog.
+    pub(super) fn arm(&self) -> Result<()> {
+        self.tablet.arm_watchdog(self.lock(), self.watchdog)
+    }
+
+    pub(super) fn stop(&mut self) -> Result<()> {
+        self.arm()?;
+        self.maybe_stopped = true;
+        self.tablet.stop_xochitl(self.lock())
+    }
+
+    /// Start xochitl; the device time just before the start.
+    pub(super) fn start(&mut self) -> Result<i64> {
+        let time = self.tablet.start_xochitl(self.lock())?;
+        self.maybe_stopped = false;
+        Ok(time)
+    }
+
+    pub(super) fn write_state(&self, state: &TabletState) -> Result<()> {
+        self.tablet.write_state(self.lock(), state)
+    }
+
+    /// Step 16 after success: disarm and release. Failures here leave
+    /// nothing unsafe (a pending watchdog only restarts a running
+    /// xochitl; a left lock goes stale when it fires), so they are
+    /// warnings.
+    fn finish(&mut self) -> Vec<Warning> {
+        let Some(lock) = self.lock.take() else {
+            return Vec::new();
+        };
+        let disarm = self.tablet.disarm_watchdog(&lock).err();
+        let release = self.tablet.release_lock(&lock).err();
+        [
+            disarm.map(|e| Warning::DisarmFailed {
+                error: e.to_string(),
+            }),
+            release.map(|e| Warning::ReleaseFailed {
+                error: e.to_string(),
+            }),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+
+    /// The error path: bring xochitl back if this run may have stopped
+    /// it, disarm only once it runs, release the lock. Everything is best
+    /// effort; with the connection gone the watchdog brings xochitl back.
+    fn abort(&mut self) {
+        let Some(lock) = self.lock.take() else {
+            return;
+        };
+        let running = !self.maybe_stopped || self.tablet.start_xochitl(&lock).is_ok();
+        if running {
+            let _ = self.tablet.disarm_watchdog(&lock);
+        }
+        let _ = self.tablet.release_lock(&lock);
+    }
+}
+
+fn is_transport(error: &Error) -> bool {
+    !matches!(
+        error,
+        Error::HubDevice(
+            DeviceError::Locked(_)
+                | DeviceError::LockContended
+                | DeviceError::Busy
+                | DeviceError::InvalidRequest(_)
+        )
+    )
+}
+
+impl<'a> Hub<'a> {
+    /// Run `body` on a tablet session: on error, the error path; on
+    /// success, disarm and release, then (if `body` hands its origin back,
+    /// whose cache `flock` is still held) `git maintenance run --auto` on
+    /// the cache, with the tablet free again. Warnings returned.
+    pub(super) fn session<T>(
+        &self,
+        tablet: &dyn Tablet,
+        body: impl FnOnce(&mut Session) -> Result<(T, Option<OriginCtx>)>,
+    ) -> Result<(T, Vec<Warning>)> {
+        let mut session = Session::new(tablet, self.options.watchdog);
+        let result = match body(&mut session) {
+            Ok((value, origin)) => {
+                let mut warnings = session.finish();
+                if let Some(origin) = origin {
+                    warnings.extend(self.maintain(&origin));
+                }
+                Ok((value, warnings))
+            }
+            Err(error) => {
+                session.abort();
+                Err(error)
+            }
+        };
+        self.progress.finished();
+        result
+    }
+
+    /// `git maintenance run --auto` on the cache (the user's thresholds
+    /// decide whether anything happens); a failure is only a warning.
+    fn maintain(&self, origin: &OriginCtx) -> Option<Warning> {
+        self.progress.step("Maintaining the local cache");
+        origin
+            .cache
+            .repo
+            .maintenance_auto()
+            .err()
+            .map(|error| Warning::MaintenanceFailed {
+                error: error.to_string(),
+            })
+    }
+}
