@@ -46,6 +46,7 @@
 //! prints: progress goes to a [`Progress`], results come back as reports.
 
 mod admin;
+mod history;
 mod inspect;
 mod message;
 mod plan;
@@ -764,7 +765,7 @@ impl OriginCtx {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .try_for_each(|base| {
-                if self.store.has_commit(base)? && self.cache.repo.is_ancestor(base, &self.main)? {
+                if self.store.is_ancestor(base, &self.main)? {
                     Ok(())
                 } else {
                     Err(CycleError::OriginRewound { base: base.clone() }.into())
