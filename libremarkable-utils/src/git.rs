@@ -908,10 +908,19 @@ pub struct ObjectReader<'a> {
 /// A whole object as [`CatFile::read`] returns it.
 pub type RawObject = (ObjectKind, Vec<u8>);
 
-/// Requests [`CatFile::read_many`] sends before reading answers: at most
-/// about 8 KiB of ids, below any pipe's buffer, so sending never waits for
-/// git while git waits for its answers to be read.
-const READ_MANY_CHUNK: usize = 128;
+/// Bytes of requests [`CatFile::read_many`] sends before reading answers:
+/// half of a one-page (4 KiB) pipe, the smallest a kernel gives (Linux
+/// when a user is over its pipe-page allowance, BSDs under memory
+/// pressure). The whole chunk fits in git's stdin pipe even if git has
+/// read none of it, so the write completes before git answers anything,
+/// and git, blocked writing answers, never waits on us still writing.
+const READ_MANY_REQUEST_BYTES: usize = 2048;
+
+/// Ids per [`CatFile::read_many`] chunk for request lines of `line`
+/// bytes (id and newline): 49 SHA-1 or 31 SHA-256 ids.
+fn read_many_chunk(line: usize) -> usize {
+    (READ_MANY_REQUEST_BYTES / line.max(1)).max(1)
+}
 
 impl CatFile {
     /// Look up `oid`; `None` if the repository does not have it.
@@ -929,8 +938,8 @@ impl CatFile {
     /// order, with the requests pipelined (in chunks small enough for any
     /// pipe buffer): a round trip per chunk, not per object.
     pub fn read_many(&mut self, oids: &[Oid]) -> Result<Vec<Option<RawObject>>> {
-        self.skip_pending()?;
-        oids.chunks(READ_MANY_CHUNK).try_fold(
+        let line = oids.iter().map(|oid| oid.as_str().len() + 1).max();
+        oids.chunks(read_many_chunk(line.unwrap_or(1))).try_fold(
             Vec::with_capacity(oids.len()),
             |mut objects, chunk| {
                 self.send(
@@ -940,6 +949,11 @@ impl CatFile {
                         .collect::<String>(),
                 )?;
                 chunk.iter().try_for_each(|oid| {
+                    // Before each answer, the rest of the previous object
+                    // (one half-read before this call included): the
+                    // answers follow it on stdout. Sending first is safe:
+                    // the chunk fits in the stdin pipe even while git is
+                    // blocked writing that rest.
                     self.skip_pending()?;
                     let object = self
                         .header(oid)?
@@ -2670,6 +2684,17 @@ mod tests {
         });
         // A SHA-1 tree read as SHA-256 runs out of id bytes.
         assert!(parse_tree(&entry("100644", b"f", A), ObjectFormat::Sha256).is_err());
+    }
+
+    #[test]
+    fn read_many_chunks_fit_in_half_a_page() {
+        assert_eq!(read_many_chunk(41), 49);
+        assert_eq!(read_many_chunk(65), 31);
+        [41, 65, 1, 5000].into_iter().for_each(|line| {
+            let chunk = read_many_chunk(line);
+            assert!(chunk >= 1 && (chunk == 1 || chunk * line <= 2048), "{line}");
+        });
+        assert_eq!(read_many_chunk(0), 2048);
     }
 
     #[test]

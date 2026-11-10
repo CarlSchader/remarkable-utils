@@ -1481,11 +1481,20 @@ fn refs_deleted_counted_and_borrowed_objects_repacked_in() {
 /// `read_many` answers exactly as `read` does for each id, in order:
 /// present and missing objects, repeats, several kinds, more ids than one
 /// pipelined chunk holds, a large blob, and a half-read object before it;
-/// the process stays usable afterwards.
+/// the process stays usable afterwards. In both object formats.
 #[test]
 fn cat_file_read_many_matches_read() {
+    [ObjectFormat::Sha1, ObjectFormat::Sha256]
+        .into_iter()
+        .for_each(read_many_matches_read);
+}
+
+fn read_many_matches_read(format: ObjectFormat) {
     let sandbox = Sandbox::new();
-    let cache = sandbox.init("cache.git");
+    let cache = sandbox
+        .git()
+        .init_bare(&sandbox.path("cache.git"), format)
+        .unwrap();
     let mut writer = cache.commit_writer(&NoProgress, None).unwrap();
     let blobs: Vec<Oid> = (0..300)
         .map(|n| {
@@ -1510,7 +1519,7 @@ fn cat_file_read_many_matches_read() {
         .filter(|entry| entry.kind == ObjectKind::Tree)
         .map(|entry| entry.oid)
         .collect();
-    let missing: Oid = "0".repeat(40).parse().unwrap();
+    let missing: Oid = "0".repeat(commit.as_str().len()).parse().unwrap();
     let oids: Vec<Oid> = blobs
         .iter()
         .chain(&trees)
