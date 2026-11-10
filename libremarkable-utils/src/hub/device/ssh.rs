@@ -787,6 +787,20 @@ mod tests {
         let incomplete = |result: Result<ApplyReport>, docs: usize| matches!(result, Err(Error::HubDevice(DeviceError::ApplyIncomplete { applied, .. })) if applied.len() == docs);
         // One stat line short of the files written.
         assert!(incomplete(apply_report(&output(0, &complete, ""), 2), 1));
+        // The tablet stopped answering part-way: the reason says so.
+        let asleep = apply_report(
+            &output(
+                255,
+                &format!("rmu-done {DOC}\n"),
+                "Timeout, server tablet not responding.",
+            ),
+            1,
+        );
+        assert!(
+            matches!(&asleep, Err(Error::HubDevice(DeviceError::ApplyIncomplete { applied, reason }))
+                if applied.len() == 1 && reason.contains("did not answer")),
+            "{asleep:?}"
+        );
         // No completion line, a failed exit, unparsable output.
         assert!(incomplete(
             apply_report(&output(0, &format!("rmu-done {DOC}\n"), ""), 0),

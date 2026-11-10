@@ -2950,9 +2950,15 @@ pub fn execute(
                             .strip_prefix(&format!("{from_dir}/"))
                             .expect("filtered on prefix");
                         let new_key = join_rel(to_dir, sub);
-                        if let Ok((size, mtime)) = fs_side.stat(&new_key) {
-                            entry.local_size = size;
-                            entry.local_mtime_ms = mtime;
+                        match fs_side.stat(&new_key) {
+                            Ok((size, mtime)) => {
+                                entry.local_size = size;
+                                entry.local_mtime_ms = mtime;
+                            }
+                            // Each further entry would wait for another
+                            // timeout.
+                            Err(error @ Error::Unreachable(_)) => return Err(error),
+                            Err(_) => {}
                         }
                         state.entries.insert(new_key, entry);
                         Ok(())
