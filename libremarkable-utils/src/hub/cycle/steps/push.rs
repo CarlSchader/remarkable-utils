@@ -181,8 +181,7 @@ impl Hub<'_> {
         p.origin.check(&p.state)?;
         self.progress.step("Merging");
         let run = self.run_merge(&p.origin, &p.state, base_tree, snapshot, &p.read)?;
-        let outcome = run.outcome;
-        let names = run.names;
+        let (outcome, names, summary) = (run.outcome, run.names, run.summary);
         if outcome.guard.blocked() {
             return Err(CycleError::DeletionsNeedConsent {
                 from_origin: outcome.guard.from_origin.iter().cloned().collect(),
@@ -205,6 +204,7 @@ impl Hub<'_> {
                 base: main,
                 merged: run.theirs,
                 outcome,
+                summary,
                 attempts: attempt,
                 names,
             }));
@@ -225,6 +225,7 @@ impl Hub<'_> {
                 base: main,
                 merged: run.theirs,
                 outcome,
+                summary,
                 attempts: attempt,
                 names,
             }));
@@ -275,6 +276,7 @@ impl Hub<'_> {
             base: commit.clone(),
             merged,
             outcome,
+            summary,
             attempts: attempt,
             names,
         };

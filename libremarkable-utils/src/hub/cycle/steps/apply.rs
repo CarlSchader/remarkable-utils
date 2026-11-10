@@ -411,7 +411,7 @@ impl Hub<'_> {
             read: read_summary(&p.read),
             notes: pushed.outcome.notes.clone(),
             forks: pushed.outcome.forks.clone(),
-            summary: pushed.outcome.summary(),
+            summary: pushed.summary,
             deletions: pushed.outcome.guard.clone(),
             names: pushed.names,
             reconciled: p.reconciled.take(),

@@ -468,6 +468,50 @@ fn changed_on_one_side_takes_that_side() {
 }
 
 #[test]
+fn view_state_alone_can_be_reported_as_unchanged() {
+    let mut lib = Lib::default();
+    let base = D::notebook("Notes", "", 2, "base");
+    let other = D::notebook("Other", "", 1, "other");
+    let read = base.clone().scroll(5);
+    // Decided by blob ids, without reading: a change on one side, or the
+    // same bytes on both. The caller judges them as view state only.
+    [
+        (&read, &base, Resolution::Changed(Side::Ours)),
+        (&base, &read, Resolution::Changed(Side::Theirs)),
+        (&read, &read, Resolution::Identical),
+    ]
+    .into_iter()
+    .for_each(|(ours, theirs, decided)| {
+        let renamed = other.clone().rename("Renamed");
+        let (b, o, t) = three(
+            &mut lib,
+            &[(1, &base), (2, &other)],
+            &[(1, ours), (2, &renamed)],
+            &[(1, theirs), (2, &other)],
+        );
+        let outcome = run(&lib, &b, &o, &t);
+        assert_eq!(outcome.resolutions[&u(1)], decided);
+        assert_eq!(outcome.summary().unchanged, 0);
+        let summary = outcome.summary_with(|doc| Ok(*doc == u(1))).unwrap();
+        assert_eq!(
+            summary,
+            Summary {
+                unchanged: 1,
+                changed_ours: 1,
+                ..Summary::default()
+            }
+        );
+    });
+    // Other resolutions are never asked about.
+    let (b, o, t) = three(&mut lib, &[], &[(1, &base)], &[]);
+    let outcome = run(&lib, &b, &o, &t);
+    let summary = outcome
+        .summary_with(|_| panic!("asked about an added document"))
+        .unwrap();
+    assert_eq!(summary.added, 1);
+}
+
+#[test]
 fn identical_change_is_taken_once() {
     let mut lib = Lib::default();
     let base = D::notebook("Notes", "", 1, "base");
