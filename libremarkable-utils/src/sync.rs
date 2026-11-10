@@ -20,6 +20,7 @@ use crate::client::Client;
 use crate::error::{Error, Result};
 use crate::progress::Progress;
 use crate::ssh::{SshSession, shell_quote};
+use crate::xdg;
 use crate::xochitl::{self, Item};
 
 #[cfg(all(test, unix))]
@@ -3529,11 +3530,14 @@ pub fn listing_cache_path(destination: &str, xochitl_dir: &str) -> PathBuf {
 /// The rmu state directory: `$XDG_STATE_HOME/rmu` (or
 /// `~/.local/state/rmu`).
 fn state_dir() -> PathBuf {
-    let base = std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
-        .unwrap_or_else(|| PathBuf::from("."));
-    base.join("rmu")
+    // Empty variables count as set here (unlike the hub's cache dir).
+    xdg::base_dir(
+        std::env::var_os("XDG_STATE_HOME"),
+        std::env::var_os("HOME"),
+        ".local/state",
+    )
+    .unwrap_or_else(|| PathBuf::from("."))
+    .join("rmu")
 }
 
 /// Order-independent stable hash of an endpoint pair.

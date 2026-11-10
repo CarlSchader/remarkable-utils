@@ -158,15 +158,15 @@ This repository is **open source** (dual-licensed MIT OR Apache-2.0):
   the typed `Warning`; `cycle.rs` itself keeps only the errors, options,
   `Hub` and helpers its submodules share): the tablet session (lock,
   watchdog, error path: `cycle/session.rs`), what a run knows about
-  origin (`cycle/origin.rs`), `init` (`cycle/init.rs`), the local cache (`cycle/store.rs`: a
-  bare repository per repo id under `$XDG_CACHE_HOME/rmu/hub`, an
-  `flock`, raw commits and trees read through one `cat-file`, bounded
-  caches; never a tree read per commit of history: searches go through
-  the **pure** history index, `cycle/history.rs`, built from one
-  `rev-list` and one `diff-tree` stream), reading
-  the tablet into `fast-import` (`cycle/snapshot.rs`), the **pure**
-  decisions (`cycle/plan.rs`: version equivalence, the apply plan,
-  verification, step-14 moved paths, tree and trash checks,
+  origin (`cycle/origin.rs`), `init` (`cycle/init.rs`), the local
+  cache (`cycle/store.rs`: a bare repository per repo id under
+  `$XDG_CACHE_HOME/rmu/hub`, an `flock`, raw commits and trees read
+  through one `cat-file`, bounded caches; never a tree read per commit
+  of history: searches go through the **pure** history index,
+  `cycle/history.rs`, built from one `rev-list` and one `diff-tree`
+  stream), reading the tablet into `fast-import` (`cycle/snapshot.rs`),
+  the **pure** decisions (`cycle/plan.rs`: version equivalence, the
+  apply plan, verification, step-14 moved paths, tree and trash checks,
   reconciliation verdicts and finish, the manifest; new decisions go
   there, with tests), commit trailers (`cycle/message.rs`), the steps
   (`cycle/steps.rs`: `sync`, `backup`, steps 1–6; its submodules
@@ -182,8 +182,9 @@ This repository is **open source** (dual-licensed MIT OR Apache-2.0):
   first-parent chain with each commit's document changes), and
   `cycle/restore.rs`/`cycle/add.rs` with their pure naming, placement
   and `.content` rules (deterministic UUIDv5 page ids for added PDFs;
-  never change them, or every added document forks). Base inference uses the merge's own "unchanged"
-  predicate (`merge::unchanged`); keep the two from drifting. `tests/hub_e2e.rs` (harness in
+  never change them, or every added document forks). Base inference
+  uses the merge's own "unchanged" predicate (`merge::unchanged`);
+  keep the two from drifting. `tests/hub_e2e.rs` (harness in
   `tests/hub_e2e/world.rs`) runs fake tablets against a bare origin,
   ending every scenario that syncs to the end with one oracle
   (`World::check`: the tablets equal origin, no ink lost, xochitl up, no
@@ -205,6 +206,15 @@ This repository is **open source** (dual-licensed MIT OR Apache-2.0):
   marker-sectioned SSH round trip, pure best-effort parsing (every
   field `Option`al — firmware/models differ), pure rendering.
 - `error.rs` — typed errors (`thiserror`).
+- `marked.rs` — marker-sectioned script output (one round trip, several
+  answers): the random marker, the splitter (listings, `rmu status`)
+  and the single-section reader (the hub probe). Use it for new
+  batched scripts rather than another parser.
+- `xochitl_service.rs` — the systemctl commands for the xochitl unit,
+  shared by `Client::restart_xochitl` and the hub (reset-failed first,
+  always; see below).
+- `xdg.rs` — XDG base-dir lookup for rmu's files on this computer (the
+  hub's cache, sync's state).
 - `relative_path.rs` — the pure safe relative-path splitter shared by
   `sync.rs` and `hub/model.rs`.
 

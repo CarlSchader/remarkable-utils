@@ -82,6 +82,7 @@ use crate::hub::model::{
     XochitlPath,
 };
 use crate::progress::Progress;
+use crate::xdg;
 
 pub use self::report::{
     AddReport, BackupReport, CommitDevice, CommitKind, DetachReport, DocChange, DocEvent,
@@ -319,15 +320,12 @@ impl Default for HubOptions {
 /// `$XDG_CACHE_HOME/rmu/hub` (or `~/.cache/rmu/hub`): where local caches
 /// live by default.
 pub fn default_cache_dir() -> Option<PathBuf> {
-    std::env::var_os("XDG_CACHE_HOME")
-        .filter(|dir| !dir.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .filter(|dir| !dir.is_empty())
-                .map(|home| PathBuf::from(home).join(".cache"))
-        })
-        .map(|dir| dir.join("rmu").join("hub"))
+    xdg::base_dir(
+        xdg::non_empty_var("XDG_CACHE_HOME"),
+        xdg::non_empty_var("HOME"),
+        ".cache",
+    )
+    .map(|dir| dir.join("rmu").join("hub"))
 }
 
 /// The hub operations, for one computer (its git, its cache directory)

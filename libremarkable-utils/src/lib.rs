@@ -38,13 +38,16 @@ pub mod client;
 pub mod error;
 pub mod git;
 pub mod hub;
+mod marked;
 pub mod pdf;
 pub mod progress;
 mod relative_path;
 pub mod ssh;
 pub mod status;
 pub mod sync;
+mod xdg;
 pub mod xochitl;
+mod xochitl_service;
 
 pub use client::Client;
 pub use error::{Error, Result};
