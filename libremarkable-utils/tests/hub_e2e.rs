@@ -3447,3 +3447,33 @@ fn an_open_conflict_recorded_twice_is_listed_once() {
         "{status:?}"
     );
 }
+
+/// B inks both pages of the diary and adds one; A's apply stops after
+/// every move; A's user then inks the diary's second page. Where that
+/// page's write was still pending, keeping the user's page with base =
+/// merge would drop B's ink on it: it must fork instead.
+#[test]
+fn a_pending_page_the_user_inked_is_never_kept_over_the_merge() {
+    let (template, lib) = two_tablets();
+    template
+        .pages(1, &lib.diary)
+        .iter()
+        .for_each(|page| template.ink(1, &lib.diary, page));
+    template.insert_page(1, &lib.diary);
+    template.sync(1).unwrap();
+    (0..14).for_each(|k| {
+        let world = template.duplicate();
+        world.tablet(0).inject(Fault::KillApplyAfter(k));
+        let _ = world.sync(0);
+        world.tablet(0).reconnect();
+        if world.tablet(0).watchdog_armed().is_some() {
+            world.tablet(0).fire_watchdog();
+        }
+        let page = world.pages(0, &lib.diary)[1].clone();
+        world.ink(0, &lib.diary, &page);
+        world
+            .sync(0)
+            .unwrap_or_else(|e| panic!("apply killed after {k}: {e}"));
+        world.converge();
+    });
+}

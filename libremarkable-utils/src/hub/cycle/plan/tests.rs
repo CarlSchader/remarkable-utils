@@ -1245,3 +1245,39 @@ fn a_partial_finish_the_live_tree_refuses_is_kept() {
     assert!(planned.is_empty(), "{planned:?}");
     assert_eq!(skipped, [doc(1)].into());
 }
+/// The merge brings B's ink on pages 1-3; the apply wrote page 1 and
+/// died; pages 2 and 3 are still staged. The user then inked page 2.
+/// Keeping the user's page 2 with base = merge would drop B's ink on it.
+#[test]
+fn a_user_change_to_a_pending_file_is_never_kept_while_another_is_pending() {
+    let mut blobs = Blobs::default();
+    let snapshot = notebook(&mut blobs, "Diary", "", &[(1, 10), (2, 20), (3, 30)]);
+    let merge = notebook(&mut blobs, "Diary", "", &[(1, 11), (2, 21), (3, 31)]);
+    let tablet: BTreeMap<DocFile, Oid> = [
+        (
+            DocFile::Metadata,
+            snapshot.files[&DocFile::Metadata].id.clone(),
+        ),
+        (
+            DocFile::Content,
+            snapshot.files[&DocFile::Content].id.clone(),
+        ),
+        (page(1), oid(11)),
+        (page(2), oid(22)),
+        (page(3), oid(30)),
+    ]
+    .into();
+    let pending: BTreeSet<String> =
+        [page(2).xochitl_path(&doc(1)), page(3).xochitl_path(&doc(1))].into();
+    let target = partial_target(
+        rules(),
+        &doc(1),
+        Some(&merge),
+        Some(&snapshot),
+        &tablet,
+        &pending,
+        &blobs.0,
+    )
+    .unwrap();
+    assert!(target.is_none(), "{target:?}");
+}
