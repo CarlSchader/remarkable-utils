@@ -13,6 +13,14 @@ pub enum Error {
     #[error("remote command exited with status {status}: {stderr}")]
     Remote { status: i32, stderr: String },
 
+    /// ssh gave up on the tablet: it did not answer in time (asleep, off
+    /// the network) or stopped answering mid-command. Carries ssh's message.
+    #[error(
+        "the tablet did not answer ({0}); is it asleep or off the network? \
+         Wake it, keep it awake until rmu is done, and try again"
+    )]
+    Unreachable(String),
+
     /// Local I/O failure (spawning ssh, reading/writing local files).
     #[error(transparent)]
     Io(#[from] io::Error),

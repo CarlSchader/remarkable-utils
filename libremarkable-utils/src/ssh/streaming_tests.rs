@@ -317,6 +317,7 @@ fn check_inherited_outputs() {
         stdout: None,
         reaped: false,
         cancellation,
+        master_log: None,
     };
     let pid = child.child.id();
     child.stderr = Some(drain_pipe(stderr_reader, &child.cancellation).unwrap());
@@ -383,6 +384,7 @@ fn check_completed_inherited_outputs(status: i32, with_stdin: bool, noisy_holder
         stdout: None,
         reaped: false,
         cancellation,
+        master_log: None,
     };
     let pid = child.child.id();
     child.stderr = Some(drain_pipe(stderr_reader, &child.cancellation).unwrap());

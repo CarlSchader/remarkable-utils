@@ -92,6 +92,10 @@ fn with_device(test_name: &str, test: impl FnOnce(Device)) {
         "ssh",
         r##"[ "$#" = 3 ] && [ "$1" = -- ] && [ "$2" = mock-device ] || exit 90
 printf 'call\n' >> "$RMU_CACHE_TEST_ROOT/calls"
+if [ -e "$RMU_CACHE_TEST_ROOT/asleep" ]; then
+    echo 'ssh: connect to host mock-device port 22: Connection timed out' >&2
+    exit 255
+fi
 sh -c "$3"
 status=$?
 case "$3" in
@@ -286,6 +290,24 @@ fn failed_write_response_does_not_preserve_stale_cache() {
             ));
         },
     );
+}
+
+#[test]
+fn an_asleep_tablet_is_asked_once() {
+    with_device("an_asleep_tablet_is_asked_once", |device| {
+        device.put("doc", "AAAA", "", false);
+        device.client().list_items().unwrap();
+        assert!(device.root.join("cache.json").exists());
+        fs::write(device.root.join("asleep"), "").unwrap();
+        let calls = device.calls();
+        // No full listing after the incremental one: it would only wait
+        // for another timeout.
+        assert!(matches!(
+            device.client().list_items(),
+            Err(Error::Unreachable(_))
+        ));
+        assert_eq!(device.calls(), calls + 1);
+    });
 }
 
 #[test]
