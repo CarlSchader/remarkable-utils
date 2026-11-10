@@ -22,6 +22,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, TryLockError};
 use std::io::Read;
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -678,6 +679,14 @@ impl<V: Clone> Bounded<V> {
 /// of its parsed size ([`PARSED_JSON_FACTOR`] times its source bytes).
 const COMMIT_CACHE: usize = 16 * 1024;
 const TREE_CACHE: usize = 256 * 1024;
+
+/// The trees of one level of a walk, each with its path.
+type Level = Vec<(Oid, Vec<u8>)>;
+
+/// Deepest tree nesting the store walks: git's own default bound
+/// (`core.maxTreeDepth`, git 2.44), which `ls-tree` enforced for `tree_of`
+/// before the store read whole trees itself.
+const MAX_TREE_DEPTH: usize = 4096;
 const JSON_CACHE: usize = 64 * 1024 * 1024;
 
 /// A parsed `serde_json::Value` takes about this many times its source
@@ -883,23 +892,41 @@ impl Store {
     /// Every non-tree entry below tree `oid`, paths prefixed (`prefix/…`;
     /// none for an empty prefix): the one way the store reads trees. Raw
     /// tree objects through the cache's `cat-file`, cached, a level at a
-    /// time (one pipelined batch per level, not a round trip per tree).
+    /// time (one pipelined batch per level, not a round trip per tree),
+    /// at most [`MAX_TREE_DEPTH`] levels below `oid`.
     fn walk(&self, oid: &Oid, prefix: &[u8]) -> Result<Vec<TreeEntry>> {
-        self.walk_levels(vec![(oid.clone(), prefix.to_vec())], Vec::new())
+        self.walk_to_depth(oid, prefix, MAX_TREE_DEPTH)
     }
 
-    /// [`Self::walk`] from the trees of one level (each with its path),
-    /// adding to `files`.
-    fn walk_levels(
-        &self,
-        level: Vec<(Oid, Vec<u8>)>,
-        files: Vec<TreeEntry>,
-    ) -> Result<Vec<TreeEntry>> {
-        if level.is_empty() {
-            return Ok(files);
+    /// [`Self::walk`], refusing trees nested more than `max` levels below
+    /// `oid` ([`CycleError::TreeTooDeep`]).
+    fn walk_to_depth(&self, oid: &Oid, prefix: &[u8], max: usize) -> Result<Vec<TreeEntry>> {
+        let start = (vec![(oid.clone(), prefix.to_vec())], Vec::new());
+        let walked = (0..=max).try_fold(start, |(level, files), _| {
+            if level.is_empty() {
+                return ControlFlow::Break(Ok(files));
+            }
+            match self.next_level(&level, files) {
+                Ok(next) => ControlFlow::Continue(next),
+                Err(error) => ControlFlow::Break(Err(error)),
+            }
+        });
+        match walked {
+            ControlFlow::Break(result) => result,
+            ControlFlow::Continue((level, files)) if level.is_empty() => Ok(files),
+            ControlFlow::Continue(_) => Err(CycleError::TreeTooDeep {
+                tree: oid.clone(),
+                max,
+            }
+            .into()),
         }
+    }
+
+    /// The trees one level below `level`, and `files` with the level's
+    /// non-tree entries added.
+    fn next_level(&self, level: &Level, files: Vec<TreeEntry>) -> Result<(Level, Vec<TreeEntry>)> {
         self.prefetch_trees(level.iter().map(|(oid, _)| oid))?;
-        let (next, files) = level.iter().try_fold(
+        level.iter().try_fold(
             (Vec::new(), files),
             |(mut next, mut files), (oid, prefix)| {
                 self.tree(oid)?.iter().for_each(|entry| {
@@ -917,8 +944,7 @@ impl Store {
                 });
                 Ok::<_, Error>((next, files))
             },
-        )?;
-        self.walk_levels(next, files)
+        )
     }
 
     /// The document version held by subtree `oid` of `docs/<doc>`.
@@ -1668,6 +1694,40 @@ mod tests {
             &["hash-object", "-t", "tree", "--literally", "-w", "--stdin"],
             &raw,
         )
+    }
+
+    /// The walk goes as deep as its bound and refuses anything deeper
+    /// (typed, never a stack overflow: it holds one level at a time).
+    #[test]
+    fn walks_stop_at_their_depth_bound() {
+        let scratch = Scratch::new("tree-depth");
+        let git = hermetic(&scratch);
+        let repo = git
+            .init_bare(&scratch.path().join("r.git"), ObjectFormat::Sha1)
+            .unwrap();
+        // Five trees below the root: a, b, c, d, e.
+        let tip = commit(&repo, &[], &[("a/b/c/d/e/f".to_string(), "deep")]);
+        let store = Store::new(repo.clone()).unwrap();
+        let root = store.commit(&tip).unwrap().tree.clone();
+        let paths = |entries: Vec<TreeEntry>| -> Vec<Vec<u8>> {
+            entries.into_iter().map(|entry| entry.path).collect()
+        };
+        assert_eq!(
+            paths(store.walk_to_depth(&root, b"", 5).unwrap()),
+            [b"a/b/c/d/e/f".to_vec()]
+        );
+        assert_eq!(
+            paths(store.walk_to_depth(&root, b"x", 5).unwrap()),
+            [b"x/a/b/c/d/e/f".to_vec()]
+        );
+        assert!(matches!(
+            store.walk_to_depth(&root, b"", 4),
+            Err(Error::HubCycle(CycleError::TreeTooDeep { max: 4, .. }))
+        ));
+        assert_eq!(
+            paths(store.walk(&root, b"").unwrap()),
+            [b"a/b/c/d/e/f".to_vec()]
+        );
     }
 
     /// `tree_of` reads historic modes (`100664`, `100775`, kept in old
