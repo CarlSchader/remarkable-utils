@@ -391,7 +391,7 @@ impl Tablet for SshTablet {
     }
 
     fn device_info(&self) -> Result<DeviceInfo> {
-        let marker = format!("===RMU:{}===", uuid::Uuid::new_v4().simple());
+        let marker = crate::marked::new_marker();
         let status =
             status::parse_status(&marker, &self.script_text(&status::status_script(&marker))?);
         Ok(DeviceInfo {

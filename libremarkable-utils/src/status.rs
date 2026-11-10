@@ -8,6 +8,7 @@
 
 use serde::Serialize;
 
+use crate::marked;
 use crate::xochitl::{self, Item};
 
 /// One mounted filesystem's usage (from `df -kP`).
@@ -87,7 +88,7 @@ pub fn status_script(marker: &str) -> String {
 
 /// Parse the status script output. Pure.
 pub fn parse_status(marker: &str, output: &str) -> SystemStatus {
-    let sections = split_sections(marker, output);
+    let sections = marked::split_sections(marker, output);
     let section = |name: &str| {
         sections
             .iter()
@@ -236,26 +237,6 @@ pub fn render(status: &SystemStatus) -> Vec<String> {
 // ---------------------------------------------------------------------------
 // Parsing helpers (pure)
 // ---------------------------------------------------------------------------
-
-fn split_sections(marker: &str, output: &str) -> Vec<(String, String)> {
-    output
-        .lines()
-        .fold(Vec::<(String, String)>::new(), |mut sections, line| {
-            match line
-                .strip_prefix(marker)
-                .and_then(|rest| rest.strip_prefix(' '))
-            {
-                Some(name) => sections.push((name.trim().to_string(), String::new())),
-                None => {
-                    if let Some((_, body)) = sections.last_mut() {
-                        body.push_str(line);
-                        body.push('\n');
-                    }
-                }
-            }
-            sections
-        })
-}
 
 /// Device-tree string files are NUL-terminated (and sometimes
 /// NUL-padded); strip that before use.

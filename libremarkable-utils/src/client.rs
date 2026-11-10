@@ -38,6 +38,7 @@ use crate::hub::device::{
     DeviceError, EXIT_HUB_BUSY, EXIT_HUB_LOCK_CHANGED, HubLock, HubProbe, ProbeCache, TabletPaths,
     parse_probe, probe_script,
 };
+use crate::marked;
 use crate::progress::{NoProgress, Progress};
 use crate::ssh::{SshSession, shell_quote};
 use crate::status::{self, SystemStatus};
@@ -122,7 +123,7 @@ impl Client {
 
     fn list_items_full(&self) -> Result<Vec<Item>> {
         self.progress.step("Reading document index");
-        let marker = format!("===RMU:{}===", uuid::Uuid::new_v4().simple());
+        let marker = marked::new_marker();
         let script = format!(
             "{probe}cd {dir} || exit 9\n\
              for f in *.metadata *.content; do\n\
@@ -155,7 +156,7 @@ impl Client {
         // Round trip 1: stat everything relevant in one invocation.
         // Skip only unmatched glob literals, not files whose stat fails:
         // a partial stat listing must never replace the cached index.
-        let marker = format!("===RMU:{}===", uuid::Uuid::new_v4().simple());
+        let marker = marked::new_marker();
         let script = format!(
             "{probe}cd {dir} || exit 9\n\
              set --\n\
@@ -172,7 +173,7 @@ impl Client {
         );
         let output = self.session.run_checked(&script)?;
         self.remember_probe(&marker, &output);
-        let stats = parse_marked_sections(&marker, &output)
+        let stats = marked::split_sections(&marker, &output)
             .into_iter()
             .find(|(name, _)| name == "__stat__")
             .map(|(_, body)| parse_stat_listing(&body))
@@ -191,7 +192,7 @@ impl Client {
                 "Fetching {} changed metadata file(s)",
                 to_fetch.len()
             ));
-            let marker = format!("===RMU:{}===", uuid::Uuid::new_v4().simple());
+            let marker = marked::new_marker();
             let names = to_fetch
                 .iter()
                 .map(|name| format!("{} ", shell_quote(name)))
@@ -207,7 +208,7 @@ impl Client {
             );
             let stdout_bytes = self.session.run_checked_bytes(&script, &*self.progress)?;
             let stdout = String::from_utf8_lossy(&stdout_bytes);
-            fetched = parse_marked_sections(&marker, &stdout);
+            fetched = marked::split_sections(&marker, &stdout);
         }
 
         // Merge into a Listing; payload sizes come from the stats.
@@ -892,7 +893,7 @@ impl Client {
     /// system facts, plus the document listing for the counts).
     pub fn system_status(&self) -> Result<SystemStatus> {
         self.progress.step("Reading system state");
-        let marker = format!("===RMU:{}===", uuid::Uuid::new_v4().simple());
+        let marker = marked::new_marker();
         let output = self.session.run_checked(&status::status_script(&marker))?;
         let mut system = status::parse_status(&marker, &output);
         system.documents = Some(status::document_counts(&self.list_items()?));
@@ -914,7 +915,7 @@ impl Client {
         // restart always looks at the lock afresh, in the round trip of
         // its `reset-failed` (whose status, as before, does not matter),
         // and carries the write guard itself.
-        let marker = format!("===RMU:{}===", uuid::Uuid::new_v4().simple());
+        let marker = marked::new_marker();
         let reset = self.session.run(&format!(
             "{}systemctl reset-failed xochitl.service\n",
             probe_script(&self.hub_paths, &marker)
@@ -991,7 +992,7 @@ impl Client {
         if let Some(probe) = self.hub_probe.get() {
             return Ok(probe);
         }
-        let marker = format!("===RMU:{}===", uuid::Uuid::new_v4().simple());
+        let marker = marked::new_marker();
         let output = self
             .session
             .run_checked(&probe_script(&self.hub_paths, &marker))?;
@@ -1258,27 +1259,6 @@ struct Listing {
     sizes: HashMap<String, u64>,
 }
 
-/// Split marker-delimited output into `(section name, body)` pairs.
-fn parse_marked_sections(marker: &str, output: &str) -> Vec<(String, String)> {
-    output
-        .lines()
-        .fold(Vec::<(String, String)>::new(), |mut sections, line| {
-            match line
-                .strip_prefix(marker)
-                .and_then(|rest| rest.strip_prefix(' '))
-            {
-                Some(name) => sections.push((name.trim().to_string(), String::new())),
-                None => {
-                    if let Some((_, body)) = sections.last_mut() {
-                        body.push_str(line);
-                        body.push('\n');
-                    }
-                }
-            }
-            sections
-        })
-}
-
 /// Parse `stat -c '%Y %s %n'` lines into `(name, mtime, size)`.
 fn parse_stat_listing(output: &str) -> Vec<(String, i64, u64)> {
     output
@@ -1395,7 +1375,7 @@ fn listing_delta(
 }
 
 fn parse_listing(marker: &str, output: &str) -> Listing {
-    parse_marked_sections(marker, output).into_iter().fold(
+    marked::split_sections(marker, output).into_iter().fold(
         Listing::default(),
         |mut listing, (name, body)| {
             if name == "__sizes__" {
