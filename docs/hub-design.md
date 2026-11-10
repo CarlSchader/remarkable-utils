@@ -1790,6 +1790,12 @@ those need a second tablet (phase 2).
    validation passed `-o ConnectTimeout=15 -o ServerAliveInterval=10
    -o ServerAliveCountMax=3` on every command. Defaults must not
    override the user's ssh config (ssh takes the first value it sees).
+   Fixed: `ConnectTimeout=15` and `ServerAliveInterval=10` are added
+   where `ssh -G` reports ssh's built-in values and the user's `-o` does
+   not set them (a config line setting the built-in value looks unset:
+   `-o` or `--no-ssh-defaults` keeps it); a tablet that stops answering
+   is `Error::Unreachable` (`rmu hub` exit status 8) and nothing retries
+   it (see "A tablet that stops answering" above).
 2. **`rmu mkdir` is not atomic and writes the visible file first.**
    `Client::create_folder_in` writes `.metadata`, `.content` and
    `.pagedata` in three round trips, `.metadata` first. The sleep above
@@ -1802,7 +1808,9 @@ those need a second tablet (phase 2).
    which is the base OS's version (`5.8.203`), not the reMarkable
    release; that one is `IMG_VERSION` (`3.28.0.172`) in the same file.
    `Rmu-Model` is the board codename (`reMarkable Ferrari`), which is
-   cosmetic.
+   cosmetic. Fixed: `IMG_VERSION` first, then update.conf, then
+   `VERSION_ID`; `reMarkable Ferrari` is shown as `reMarkable Paper Pro`
+   (reMarkable's documented code name).
 4. **View state counted as a change.** After the owner only opened a
    document, `sync` reported `Documents: 1 changed on the tablet` next
    to `already in sync with origin; nothing pushed`, and `status`
