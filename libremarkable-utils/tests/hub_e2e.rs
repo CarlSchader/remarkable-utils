@@ -4046,3 +4046,638 @@ fn a_killed_fast_imports_keep_files_are_removed_on_open() {
     world.sync(0).unwrap();
     assert!(!pack_dir.join("pack-killed.keep").exists());
 }
+
+// ---- log, restore, add --------------------------------------------------------
+
+use libremarkable_utils::hub::cycle::{CommitKind, DocEvent};
+use libremarkable_utils::hub::model::DocId;
+
+/// Names on origin (present documents).
+fn origin_names(world: &World) -> std::collections::BTreeMap<DocId, String> {
+    world
+        .origin_docs()
+        .into_iter()
+        .filter_map(|(doc, files)| {
+            let metadata: serde_json::Value = serde_json::from_slice(
+                files.get(&libremarkable_utils::hub::model::DocFile::Metadata)?,
+            )
+            .ok()?;
+            Some((doc, metadata["visibleName"].as_str()?.to_string()))
+        })
+        .collect()
+}
+
+/// The ink markers in one document's `.rm` files on a tablet.
+fn doc_ink(world: &World, i: usize, doc: &DocId) -> std::collections::BTreeSet<String> {
+    let docs = world.device(i).docs();
+    let files = docs.get(doc).cloned().unwrap_or_default();
+    world::ink_markers(&[(doc.clone(), files)].into())
+}
+
+#[test]
+fn a_restored_version_arrives_on_both_tablets_as_a_new_document() {
+    let (world, lib) = two_tablets();
+    let page = world.pages(0, &lib.notes)[0].clone();
+    world.ink(0, &lib.notes, &page);
+    world.converge();
+    let then = origin_main(&world);
+    let old_ink = doc_ink(&world, 0, &lib.notes);
+    world.ink(1, &lib.notes, &page);
+    world.rename(1, &lib.notes, "Notes, later");
+    world.converge();
+    // From a computer without a tablet, by the path the document had then.
+    let report = world
+        .desk()
+        .restore(None, "Projects/Notes", &then.to_string()[..10])
+        .unwrap();
+    assert_eq!(report.original, lib.notes);
+    assert_eq!(report.original_name, "Notes");
+    assert_eq!(report.from, then);
+    assert_eq!(report.name, format!("Notes (restored {})", world::DATE));
+    assert_eq!(report.place.parent, lib.folder.as_str());
+    assert_eq!(report.place.path, "/Projects");
+    assert_eq!(report.push_attempts, 1);
+    world.converge();
+    assert!(world.conflicts().is_empty(), "{:?}", world.conflicts());
+    (0..2).for_each(|i| {
+        let metadata = world.device(i).metadata(&report.copy).expect("restored");
+        assert_eq!(metadata["visibleName"], report.name.as_str());
+        assert_eq!(metadata["parent"], lib.folder.as_str());
+        assert_eq!(doc_ink(&world, i, &report.copy), old_ink, "tablet {i}");
+        // The original is untouched.
+        assert_eq!(
+            world.device(i).metadata(&lib.notes).unwrap()["visibleName"],
+            "Notes, later"
+        );
+    });
+    // Restoring the same version again: the name is taken, an id is added.
+    let again = world
+        .desk()
+        .restore(None, lib.notes.as_str(), then.as_str())
+        .unwrap();
+    assert_eq!(
+        again.name,
+        format!(
+            "Notes (restored {} {})",
+            world::DATE,
+            &again.copy.as_str()[..8]
+        )
+    );
+    world.converge();
+    assert!(world.conflicts().is_empty());
+}
+
+#[test]
+fn a_deleted_document_is_restored_to_its_folder_or_the_root() {
+    let (world, lib) = two_tablets();
+    let page = world.pages(0, &lib.diary)[0].clone();
+    world.ink(0, &lib.diary, &page);
+    world.converge();
+    let diary_ink = doc_ink(&world, 0, &lib.diary);
+    world.delete(0, &lib.notes);
+    world.delete(0, &lib.diary);
+    world.delete(0, &lib.archive);
+    world.converge();
+    assert!(!world.origin_docs().contains_key(&lib.notes));
+    // Its folder still exists: back there, from the version just before
+    // the deletion (`--at main`, where it is gone).
+    let notes = world
+        .desk()
+        .restore(None, "Projects/Notes", "main")
+        .unwrap();
+    assert_eq!(notes.place.parent, lib.folder.as_str());
+    assert_ne!(notes.from, notes.at);
+    // Its folder is gone too: to the root.
+    let diary = world
+        .desk()
+        .restore(None, lib.diary.as_str(), "main")
+        .unwrap();
+    assert_eq!(diary.place.parent, "");
+    assert_eq!(diary.place.path, "/");
+    world.converge();
+    assert!(world.conflicts().is_empty());
+    (0..2).for_each(|i| {
+        let names = world.device(i).names();
+        assert_eq!(names.get(&notes.copy), Some(&notes.name));
+        assert_eq!(names.get(&diary.copy), Some(&diary.name));
+        assert!(!names.contains_key(&lib.diary));
+        assert_eq!(doc_ink(&world, i, &diary.copy), diary_ink);
+    });
+    // The deletion is in the document's history, found by its old path.
+    let log = world.desk().doc_log(None, "Archive/Diary").unwrap();
+    assert_eq!(log.doc, lib.diary);
+    assert_eq!(log.place, None);
+    assert_eq!(log.name.as_deref(), Some("Diary"));
+    let events: Vec<&DocEvent> = log.entries.iter().flat_map(|e| &e.events).collect();
+    assert!(
+        matches!(events[0], DocEvent::RestoredAs { copy, .. } if *copy == diary.copy),
+        "{events:?}"
+    );
+    assert!(events.contains(&&DocEvent::Deleted));
+    assert!(matches!(events.last().unwrap(), DocEvent::Added { .. }));
+}
+
+#[test]
+fn restore_refuses_what_it_cannot_restore() {
+    let (world, lib) = two_tablets();
+    let desk = world.desk();
+    let main = origin_main(&world).to_string();
+    let error = desk.restore(None, "Projects", &main).unwrap_err();
+    assert!(
+        matches!(error, libremarkable_utils::Error::NotADocument(_)),
+        "{error}"
+    );
+    let error = desk.restore(None, "Projects/Notes", "nope").unwrap_err();
+    assert!(
+        is_cycle(&error, |e| matches!(e, CycleError::UnknownRevision(_))),
+        "{error}"
+    );
+    let error = desk.restore(None, "Nowhere/Nothing", "main").unwrap_err();
+    assert!(
+        matches!(error, libremarkable_utils::Error::PathNotFound(_)),
+        "{error}"
+    );
+    let unknown = "0f0e0d0c-0000-4000-8000-0000000fffff";
+    let error = desk.restore(None, unknown, "main").unwrap_err();
+    assert!(
+        is_cycle(&error, |e| matches!(e, CycleError::NotInHistory(_))),
+        "{error}"
+    );
+    // A document created after `--at` has no version there.
+    let first = world
+        .git
+        .open(Path::new(&world.origin))
+        .unwrap()
+        .rev_list(&["refs/heads/main"], true)
+        .unwrap()
+        .pop()
+        .unwrap();
+    let error = desk
+        .restore(None, lib.notes.as_str(), first.as_str())
+        .unwrap_err();
+    assert!(
+        is_cycle(&error, |e| matches!(e, CycleError::NoVersionAt { .. })),
+        "{error}"
+    );
+    // A commit that is not on main (a snapshot only on the device ref).
+    world.read(0, &lib.notes);
+    let snapshot = world.backup(0).unwrap().snapshot;
+    let error = world
+        .hub(0)
+        .restore(Some(world.tablet(0)), "Projects/Notes", snapshot.as_str())
+        .unwrap_err();
+    assert!(
+        is_cycle(&error, |e| matches!(e, CycleError::NotOnMain(_))),
+        "{error}"
+    );
+    // Two documents of one name in one folder: refused, never guessed.
+    world.create(0, Kind::Pdf, "Notes", lib.folder.as_str());
+    world.converge();
+    let error = desk.restore(None, "Projects/Notes", "main").unwrap_err();
+    assert!(
+        matches!(error, libremarkable_utils::Error::AmbiguousPath { .. }),
+        "{error}"
+    );
+    assert!(world.conflicts().is_empty());
+}
+
+#[test]
+fn an_added_pdf_reaches_both_tablets_and_never_forks() {
+    let (world, lib) = two_tablets();
+    let file = world.pdf_file("Report 2026.pdf", 3);
+    let report = world
+        .desk()
+        .add(None, &file, Some("Projects"), None)
+        .unwrap();
+    assert_eq!(report.name, "Report 2026");
+    assert_eq!(report.pages, Some(3));
+    assert_eq!(report.place.parent, lib.folder.as_str());
+    assert_eq!(report.file_type, "pdf");
+    world.converge();
+    let doc = report.doc.clone();
+    let listed = world.pages(0, &doc);
+    assert_eq!(listed.len(), 3);
+    assert_eq!(listed, world.pages(1, &doc), "the same page ids everywhere");
+    let payload = std::fs::read(&file).unwrap();
+    (0..2).for_each(|i| {
+        assert_eq!(
+            world.tablet(i).read_file(&format!("{doc}.pdf")).unwrap(),
+            payload
+        );
+        assert_eq!(world.device(i).metadata(&doc).unwrap()["new"], true);
+    });
+    // Both tablets open it: one keeps the list it found, the other
+    // materialises it again with page ids of its own (whichever xochitl
+    // does, nothing forks).
+    world.read(0, &doc);
+    world.open_pdf(1, &doc, 3);
+    world.sync(1).unwrap();
+    world.sync(0).unwrap();
+    world.converge();
+    assert!(world.conflicts().is_empty(), "{:?}", world.conflicts());
+    assert_eq!(world.pages(0, &doc), world.pages(1, &doc));
+    // Both materialise again before syncing, then one inks a page: still
+    // no fork.
+    world.open_pdf(0, &doc, 3);
+    world.open_pdf(1, &doc, 3);
+    world.sync(0).unwrap();
+    world.sync(1).unwrap();
+    let page = world.pages(1, &doc)[2].clone();
+    world.ink(1, &doc, &page);
+    world.converge();
+    assert!(world.conflicts().is_empty(), "{:?}", world.conflicts());
+    // An EPUB has no page count to read: unmaterialised.
+    let epub = world.root.join("files").join("Book.epub");
+    std::fs::write(&epub, b"PK\x03\x04 fabricated epub").unwrap();
+    let book = world.desk().add(None, &epub, None, Some("A book")).unwrap();
+    assert_eq!(book.pages, None);
+    assert_eq!(book.place.path, "/");
+    world.converge();
+    assert!(world.pages(0, &book.doc).is_empty());
+    assert!(
+        world
+            .tablet(1)
+            .read_file(&format!("{}.epub", book.doc))
+            .is_some()
+    );
+}
+
+#[test]
+fn add_refuses_taken_names_trashed_folders_and_other_files() {
+    let (world, lib) = two_tablets();
+    let desk = world.desk();
+    let file = world.pdf_file("Paper.pdf", 1);
+    let error = desk.add(None, &file, Some("Projects"), None).unwrap_err();
+    assert!(
+        matches!(error, libremarkable_utils::Error::NameConflict { .. }),
+        "{error}"
+    );
+    world.trash(0, &lib.archive);
+    world.converge();
+    let error = desk
+        .add(None, &file, Some(lib.archive.as_str()), None)
+        .unwrap_err();
+    assert!(
+        is_cycle(&error, |e| matches!(e, CycleError::FolderUnusable(_))),
+        "{error}"
+    );
+    let error = desk
+        .add(None, &file, Some("Projects/Notes"), None)
+        .unwrap_err();
+    assert!(
+        matches!(error, libremarkable_utils::Error::NotAFolder(_)),
+        "{error}"
+    );
+    let text = world.root.join("files").join("notes.txt");
+    std::fs::write(&text, b"text").unwrap();
+    let error = desk.add(None, &text, None, None).unwrap_err();
+    assert!(
+        is_cycle(
+            &error,
+            |e| matches!(e, CycleError::NotAddable(name) if name == "notes.txt")
+        ),
+        "{error}"
+    );
+    // A `.pdf` that is not one.
+    let fake = world.root.join("files").join("fake.pdf");
+    std::fs::write(&fake, b"<html>not a pdf</html>").unwrap();
+    let error = desk.add(None, &fake, None, None).unwrap_err();
+    assert!(
+        is_cycle(
+            &error,
+            |e| matches!(e, CycleError::NotAPdf(name) if name == "fake.pdf")
+        ),
+        "{error}"
+    );
+    // Nothing was pushed.
+    let log = world.desk().log(None, None).unwrap();
+    assert!(log.entries.iter().all(|e| e.kind != CommitKind::Add));
+}
+
+#[test]
+fn log_shows_the_library_history_and_a_documents() {
+    let (world, lib) = two_tablets();
+    world.rename(0, &lib.sketch, "Drawing");
+    world.converge();
+    world.move_to(1, &lib.sketch, lib.folder.as_str());
+    world.converge();
+    let page = world.pages(0, &lib.sketch)[0].clone();
+    world.ink(0, &lib.sketch, &page);
+    world.converge();
+    let added = world
+        .hub(1)
+        .add(
+            Some(world.tablet(1)),
+            &world.pdf_file("Scan.pdf", 2),
+            None,
+            None,
+        )
+        .unwrap();
+    let restored = world
+        .desk()
+        .restore(None, lib.sketch.as_str(), "main~1")
+        .unwrap();
+    world.converge();
+
+    let log = world.desk().log(None, None).unwrap();
+    let chain = world
+        .git
+        .open(Path::new(&world.origin))
+        .unwrap()
+        .rev_list(&["refs/heads/main"], true)
+        .unwrap();
+    let commits: Vec<_> = log.entries.iter().map(|e| e.commit.clone()).collect();
+    assert_eq!(commits, chain, "one entry per first-parent commit");
+    assert_eq!(log.more, 0);
+    assert_eq!(log.main, chain[0]);
+    assert_eq!(log.entries.last().unwrap().kind, CommitKind::Init);
+    let add = log
+        .entries
+        .iter()
+        .find(|e| e.kind == CommitKind::Add)
+        .unwrap();
+    assert_eq!(add.commit, added.commit);
+    assert_eq!(add.added, vec![added.doc.clone()]);
+    assert_eq!(add.names[&added.doc], "Scan");
+    assert_eq!(add.author, "Tablet B");
+    assert_eq!(
+        add.device.as_ref().and_then(|d| d.firmware.as_deref()),
+        Some(world::FIRMWARE)
+    );
+    let restore = log
+        .entries
+        .iter()
+        .find(|e| e.kind == CommitKind::Restore)
+        .unwrap();
+    assert_eq!(restore.author, "rmu");
+    assert!(restore.device.is_none());
+    assert_eq!(restore.restored[0].copy, restored.copy);
+    assert_eq!(restore.restored[0].original, lib.sketch);
+    // The first clone added the library (folders too), from Tablet A.
+    let first = &log.entries[log.entries.len() - 2];
+    assert_eq!(first.kind, CommitKind::Sync);
+    assert_eq!(first.added.len(), 6);
+    assert_eq!(
+        first.device.as_ref().unwrap().name.as_deref(),
+        Some("Tablet A")
+    );
+    // A limit, and a tablet's base.
+    let limited = world.hub(0).log(Some(world.tablet(0)), Some(2)).unwrap();
+    assert_eq!(limited.entries.len(), 2);
+    assert_eq!(limited.more, chain.len() - 2);
+    let base = limited.tablet.unwrap();
+    assert_eq!(base.base, world.device(0).state().unwrap().base);
+    assert!(chain.contains(base.base.as_ref().unwrap()));
+
+    // The sketch's own history, newest first: restored from, inked,
+    // moved, renamed, added.
+    let doc = world.desk().doc_log(None, "Projects/Drawing").unwrap();
+    assert_eq!(doc.doc, lib.sketch);
+    assert_eq!(doc.name.as_deref(), Some("Drawing"));
+    assert_eq!(doc.place.as_ref().unwrap().path, "/Projects");
+    let events: Vec<&DocEvent> = doc.entries.iter().flat_map(|e| &e.events).collect();
+    assert!(
+        matches!(events[0], DocEvent::RestoredAs { copy, .. } if *copy == restored.copy),
+        "{events:?}"
+    );
+    assert_eq!(events[1], &DocEvent::Changed, "{events:?}");
+    assert!(
+        matches!(events[2], DocEvent::Moved { from, to } if from.path == "/" && to.path == "/Projects"),
+        "{events:?}"
+    );
+    assert!(
+        matches!(events[3], DocEvent::Renamed { from, to }
+            if from.as_deref() == Some("Sketch") && to.as_deref() == Some("Drawing")),
+        "{events:?}"
+    );
+    assert!(
+        matches!(events[4], DocEvent::Added { name, place }
+            if name.as_deref() == Some("Sketch") && place.path == "/"),
+        "{events:?}"
+    );
+    assert_eq!(events.len(), 5, "{events:?}");
+    // The copy's history names its origin.
+    let copy = world.desk().doc_log(None, restored.copy.as_str()).unwrap();
+    assert!(copy.entries[0].events.contains(&DocEvent::RestoredFrom {
+        original: lib.sketch.clone(),
+        from: restored.from.clone(),
+    }));
+}
+
+#[test]
+fn log_shows_forks_in_both_histories() {
+    let (world, lib) = same_page_conflict();
+    world.sync(1).unwrap();
+    world.converge();
+    let log = world.desk().log(None, None).unwrap();
+    let fork = log.entries.iter().find(|e| !e.forks.is_empty()).unwrap();
+    let copy = fork.forks[0].copy.clone();
+    assert_eq!(fork.forks[0].original, lib.notes);
+    assert!(fork.added.contains(&copy));
+    let doc = world.desk().doc_log(None, lib.notes.as_str()).unwrap();
+    assert!(doc.entries.iter().any(|e| {
+        e.events
+            .contains(&DocEvent::ForkedInto { copy: copy.clone() })
+    }));
+    let copy_log = world.desk().doc_log(None, copy.as_str()).unwrap();
+    assert!(copy_log.entries[0].events.contains(&DocEvent::ForkOf {
+        original: lib.notes.clone()
+    }));
+}
+
+#[test]
+fn concurrent_add_and_sync_retry_their_pushes() {
+    // An add lands while a sync is between its merge and its push.
+    let (base, lib) = two_tablets();
+    let page = base.pages(0, &lib.notes)[1].clone();
+    base.ink(0, &lib.notes, &page);
+    let journal = op_index(&base, 0, OpKind::WriteState, 2, |w| {
+        w.sync(0).unwrap();
+    });
+    let world = base.duplicate();
+    let file = world.pdf_file("Late.pdf", 2);
+    let desk = world.desk_parts();
+    let added = Arc::new(std::sync::Mutex::new(None));
+    let slot = Arc::clone(&added);
+    world.tablet(0).inject(Fault::EditBefore(
+        journal,
+        Box::new(move |_| {
+            *slot.lock().unwrap() = Some(desk.hub().add(None, &file, None, None).unwrap());
+        }),
+    ));
+    let report = world.sync(0).unwrap();
+    assert_eq!(report.push_attempts, 2, "{report:?}");
+    let added = added.lock().unwrap().take().expect("the add ran");
+    assert!(report.applied.contains(&added.doc));
+    world.converge();
+    assert!(origin_names(&world).contains_key(&added.doc));
+
+    // A sync lands while an add is about to push.
+    let (world, lib) = two_tablets();
+    world.rename(1, &lib.sketch, "Sketch (B)");
+    let progress: &'static PushHook = Box::leak(Box::default());
+    let (git, origin, options) = (
+        world.git.clone(),
+        world.origin.clone(),
+        world.options.clone(),
+    );
+    let (tablet, cache) = (
+        Arc::clone(&world.device(1).tablet),
+        world.device(1).cache.clone(),
+    );
+    *progress.hook.lock().unwrap() = Some(Box::new(move || {
+        static QUIET: libremarkable_utils::progress::NoProgress =
+            libremarkable_utils::progress::NoProgress;
+        let hub = libremarkable_utils::hub::cycle::Hub::new(
+            git,
+            cache,
+            libremarkable_utils::hub::device::LockRequest::for_this_process("other-host"),
+            &QUIET,
+        )
+        .with_options(HubOptions {
+            origin: Some(origin),
+            ..options
+        });
+        hub.sync(&*tablet).unwrap();
+    }));
+    let desk = world.desk_parts();
+    let hub = libremarkable_utils::hub::cycle::Hub::new(
+        desk.git,
+        desk.cache,
+        libremarkable_utils::hub::device::LockRequest::for_this_process("desk-host"),
+        progress,
+    )
+    .with_options(desk.options);
+    let added = hub
+        .add(
+            None,
+            &world.pdf_file("Raced.pdf", 1),
+            Some("Projects"),
+            None,
+        )
+        .unwrap();
+    assert_eq!(added.push_attempts, 2, "{added:?}");
+    world.converge();
+    let names = origin_names(&world);
+    assert_eq!(names[&lib.sketch], "Sketch (B)");
+    assert_eq!(names[&added.doc], "Raced");
+}
+
+/// Runs a hook the first time a run is about to push to origin.
+#[derive(Default)]
+struct PushHook {
+    hook: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+impl libremarkable_utils::progress::Progress for PushHook {
+    fn step(&self, message: &str) {
+        let hook = match message {
+            "Pushing to origin" => self.hook.lock().unwrap().take(),
+            _ => None,
+        };
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+    fn bytes(&self, _: u64, _: Option<u64>) {}
+    fn bytes_done(&self) {}
+    fn finished(&self) {}
+}
+
+#[test]
+fn log_restore_and_add_through_the_tablets_origin() {
+    // Without --origin, the tablet supplies the URL; a tablet of another
+    // repository is refused.
+    let (world, lib) = two_tablets();
+    let hub = world.hub(0).with_options(HubOptions {
+        origin: None,
+        ..world.options.clone()
+    });
+    let log = hub.log(Some(world.tablet(0)), None).unwrap();
+    assert_eq!(log.origin, world.origin);
+    let doc = hub
+        .doc_log(Some(world.tablet(0)), lib.notes.as_str())
+        .unwrap();
+    assert_eq!(
+        doc.tablet.unwrap().base,
+        world.device(0).state().unwrap().base
+    );
+    let error = world
+        .desk()
+        .with_options(HubOptions {
+            origin: None,
+            ..world.options.clone()
+        })
+        .log(None, None)
+        .unwrap_err();
+    assert!(
+        is_cycle(&error, |e| matches!(e, CycleError::NoOrigin)),
+        "{error}"
+    );
+    let other = World::new(1);
+    let mut state = world.device(0).state().unwrap();
+    state.origin = other.origin.clone();
+    world.device(0).set_state(&state);
+    let error = hub.log(Some(world.tablet(0)), None).unwrap_err();
+    assert!(
+        is_cycle(&error, |e| matches!(e, CycleError::RepoMismatch { .. })),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_lost_acknowledgement_of_an_add_is_resolved_by_looking_at_origin() {
+    let (world, _) = two_tablets();
+    let before = origin_main(&world);
+    let trigger = lose_next_main_push_ack(&world);
+    // The push lands, its acknowledgement does not: rmu fetches and finds
+    // its commit on origin.
+    let report = world
+        .desk()
+        .add(None, &world.pdf_file("Lost.pdf", 2), None, None)
+        .unwrap();
+    assert!(!trigger.exists(), "the hook did not fire");
+    assert_eq!(report.push_attempts, 1);
+    let main = origin_main(&world);
+    assert_eq!(main, report.commit);
+    let repo = world.git.open(Path::new(&world.origin)).unwrap();
+    assert_eq!(
+        repo.rev_list(&[main.as_str(), &format!("^{before}")], false)
+            .unwrap()
+            .len(),
+        1,
+        "exactly one new commit"
+    );
+    world.converge();
+    let names = origin_names(&world);
+    assert_eq!(names.values().filter(|name| *name == "Lost").count(), 1);
+}
+
+#[test]
+fn a_restore_lands_while_a_tablet_edits_the_original() {
+    let (world, lib) = two_tablets();
+    let page = world.pages(0, &lib.notes)[0].clone();
+    let old_ink = doc_ink(&world, 0, &lib.notes);
+    world.ink(0, &lib.notes, &page);
+    world.converge();
+    // Tablet B inks the original and has not synced when the copy of the
+    // old version lands.
+    world.ink(1, &lib.notes, &page);
+    let edited = doc_ink(&world, 1, &lib.notes);
+    let first = world
+        .git
+        .open(Path::new(&world.origin))
+        .unwrap()
+        .rev_list(&["refs/heads/main"], true)
+        .unwrap();
+    let report = world
+        .desk()
+        .restore(None, lib.notes.as_str(), first[first.len() - 2].as_str())
+        .unwrap();
+    world.converge();
+    assert!(world.conflicts().is_empty(), "{:?}", world.conflicts());
+    (0..2).for_each(|i| {
+        assert_eq!(doc_ink(&world, i, &lib.notes), edited, "tablet {i}");
+        assert_eq!(doc_ink(&world, i, &report.copy), old_ink, "tablet {i}");
+    });
+}

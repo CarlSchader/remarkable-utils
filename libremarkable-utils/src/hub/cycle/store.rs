@@ -783,6 +783,12 @@ impl Store {
         Ok(commit)
     }
 
+    /// A commit object as stored (headers included), uncached: `log`
+    /// reads each commit's author line once.
+    pub fn raw_commit(&self, oid: &Oid) -> Result<Vec<u8>> {
+        self.object(oid, ObjectKind::Commit)
+    }
+
     /// Whether `oid` names a commit the cache has.
     pub fn has_commit(&self, oid: &Oid) -> Result<bool> {
         Ok(self.repo.rev_parse(&format!("{oid}^{{commit}}"))?.as_ref() == Some(oid))

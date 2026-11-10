@@ -507,6 +507,19 @@ pub fn find_child<'a>(
     }
 }
 
+/// A visible name for a new or renamed item: trimmed, not empty, and
+/// without `/` (logical paths split on it).
+pub fn checked_name(name: &str) -> Result<&str> {
+    let name = name.trim();
+    if name.is_empty() {
+        Err(Error::InvalidName("name cannot be empty".to_string()))
+    } else if name.contains('/') {
+        Err(Error::InvalidName("name cannot contain '/'".to_string()))
+    } else {
+        Ok(name)
+    }
+}
+
 /// Error if `parent_uuid` already contains an item named `name`
 /// (other than `ignore_uuid`).
 pub fn ensure_no_conflict(
@@ -670,6 +683,13 @@ fn display_parent(parent_uuid: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn names_are_checked() {
+        assert_eq!(checked_name("  Paper ").unwrap(), "Paper");
+        assert!(matches!(checked_name(" "), Err(Error::InvalidName(_))));
+        assert!(matches!(checked_name("a/b"), Err(Error::InvalidName(_))));
+    }
 
     fn folder(uuid: &str, name: &str, parent: &str) -> Item {
         Item {

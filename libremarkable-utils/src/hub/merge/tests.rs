@@ -1451,6 +1451,51 @@ fn non_trivial_materialisations_are_changes() {
     });
 }
 
+/// A base whose page list is already materialised (as `rmu hub add`
+/// writes it), materialised again by tablets with ids of their own.
+#[test]
+fn a_materialised_base_materialised_again_is_no_change() {
+    let mut lib = Lib::default();
+    let skeleton = D::skeleton("Added", "");
+    let base = opened(&skeleton, 300, 3).set("new", json!(true));
+    let ours = opened(&skeleton, 100, 3);
+    // Origin unchanged: the tablet's bytes are taken (as for any version
+    // origin did not touch), and nothing forks.
+    let (b, o, t) = three(&mut lib, &[(1, &base)], &[(1, &ours)], &[(1, &base)]);
+    let outcome = run(&lib, &b, &o, &t);
+    assert!(outcome.forks.is_empty());
+    assert_eq!(outcome.docs[&u(1)], version_of(&mut lib, &ours));
+    // Both materialised again: no change on either side, and origin's
+    // ids win.
+    let theirs = opened(&skeleton, 200, 3);
+    let (b, o, t) = three(&mut lib, &[(1, &base)], &[(1, &ours)], &[(1, &theirs)]);
+    let outcome = run(&lib, &b, &o, &t);
+    assert!(outcome.forks.is_empty());
+    assert_eq!(outcome.resolutions[&u(1)], Resolution::Unchanged);
+    assert_eq!(outcome.docs[&u(1)], version_of(&mut lib, &theirs));
+    // Origin inked a page of the base's list: its change wins whole.
+    let inked = base.clone().ink(301, "origin ink");
+    let (b, o, t) = three(&mut lib, &[(1, &base)], &[(1, &ours)], &[(1, &inked)]);
+    let outcome = run(&lib, &b, &o, &t);
+    assert!(outcome.forks.is_empty());
+    assert_eq!(
+        outcome.resolutions[&u(1)],
+        Resolution::Changed(Side::Theirs)
+    );
+    // Materialised again with another page count: a real change, which
+    // forks against origin's ink.
+    let longer = opened(&skeleton, 100, 4);
+    let (b, o, t) = three(&mut lib, &[(1, &base)], &[(1, &longer)], &[(1, &inked)]);
+    let outcome = run(&lib, &b, &o, &t);
+    assert_eq!(outcome.forks.len(), 1);
+    // And the tablet's ink on its own ids is never hidden.
+    let tablet_ink = ours.clone().ink(100, "tablet ink");
+    let (b, o, t) = three(&mut lib, &[(1, &base)], &[(1, &tablet_ink)], &[(1, &base)]);
+    let outcome = run(&lib, &b, &o, &t);
+    assert_eq!(outcome.resolutions[&u(1)], Resolution::Changed(Side::Ours));
+    assert_eq!(outcome.docs[&u(1)], version_of(&mut lib, &tablet_ink));
+}
+
 #[test]
 fn new_on_both_with_both_sides_materialised_takes_origins_page_ids() {
     // Lost tablet state or a reattach: two tablets each opened the same

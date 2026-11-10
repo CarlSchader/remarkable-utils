@@ -192,12 +192,29 @@ impl World {
 
     /// `rmu --host tablet --no-multiplex <globals> hub <args>` in `dir`.
     fn rmu_full(&self, dir: &Path, globals: &[&str], args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_rmu"))
-            .current_dir(dir)
+        self.command(dir)
             .args(["--host", "tablet", "--no-multiplex"])
             .args(globals)
             .arg("hub")
             .args(args)
+            .output()
+            .unwrap()
+    }
+
+    /// `rmu --no-multiplex hub <args>`: the default host, not given.
+    fn rmu_default_host(&self, args: &[&str]) -> Output {
+        self.command(&self.scratch.join("home"))
+            .args(["--no-multiplex", "hub"])
+            .args(args)
+            .output()
+            .unwrap()
+    }
+
+    /// The binary in `dir`, with the mock `ssh` and hermetic git.
+    fn command(&self, dir: &Path) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_rmu"));
+        command
+            .current_dir(dir)
             .env("PATH", self.scratch.mock_path())
             .env("MOCK_TOOLS", self.scratch.join("tools"))
             .env("MOCK_DEVICE", self.device())
@@ -211,9 +228,8 @@ impl World {
             .env_remove("GIT_TRACE")
             .env_remove("GIT_TRACE_PACKET")
             .env_remove("GIT_CONFIG_PARAMETERS")
-            .env_remove("RMU_SSH_PASSWORD")
-            .output()
-            .unwrap()
+            .env_remove("RMU_SSH_PASSWORD");
+        command
     }
 
     fn json(&self, args: &[&str]) -> Value {
@@ -402,6 +418,68 @@ fn every_command(busybox: Option<&Path>) {
     assert!(world.running());
     assert!(world.xochitl().join(format!("{first}.pdf")).exists());
     assert!(world.xochitl().join(format!("{second}.pdf")).exists());
+}
+
+#[test]
+fn history_commands_over_ssh() {
+    tool_sets()
+        .iter()
+        .for_each(|busybox| history_commands(busybox.as_deref()));
+}
+
+/// `log`, `restore` and `add`: with `--origin` alone the tablet is never
+/// contacted; without it, it supplies its stored origin; with `--host`
+/// as well, it is the commit's author.
+fn history_commands(busybox: Option<&Path>) {
+    let world = World::new(busybox);
+    let origin = world.origin();
+    let paper = world.put_pdf(1, "Paper one");
+    assert_success(&world.rmu(&["init", &origin]));
+    assert_success(&world.rmu(&["clone", &origin, "--name", "Tablet A"]));
+    let contacts = world.ssh_log().lines().count();
+
+    let file = world.scratch.join("Scan.pdf");
+    fs::write(&file, test_support::pdf(4)).unwrap();
+    let output = world.rmu_default_host(&["add", &file.display().to_string(), "--origin", &origin]);
+    assert_success(&output);
+    let added = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    assert!(
+        stderr(&output).contains("4 pages (page list written)"),
+        "{}",
+        stderr(&output)
+    );
+    let output = world.rmu_default_host(&["log", "--origin", &origin, "--json"]);
+    assert_success(&output);
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["entries"][0]["added"], json!([added]));
+    assert_eq!(value["tablet"], Value::Null);
+    assert_eq!(
+        world.ssh_log().lines().count(),
+        contacts,
+        "--origin alone never contacts the tablet"
+    );
+
+    let value = world.json(&["log", "Paper one"]);
+    assert_eq!(value["doc"], paper.as_str());
+    assert_eq!(value["tablet"]["device_name"], "Tablet A");
+    let value = world.json(&["restore", &paper, "--at", "main", "--origin", &origin]);
+    assert_eq!(value["command"], "restore");
+    let author = Command::new("git")
+        .args(["--git-dir", &origin, "log", "-1", "--format=%an", "main"])
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&author.stdout).trim(), "Tablet A");
+
+    let value = world.json(&["sync"]);
+    assert_eq!(value["applied"].as_array().unwrap().len(), 2, "{value}");
+    assert!(world.xochitl().join(format!("{added}.pdf")).exists());
+    let content: Value = serde_json::from_slice(
+        &fs::read(world.xochitl().join(format!("{added}.content"))).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(content["cPages"]["pages"].as_array().unwrap().len(), 4);
 }
 
 #[test]

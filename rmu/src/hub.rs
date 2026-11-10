@@ -10,6 +10,11 @@
 //! ids (the summary then goes to stderr, unless `--quiet`). Progress,
 //! warnings and error details go to stderr. Nothing prompts, except git
 //! asking for credentials when stdin and stderr are both terminals.
+//!
+//! `log`, `restore` and `add` work on origin alone: with `--origin` they
+//! never contact the tablet unless a flag naming it (`--host`, `--user`,
+//! ...) is given too; without it the
+//! tablet supplies its stored origin URL ([`wants_tablet`]).
 
 mod json;
 mod render;
@@ -18,7 +23,7 @@ mod tests;
 
 use std::collections::BTreeMap;
 use std::io::{IsTerminal, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -27,8 +32,9 @@ use clap::{Args, Subcommand};
 use libremarkable_utils::Error;
 use libremarkable_utils::git::Git;
 use libremarkable_utils::hub::cycle::{
-    self, BackupReport, CycleError, DetachOptions, DetachReport, DryRunReport, Hub, HubOptions,
-    InitReport, RemoteReport, SetUrlReport, StatusReport, SyncReport,
+    self, AddReport, BackupReport, CycleError, DetachOptions, DetachReport, DocLogReport,
+    DryRunReport, Hub, HubOptions, InitReport, LogReport, RemoteReport, RestoreReport,
+    SetUrlReport, StatusReport, SyncReport,
 };
 use libremarkable_utils::hub::device::{DeviceError, LockRequest, SshTablet, Tablet, TabletPaths};
 use libremarkable_utils::hub::model::{DeviceName, DocId, XochitlPath};
@@ -154,6 +160,48 @@ pub enum HubCommand {
         #[command(flatten)]
         origin: OriginArg,
     },
+    /// Show the library's history (one entry per sync, restore and add),
+    /// or one document's (by logical path or UUID). No tablet is needed
+    /// with --origin (unless --host or another SSH flag names one)
+    #[command(after_help = AFTER_HELP)]
+    Log {
+        /// A document's logical path (as it is now, or was) or UUID
+        doc: Option<String>,
+        /// Show at most this many entries of the library's history
+        #[arg(short = 'n', long, value_name = "N", conflicts_with = "doc")]
+        max_count: Option<usize>,
+        #[command(flatten)]
+        origin: OriginArg,
+    },
+    /// Bring back an old version of a document, deleted ones included, as
+    /// a new document (the original is never touched); every tablet gets
+    /// it at its next sync. No tablet is needed with --origin (unless --host or another SSH flag names one)
+    #[command(after_help = AFTER_HELP)]
+    Restore {
+        /// The document's logical path (at that commit) or UUID
+        doc: String,
+        /// The commit to restore from, as `rmu hub log` shows it, or main,
+        /// main~N (a document deleted by then comes back as it was just
+        /// before its deletion)
+        #[arg(long, value_name = "REV")]
+        at: String,
+        #[command(flatten)]
+        origin: OriginArg,
+    },
+    /// Add a PDF or EPUB to the library on origin; every tablet gets it at
+    /// its next sync. No tablet is needed with --origin (unless --host or another SSH flag names one)
+    #[command(after_help = AFTER_HELP)]
+    Add {
+        /// The .pdf or .epub file
+        file: PathBuf,
+        /// The folder (logical path or UUID; default: the root)
+        folder: Option<String>,
+        /// The document's name (default: the file name without extension)
+        #[arg(long)]
+        name: Option<String>,
+        #[command(flatten)]
+        origin: OriginArg,
+    },
     /// Forget the hub state on the tablet; its documents are untouched
     #[command(after_help = AFTER_HELP)]
     Detach {
@@ -253,6 +301,10 @@ pub enum Report {
     Remote(RemoteReport),
     SetUrl(SetUrlReport),
     Detach(DetachReport),
+    Log(LogReport),
+    DocLog(DocLogReport),
+    Restore(RestoreReport),
+    Add(AddReport),
 }
 
 /// Why a command failed, as an exit status (see [`AFTER_HELP`]); it
@@ -339,6 +391,23 @@ pub struct Env<'a> {
     pub quiet: bool,
     pub xochitl_dir: &'a str,
     pub progress: Arc<dyn Progress>,
+    /// A flag naming the tablet (`--host`, `--user`, `--port`, `-i`, `-o`,
+    /// `--password`, `--password-file`) was given explicitly.
+    pub tablet_given: bool,
+}
+
+/// Whether a command contacts the tablet. `init` never does; `log`,
+/// `restore` and `add` only without `--origin` (the tablet supplies its
+/// stored URL) or with an explicit flag naming the tablet (for its base,
+/// or as the commit's author); every other command always does.
+pub fn wants_tablet(command: &HubCommand, tablet_given: bool) -> bool {
+    match command {
+        HubCommand::Init { .. } => false,
+        HubCommand::Log { origin, .. }
+        | HubCommand::Restore { origin, .. }
+        | HubCommand::Add { origin, .. } => origin.origin.is_none() || tablet_given,
+        _ => true,
+    }
 }
 
 /// The library options for a command.
@@ -379,7 +448,10 @@ pub fn options(command: &HubCommand) -> HubOptions {
         | HubCommand::Remote {
             action: None,
             origin: url,
-        } => origin(url),
+        }
+        | HubCommand::Log { origin: url, .. }
+        | HubCommand::Restore { origin: url, .. }
+        | HubCommand::Add { origin: url, .. } => origin(url),
         HubCommand::Remote {
             action: Some(RemoteAction::SetUrl { lock, .. }),
             ..
@@ -456,9 +528,9 @@ pub fn run(
         &*env.progress,
     )
     .with_options(options(&args.command));
-    let tablet = match &args.command {
-        HubCommand::Init { .. } => None,
-        _ => Some(
+    let tablet = match wants_tablet(&args.command, env.tablet_given) {
+        false => None,
+        true => Some(
             SshTablet::new(connect().map_err(setup_error)?)
                 .with_paths(TabletPaths {
                     xochitl_dir: env.xochitl_dir.to_string(),
@@ -484,14 +556,28 @@ pub fn run(
     )
 }
 
-/// Run a command. Every command but `init` needs `tablet`.
+/// Run a command. Every command but `init`, `log`, `restore` and `add`
+/// needs `tablet` (see [`wants_tablet`]).
 pub fn execute(
     hub: &Hub<'_>,
     tablet: Option<&dyn Tablet>,
     command: &HubCommand,
 ) -> libremarkable_utils::Result<Report> {
-    let tablet = || tablet.expect("every command but init has a tablet");
+    let optional = tablet;
+    let tablet = || tablet.expect("the command has a tablet");
     match command {
+        HubCommand::Log {
+            doc: None,
+            max_count,
+            ..
+        } => hub.log(optional, *max_count).map(Report::Log),
+        HubCommand::Log { doc: Some(doc), .. } => hub.doc_log(optional, doc).map(Report::DocLog),
+        HubCommand::Restore { doc, at, .. } => hub.restore(optional, doc, at).map(Report::Restore),
+        HubCommand::Add {
+            file, folder, name, ..
+        } => hub
+            .add(optional, file, folder.as_deref(), name.as_deref())
+            .map(Report::Add),
         HubCommand::Init { origin } => {
             let origin = absolute_origin(origin);
             hub.init(&origin)

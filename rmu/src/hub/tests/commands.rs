@@ -48,7 +48,19 @@ impl World {
     /// Run `args` (after `rmu hub`) on `tablet`; the result as `finish`
     /// writes it, and the exit code.
     fn run(&self, tablet: &FakeTablet, args: &[&str], output: Output) -> (String, String, u8) {
+        self.run_on(Some(tablet), args, output)
+    }
+
+    /// [`World::run`], with or without a tablet (`log`, `restore`, `add`
+    /// with `--origin`).
+    fn run_on(
+        &self,
+        tablet: Option<&FakeTablet>,
+        args: &[&str],
+        output: Output,
+    ) -> (String, String, u8) {
         static PROGRESS: NoProgress = NoProgress;
+        let tablet = tablet.map(|tablet| tablet as &dyn Tablet);
         let args = hub_args(args);
         let hub = Hub::new(
             self.git.clone(),
@@ -60,11 +72,11 @@ impl World {
             date: Some(DATE.to_string()),
             ..options(&args.command)
         });
-        let result = execute(&hub, Some(tablet), &args.command);
+        let result = execute(&hub, tablet, &args.command);
         let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
         let cache = self.scratch.join("cache");
         let context = OutputContext {
-            tablet: Some(tablet),
+            tablet,
             cache_dir: Some(&cache),
             output,
             quiet: false,
@@ -562,4 +574,75 @@ fn set_url_refuses_an_origin_without_the_journaled_merge() {
         "{value}"
     );
     assert_eq!(world.json(&a, &["remote"]).0["origin"], origin.as_str());
+}
+
+#[test]
+fn log_restore_and_add_with_and_without_a_tablet() {
+    let world = World::new();
+    let origin = world.origin();
+    let a = world.tablet("a", |b| with_pdf(b, 1, "Paper one"));
+    assert_eq!(world.json(&a, &["init", &origin]).1, 0);
+    assert_eq!(
+        world.json(&a, &["clone", &origin, "--name", "Tablet A"]).1,
+        0
+    );
+
+    // `add` from a computer without the tablet.
+    let file = world.scratch.join("Scan.pdf");
+    std::fs::write(&file, test_support::pdf(2)).unwrap();
+    let file = file.display().to_string();
+    let (stdout, stderr, code) =
+        world.run_on(None, &["add", &file, "--origin", &origin], Output::Plain);
+    assert_eq!(code, 0, "{stderr}");
+    let added = DocId::new(stdout.trim()).unwrap();
+    assert!(stderr.starts_with("Added \"Scan\""), "{stderr}");
+    assert!(stderr.contains("2 pages (page list written)"), "{stderr}");
+
+    // `log` through the tablet's stored origin: its base is marked.
+    let (value, code) = world.json(&a, &["log"]);
+    assert_eq!(code, 0, "{value}");
+    assert_eq!(value["command"], "log");
+    assert_eq!(value["entries"][0]["kind"], "add");
+    assert_eq!(value["entries"][0]["added"], json!([added.to_string()]));
+    assert_eq!(value["tablet"]["device_name"], "Tablet A");
+    assert_eq!(value["entries"].as_array().unwrap().len(), 3);
+    let (value, _) = world.json(&a, &["log", "-n", "1"]);
+    assert_eq!(value["more"], 2);
+
+    // A document's history, by path.
+    let (stdout, _, code) = world.run(&a, &["log", "Paper one"], Output::Human);
+    assert_eq!(code, 0);
+    assert!(
+        stdout.starts_with(&format!("\"Paper one\" ({}), in the root", doc(1))),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("Tablet A: added as \"Paper one\" in the root"),
+        "{stdout}"
+    );
+
+    // `restore` with the tablet as the author.
+    let (value, code) = world.json(&a, &["restore", "Paper one", "--at", "main"]);
+    assert_eq!(code, 0, "{value}");
+    assert_eq!(value["command"], "restore");
+    assert_eq!(value["name"], format!("Paper one (restored {DATE})"));
+    let (value, _) = world.json(&a, &["log", "-n", "1"]);
+    assert_eq!(value["entries"][0]["author"], "Tablet A");
+
+    // The next sync brings both.
+    let (value, code) = world.json(&a, &["sync"]);
+    assert_eq!(code, 0, "{value}");
+    assert_eq!(value["applied"].as_array().unwrap().len(), 2, "{value}");
+    assert!(a.read_file(&format!("{added}.pdf")).is_some());
+
+    // Errors: unknown documents and revisions exit 1, as JSON too.
+    let (value, code) = world.json(&a, &["restore", "Nothing", "--at", "main"]);
+    assert_eq!(code, 1);
+    assert_eq!(value["error"]["kind"], "error");
+    let (_, stderr, code) = world.run_on(
+        None,
+        &["restore", "Paper one", "--at", "nope", "--origin", &origin],
+        Output::Human,
+    );
+    assert_eq!(code, 1, "{stderr}");
 }

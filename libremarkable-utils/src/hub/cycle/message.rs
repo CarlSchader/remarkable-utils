@@ -7,10 +7,14 @@
 //! (`Rmu-Deletion-Consent: <uuid>`). Other tablets read the consent
 //! trailers to apply such deletions without asking again, `status` reads
 //! the fork trailers to list open conflict copies, and `clone` reads the
-//! model trailers to warn about mixed models.
+//! model trailers to warn about mixed models. `restore` and `add` commits
+//! record the document they create (`Rmu-Restored: <copy> <original>
+//! <commit>`, `Rmu-Added: <uuid>`), with the device trailers when a
+//! tablet was given; `log` reads them all back.
 
 use std::collections::BTreeSet;
 
+use crate::git::Oid;
 use crate::hub::model::{DeviceId, DeviceName, DocId};
 
 pub(super) const DEVICE: &str = "Rmu-Device";
@@ -20,6 +24,8 @@ pub(super) const FIRMWARE: &str = "Rmu-Firmware";
 pub(super) const FORK: &str = "Rmu-Fork";
 pub(super) const CONSENT: &str = "Rmu-Deletion-Consent";
 pub(super) const QUARANTINED: &str = "Rmu-Quarantined";
+pub(super) const RESTORED: &str = "Rmu-Restored";
+pub(super) const ADDED: &str = "Rmu-Added";
 
 /// Who wrote a commit.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,6 +132,74 @@ pub(super) fn merge(origin: &Author, record: &MergeRecord) -> String {
     )
 }
 
+/// The message of a `restore` commit: `copy` is `original`'s version
+/// from commit `from`, named `name`. `origin`: the tablet given, if any.
+pub(super) fn restore(
+    origin: Option<&Author>,
+    name: &str,
+    copy: &DocId,
+    original: &DocId,
+    from: &Oid,
+) -> String {
+    let trailers: Vec<_> = origin
+        .map(device_trailers)
+        .unwrap_or_default()
+        .into_iter()
+        .chain([(RESTORED, format!("{copy} {original} {from}"))])
+        .collect();
+    compose(&format!("rmu hub: restore \"{name}\""), &[], &trailers)
+}
+
+/// The message of an `add` commit.
+pub(super) fn add(origin: Option<&Author>, name: &str, doc: &DocId) -> String {
+    let trailers: Vec<_> = origin
+        .map(device_trailers)
+        .unwrap_or_default()
+        .into_iter()
+        .chain([(ADDED, doc.to_string())])
+        .collect();
+    compose(&format!("rmu hub: add \"{name}\""), &[], &trailers)
+}
+
+/// A message's subject: its first line.
+pub(super) fn subject(message: &str) -> &str {
+    message.lines().next().unwrap_or_default()
+}
+
+/// The lines of a message's body: the paragraphs between its subject and
+/// its trailers (a merge's notes).
+pub(super) fn body(message: &str) -> Vec<String> {
+    let paragraphs: Vec<&str> = message.trim_end().split("\n\n").skip(1).collect();
+    let is_trailers = |paragraph: &str| {
+        paragraph.lines().all(|line| {
+            line.split_once(": ")
+                .is_some_and(|(key, _)| key.starts_with("Rmu-") && !key.contains(' '))
+        })
+    };
+    let body = match paragraphs.split_last() {
+        Some((last, rest)) if is_trailers(last) => rest,
+        _ => &paragraphs[..],
+    };
+    body.iter()
+        .flat_map(|paragraph| paragraph.lines())
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// `(copy, original, from)` of `Rmu-Restored` trailers.
+pub(super) fn restored(trailers: &[(String, String)]) -> Vec<(DocId, DocId, Oid)> {
+    values(trailers, RESTORED)
+        .filter_map(|value| {
+            let mut parts = value.split(' ');
+            let copy = DocId::new(parts.next()?).ok()?;
+            let original = DocId::new(parts.next()?).ok()?;
+            let from = parts.next()?.parse().ok()?;
+            parts.next().is_none().then_some((copy, original, from))
+        })
+        .collect()
+}
+
 /// The `Rmu-*` trailers of a message: `Key: value` lines of its last
 /// paragraph whose key starts with `Rmu-`.
 pub(super) fn trailers(message: &str) -> Vec<(String, String)> {
@@ -225,6 +299,50 @@ mod tests {
         );
         assert!(values(&parsed, MODEL).next().is_none());
         assert_eq!(doc_ids(values(&parsed, QUARANTINED)), [doc(9)].into());
+    }
+
+    #[test]
+    fn restore_and_add_messages_round_trip() {
+        let from: Oid = "ab".repeat(20).parse().unwrap();
+        let message = restore(None, "Notes (restored 2026-11-09)", &doc(2), &doc(1), &from);
+        assert_eq!(
+            subject(&message),
+            "rmu hub: restore \"Notes (restored 2026-11-09)\""
+        );
+        let parsed = trailers(&message);
+        assert_eq!(restored(&parsed), vec![(doc(2), doc(1), from.clone())]);
+        assert!(values(&parsed, DEVICE).next().is_none());
+        assert!(body(&message).is_empty());
+        let name = DeviceName::new("T").unwrap();
+        let id = DeviceId::new("0f0e0d0c-0000-4000-8000-00000000c001").unwrap();
+        let message = add(Some(&origin(&name, &id)), "Paper\nx", &doc(3));
+        assert_eq!(subject(&message), "rmu hub: add \"Paper?x\"");
+        let parsed = trailers(&message);
+        assert_eq!(doc_ids(values(&parsed, ADDED)), [doc(3)].into());
+        assert_eq!(values(&parsed, DEVICE).collect::<Vec<_>>(), ["T"]);
+        // Malformed restore trailers are ignored.
+        let odd = format!(
+            "s\n\nRmu-Restored: {} {}\nRmu-Restored: {} {} {from} extra\n",
+            doc(1),
+            doc(2),
+            doc(1),
+            doc(2)
+        );
+        assert!(restored(&trailers(&odd)).is_empty());
+    }
+
+    #[test]
+    fn bodies_are_the_paragraphs_between_subject_and_trailers() {
+        let name = DeviceName::new("T").unwrap();
+        let id = DeviceId::new("0f0e0d0c-0000-4000-8000-00000000c001").unwrap();
+        let record = MergeRecord {
+            notes: vec!["first note".into(), "second note".into()],
+            ..MergeRecord::default()
+        };
+        let message = merge(&origin(&name, &id), &record);
+        assert_eq!(body(&message), ["first note", "second note"]);
+        assert_eq!(body("subject only"), Vec::<String>::new());
+        assert_eq!(body("subject\n\nfree text\nmore\n"), ["free text", "more"]);
     }
 
     #[test]

@@ -2,9 +2,10 @@
 
 Status: **phase 1 implemented** (git plumbing, data model, merge
 engine, device layer, sync cycle with clone, backup, status and
-`--dry-run`, the `rmu hub` CLI, and the hub lock for other `rmu`
-commands) and **validated on one Paper Pro** (see "Device validation
-results"); the bugs found there are listed with the results.
+`--dry-run`, the `rmu hub` CLI, the hub lock for other `rmu`
+commands, and `log`, `restore` and `add`) and **validated on one Paper
+Pro** (see "Device validation results"; `log`, `restore` and `add`
+landed after it); the bugs found there are listed with the results.
 This document is the plan of record; update it as phases land and as
 device experiments confirm or refute its assumptions.
 
@@ -226,10 +227,9 @@ rmu hub status                   # read-only: changes since base, ahead/behind, 
 rmu hub sync --dry-run           # read-only: merge result and planned tablet writes
 rmu hub remote [set-url <url>]   # show/change the origin URL stored on the tablet
 rmu hub detach                   # forget hub state on the tablet; documents untouched
-# later
-rmu hub log [path]               # history of the library or one document
-rmu hub restore <path> --at <rev># bring back an old version as a new document
-rmu hub add <file.pdf> <folder>  # add a document to origin without a tablet
+rmu hub log [path|uuid]          # history of the library or one document
+rmu hub restore <path|uuid> --at <rev>  # bring back an old version as a new document
+rmu hub add <file.pdf|file.epub> [folder]  # add a document to origin without a tablet
 ```
 
 The tablet is chosen with rmu's existing global SSH flags (`--host`,
@@ -242,7 +242,9 @@ local path that does not exist yet (git's rule: no `scheme://`, and no
 `host:` before the first `/`), and removes what it created if it fails.
 
 `status` and `--dry-run` never stop xochitl, take the lock, or push
-anything; their snapshot is best effort and they say so.
+anything; their snapshot is best effort and they say so. `log`,
+`restore` and `add` work on origin alone and need a tablet only for
+its stored URL (see "History, restore and add").
 
 ## The sync cycle
 
@@ -1065,6 +1067,11 @@ reMarkable cloud account, and the case after lost tablet state.
   `cPages.original` when that is set, and no `.rm` files. The reference
   is the base's `.content`; for "new on both" it is an empty page list,
   so two tablets that each opened the same imported PDF agree.
+  A reference that is itself a trivial materialisation with the same
+  number of entries and no ink counts as empty too (and so reads as the
+  empty list itself): a page list `rmu hub add` wrote, materialised
+  again with other ids by a tablet, is no change (see "History,
+  restore and add").
   When both sides materialised, origin's page ids win, even if the tablet
   also changed the metadata (the fork class then comes from origin).
 - **Unparsable JSON** stops the run: the `.metadata` of every present
@@ -1236,6 +1243,161 @@ race, the loser's push is rejected and it merges with the winner's
 merge identically either way). `clone` warns when the tablet's model
 differs from the one model the repository's history has seen.
 
+## History, restore and add
+
+`rmu hub log`, `restore` and `add` work on origin through the local
+cache. None of them stops xochitl, takes the tablet lock or writes to
+the tablet.
+
+**Which origin.** With `--origin <url>` no tablet is needed: the cache
+this computer keeps for that URL is used, or created by fetching the
+library once, exactly as `clone` finds its cache. Without `--origin`
+the tablet (chosen with the global SSH flags, as for every command) is
+asked for its hub state, and its stored URL and its repository's cache
+are used; origin's repo id must be the tablet's (`RepoMismatch`
+otherwise). `--origin` together with an explicit flag naming the tablet
+(`--host`, `--user`, `--port`, `-i`, `-o`, `--password`,
+`--password-file`) uses both: the URL given, and the tablet for its
+base (`log`) and as the author (`restore`, `add`). The tablet is only read: its state file, and for
+`restore`/`add` its model and firmware (for the trailers).
+
+**`rmu hub log`.** Without an argument it shows the library's history:
+`main`'s first-parent chain, newest first (`-n` limits the count), so
+one entry per sync, `restore` and `add`, plus `init`. Each entry has
+the commit, its time and author, its kind (from its subject, parents
+and trailers: init, a sync's merge commit, a snapshot that
+fast-forwarded `main`, restore, add, or another commit made by hand),
+the device, model and firmware trailers, the merge's notes (its body),
+its forks, deletions with recorded consent, restores and additions, and
+the documents it added, changed (any file, view state included) and
+deleted against its first parent, with their names (from each version's `.metadata`: the new one, or the
+last one for a deletion). The changes come from the history index, so
+no tree is read per commit: each document's touches on the chain, in
+order, are the versions it moved between. With a tablet, the entry its
+base points at is marked and its base overrides are counted.
+
+With an argument, a logical path or a UUID, it shows that document's
+history on the same chain, newest first: every commit where its
+`docs/<uuid>` subtree changed, saying what changed (added, content
+changed, renamed, moved, the trash included, deleted; a commit that
+only moved view state or derived fields is left out), plus every
+commit whose trailers name it (a conflict copy forked from it or it
+being one, a restore made from it or it being one). A path is resolved
+against `main`; a path that resolves to nothing there (the document was
+deleted, renamed or moved) is resolved against each older first-parent
+commit in turn, and the newest commit where it matches anything decides.
+Ambiguous paths are refused, never guessed: the error asks for the UUID.
+A UUID must name a document that was on `main`'s history. With a
+tablet, the document's own base is reported.
+
+**`rmu hub restore <doc> --at <rev>`.** `<rev>` is a commit id as `log`
+prints it (an abbreviation is fine) or `main`, `main~N`; it must be
+`main` or one of its ancestors. Merged snapshots count, so a tablet's
+state from just before a merge can be restored; a commit that is only
+on a device ref cannot. The path resolves at `<rev>`, falling back to
+older commits as for `log`. The version restored is the document's at
+`<rev>`; if it is absent there (deleted by then), the newest version
+before `<rev>` on its first-parent chain, so `--at` a deletion commit
+restores what was deleted. Folders are refused (their documents can be
+restored one by one).
+
+The version becomes a **new document with a fresh random UUID**; the
+original, if it still exists, is never touched. Every file of its
+subtree is reused as it is (the same blobs, so nothing is transferred;
+page ids are scoped to the document and cannot collide), except
+`.metadata`, rewritten with every unknown field kept: `visibleName`
+becomes `<name> (restored <yyyy-mm-dd>)` (the UTC date of the restore,
+with the copy's first 8 hex digits appended if that name is taken in
+the folder, as for conflict copies), `parent` stays the original folder
+if that is present on `main`, a folder and not in the trash, and becomes
+the root otherwise, and `lastModified` is now. Since its UUID is new,
+every tablet's next sync adds it as new on origin; no tablet can fork
+it.
+
+**`rmu hub add <file> [folder]`.** A `.pdf` or `.epub` becomes a new
+document (fresh random UUID) in `folder` (a logical path or UUID on
+`main`; the root by default; it must be a folder outside the trash),
+named `--name` or the file's stem. A name already taken in that folder
+is refused, as `rmu upload` does, and so is a `.pdf` that does not start
+with `%PDF-` within its first KiB. Its files: `.metadata` as `rmu
+upload` writes it (`new: true`, never opened), the payload, and
+`.content`, without a `.pagedata` (firmware 3.28 writes none for
+documents it creates). For a PDF whose page count can be read,
+`.content` carries a **materialised page list**: one entry per page,
+`id` = UUIDv5(namespace: the document's UUID, name: the page index in
+decimal), `idx` = `b` followed by the index in base 26 (`a` to `z`,
+fixed width: `ba`, `bb`, ... up to 26 pages), `redir` = the index,
+registers stamped `1:2` as xochitl stamps them; `cPages.original` and
+`pageCount` are the page count and `sizeInBytes` the payload's size. A
+tablet opening it finds the list in place, and every tablet has the
+same page ids. EPUBs (laid out on the device) and PDFs whose page count
+cannot be read reliably get rmu's unmaterialised skeleton
+(`"pages": []`), and the first-open materialisation rule keeps two
+tablets that open them from forking.
+
+**The page count, without native dependencies.** A small reader
+(`pdf.rs`, pure and unit-tested) follows `startxref` to the
+cross-reference data: classic tables and cross-reference streams,
+hybrid files (`/XRefStm`), incremental updates (`/Prev`) and objects
+inside object streams; Flate streams with PNG predictors are decoded
+with `flate2`, which `zip` already brings in with its pure-Rust
+`zlib-rs` backend. When the cross-reference data is unusable it
+rebuilds the table by scanning for `N G obj`. It then reads `/Root`,
+`/Pages` and `/Count`, and walks the page tree counting its leaves. The
+count is used only when the walk agrees with `/Count`; anything else
+(encrypted object streams, filters other than Flate, a damaged file)
+falls back to the skeleton. `add` is fed files from anywhere, so every
+count runs within limits (`pdf::Limits`), and running out of any of
+them is "no count", the skeleton again: a work budget of 16 units per
+byte of the file plus 64 Mi (a unit per byte searched, parsed or
+decoded and per object built), so no input makes it search the rest of
+the file once per object; 16 MiB per decoded stream; 32 MiB of object
+streams held decoded; a million cross-reference entries across every
+section and the scan, checked against the declared counts before
+anything is allocated (offsets past the end of the file are dropped);
+256 Ki objects per parse; a million page-tree nodes; and nesting,
+reference hops, sections and tree depth. Stream data is read only for
+cross-reference and object streams, and a hex string ends at its first
+non-hex byte. Measured (`tests/pdf_bounds.rs`, a counting allocator):
+the hostile files from review (cross-reference stream bombs, chained
+sections, huge arrays in object streams, quadratic scans, a valid
+table of pages followed by unterminated streams) peak at 33 MiB of heap
+(67 MiB for a stream filling the entry cap) and take under 50 ms in a
+release build; 12 million mutated files stayed within their limits
+without a panic. The
+alternatives were worse: a count given by the user can be wrong, and a
+wrong list is worse than none (a list whose length disagrees with the
+PDF is a change each tablet would make on its own); always writing the
+skeleton gives up the deterministic ids that spare every tablet the
+first-open rewrite and that phase 2 needs to match pages.
+
+**If xochitl rewrites a page list it is given.** Device validation
+found that xochitl keeps a page list changed externally on a document
+it had opened (question 7); whether it keeps the list `add` writes on a
+document it never opened is still to be confirmed. Should it materialise again, with ids of its own, the
+first-open materialisation rule is generalised so that this is no change
+either: a trivially materialised page list reads as the empty list when
+its reference is empty **or itself trivially materialised with the same
+number of pages** (see "Changed on both, differently"). As for the
+empty list, the first tablet to sync after opening it pushes its ids
+(origin did not change it, so the tablet's bytes are taken), and when
+two tablets materialised it, origin's ids win; nothing forks. A list of
+another length is a real change.
+
+**Writes.** `restore` and `add` write one commit on top of origin's
+`main` (single parent; its tree is `main`'s plus the new subtree) and
+push it fast-forward only, as a sync pushes: on rejection they fetch,
+decide the folder and the name again against the new `main`, and retry
+(`push_attempts` in all); a lost acknowledgement is resolved by
+fetching. `add` writes the payload and `.content` into the cache once,
+before the first attempt (in a commit no ref points to). Identity is
+explicit: author and committer `rmu`, or with a tablet the author is its
+device name, as in its syncs. Trailers record what happened:
+`Rmu-Restored: <copy> <original> <commit the version came from>` or
+`Rmu-Added: <uuid>`, plus the device trailers when a tablet is given.
+`.rmu/hub.json` is pinned as in a sync (if it changes between attempts,
+the run stops). The next sync of each tablet applies the new document.
+
 ## View state
 
 View state is **device-local**: it never counts as a change, never forks,
@@ -1258,7 +1420,8 @@ clocks and per-model translation.
 |---|---|
 | `libremarkable-utils/src/git.rs` | Plumbing over the `git` binary: `init --bare`, `ls-remote`, `fetch`, `push` (rejection as a typed error, `--force-with-lease`), `ls-tree`, `cat-file --batch`, `fast-import`, `commit-tree`, `merge-base --is-ancestor`, `update-ref`. Explicit environment, no working tree. |
 | `libremarkable-utils/src/hub/mod.rs` | Module root (all submodules declared from the start). |
-| `libremarkable-utils/src/hub/cycle.rs` | The operations composing the parts below (`init`, `clone`, `sync`, `backup`, `status`, `--dry-run`, `remote`, `detach`); `Progress` steps; submodules for the serialisable reports and typed warnings (`report`), the tablet session (`session`), what a run knows about origin (`origin`), `init` (`init`), the merge a sync runs (`merge_run`), the local cache (`store`), reading the tablet (`snapshot`), the pure decisions (`plan`: equivalence, apply plan, verification, step-14 moved paths, tree and trash checks, reconciliation verdicts and finish, manifest), commit messages and trailers (`message`), the history index (`history`), the steps (`steps`, with `clone`, `reconcile`, `push` and `apply`), the read-only commands (`inspect`) and `remote`/`detach` (`admin`). |
+| `libremarkable-utils/src/hub/cycle.rs` | The operations composing the parts below (`init`, `clone`, `sync`, `backup`, `status`, `--dry-run`, `remote`, `detach`); `Progress` steps; submodules for the serialisable reports and typed warnings (`report`), the tablet session (`session`), what a run knows about origin (`origin`), `init` (`init`), the merge a sync runs (`merge_run`), the local cache (`store`), reading the tablet (`snapshot`), the pure decisions (`plan`: equivalence, apply plan, verification, step-14 moved paths, tree and trash checks, reconciliation verdicts and finish, manifest), commit messages and trailers (`message`), the history index (`history`), the steps (`steps`, with `clone`, `reconcile`, `push` and `apply`), the read-only commands (`inspect`), `remote`/`detach` (`admin`), and `log` (`log`), `restore` (`restore`) and `add` (`add`) over what they share (`library`: origin without a sync, document resolution, the push of one new document). |
+| `libremarkable-utils/src/pdf.rs` | Pure: the PDF page counter `add` uses (see "History, restore and add"). |
 | `libremarkable-utils/src/hub/model.rs` | Pure: layout mapping, allowlist classification, view-state paths, document grouping, carry-forward, tablet state and journal formats, snapshot validation (submodules `ids`, `layout`, `rules`, `state`, `grouping`, `snapshot`, re-exported from `hub::model`). |
 | `libremarkable-utils/src/hub/merge.rs` | Pure: merge rules, deletion guard, fork naming and UUIDs, orphan/cycle checks. |
 | `libremarkable-utils/src/hub/device.rs` | Device I/O behind a trait: lock, watchdog, stop/start, stat pass, streaming download, verify, staged apply, journal and state removal, listing what is still staged. A local-directory fake implements the trait, with fault injection. |
@@ -1346,7 +1509,14 @@ see "Device validation results" below):
    stopping xochitl safe on the Paper Pro with encrypted storage, and
    within the start-limit window when repeated?
 7. Does xochitl accept a `.content` whose page list was merged
-   externally?
+   externally? (Answered: it does, see the results.) Still open: the page
+   list `rmu hub add` writes, which validation did not cover. Its
+   registers name author `1` without a `cPages.uuids` table defining it,
+   and its `idx` values past 26 pages (`baa`, `bab`, ...) are rmu's own
+   scheme, not checked against what xochitl writes for long PDFs.
+   Neither matters to the merge (`uuids` is derived and `idx` compares
+   within a document), but if xochitl rejects such a list, `add`
+   switches to the skeleton.
 
 ### Device survey results
 
@@ -1677,10 +1847,12 @@ To be handled in the implementation PRs named:
   files — counts as unchanged (only view state and derived fields
   moved). If both sides materialised, origin's page ids win and the
   tablet takes them on apply. Without this, two tablets opening the same
-  new PDF fork it. `rmu hub add` should write a materialised page list
-  with deterministic page ids (UUIDv5 over document UUID and page index)
-  so documents added through the hub never hit the case. Phase 2 matches
-  pages by `redir` when both sides materialised from an empty base.
+  new PDF fork it. `rmu hub add` writes a materialised page list with
+  deterministic page ids (UUIDv5 over document UUID and page index) so
+  documents added through the hub never hit the case (done, with the
+  rule generalised to a materialised base materialised again; see
+  "History, restore and add"). Phase 2 matches pages by `redir` when
+  both sides materialised from an empty base.
 - Sync cycle, step 2 (done): the pairing guard runs the survey's check
   (in the device layer's fail-closed form, which errors when the
   configuration cannot be read) and refuses on `true`.
@@ -1744,4 +1916,8 @@ Each item is one reviewed PR; items on the same line run in parallel.
 9. **Refactor checkpoint**: shared code between `sync` and `hub`
    (listing, stat passes, tar transfer), module sizes, naming.
 10. **Phase 2 page-level merge.**
-11. **`log`, `restore`, `add`.**
+11. **`log`, `restore`, `add`** (done: `hub::cycle::{library, log,
+    restore, add}`, `pdf.rs`, the CLI with `--json` goldens; e2e
+    scenarios restore a changed and a deleted document onto two
+    tablets, add a PDF that both open without forking, check the log
+    against the history, and race an `add` against a sync both ways).
