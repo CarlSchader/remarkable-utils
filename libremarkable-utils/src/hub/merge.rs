@@ -311,6 +311,11 @@ pub enum NoteKind {
     MetadataConflict { field: String },
     /// Deleted on one side but changed on the other, so it was kept.
     KeptOverDeletion { deleted_by: Side },
+    /// Brought to the tablet although the library had deleted it (here,
+    /// on another tablet, or before this tablet was cloned): another
+    /// tablet changed it after the deletion (or added it back), so the
+    /// merge there kept it. Noted by the sync cycle, not the merge.
+    ReturnedAfterDeletion,
     /// The fork class changed on both sides; the tablet's version is now
     /// `copy`.
     Forked { copy: DocId },
@@ -347,6 +352,10 @@ impl fmt::Display for Note {
             NoteKind::KeptOverDeletion { deleted_by } => write!(
                 f,
                 "{doc}: deleted on {deleted_by} but changed on the other side; kept"
+            ),
+            NoteKind::ReturnedAfterDeletion => write!(
+                f,
+                "{doc}: deleted from the library earlier, but another tablet changed or restored it since; back from origin"
             ),
             NoteKind::Forked { copy } => write!(
                 f,

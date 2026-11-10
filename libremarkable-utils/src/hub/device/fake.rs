@@ -1042,6 +1042,10 @@ impl Tablet for FakeTablet {
         self.op(OpKind::XochitlActive, || Ok(self.is_running()))
     }
 
+    fn destination(&self) -> String {
+        format!("fake:{}", self.xochitl.display())
+    }
+
     fn cloud_paired(&self) -> Result<bool> {
         self.op(OpKind::CloudPaired, || Ok(self.state().cloud_paired))
     }

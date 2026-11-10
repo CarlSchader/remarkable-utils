@@ -59,6 +59,18 @@ pub(super) fn known_from_manifest(
         .collect()
 }
 
+/// A saved pre-read's entries as [`Known`] files: like the pre-read of
+/// this run ([`pre_read_known`]), only entries with a nanosecond mtime,
+/// their blobs checked against the cache.
+pub(super) fn saved_known(
+    saved: &BTreeMap<XochitlPath, ManifestEntry>,
+) -> BTreeMap<XochitlPath, Known> {
+    known_from_manifest(saved)
+        .into_iter()
+        .filter(|(_, known)| known.stat.fine_mtime())
+        .collect()
+}
+
 /// One mirrored regular file as read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ReadFile {
@@ -86,6 +98,22 @@ pub(super) struct TabletRead {
 }
 
 impl TabletRead {
+    /// Each file's stat and blob.
+    pub fn manifest_entries(&self) -> BTreeMap<XochitlPath, ManifestEntry> {
+        self.files
+            .iter()
+            .map(|(path, read)| {
+                (
+                    path.clone(),
+                    ManifestEntry {
+                        stat: read.stat,
+                        blob: read.blob.clone(),
+                    },
+                )
+            })
+            .collect()
+    }
+
     /// As [`Known`] files for a re-read later in the same run.
     pub fn as_known(&self) -> BTreeMap<XochitlPath, Known> {
         self.files
@@ -194,6 +222,52 @@ fn classify(
     )
 }
 
+/// Checkpoints of a long read: after about `every` downloaded bytes the
+/// writer is checkpointed (its objects become durable), and `save` is
+/// told every file known so far (reused, or downloaded and now durable),
+/// so a cut later in the read loses at most `every` bytes of progress.
+pub(super) struct Checkpoints<'a> {
+    pub every: u64,
+    pub save: &'a mut dyn FnMut(&BTreeMap<XochitlPath, ManifestEntry>),
+}
+
+/// Where a read streams the blobs it downloads, and its checkpoints.
+pub(super) struct Sink<'a, 'p> {
+    pub writer: &'a mut CommitWriter<'p>,
+    pub checkpoints: Option<Checkpoints<'a>>,
+}
+
+impl<'a, 'p> Sink<'a, 'p> {
+    /// Into `writer`, without checkpoints.
+    pub fn plain(writer: &'a mut CommitWriter<'p>) -> Self {
+        Self {
+            writer,
+            checkpoints: None,
+        }
+    }
+}
+
+/// Files a read knows: what it reused and what it downloaded.
+fn known_entries<'a>(
+    reusable: impl Iterator<Item = (&'a XochitlPath, &'a Known)>,
+    fetched: impl Iterator<Item = (&'a XochitlPath, &'a Oid)>,
+    stats: &BTreeMap<&XochitlPath, StatSignature>,
+) -> BTreeMap<XochitlPath, ManifestEntry> {
+    reusable
+        .map(|(path, known)| (path, &known.blob))
+        .chain(fetched)
+        .filter_map(|(path, blob)| {
+            Some((
+                path.clone(),
+                ManifestEntry {
+                    stat: *stats.get(path)?,
+                    blob: blob.clone(),
+                },
+            ))
+        })
+        .collect()
+}
+
 /// How strictly to read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ReadMode {
@@ -212,7 +286,7 @@ pub(super) enum ReadMode {
 pub(super) fn pre_read_known(read: &TabletRead) -> BTreeMap<XochitlPath, Known> {
     read.as_known()
         .into_iter()
-        .filter(|(_, known)| known.stat.keep_in_manifest(i64::MAX))
+        .filter(|(_, known)| known.stat.fine_mtime())
         .map(|(path, known)| {
             (
                 path,
@@ -235,10 +309,14 @@ pub(super) fn read_tablet(
     rules: &MirrorRules,
     known: &BTreeMap<XochitlPath, Known>,
     store: &Store,
-    writer: &mut CommitWriter,
+    sink: Sink,
     progress: &dyn Progress,
     mode: ReadMode,
 ) -> Result<TabletRead> {
+    let Sink {
+        writer,
+        mut checkpoints,
+    } = sink;
     let listing = tablet.stat_all()?;
     let (candidates, excluded, irregular) = classify(rules, &listing)?;
     let matching: Vec<(&Candidate, &Known)> = candidates
@@ -274,8 +352,13 @@ pub(super) fn read_tablet(
         "Reading {} changed file(s) from the tablet",
         wanted.len()
     ));
+    let stats: BTreeMap<&XochitlPath, StatSignature> = candidates
+        .iter()
+        .map(|candidate| (&candidate.path, candidate.stat))
+        .collect();
     let mut fetched: BTreeMap<XochitlPath, (Oid, Option<Vec<u8>>)> = BTreeMap::new();
     let mut transferred = 0u64;
+    let mut unsaved = 0u64;
     let paths: Vec<XochitlPath> = wanted
         .iter()
         .map(|candidate| candidate.path.clone())
@@ -307,8 +390,18 @@ pub(super) fn read_tablet(
             (writer.write_blob(path.as_str(), size, reader)?, None)
         };
         transferred += size;
+        unsaved += size;
         progress.bytes(transferred, Some(total));
         fetched.insert(path.clone(), entry);
+        if let Some(checkpoints) = checkpoints.as_mut().filter(|c| unsaved >= c.every) {
+            writer.checkpoint()?;
+            unsaved = 0;
+            (checkpoints.save)(&known_entries(
+                reusable.iter().map(|(path, known)| (*path, *known)),
+                fetched.iter().map(|(path, (blob, _))| (path, blob)),
+                &stats,
+            ));
+        }
         Ok(())
     });
     progress.bytes_done();
@@ -435,4 +528,64 @@ pub(super) fn build(rules: &MirrorRules, read: &TabletRead, base: &RepoTree) -> 
         quarantined,
         orphans,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stat(mtime_ns: i64) -> StatSignature {
+        StatSignature {
+            size: 1,
+            mtime_ns,
+            ctime_ns: mtime_ns,
+            inode: 7,
+        }
+    }
+
+    fn path(name: &str) -> XochitlPath {
+        XochitlPath::new(format!("8c1f0b9e-0000-4000-8000-000000000001.{name}")).unwrap()
+    }
+
+    fn blob(n: u32) -> Oid {
+        format!("{n:040x}").parse().unwrap()
+    }
+
+    /// A pre-read's coarse (whole-second) mtimes could hide a change made
+    /// within that second: only nanosecond ones are trusted, and every
+    /// blob is checked against the cache (`trusted` off). The same goes
+    /// for what an earlier run's pre-read saved.
+    #[test]
+    fn pre_read_entries_need_nanosecond_mtimes() {
+        let doc = DocId::new("8c1f0b9e-0000-4000-8000-000000000001").unwrap();
+        let read = TabletRead {
+            files: [
+                ("metadata", 5_000_000_000, 1, DocFile::Metadata),
+                ("content", 5_000_000_123, 2, DocFile::Content),
+            ]
+            .into_iter()
+            .map(|(name, mtime, n, file)| {
+                (
+                    path(name),
+                    ReadFile {
+                        file: MirroredFile {
+                            doc: doc.clone(),
+                            file,
+                        },
+                        stat: stat(mtime),
+                        blob: blob(n),
+                    },
+                )
+            })
+            .collect(),
+            ..TabletRead::default()
+        };
+        let known = pre_read_known(&read);
+        assert_eq!(known.keys().collect::<Vec<_>>(), vec![&path("content")]);
+        assert!(!known[&path("content")].trusted);
+        let saved = saved_known(&read.manifest_entries());
+        assert_eq!(saved.keys().collect::<Vec<_>>(), vec![&path("content")]);
+        assert_eq!(saved[&path("content")].blob, blob(2));
+        assert!(!saved[&path("content")].trusted);
+    }
 }

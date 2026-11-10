@@ -857,6 +857,125 @@ pub fn commit_repo_config(git: &Git, origin: &str, bytes: &[u8]) -> Oid {
     commit
 }
 
+/// Run the git CLI hermetically (what a user does by hand, with a
+/// fabricated identity); it must succeed. Its output, trimmed.
+pub fn git_cli(root: &Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("HOME", root.join("home"))
+        .env("GIT_AUTHOR_NAME", "Admin")
+        .env("GIT_AUTHOR_EMAIL", "admin@example.invalid")
+        .env("GIT_COMMITTER_NAME", "Admin")
+        .env("GIT_COMMITTER_EMAIL", "admin@example.invalid")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+/// Append `rounds` updates to origin's `main` in one `fast-import`
+/// stream. Each is a merge whose first parent is the previous `main` and
+/// whose second is a side commit off it (as a merged device-ref snapshot
+/// is), both writing the repository files `edit(round)` returns. Returns
+/// the new `main`.
+pub fn append_history(
+    root: &Path,
+    origin: &str,
+    rounds: usize,
+    edit: impl Fn(usize) -> Vec<(String, Vec<u8>)>,
+) -> Oid {
+    use std::io::Write as _;
+    let git = |args: &[&str]| {
+        let mut cmd = std::process::Command::new("git");
+        cmd.arg(format!("--git-dir={origin}"))
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", root.join("home"));
+        cmd
+    };
+    let main = String::from_utf8(
+        git(&["rev-parse", "refs/heads/main"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    let stream = (0..rounds).fold(Vec::new(), |mut out, round| {
+        let previous = match round {
+            0 => main.clone(),
+            _ => format!(":{}", 2 * round),
+        };
+        let files = edit(round);
+        let header = |reference: &str, mark: usize| {
+            format!(
+                "commit {reference}\nmark :{mark}\ncommitter Scale <scale@example.invalid> {} +0000\ndata 6\nround\nfrom {previous}\n",
+                1_800_000_000 + round
+            )
+        };
+        let changes: Vec<u8> = files
+            .iter()
+            .flat_map(|(path, bytes)| {
+                [
+                    format!("M 100644 inline {path}\ndata {}\n", bytes.len()).into_bytes(),
+                    bytes.clone(),
+                    b"\n".to_vec(),
+                ]
+                .concat()
+            })
+            .collect();
+        out.extend(header("refs/rmu-scale/side", 2 * round + 1).into_bytes());
+        out.extend(&changes);
+        out.extend(header("refs/heads/main", 2 * round + 2).into_bytes());
+        out.extend(format!("merge :{}\n", 2 * round + 1).into_bytes());
+        out.extend(&changes);
+        out
+    });
+    let mut child = git(&["fast-import", "--quiet", "--force"])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(&stream).unwrap();
+    assert!(child.wait().unwrap().success());
+    assert!(
+        git(&["update-ref", "-d", "refs/rmu-scale/side"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    String::from_utf8(
+        git(&["rev-parse", "refs/heads/main"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .parse()
+    .unwrap()
+}
+
+/// This process's peak resident set size in KiB (Linux), after `reset`
+/// cleared it (best effort).
+pub fn peak_rss_kib(reset: bool) -> Option<u64> {
+    if reset {
+        let _ = fs::write("/proc/self/clear_refs", "5");
+    }
+    fs::read_to_string("/proc/self/status")
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("VmHWM:"))
+        .and_then(|value| value.trim().trim_end_matches("kB").trim().parse().ok())
+}
+
 pub fn metadata(name: &str, parent: &str, type_: &str) -> Value {
     json!({
         "createdTime": "1767225600000",

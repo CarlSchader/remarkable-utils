@@ -314,13 +314,68 @@ while implementing it, beyond the steps above:
   stat moved since, so a tablet with gigabytes of new data (a first
   clone) is down for seconds, not for the whole download. A pre-read
   entry counts only with a nanosecond mtime (a coarse one could hide a
-  change within its second) and only if its blob is in the cache (a
-  pre-read cut mid-file loses its whole `fast-import`); everything else
-  is read again while stopped. Step 5 reads **before** step 4 decides:
+  change within its second) and only if its blob is in the cache;
+  everything else is read again while stopped. The pre-read checkpoints
+  its `fast-import` about every 64 MiB (`HubOptions::pre_read_checkpoint`)
+  and saves what is durable (each file's stat and blob) next to the
+  cache, so a cut — even mid-file, which ends the `fast-import` — loses
+  at most that much plus the file being read: in this run, and in the
+  next, whose pre-read and stopped read both count the saved files as
+  known (checked like any other entry; a pre-read that fails outright
+  keeps what was saved). The saved file is the tablet's: keyed by its
+  device id, or before it has one by where this computer reaches it
+  (`Tablet::destination`, the SSH destination and port). A killed
+  `fast-import` leaves `.keep` files on the packs its checkpoints wrote;
+  an aborted writer removes them, and so does the next opening of the
+  cache when rmu itself was killed, so git can repack. A tablet the run
+  would refuse anyway is not read: the pairing
+  check (and, for `clone`, the attached and pending-journal checks) run
+  read-only first, and a tablet whose lock another run holds gets no
+  pre-read unless the lock is stale by its fired watchdog or is being
+  broken (a lock gone stale by a reboot cannot be told apart before
+  locking; that run reads from what earlier pre-reads saved). Step 5
+  reads **before** step 4 decides:
   reconciliation judges the files just read, and a document it finishes
   is read again. `status` and `--dry-run` read the same way, with the
   second read also while xochitl runs (retried once if a file changes
   while read).
+- **The history index.** Searches over origin's history go through an
+  index of which subtree of each document (`docs/<uuid>`) every ancestor
+  of `main` holds. It is built from one `rev-list --topo-order --parents`,
+  one `cat-file --batch-check` resolving each commit's `docs` tree, and
+  one `diff-tree --stdin` over (first parent's `docs` tree, the commit's)
+  pairs without recursion, so it lists one entry per changed document
+  however many files changed in it, and every pair must come back
+  (diff-tree skips an unreadable pair silently). The parsers and the
+  index are pure. Base inference walks each document's distinct versions
+  newest holder first and stops at the first match; the merge's history
+  reads the first-parent chain from it; a document version at a commit
+  the index has needs no tree read. The ancestry check uses the index,
+  or one `rev-list` of `main`, not a process per base. The cache
+  reader's caches are bounded (commits by count, trees by entries, JSON
+  by an estimate of its parsed size, 16 times its source bytes).
+  Measured, release build: building the index of two commits that each
+  change all 204,000 files of 2000 notebooks of 100 pages takes 7.5 ms
+  and +0.6 MB (0.42 s and +106 MB with a recursive diff); reattaching
+  1000 documents over 2400 commits on a fake tablet takes about 1.3 s
+  and +21 MB (10.5 s and +239 MB with a tree read per commit and
+  document), of which base inference is about 0.3 s, and the same
+  reattach with a one-merge history 0.38 s. The index is built per run
+  when needed (inference, an orphan's history, a document that comes
+  back); keeping it next to the cache and extending it from its last
+  tip is a follow-up.
+- **A clone fetches the library once.** Each cache records the origin
+  URL it was last opened with (`rmu-origin` in it). `clone` fetches into
+  the cache this computer keeps for its URL, if origin's `main` still
+  has that cache's repo id (otherwise that cache is left as it was);
+  else it fetches `main` once into a temporary repository, reads the
+  repo id there and renames it into place (or fetches from it locally
+  into an existing cache with that id). Measured with pack bytes
+  (`GIT_TRACE_PACKFILE`): a first clone on a computer with no cache
+  fetches 2.10 MB for a 2.10 MB library, and a reattach to an up-to-date
+  cache fetches nothing. Opening a cache under its `flock` also removes
+  the `.keep` files a killed `fast-import` left there (their content is
+  exactly `fast-import`).
 - **Pure work after the start.** Validation, carry-forward, and (for
   `clone`) base inference run after step 6; while xochitl is stopped
   only the stat pass and downloads (streamed into `fast-import`) happen.
@@ -364,11 +419,18 @@ while implementing it, beyond the steps above:
   and, when reconciliation finds the journaled snapshot is not an
   ancestor of the journaled merge, documents kept at their snapshot
   version or changed since. The snapshot is still committed and pushed
-  to the device ref at step 7 (before the merge is known, and so that
-  another computer can reconcile the journal); a device ref already
-  holding the same tree is reused, so a tablet that changed nothing
-  pushes nothing at all. Device refs are never ancestors of `main`
-  unless merged, so they do not grow what base inference searches.
+  to the device ref at step 7: the pull overwrites the tablet's files,
+  and "equivalent" ignores view state and derived fields, so the device
+  ref is the only place those bytes stay; and a pull-only journal names
+  the snapshot, which another computer reconciling it must be able to
+  fetch. A device ref already holding the same tree is reused, but that
+  only defers the push: the next run's snapshot (the pulled state plus
+  the tablet's own view state) differs from the last one, so every pull
+  adds one small commit to the device ref. And at the tablet's next
+  fast-forward or merge, its snapshot's device-ref parent brings that
+  chain of pull snapshots into `main`'s ancestry, where base inference
+  searches it (cheaply, through the history index). What a pull-only
+  run saves is the merge commit on `main`'s first-parent history.
 - **A lost push acknowledgement** (any push error but a rejection) is
   resolved by fetching: if `main` contains the merge, the push landed
   and the run carries on to apply it.
@@ -425,13 +487,26 @@ while implementing it, beyond the steps above:
 - **`remote` and `detach`.** `Hub::remote` reports the stored and the
   effective origin without the lock. `Hub::set_remote_url` stores a new
   URL under the lock, after checking that it holds the tablet's
-  repository (repo id, every base in `main`'s history), so a wrong URL
-  fails there and not at the next sync. `Hub::detach` removes the hub
-  state and the staging directories under the lock and leaves every
-  document alone; with `--prune-ref` it first deletes the device ref on
-  origin, leased on the value origin just advertised (a failure there
-  is a warning). A pending journal is discarded with the state, with a
-  warning.
+  repository (repo id, every base in `main`'s history, and the device
+  ref the tablet recorded, continuing it: an origin moved with
+  `git clone --bare` lacks `refs/rmu/*`, and the message says so),
+  before the lock and again under it (a sync from another computer in
+  between may have moved the bases), so a wrong URL fails there and not
+  at the next sync. While a journal is pending, the new origin must also
+  have its merge, before the lock and under it (`JournalMergeMissing`:
+  only there can `sync` finish it). `Hub::detach` removes the staging
+  directories and
+  the hub state under the lock and leaves every document alone; with
+  `--prune-ref` it then deletes the device ref on origin, leased on the
+  value origin just advertised (a failure there is a warning; state
+  first, so a crash in between leaves an unreferenced device ref, not a
+  state whose device ref is gone). While an interrupted sync's journal
+  is pending it refuses (`DetachJournalPending`: documents that apply
+  was writing may be half-updated on the tablet, and `sync` would finish
+  them) unless forced (`DetachOptions::force`), which discards the
+  journal with a warning. A failed `init` removes the bare
+  repository it created only if it has no `main` (a concurrent `init`
+  of the same path may have won).
 - **Cache maintenance** (`git maintenance run --auto`, the user's
   thresholds deciding whether anything happens) runs once the tablet is
   disarmed and unlocked, with the cache's `flock` still held: a slow
@@ -527,6 +602,21 @@ count as documents. The percentage is of origin's library for
 deletions from origin and of the tablet's for deletions from the
 tablet. With `--allow-deletions`, the trailer lists this merge's
 deletions from origin.
+
+The documents listed are by definition ones the tablet no longer has
+(deleted from origin) or is about to lose (deleted from the tablet), so
+the refusal (`DeletionsNeedConsent`), the sync report, `status` and
+`--dry-run` carry each one's `visibleName` (`names`), taken from the
+trees the merge already reads: origin's, then the tablet's snapshot,
+then the document's base. `status` also names the documents the tablet
+deleted since its base, and `--dry-run` those it would delete.
+
+A document this tablet's history deleted can come back: another tablet
+changed it after the deletion, so its merge kept it (`KeptOverDeletion`
+there). The pull that brings it back to this tablet notes it
+(`ReturnedAfterDeletion`): the merge adds it (absent from the snapshot
+and from the document's base), and the history index shows it present
+in an earlier first-parent ancestor of that base.
 
 ### Stage and apply (steps 12–14)
 
@@ -707,7 +797,15 @@ may write files:
     still staged by that run, and every file it was to remove is gone.
     Then the change is on top of the merge and the document takes base =
     merge; without this, an edit made after an unrecorded apply would
-    read the merge as the user's own change and fork it.
+    read the merge as the user's own change and fork it. Likewise when
+    the apply stopped inside the document and the user changed it since,
+    as long as every file is at the merge version, one the merge leaves
+    alone (the user's change), at the snapshot version with its write
+    still staged by that run (or, for a removal, still there), or one
+    the apply had written that the user changed since; and something was
+    written and something is pending: the pending files are finished,
+    one by one (never a file the user changed, so not the merge's whole
+    version), then base = merge.
 
   Documents whose merge and snapshot versions agree take base = merge.
   A document is never given base = merge unless its files are at the
@@ -755,7 +853,8 @@ Further:
   document), and device ids are random per clone, so only a copied
   state shares one. With no recorded value, a remote head is accepted
   as our own lost first push (a clone never reuses another tablet's
-  state); a recorded value with no remote ref stops the run.
+  state); a recorded value with no remote ref stops the run with a
+  message saying origin was probably moved without its `refs/rmu/*`.
   `clone --reattach` is the way out of both stops.
 - **Known limits** (no ink is lost in any): a document the user edits
   during the window of a sync that forks it is skipped, its copy with
@@ -764,10 +863,14 @@ Further:
   when a forking sync's push lands and the run stops before its staging
   completes, and the user then edits the original; and a document edited
   after the hub state was lost has no known base, so `--reattach` treats
-  it as new on both sides and forks it if it differs from origin's; and
-  a rename or move the user exactly reverts, after a crash between an
+  it as new on both sides and forks it if it differs from origin's; a
+  rename or move the user exactly reverts, after a crash between an
   apply and its record, is lost (the document reads as never reached by
-  the apply, so the next merge applies the change again; metadata only).
+  the apply, so the next merge applies the change again; metadata only);
+  and a document an apply stopped inside, in which the user then changed
+  a file whose write was still pending, forks (finishing that file
+  would overwrite the user's change, and the snapshot base reads the
+  files already written as the tablet's own change).
 - **Residual risks** (theoretical; no ink is lost): a pre-read entry is
   trusted on stat equality alone, which is safe only if a file's
   download starts at least one timestamp granule after its stat (a
@@ -778,10 +881,15 @@ Further:
   landed"; the tablet's later edits would then fork once. That needs a
   push longer than the watchdog timeout and a second computer syncing
   the same tablet meanwhile.
-- **`clone --reattach` with a pending journal** for the same repository
-  refuses (`JournalPending`): only that journal's reconciliation knows
-  which documents an interrupted apply stopped inside, and a fresh state
-  would fork them. `sync` reconciles it first.
+- **`clone --reattach` with a pending journal** refuses
+  (`JournalPending`) when the journaled merge is in the new origin's
+  history: only that journal's reconciliation knows which documents an
+  interrupted apply stopped inside, a fresh state would fork them, and
+  `sync` reconciles it first. Any other journal (origin rewound or
+  replaced, or the merge never landed) can never be reconciled: the
+  reattach discards it with a warning, so a rewound origin's
+  `OriginRewound` ("`--reattach` is the deliberate recovery") does not
+  send the user back to `sync` in a loop.
 
 ## Merge rules
 
@@ -1045,8 +1153,11 @@ When fork-class content changed on both sides:
 As implemented: `clone` locks, stops, reads and restarts as a sync does
 (with the pre-read), then infers bases with xochitl running: the newest
 ancestor of `main` (children before parents, `rev-list --topo-order`,
-so versions only in merged snapshots count too; device refs never)
-whose version of the document the tablet's is an unchanged version of,
+through the history index; device refs are not searched as such, but
+snapshots merged into `main` are ancestors, and so, through each
+snapshot's device-ref parent, are the earlier snapshots of that
+tablet) whose version of the document the tablet's is an unchanged
+version of,
 by the merge's own rule (`merge::unchanged`: view state and derived
 fields ignored, tags as sets, page order free, a first-open
 materialisation reading as the empty page list), is that document's
@@ -1084,7 +1195,7 @@ clocks and per-model translation.
 |---|---|
 | `libremarkable-utils/src/git.rs` | Plumbing over the `git` binary: `init --bare`, `ls-remote`, `fetch`, `push` (rejection as a typed error, `--force-with-lease`), `ls-tree`, `cat-file --batch`, `fast-import`, `commit-tree`, `merge-base --is-ancestor`, `update-ref`. Explicit environment, no working tree. |
 | `libremarkable-utils/src/hub/mod.rs` | Module root (all submodules declared from the start). |
-| `libremarkable-utils/src/hub/cycle.rs` | The operations composing the parts below (`init`, `clone`, `sync`, `backup`, `status`, `--dry-run`, `remote`, `detach`); `Progress` steps; serialisable reports and typed warnings; submodules for the local cache (`store`), reading the tablet (`snapshot`), the pure decisions (`plan`: equivalence, apply plan, verification, step-14 moved paths, tree and trash checks, reconciliation verdicts and finish, manifest), commit messages and trailers (`message`), the steps (`steps`), the read-only commands (`inspect`) and `remote`/`detach` (`admin`). |
+| `libremarkable-utils/src/hub/cycle.rs` | The operations composing the parts below (`init`, `clone`, `sync`, `backup`, `status`, `--dry-run`, `remote`, `detach`); `Progress` steps; serialisable reports and typed warnings; submodules for the local cache (`store`), reading the tablet (`snapshot`), the pure decisions (`plan`: equivalence, apply plan, verification, step-14 moved paths, tree and trash checks, reconciliation verdicts and finish, manifest), commit messages and trailers (`message`), the history index (`history`), the steps (`steps`), the read-only commands (`inspect`) and `remote`/`detach` (`admin`). |
 | `libremarkable-utils/src/hub/model.rs` | Pure: layout mapping, allowlist classification, view-state paths, document grouping, carry-forward, tablet state and journal formats, snapshot validation. |
 | `libremarkable-utils/src/hub/merge.rs` | Pure: merge rules, deletion guard, fork naming and UUIDs, orphan/cycle checks. |
 | `libremarkable-utils/src/hub/device.rs` | Device I/O behind a trait: lock, watchdog, stop/start, stat pass, streaming download, verify, staged apply, journal and state removal, listing what is still staged. A local-directory fake implements the trait, with fault injection. |
@@ -1133,7 +1244,12 @@ clocks and per-model translation.
   variants of the matrix add a user edit after every crash (a base too
   old forks the tablet's own change, one too new reverts another's),
   crash a shared-library `clone` and a `backup` at every operation, and
-  crash a pull-only run at every operation and apply move.
+  crash a pull-only run at every operation and apply move, and crash a
+  pull-only and a merge run at every operation and apply move with the
+  user editing both sides' documents before the next run. A scale test
+  builds 1000 documents and 2400 commits with one `fast-import` stream
+  and reattaches (a debug-sized variant runs always; the full size is
+  `#[ignore]`d, run in release to measure).
 - **Real device**, only with the owner's explicit go-ahead.
 
 ## Device questions
@@ -1350,6 +1466,11 @@ To be handled in the implementation PRs named:
 - Sync cycle, step 2 (done): the pairing guard runs the survey's check
   (in the device layer's fail-closed form, which errors when the
   configuration cannot be read) and refuses on `true`.
+- History index (deferred): keep the index next to the cache, keyed by
+  its tip, and extend it with `rev-list <new> ^<old>`, instead of
+  building it per run (an O(history) cost on syncs that receive a new
+  document, and on `status` while one waits on origin); or query only
+  the candidate documents for "came back after deletion".
 - Device layer (done): skip the `tar` call when there is nothing to
   download (BusyBox `tar` fails on an empty file list); stat signatures
   use `%y`/`%z` for nanosecond times. When recording the manifest, leave out

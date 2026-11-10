@@ -46,6 +46,7 @@
 //! prints: progress goes to a [`Progress`], results come back as reports.
 
 mod admin;
+mod history;
 mod inspect;
 mod message;
 mod plan;
@@ -73,7 +74,7 @@ use crate::hub::device::{
 };
 use crate::hub::merge::{
     self, DeletionGuard, Fork, GuardThresholds, MergeInput, MergeOutcome, MergeParams, MergedEntry,
-    Note, Summary, TreeItem,
+    Note, NoteKind, Summary, TreeItem,
 };
 use crate::hub::model::{
     DeviceId, DeviceName, DocFile, DocId, DocVersion, ListingEntry, MirrorRules, RepoConfig,
@@ -89,11 +90,26 @@ pub enum CycleError {
     NotAttached,
 
     /// `clone --reattach` to the same repository while an interrupted
-    /// sync's journal is pending: `sync` reconciles it first.
+    /// sync's journal, whose merge origin has, is pending: `sync`
+    /// reconciles it first.
     #[error(
-        "an interrupted sync left a journal on the tablet; run `rmu hub sync` first, then reattach if it still fails"
+        "an interrupted sync left a journal on the tablet that origin can still finish; run `rmu hub sync` first (`rmu hub detach --force` then `rmu hub clone` would attach the tablet afresh, discarding it)"
     )]
     JournalPending,
+
+    /// `remote set-url` to an origin that lacks the merge of a pending
+    /// journal (where `sync` could no longer finish it).
+    #[error(
+        "the new origin does not have merge {merge}, which an interrupted sync on this tablet is waiting to finish; run `rmu hub sync` against the current origin first, then set the URL"
+    )]
+    JournalMergeMissing { merge: Oid },
+
+    /// `detach` while an interrupted sync's journal is pending (without
+    /// `force`).
+    #[error(
+        "an interrupted sync left a journal on the tablet: documents its apply was writing may be half-updated there (both versions stay in origin's history); run `rmu hub sync` first, or detach with --force to discard it"
+    )]
+    DetachJournalPending,
 
     /// `clone` on a tablet that already has hub state.
     #[error(
@@ -127,19 +143,26 @@ pub enum CycleError {
     /// or replaced. Nothing is inferred (a rewound origin would read as
     /// "everything since was deleted").
     #[error(
-        "base commit {base} is not in origin's history: origin was rewound or replaced; stopping (`rmu hub clone --reattach` is the deliberate recovery)"
+        "base commit {base} is not in origin's history: origin was rewound or replaced; stopping (`rmu hub clone --reattach`, or `rmu hub detach` then `rmu hub clone`, attaches the tablet to it deliberately)"
     )]
     OriginRewound { base: Oid },
 
-    /// The device ref moved in a way this tablet did not.
+    /// The device ref was rewritten or replaced: it does not continue
+    /// the snapshots this tablet recorded.
     #[error(
-        "origin's device ref {reference} ({remote}) does not continue the snapshot history recorded on the tablet ({recorded}): another tablet may use this device id; stopping"
+        "origin's device ref {reference} ({remote}) does not continue the snapshot history recorded on the tablet ({recorded}): it was rewritten or replaced; stopping (`rmu hub clone --reattach` starts the tablet's snapshot history afresh)"
     )]
     DeviceRefConflict {
         reference: String,
         recorded: String,
         remote: String,
     },
+
+    /// Origin lacks the device ref the tablet recorded pushing.
+    #[error(
+        "origin has no device ref {reference}, though the tablet recorded pushing snapshot {recorded} to it: origin was probably moved or copied without its `refs/rmu/*` (copy them too, e.g. `git push <new origin> 'refs/rmu/*:refs/rmu/*'`); stopping (`rmu hub clone --reattach` starts the tablet's snapshot history afresh)"
+    )]
+    DeviceRefMissing { reference: String, recorded: Oid },
 
     /// The deletion guard.
     #[error(
@@ -152,6 +175,9 @@ pub enum CycleError {
         from_origin: Vec<DocId>,
         from_tablet: Vec<DocId>,
         empty_snapshot: bool,
+        /// The visible name of each document listed, from origin's or the
+        /// tablet's history (the tablet may no longer have it).
+        names: BTreeMap<DocId, String>,
     },
 
     /// Origin kept moving.
@@ -215,6 +241,9 @@ pub struct HubOptions {
     pub origin: Option<String>,
     /// The date in fork names, `yyyy-mm-dd`; today (UTC) if `None`.
     pub date: Option<String>,
+    /// The pre-read checkpoints its local writes about every this many
+    /// bytes, so a connection cut loses at most that much progress.
+    pub pre_read_checkpoint: u64,
 }
 
 impl Default for HubOptions {
@@ -227,6 +256,7 @@ impl Default for HubOptions {
             thresholds: GuardThresholds::default(),
             origin: None,
             date: None,
+            pre_read_checkpoint: 64 * 1024 * 1024,
         }
     }
 }
@@ -334,7 +364,9 @@ pub enum Warning {
     StagingNotCleared { error: String },
     /// `git maintenance run --auto` on the local cache failed.
     MaintenanceFailed { error: String },
-    /// `detach`: the journal of an interrupted sync was discarded.
+    /// `detach`, or `clone --reattach` to an origin that no longer has
+    /// the journaled merge: the journal of an interrupted sync was
+    /// discarded.
     JournalDiscarded,
     /// `detach`: the device ref on origin could not be deleted.
     DeviceRefNotPruned { error: String },
@@ -371,8 +403,11 @@ impl fmt::Display for Warning {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SyncReport {
     pub update: MainUpdate,
-    /// The snapshot commit (device ref). For [`MainUpdate::Pulled`] it is
-    /// a local commit only.
+    /// The snapshot commit, on the device ref (pushed at step 7, unless
+    /// the device ref already held the same tree and its head is reused).
+    /// For [`MainUpdate::Pulled`] and [`MainUpdate::UpToDate`] this run
+    /// did not merge it into `main` (a reused head may be there from an
+    /// earlier merge).
     pub snapshot: Oid,
     /// The commit the tablet now agrees with.
     pub base: Oid,
@@ -393,6 +428,10 @@ pub struct SyncReport {
     pub notes: Vec<Note>,
     pub forks: Vec<Fork>,
     pub deletions: DeletionGuard,
+    /// The visible name of every document `deletions` lists, from
+    /// origin's or the tablet's history: the tablet no longer has (or is
+    /// about to lose) these.
+    pub names: BTreeMap<DocId, String>,
     pub summary: Summary,
     pub reconciled: Option<Reconciled>,
     pub push_attempts: usize,
@@ -450,6 +489,12 @@ pub struct StatusReport {
     pub open_conflicts: Vec<OpenConflict>,
     /// What a sync would decide about deletions.
     pub guard: DeletionGuard,
+    /// The visible name of every document `guard` lists, of every
+    /// [`DocChange::Deleted`] document, and (for `--dry-run`) of every
+    /// document the sync would delete, from origin's or the tablet's
+    /// history: the tablet no longer has these. [`DryRunReport`] has its
+    /// names here.
+    pub names: BTreeMap<DocId, String>,
     pub summary: Summary,
     pub notes: Vec<Note>,
     pub forks: Vec<Fork>,
@@ -461,7 +506,8 @@ pub struct DryRunReport {
     pub status: StatusReport,
     /// Documents the sync would write on the tablet.
     pub writes: Vec<DocId>,
-    /// Documents the sync would delete from the tablet.
+    /// Documents the sync would delete from the tablet (named in
+    /// `status.names`).
     pub deletes: Vec<DocId>,
     /// Whether the sync would push to origin `main` (it would not when
     /// the tablet already agrees with origin, or has no changes of its
@@ -479,6 +525,16 @@ pub struct RemoteReport {
     pub origin: String,
     /// The URL this invocation uses ([`HubOptions::origin`] if set).
     pub effective: String,
+}
+
+/// How `detach` goes about it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DetachOptions {
+    /// Also delete the tablet's device ref on origin (`--prune-ref`).
+    pub prune_device_ref: bool,
+    /// Detach even while an interrupted sync's journal is pending,
+    /// discarding it (`--force`).
+    pub force: bool,
 }
 
 /// What `remote set-url` changed.
@@ -764,7 +820,7 @@ impl OriginCtx {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .try_for_each(|base| {
-                if self.store.has_commit(base)? && self.cache.repo.is_ancestor(base, &self.main)? {
+                if self.store.is_ancestor(base, &self.main)? {
                     Ok(())
                 } else {
                     Err(CycleError::OriginRewound { base: base.clone() }.into())
@@ -845,6 +901,80 @@ fn consented_deletions(
             consented.extend(docs.into_iter().filter(|doc| recorded.contains(doc)));
             Ok(consented)
         })
+}
+
+/// The `visibleName` of each of `docs`, from the first of `trees` whose
+/// version of it has one (documents with none are left out).
+fn names_of<'a>(
+    docs: impl IntoIterator<Item = &'a DocId>,
+    trees: &[&RepoTree],
+    json: &dyn JsonBlobs,
+) -> Result<BTreeMap<DocId, String>> {
+    let name_in = |tree: &RepoTree, doc: &DocId| -> Result<Option<String>> {
+        let Some(entry) = tree
+            .docs
+            .get(doc)
+            .and_then(|version| version.files.get(&DocFile::Metadata))
+        else {
+            return Ok(None);
+        };
+        Ok(json.json(&entry.id)?.and_then(|metadata| {
+            metadata
+                .get("visibleName")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        }))
+    };
+    docs.into_iter()
+        .map(|doc| -> Result<Option<(DocId, String)>> {
+            let name = trees
+                .iter()
+                .map(|tree| name_in(tree, doc))
+                .find_map(Result::transpose)
+                .transpose()?;
+            Ok(name.map(|name| (doc.clone(), name)))
+        })
+        .filter_map(Result::transpose)
+        .collect()
+}
+
+/// Notes for documents the merge brings to the tablet that its own
+/// history had deleted: absent from the snapshot and from the document's
+/// base, but present in an earlier first-parent ancestor of that base.
+/// Another tablet kept (or re-added) such a document; without a note it
+/// would come back unexplained.
+fn returned_after_deletion(
+    store: &Store,
+    main: &Oid,
+    state: &TabletState,
+    base_tree: &RepoTree,
+    snapshot: &Snapshot,
+    outcome: &MergeOutcome,
+) -> Result<Vec<Note>> {
+    let present =
+        |tree: &RepoTree, doc: &DocId| tree.docs.get(doc).is_some_and(DocVersion::is_present);
+    let candidates: Vec<(&DocId, &Oid)> = outcome
+        .docs
+        .iter()
+        .filter(|(doc, version)| {
+            version.files.contains_key(&DocFile::Metadata)
+                && !present(&snapshot.tree, doc)
+                && !present(base_tree, doc)
+        })
+        .filter_map(|(doc, _)| Some((doc, state.base_for(doc)?)))
+        .collect();
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let index = store.history(main)?;
+    Ok(candidates
+        .into_iter()
+        .filter(|(doc, base)| index.deleted_at(base, doc) == Some(true))
+        .map(|(doc, _)| Note {
+            doc: doc.clone(),
+            kind: NoteKind::ReturnedAfterDeletion,
+        })
+        .collect())
 }
 
 /// Every document of either tree has equivalent versions in both.
@@ -1055,6 +1185,8 @@ struct MergeRun<'p> {
     /// The tablet has no changes of its own (every document equals its
     /// base version) and the merge is origin's tree: nothing to push.
     pull_only: bool,
+    /// The visible names of the documents the deletion guard lists.
+    names: BTreeMap<DocId, String>,
 }
 
 /// What steps 8–11 decided.
@@ -1064,6 +1196,7 @@ struct Pushed {
     merged: RepoTree,
     outcome: MergeOutcome,
     attempts: usize,
+    names: BTreeMap<DocId, String>,
 }
 
 impl<'a> Hub<'a> {
@@ -1203,10 +1336,23 @@ impl<'a> Hub<'a> {
                 consented_deletions: &consented,
             },
         )?;
+        let mut outcome = outcome;
+        let returned = returned_after_deletion(store, main, state, base_tree, snapshot, &outcome)?;
+        outcome.notes.extend(returned);
         let mut writer = origin.cache.repo.commit_writer(self.progress, None)?;
         let (merged, new_blobs) = realise(&mut writer, &outcome)?;
         let merged_json = Overlay::new_blobs(&new_blobs, store);
         let json = Overlay::read(read, &merged_json);
+        let guard = &outcome.guard;
+        let names = names_of(
+            guard
+                .from_origin
+                .iter()
+                .chain(&guard.from_tablet)
+                .chain(&guard.exempt),
+            &[&theirs, &snapshot.tree, base_tree],
+            &json,
+        )?;
         let left_alone = plan::left_alone(rules, &merged, &tablet_versions(read), &json)?;
         let except: BTreeSet<DocId> = snapshot
             .quarantined
@@ -1228,6 +1374,7 @@ impl<'a> Hub<'a> {
             writer,
             up_to_date,
             pull_only,
+            names,
         })
     }
 
@@ -1297,9 +1444,25 @@ impl<'a> Hub<'a> {
                 let _ = std::fs::remove_dir_all(&cache_path);
                 let _ = std::fs::remove_file(&lock_path);
                 if created {
-                    let _ = std::fs::remove_dir_all(local);
+                    remove_if_uninitialised(&self.git, local);
                 }
             })
+    }
+}
+
+/// Remove the repository `init` created at `path` after it failed, unless
+/// it has a `main` by now: a concurrent `init` of the same new path won
+/// the race, and that repository is its. (A winner whose push lands
+/// between this check and the removal still loses its repository; two
+/// `init`s of one new path at the same instant are not otherwise
+/// guarded.)
+fn remove_if_uninitialised(git: &Git, path: &Path) {
+    let initialised = git
+        .open(path)
+        .and_then(|repo| repo.rev_parse(store::MAIN))
+        .is_ok_and(|main| main.is_some());
+    if !initialised {
+        let _ = std::fs::remove_dir_all(path);
     }
 }
 
@@ -1314,6 +1477,46 @@ mod tests {
         assert_eq!(civil_date(1_794_182_400), "2026-11-09");
         assert_eq!(civil_date(1_794_268_799), "2026-11-09");
         assert_eq!(civil_date(-86_400), "1969-12-31");
+    }
+
+    #[test]
+    fn a_failed_init_removes_only_an_uninitialised_repository() {
+        let scratch = test_support::Scratch::new("init-cleanup");
+        let git = Git::new()
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", scratch.path());
+        let (won, empty) = (
+            scratch.path().join("won.git"),
+            scratch.path().join("empty.git"),
+        );
+        let repo = git.init_bare(&won, crate::git::ObjectFormat::Sha1).unwrap();
+        let mut writer = repo
+            .commit_writer(&crate::progress::NoProgress, None)
+            .unwrap();
+        writer
+            .add_bytes(
+                crate::hub::model::REPO_CONFIG_PATH,
+                FileMode::Regular,
+                b"{}",
+            )
+            .unwrap();
+        let signature = rmu_signature(0);
+        let commit = writer
+            .commit(&CommitMeta {
+                parents: Vec::new(),
+                author: signature.clone(),
+                committer: signature,
+                message: "init\n".to_string(),
+            })
+            .unwrap();
+        repo.update_ref(store::MAIN, &commit, None).unwrap();
+        git.init_bare(&empty, crate::git::ObjectFormat::Sha1)
+            .unwrap();
+        remove_if_uninitialised(&git, &won);
+        remove_if_uninitialised(&git, &empty);
+        assert!(won.exists(), "another init's repository was removed");
+        assert!(!empty.exists());
     }
 
     #[test]

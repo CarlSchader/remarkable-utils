@@ -5,7 +5,7 @@
 //! moment out of date. The commits holding its blobs and the would-be
 //! merge are local garbage no ref points to.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 
@@ -15,7 +15,7 @@ use super::snapshot::{self, ReadMode, TabletRead};
 use super::store::{self, Store};
 use super::{
     CycleError, DocChange, DryRunReport, Hub, OpenConflict, OriginCtx, StatusReport, commit_tree,
-    quarantine_report, read_summary, tablet_versions, virtual_base,
+    names_of, quarantine_report, read_summary, tablet_versions, virtual_base,
 };
 use crate::error::Result;
 use crate::git::Oid;
@@ -126,9 +126,14 @@ impl Hub<'_> {
         let pre = self.pre_read(
             tablet,
             origin.rules,
-            &snapshot::known_from_manifest(&state.manifest),
+            &state.manifest,
             &origin.cache.repo,
             &origin.store,
+            &store::pre_read_path(
+                &self.cache_dir,
+                &state.repo_id,
+                store::PreReadOf::Device(&state.device_id),
+            ),
         );
         let known = snapshot::known_from_manifest(&state.manifest)
             .into_iter()
@@ -141,7 +146,7 @@ impl Hub<'_> {
                 origin.rules,
                 &known,
                 &origin.store,
-                &mut writer,
+                snapshot::Sink::plain(&mut writer),
                 self.progress,
                 ReadMode::Strict,
             )?;
@@ -176,7 +181,7 @@ impl Hub<'_> {
         let run = self.run_merge(&origin, &state, &base_tree, &snapshot, &read)?;
         let present =
             |tree: &RepoTree, doc: &DocId| tree.docs.get(doc).is_some_and(DocVersion::is_present);
-        let changes = base_tree
+        let changes: BTreeMap<DocId, DocChange> = base_tree
             .docs
             .keys()
             .chain(snapshot.tree.docs.keys())
@@ -232,6 +237,20 @@ impl Hub<'_> {
             json: store,
         })?
         .planned;
+        // Names for what the tablet no longer has (or would lose), from
+        // origin's or the tablet's history.
+        let deleted = changes
+            .iter()
+            .filter(|(_, change)| **change == DocChange::Deleted)
+            .map(|(doc, _)| doc)
+            .chain(
+                planned
+                    .iter()
+                    .filter(|entry| entry.change == Change::Delete)
+                    .map(|entry| &entry.doc),
+            );
+        let mut names = names_of(deleted, &[&run.theirs, &snapshot.tree, &base_tree], store)?;
+        names.extend(run.names);
         let outcome = run.outcome;
         let status = StatusReport {
             repo_id: state.repo_id.clone(),
@@ -248,6 +267,7 @@ impl Hub<'_> {
             open_conflicts,
             summary: outcome.summary(),
             guard: outcome.guard,
+            names,
             notes: outcome.notes,
             forks: outcome.forks,
         };
