@@ -40,7 +40,8 @@ case "$command" in
     *'/usr/bin/xochitl'*) test -d xochitl; exit $? ;;
 esac
 case "$command" in
-    *'cat >'*|*'mkdir '*|*'systemctl '*|*'tar -x'*|*'rm '*|*'mv '*|*'cp '*)
+    # 'sh -s': a new item's files, created by one script over stdin.
+    *'cat >'*|*'mkdir '*|*'systemctl '*|*'tar -x'*|*'rm '*|*'mv '*|*'cp '*|'sh -s')
         if [ "$MOCK_READ_ONLY" = 1 ]; then
             printf 'unexpected write during dry-run\n' >&2
             exit 92

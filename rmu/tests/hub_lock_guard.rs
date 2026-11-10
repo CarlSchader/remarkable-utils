@@ -278,8 +278,9 @@ fn a_lock_taken_after_the_look_stops_the_write() {
     let before = tablets.files();
     let record = owner_record(BOOT_ID);
     let output = tablets.rmu_env(
+        // The folder's files are created by one script over stdin.
         &["mkdir", "Books"],
-        &[("MOCK_LOCK_WHEN", "mv -fT"), ("MOCK_LOCK_RECORD", &record)],
+        &[("MOCK_LOCK_WHEN", "sh -s"), ("MOCK_LOCK_RECORD", &record)],
     );
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(stderr(&output), REFUSAL);
