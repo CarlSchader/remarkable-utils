@@ -195,11 +195,14 @@ Things to know:
 - **Every state is recoverable**: every sync is a git commit on origin,
   and every tablet's own state is backed up to its own ref on origin
   (`refs/rmu/devices/<id>`) before anything is merged.
-- **Leave the tablet alone during a hub sync**: don't run other `rmu`
-  write commands (`upload`, `mv`, `rm`, `rename`, `sync`, `restart`)
-  against it while `rmu hub` is working on it. (The hub skips what
-  changes under it rather than overwrite it; making those commands wait
-  for the hub's lock is planned.)
+- **Other `rmu` commands wait for a hub sync**: while `rmu hub` holds a
+  tablet, the commands that write to it (`upload`, `mkdir`, `mv`, `rm`,
+  `rename`, `empty-trash`, `restart`, and `rmu sync` when it writes
+  there) refuse, naming the sync that holds it; reading (`ls`,
+  `download`, `status`) goes on. `rmu sync` also warns before writing to
+  a tablet attached to a hub: its copies get new ids and would become
+  duplicates in the library, so share documents between hub tablets with
+  `rmu hub`.
 
 Recovery:
 
@@ -230,12 +233,22 @@ Recovery:
   a backup, or from the local cache of the computer that synced most
   recently: a bare repository at `~/.cache/rmu/hub/<repo-id>.git`
   (`$XDG_CACHE_HOME/rmu/hub/...`) holding origin's `main` as
-  `refs/remotes/origin/main`. The error prints the exact command:
+  `refs/remotes/origin/main`. Then restore the tablets' backups (their
+  device refs) from every computer that syncs a tablet: each cache holds
+  the backups of the tablets it syncs, as `refs/remotes/origin/devices/*`.
+  The error prints the exact commands:
 
   ```sh
   git --git-dir ~/.cache/rmu/hub/<repo-id>.git push <origin> refs/remotes/origin/main:refs/heads/main
+  git --git-dir ~/.cache/rmu/hub/<repo-id>.git push <origin> 'refs/remotes/origin/devices/*:refs/rmu/devices/*'
   ```
 
+  On an origin that keeps backups under `refs/heads/rmu/devices/*` (as
+  on forges that refuse custom refs), push to
+  `refs/heads/rmu/devices/*` instead. `rejected (non-fast-forward)`
+  lines are harmless: another computer's cache already restored a newer
+  backup there. A tablet whose backups are not restored stops with exit
+  5 at its next sync and needs `rmu hub clone <origin> --reattach`.
   Running `rmu hub init` on it again is a last resort: it starts a new
   repository, so every tablet then needs `clone --reattach` and the old
   history stays behind.

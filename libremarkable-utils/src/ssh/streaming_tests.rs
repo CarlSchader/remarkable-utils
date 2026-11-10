@@ -457,6 +457,7 @@ fn check_staged_upload_errors() {
         remote.to_str().unwrap(),
         (2 * PIPE_FILL) as u64,
         &progress,
+        "",
     );
     assert!(
         matches!(result, Err(Error::Io(error)) if error.to_string() == "injected read failure")
@@ -481,6 +482,7 @@ fn check_staged_upload_errors() {
         remote.to_str().unwrap(),
         PIPE_FILL as u64,
         &progress,
+        "",
     );
     assert!(matches!(result, Err(Error::Remote { status: 1, .. })));
     assert_eq!(progress.done.get(), 0);

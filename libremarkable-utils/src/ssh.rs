@@ -269,7 +269,26 @@ impl SshSession {
         data: &[u8],
         progress: &dyn Progress,
     ) -> Result<()> {
-        self.upload_reader(&mut &data[..], remote_path, data.len() as u64, progress)
+        self.write_remote_file_guarded(remote_path, data, progress, "")
+    }
+
+    /// [`Self::write_remote_file_with_progress`], running `pre_commit`
+    /// (shell, newline-terminated) right before the final rename; a
+    /// non-zero exit there leaves the destination untouched.
+    pub(crate) fn write_remote_file_guarded(
+        &self,
+        remote_path: &str,
+        data: &[u8],
+        progress: &dyn Progress,
+        pre_commit: &str,
+    ) -> Result<()> {
+        self.upload_reader(
+            &mut &data[..],
+            remote_path,
+            data.len() as u64,
+            progress,
+            pre_commit,
+        )
     }
 
     /// Stream a local file to a unique remote sibling, verify its length,
@@ -280,9 +299,21 @@ impl SshSession {
         remote_path: &str,
         progress: &dyn Progress,
     ) -> Result<()> {
+        self.upload_local_file_guarded(local, remote_path, progress, "")
+    }
+
+    /// [`Self::upload_local_file`], running `pre_commit` right before the
+    /// final rename (see [`Self::write_remote_file_guarded`]).
+    pub(crate) fn upload_local_file_guarded(
+        &self,
+        local: &Path,
+        remote_path: &str,
+        progress: &dyn Progress,
+        pre_commit: &str,
+    ) -> Result<()> {
         let mut file = fs::File::open(local)?;
         let total = file.metadata()?.len();
-        self.upload_reader(&mut file, remote_path, total, progress)
+        self.upload_reader(&mut file, remote_path, total, progress, pre_commit)
     }
 
     fn upload_reader(
@@ -291,9 +322,10 @@ impl SshSession {
         remote_path: &str,
         total: u64,
         progress: &dyn Progress,
+        pre_commit: &str,
     ) -> Result<()> {
         let mut child = StreamingChild::spawn(
-            &mut self.command(&staged_write_command(remote_path, total)),
+            &mut self.command(&staged_write_command(remote_path, total, pre_commit)),
             true,
         )?;
         let copied = {
@@ -837,7 +869,9 @@ fn join_pipe(reader: Option<JoinHandle<std::io::Result<Vec<u8>>>>) -> std::io::R
 /// The sibling is private until verified; rename stays on the same filesystem.
 /// Traps clean ordinary failures and catchable disconnect signals; uncatchable
 /// termination can leave an orphan sibling. This is not a crash-durability guarantee.
-fn staged_write_command(remote_path: &str, total: u64) -> String {
+/// `pre_commit` (shell, newline-terminated, may be empty) runs right
+/// before the rename.
+fn staged_write_command(remote_path: &str, total: u64, pre_commit: &str) -> String {
     let parent = remote_path
         .rsplit_once('/')
         .map_or(".", |(dir, _)| if dir.is_empty() { "/" } else { dir });
@@ -860,7 +894,7 @@ fn staged_write_command(remote_path: &str, total: u64) -> String {
      mask=$(umask)
      chmod "$(printf '%o' "$((0666 & ~0$mask))")" "$tmp" || exit 1
  fi
- mv -fT -- "$tmp" "$dest""#,
+{pre_commit} mv -fT -- "$tmp" "$dest""#,
         dest = shell_quote(remote_path),
         template = shell_quote(&format!("{parent}/.rmu-upload-XXXXXX")),
     )
@@ -920,6 +954,20 @@ mod streaming_tests;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pre_commit_runs_right_before_the_rename() {
+        let command = super::staged_write_command("/x/a b", 3, "guard here || exit 83\n");
+        let guard = command.find("guard here").unwrap();
+        assert!(
+            command.find("wc -c").unwrap() < guard,
+            "after the length check"
+        );
+        assert!(
+            command[guard..].starts_with("guard here || exit 83\n mv -fT -- \"$tmp\" \"$dest\"")
+        );
+        assert!(!super::staged_write_command("/x/a", 3, "").contains("guard"));
+    }
+
     use super::*;
 
     #[cfg(unix)]

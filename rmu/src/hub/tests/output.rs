@@ -344,15 +344,6 @@ fn control_characters_are_escaped() {
 }
 
 #[test]
-fn ages() {
-    assert_eq!(render::age(5).as_deref(), Some("5 s ago"));
-    assert_eq!(render::age(600).as_deref(), Some("10 min ago"));
-    assert_eq!(render::age(7_200).as_deref(), Some("2 h ago"));
-    assert_eq!(render::age(3 * 86_400).as_deref(), Some("3 days ago"));
-    assert_eq!(render::age(-10), None, "a clock ahead of this one");
-}
-
-#[test]
 fn renders_errors() {
     // The documents to delete from origin are gone from the tablet: their
     // names come from history, which the error carries.
@@ -420,9 +411,31 @@ fn renders_errors() {
             "Origin ssh://git@example.invalid/library.git has no main branch",
             "1. Check the URL",
             "2. Restore origin from a backup, or from the local cache of the computer that synced",
-            "git --git-dir '/home/user/.cache/rmu/hub/0f0e0d0c-0000-4000-8000-0000000000a1.git' push 'ssh://git@example.invalid/library.git' refs/remotes/origin/main:refs/heads/main",
+            "git --git-dir /home/user/.cache/rmu/hub/0f0e0d0c-0000-4000-8000-0000000000a1.git push ssh://git@example.invalid/library.git refs/remotes/origin/main:refs/heads/main",
+            "git --git-dir /home/user/.cache/rmu/hub/0f0e0d0c-0000-4000-8000-0000000000a1.git push ssh://git@example.invalid/library.git 'refs/remotes/origin/devices/*:refs/rmu/devices/*'",
+            "takes 'refs/remotes/origin/devices/*:refs/heads/rmu/devices/*' instead.",
+            "`rejected (non-fast-forward)` lines are harmless",
+            "A tablet whose backups are not restored needs `rmu hub clone <origin> --reattach`",
             "3. Only as a last resort",
         ],
+    );
+    // Paths are quoted for the shell, as `ssh::shell_quote` does.
+    let odd = Error::HubCycle(CycleError::OriginEmpty {
+        url: "/srv/it's here.git".into(),
+    });
+    let details = text(&render::error_details(
+        &odd,
+        &render::ErrorContext {
+            repo_id: Some(repo_id()),
+            cache_dir: Some(PathBuf::from("/home/o'neil/cache dir")),
+            ..Default::default()
+        },
+    ));
+    assert!(
+        details.contains(
+            "git --git-dir '/home/o'\\''neil/cache dir/0f0e0d0c-0000-4000-8000-0000000000a1.git' push '/srv/it'\\''s here.git' refs/remotes/origin/main:refs/heads/main"
+        ),
+        "{details}"
     );
     let details = text(&render::error_details(
         &empty,

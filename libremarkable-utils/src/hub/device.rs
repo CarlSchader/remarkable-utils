@@ -31,6 +31,7 @@
 mod apply;
 mod fake;
 mod lock;
+mod probe;
 mod scripts;
 mod ssh;
 
@@ -52,7 +53,12 @@ use crate::hub::model::{DocId, StatSignature, TabletState, XochitlPath};
 
 pub use apply::{ApplyPlan, ApplyStep, DocApply, StagedFile, StagedPath};
 pub use fake::{Edit, FakeTablet, FakeTabletBuilder, Fault, OpKind};
-pub use lock::{HeldLock, LockDecision, LockOwner, LockRequest, LockState, StaleReason};
+pub use lock::{
+    HeldLock, LockDecision, LockOwner, LockRequest, LockState, StaleReason, describe_age,
+};
+pub use probe::{
+    EXIT_HUB_BUSY, EXIT_HUB_LOCK_CHANGED, HubLock, HubProbe, ProbeCache, parse_probe, probe_script,
+};
 pub use ssh::SshTablet;
 
 /// rmu's directory on the tablet, outside the xochitl data dir and on the

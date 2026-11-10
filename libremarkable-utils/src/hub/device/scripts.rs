@@ -86,7 +86,7 @@ fn q(text: &str) -> String {
 /// at most [`FLOCK_WAIT_SECS`] ([`EXIT_BUSY`]); BusyBox `flock` has no
 /// `-w`. The file's directory must exist: in `ash`, a failed `exec`
 /// redirection exits the shell at once.
-fn take_flock(paths: &TabletPaths) -> String {
+pub(super) fn take_flock(paths: &TabletPaths) -> String {
     format!(
         "exec 9>>{flock}\n\
          n=0\n\

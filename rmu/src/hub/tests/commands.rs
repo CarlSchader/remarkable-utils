@@ -278,9 +278,12 @@ fn a_held_lock_exits_4() {
 
     let (stdout, stderr, code) = world.run(&a, &["sync"], Output::Json);
     assert_eq!(code, 4, "{stderr}");
-    assert_eq!(
-        serde_json::from_str::<Value>(&stdout).unwrap()["error"]["kind"],
-        "lock_held"
+    let value: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(value["error"]["kind"], "lock_held");
+    let message = value["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("on other-computer, started ") && message.contains(" s ago"),
+        "an age, not a unix time: {message}"
     );
 
     let (value, code) = world.json(&a, &["status"]);

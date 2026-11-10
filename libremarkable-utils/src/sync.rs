@@ -1220,6 +1220,42 @@ pub struct Plan {
     pub actions: Vec<SyncAction>,
 }
 
+impl SyncAction {
+    /// Whether executing it writes to the tablet (documents or folders;
+    /// state-only and local actions do not).
+    pub fn writes_remote(&self) -> bool {
+        match self {
+            SyncAction::CreateRemoteFolder { .. }
+            | SyncAction::Upload { .. }
+            | SyncAction::UpdateRemote { .. }
+            | SyncAction::DeleteRemote { .. }
+            | SyncAction::DeleteRemoteFolder { .. }
+            | SyncAction::MoveRemote { .. }
+            | SyncAction::MoveRemoteFolder { .. }
+            | SyncAction::CopyRemote { .. } => true,
+            SyncAction::Download { .. }
+            | SyncAction::DeleteLocal { .. }
+            | SyncAction::DeleteLocalDir { .. }
+            | SyncAction::Forget { .. }
+            | SyncAction::Rebind { .. }
+            | SyncAction::Adopt { .. }
+            | SyncAction::Refresh { .. }
+            | SyncAction::MoveLocal { .. }
+            | SyncAction::CopyLocal { .. }
+            | SyncAction::Conflict { .. }
+            | SyncAction::Skip { .. } => false,
+        }
+    }
+
+    /// Whether it deletes something on the tablet.
+    pub fn deletes_remote(&self) -> bool {
+        matches!(
+            self,
+            SyncAction::DeleteRemote { .. } | SyncAction::DeleteRemoteFolder { .. }
+        )
+    }
+}
+
 impl Plan {
     /// Number of actions that would change something.
     pub fn changes(&self) -> usize {
@@ -3516,6 +3552,39 @@ fn fnv1a(text: &str) -> u64 {
     text.bytes().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
         (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
     })
+}
+
+/// The two tablets of a tablet↔tablet sync.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DocSide {
+    A,
+    B,
+}
+
+impl DocAction {
+    /// Whether executing it writes to tablet `side` (a copy that
+    /// replaces a document also deletes the old one there).
+    pub fn writes(&self, side: DocSide) -> bool {
+        match self {
+            DocAction::CreateFolderOnA { .. }
+            | DocAction::CopyToA { .. }
+            | DocAction::DeleteOnA { .. } => side == DocSide::A,
+            DocAction::CreateFolderOnB { .. }
+            | DocAction::CopyToB { .. }
+            | DocAction::DeleteOnB { .. } => side == DocSide::B,
+            DocAction::Forget { .. } | DocAction::Conflict { .. } => false,
+        }
+    }
+
+    /// Whether it deletes a document on tablet `side` (not counting a
+    /// copy replacing its older version).
+    pub fn deletes(&self, side: DocSide) -> bool {
+        match self {
+            DocAction::DeleteOnA { .. } => side == DocSide::A,
+            DocAction::DeleteOnB { .. } => side == DocSide::B,
+            _ => false,
+        }
+    }
 }
 
 /// One planned tablet↔tablet operation.

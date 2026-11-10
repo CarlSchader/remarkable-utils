@@ -160,10 +160,34 @@ pub enum Error {
     #[error(transparent)]
     HubDevice(#[from] crate::hub::device::DeviceError),
 
+    /// An `rmu hub` run holds the tablet's lock: other commands must not
+    /// write meanwhile (`None`: the owner record is missing or unreadable).
+    #[error("{}", hub_locked(.0.as_ref()))]
+    HubLocked(Option<crate::hub::device::LockOwner>),
+
+    /// The hub lock changed under two writes in a row, and a third look
+    /// found nobody holding it: try again.
+    #[error(
+        "the tablet's hub lock kept changing while rmu was writing; nothing more was written; try again"
+    )]
+    HubLockUnsettled,
+
     /// `rmu hub` sync-cycle error (guards, identity and ancestry checks,
     /// the deletion guard, the local cache).
     #[error(transparent)]
     HubCycle(#[from] crate::hub::cycle::CycleError),
+}
+
+fn hub_locked(owner: Option<&crate::hub::device::LockOwner>) -> String {
+    let owner = owner.map_or_else(
+        || "its owner record is missing, as after a power cut while the lock was taken".to_string(),
+        ToString::to_string,
+    );
+    format!(
+        "the tablet is busy: an rmu hub run holds its lock ({owner}); nothing more was written. \
+         Try again once that run has finished; if it is gone (its computer crashed or was \
+         closed), `rmu hub sync --break-lock` frees the tablet"
+    )
 }
 
 fn describe_actual(expected: u64, actual: Option<u64>) -> String {

@@ -2,8 +2,8 @@
 
 Status: **phase 1 implemented** (git plumbing, data model, merge
 engine, device layer, sync cycle with clone, backup, status and
-`--dry-run`, and the `rmu hub` CLI); the hub lock for other `rmu`
-commands and device validation are next (see "Implementation plan").
+`--dry-run`, the `rmu hub` CLI, and the hub lock for other `rmu`
+commands); device validation is next (see "Implementation plan").
 This document is the plan of record; update it as phases land and as
 device experiments confirm or refute its assumptions.
 
@@ -769,10 +769,57 @@ in an earlier first-parent ancestor of that base.
   lock). `Tablet::staged_files` runs the stat pass over the staging root
   (`<run>/<xochitl path>` per staged file, nothing if there is none); it
   only reads, so it needs no lock.
-- Other mutating rmu commands (`upload`, `mv`, `rm`, `rename`, `sync`,
+- Other mutating rmu commands (`upload`, `mkdir`, `mv`, `rm`,
+  `rename`, `empty-trash`, `sync` when it writes to a tablet, and
   `restart`) refuse while the hub lock is held, and `rmu sync` warns
   when its target tablet is attached to a hub (fresh-UUID copies would
-  become duplicates in the library).
+  become duplicates in the library). As built: `Client` checks before
+  every write and before restarting xochitl, so every command built on
+  it is covered and reads never are. The look is a read-only probe
+  (`hub::device::probe_script`: the lock directory and owner record,
+  the boot id, the watchdog marker, whether the state file exists) that
+  rides along in the document listing a write starts from, so it costs
+  no round trip there; a write whose last look is older than 30 s looks
+  again, and the restart always looks afresh, in the round trip of its
+  `reset-failed`. A lock counts only while the hub itself would refuse
+  it (`lock::decide` without a run of its own or `--break-lock`): one
+  from an earlier boot, or whose watchdog fired, cannot change anything
+  any more and does not hold other commands back; one without a
+  readable owner record does, across reboots too (there is no boot id
+  to compare), until `--break-lock`, as for the hub. The refusal names
+  the owner and the lock's age, and points at `rmu hub sync
+  --break-lock` only for an owner that is gone. `rmu sync` warns only
+  when its plan writes to the attached tablet, and says so when the
+  plan deletes there (deletions reach the library, hence every tablet).
+- **Each write checks again, in its own command.** The look alone is
+  check-then-act, so every write's own shell command (the staged
+  upload's final `mv`, `rm`, `tar -x`, `cp`, `mkdir`, the restart)
+  carries a guard right before its commit point
+  (`HubProbe::write_guard`): it takes the hub's guard `flock` (when the
+  state directory exists) and exits 83 unless the lock is still as the
+  look saw it (absent; or, for a stale lock, its owner record unchanged,
+  compared by a checksum computed on the tablet as the hub's takeover
+  does, or the lock gone). That exit makes the write look again, then refuse,
+  or retry once when nobody holds the lock. A restart refused after a
+  command's writes stays an error: xochitl must reload what was written,
+  and only a hub sync is sure to restart it when it finishes. The hub takes its lock and
+  applies under that `flock`, and an old run's last guarded script holds
+  it to its end, so the check and the write cannot interleave with any
+  of them: while a hub run holds the lock, nothing else writes.
+- **What remains**, safely. On a tablet where no hub ever ran there is
+  no state directory and so no `flock`: a write can land in the
+  milliseconds after the first hub run created its state directory and
+  lock, which is before that run reads the tablet, so it is covered like
+  any edit made before a sync. A command with several writes can stop
+  between two of them when a hub run takes the lock in between (an
+  upload's payload without its `.metadata` is an orphan the hub reports
+  and leaves alone). Beyond that, the hub's own guards stand regardless:
+  it reads the tablet with xochitl stopped and aborts on a file whose
+  size changes while read, verifies every planned document before
+  writing it and skips one that changed, never plans new documents
+  (uploads get fresh UUIDs), and refuses to apply while xochitl runs. No
+  ink is lost either way: other commands never write the pages of an
+  existing document.
 
 ### Restartability
 
@@ -1522,7 +1569,9 @@ Each item is one reviewed PR; items on the same line run in parallel.
    while the hub lock is held, and `rmu sync` warns when its target
    tablet is attached to a hub (fresh-UUID copies would become
    duplicates in the library); see "Watchdog and lock". Touches the
-   shared `Client`, so it is its own PR.
+   shared `Client`, so it is its own PR (done: `Client` checks before
+   every write with `hub::device::probe_script`, carried by the
+   listing).
 8. **Device validation** on a real tablet (questions 5–7) and fixes.
    Requires the owner's go-ahead.
 9. **Refactor checkpoint**: shared code between `sync` and `hub`

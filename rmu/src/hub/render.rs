@@ -18,6 +18,7 @@ use libremarkable_utils::hub::cycle::{
 use libremarkable_utils::hub::device::{LockOwner, LockState, StaleReason};
 use libremarkable_utils::hub::merge::{DeletionGuard, Fork, Note, NoteKind, Summary};
 use libremarkable_utils::hub::model::{DocId, RepoId};
+use libremarkable_utils::ssh::shell_quote;
 
 use super::Report;
 
@@ -429,34 +430,10 @@ fn deletions(
     }
 }
 
-/// How long ago, roughly (`None` for a time in the future: clocks
-/// differ between computers).
-pub fn age(seconds_ago: i64) -> Option<String> {
-    let s = u64::try_from(seconds_ago).ok()?;
-    Some(match s {
-        0..90 => format!("{s} s ago"),
-        90..5_400 => format!("{} min ago", s / 60),
-        5_400..172_800 => format!("{} h ago", s / 3_600),
-        _ => format!("{} days ago", s / 86_400),
-    })
-}
-
-fn unix_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
-}
-
 fn owner_text(owner: &Option<LockOwner>) -> String {
-    owner.as_ref().map_or_else(
-        || "an unknown owner".to_string(),
-        |owner| {
-            let started = i64::try_from(owner.started_unix).unwrap_or(i64::MAX);
-            let when = age(unix_now().saturating_sub(started))
-                .unwrap_or_else(|| format!("at unix time {started}"));
-            format!("pid {} on {}, started {when}", owner.pid, owner.host)
-        },
-    )
+    owner
+        .as_ref()
+        .map_or_else(|| "an unknown owner".to_string(), ToString::to_string)
 }
 
 fn took_over(lines: &mut Vec<String>, took_over: &Option<TakeOver>) {
@@ -803,10 +780,13 @@ pub fn error_details(error: &Error, context: &ErrorContext) -> Vec<String> {
 /// makes a new repository and strands every tablet.
 fn origin_empty(url: &str, context: &ErrorContext) -> Vec<String> {
     let cache = match (&context.cache_dir, &context.repo_id) {
-        (Some(dir), Some(repo)) => dir.join(format!("{repo}.git")).display().to_string(),
-        (Some(dir), None) => dir.join("<repo-id>.git").display().to_string(),
-        _ => "$XDG_CACHE_HOME/rmu/hub/<repo-id>.git".to_string(),
+        (Some(dir), Some(repo)) => {
+            shell_quote(&dir.join(format!("{repo}.git")).display().to_string())
+        }
+        (Some(dir), None) => shell_quote(&dir.join("<repo-id>.git").display().to_string()),
+        _ => "\"$XDG_CACHE_HOME/rmu/hub/<repo-id>.git\"".to_string(),
     };
+    let quoted = shell_quote(url);
     vec![
         format!("Origin {url} has no main branch. To recover:"),
         "  1. Check the URL: it is the one stored on the tablet (`rmu hub remote`), or --origin."
@@ -815,9 +795,21 @@ fn origin_empty(url: &str, context: &ErrorContext) -> Vec<String> {
             .to_string(),
         "     most recently (a bare repository; origin's main is refs/remotes/origin/main):"
             .to_string(),
+        format!("       git --git-dir {cache} push {quoted} refs/remotes/origin/main:refs/heads/main"),
+        "     Then restore the tablets' backups (device refs) from every computer that syncs a"
+            .to_string(),
+        "     tablet; each cache holds those of the tablets it syncs:".to_string(),
         format!(
-            "       git --git-dir '{cache}' push '{url}' refs/remotes/origin/main:refs/heads/main"
+            "       git --git-dir {cache} push {quoted} 'refs/remotes/origin/devices/*:refs/rmu/devices/*'"
         ),
+        "     (An origin that keeps them under refs/heads/rmu/devices/*, as on forges that refuse"
+            .to_string(),
+        "     custom refs, takes 'refs/remotes/origin/devices/*:refs/heads/rmu/devices/*' instead."
+            .to_string(),
+        "     `rejected (non-fast-forward)` lines are harmless: a newer backup is already there.)"
+            .to_string(),
+        "     A tablet whose backups are not restored needs `rmu hub clone <origin> --reattach`."
+            .to_string(),
         "  3. Only as a last resort: `rmu hub init` origin again and `rmu hub clone <origin> --reattach`"
             .to_string(),
         "     every tablet; that starts a new repository without the old history.".to_string(),
