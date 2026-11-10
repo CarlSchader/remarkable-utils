@@ -1627,6 +1627,13 @@ those need a second tablet (phase 2).
    sync would merge: Documents: 1 changed on the tablet`. Nothing wrong
    was written; the per-document summary counts the document as
    changed by the tablet although the merged tree equals origin's.
+   Fixed: the merge still decides a document only one side changed (or
+   both to the same bytes) by blob ids, without reading it; the sync's
+   summary (`MergeOutcome::summary_with`) then counts such a document
+   as unchanged when its merged version is equivalent to its base by
+   the same test that decides pushing and applying
+   (`plan::versions_equivalent`). A first-open materialisation, which
+   is pushed, still counts as a change.
 
 ## Decisions (confirmed by the owner)
 

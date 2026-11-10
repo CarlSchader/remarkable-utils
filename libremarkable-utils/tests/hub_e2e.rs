@@ -11,6 +11,7 @@ mod world;
 
 use libremarkable_utils::hub::cycle::{DetachOptions, MainUpdate, Warning};
 use libremarkable_utils::hub::merge::NoteKind;
+use libremarkable_utils::hub::model::DocFile;
 use world::{Kind, World};
 
 #[test]
@@ -236,6 +237,38 @@ fn view_state_never_counts_and_stays_per_tablet() {
         world.device(1).content(&lib.notes).unwrap()["zoomMode"],
         before
     );
+    world.converge();
+}
+
+#[test]
+fn view_state_is_not_reported_as_a_change() {
+    let (world, lib) = two_tablets();
+    // A only opens a document: status, the dry run and the sync agree that
+    // nothing changed, as nothing is pushed.
+    world.read(0, &lib.notes);
+    let status = world.status(0).unwrap();
+    assert!(status.changes.is_empty(), "{:?}", status.changes);
+    assert_eq!(status.summary.changed_ours, 0, "{:?}", status.summary);
+    let dry_run = world.dry_run(0).unwrap();
+    assert!(!dry_run.would_push, "{dry_run:?}");
+    assert_eq!(dry_run.status.summary.changed_ours, 0);
+    let report = world.sync(0).unwrap();
+    assert_eq!(report.update, MainUpdate::UpToDate, "{report:?}");
+    assert_eq!(report.summary.changed_ours, 0, "{:?}", report.summary);
+    // A opens one document and renames another: only the rename counts,
+    // though the read document's view state reaches origin with it.
+    let before = world.origin_docs()[&lib.notes][&DocFile::Metadata].clone();
+    world.read(0, &lib.notes);
+    world.rename(0, &lib.sketch, "Sketch, renamed");
+    let report = world.sync(0).unwrap();
+    assert_eq!(report.summary.changed_ours, 1, "{:?}", report.summary);
+    assert_ne!(world.origin_docs()[&lib.notes][&DocFile::Metadata], before);
+    // On B, origin's view state of the read document is no change either.
+    let status = world.status(1).unwrap();
+    assert_eq!(status.summary.changed_theirs, 1, "{:?}", status.summary);
+    let report = world.sync(1).unwrap();
+    assert_eq!(report.summary.changed_theirs, 1, "{:?}", report.summary);
+    assert_eq!(report.applied, vec![lib.sketch.clone()], "{report:?}");
     world.converge();
 }
 
@@ -965,7 +998,7 @@ fn settle(world: &World) -> Vec<(libremarkable_utils::hub::model::DocId, String)
     assert!(
         origin[&spare]
             .keys()
-            .any(|file| matches!(file, libremarkable_utils::hub::model::DocFile::Page(_))),
+            .any(|file| matches!(file, DocFile::Page(_))),
         "the spare notebook lost its pages"
     );
     world.conflicts()

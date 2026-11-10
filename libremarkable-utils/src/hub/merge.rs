@@ -464,24 +464,51 @@ pub struct MergeOutcome {
     pub guard: DeletionGuard,
 }
 
+impl Summary {
+    fn count(mut self, resolution: &Resolution) -> Self {
+        match resolution {
+            Resolution::Unchanged => self.unchanged += 1,
+            Resolution::Changed(Side::Ours) => self.changed_ours += 1,
+            Resolution::Changed(Side::Theirs) => self.changed_theirs += 1,
+            Resolution::Identical => self.identical += 1,
+            Resolution::Added(_) | Resolution::AddedBoth => self.added += 1,
+            Resolution::Deleted(_) => self.deleted += 1,
+            Resolution::Kept(_) => self.kept += 1,
+            Resolution::Merged => self.merged += 1,
+            Resolution::Forked { .. } | Resolution::ForkCopy { .. } => self.forked += 1,
+            Resolution::Resurrected => self.resurrected += 1,
+        }
+        self
+    }
+}
+
 impl MergeOutcome {
     pub fn summary(&self) -> Summary {
         self.resolutions
             .values()
-            .fold(Summary::default(), |mut summary, resolution| {
-                match resolution {
-                    Resolution::Unchanged => summary.unchanged += 1,
-                    Resolution::Changed(Side::Ours) => summary.changed_ours += 1,
-                    Resolution::Changed(Side::Theirs) => summary.changed_theirs += 1,
-                    Resolution::Identical => summary.identical += 1,
-                    Resolution::Added(_) | Resolution::AddedBoth => summary.added += 1,
-                    Resolution::Deleted(_) => summary.deleted += 1,
-                    Resolution::Kept(_) => summary.kept += 1,
-                    Resolution::Merged => summary.merged += 1,
-                    Resolution::Forked { .. } | Resolution::ForkCopy { .. } => summary.forked += 1,
-                    Resolution::Resurrected => summary.resurrected += 1,
-                }
-                summary
+            .fold(Summary::default(), Summary::count)
+    }
+
+    /// [`Self::summary`] as a sync reports it: a document changed on one
+    /// side, or identically on both, counts as unchanged when
+    /// `view_state_only` says its merged version differs from its base
+    /// only in view state and derived fields. The merge decides such
+    /// documents by blob ids, without reading them; the sync pushes and
+    /// applies nothing for them, and its reports must agree.
+    pub fn summary_with(
+        &self,
+        mut view_state_only: impl FnMut(&DocId) -> Result<bool>,
+    ) -> Result<Summary> {
+        self.resolutions
+            .iter()
+            .try_fold(Summary::default(), |summary, (doc, resolution)| {
+                let counted = match resolution {
+                    Resolution::Changed(_) | Resolution::Identical if view_state_only(doc)? => {
+                        &Resolution::Unchanged
+                    }
+                    other => other,
+                };
+                Ok(summary.count(counted))
             })
     }
 }
