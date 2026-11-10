@@ -920,14 +920,21 @@ fn copy_with_progress(
     }
 }
 
-fn checked(output: Output) -> Result<Output> {
+/// `output` if its command succeeded, else [`remote_error`].
+pub(crate) fn checked(output: Output) -> Result<Output> {
     if output.status.success() {
         return Ok(output);
     }
-    Err(Error::Remote {
+    Err(remote_error(&output))
+}
+
+/// A failed remote command as [`Error::Remote`]: its exit status (-1
+/// without one, e.g. killed by a signal) and its trimmed stderr.
+pub(crate) fn remote_error(output: &Output) -> Error {
+    Error::Remote {
         status: output.status.code().unwrap_or(-1),
         stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-    })
+    }
 }
 
 /// Short-pathed private directory for ControlMaster sockets.
