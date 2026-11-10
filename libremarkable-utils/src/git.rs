@@ -610,6 +610,23 @@ impl Repo {
     /// Point local ref `name` (a full `refs/...` name) at `new`; with
     /// `old`, only if the ref currently has that value (atomic
     /// compare-and-swap).
+    /// Pack every object reachable from the repository's refs into one
+    /// pack, objects borrowed from its alternates included (`repack -a
+    /// -d`, without `-l`): afterwards it no longer needs them.
+    pub fn repack_all(&self) -> Result<()> {
+        let mut cmd = self.command("repack");
+        cmd.args(["-a", "-d", "-q"]);
+        run("repack", &mut cmd).map(drop)
+    }
+
+    /// Delete the local ref `name` (absent: nothing to do).
+    pub fn delete_ref(&self, name: &str) -> Result<()> {
+        validate_ref_name(name)?;
+        let mut cmd = self.command("update-ref");
+        cmd.args(["-d", "--end-of-options", name]);
+        run("update-ref", &mut cmd).map(drop)
+    }
+
     pub fn update_ref(&self, name: &str, new: &Oid, old: Option<&Expected>) -> Result<()> {
         validate_ref_name(name)?;
         let mut cmd = self.command("update-ref");

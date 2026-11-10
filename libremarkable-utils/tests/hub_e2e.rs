@@ -3684,9 +3684,18 @@ fn a_pending_page_the_user_inked_is_never_kept_over_the_merge() {
 /// A clone (or reattach) of tablet `i` from its computer, counting the
 /// pack bytes it fetches (`GIT_TRACE_PACKFILE`).
 fn fetched_by_clone(world: &World, i: usize, reattach: bool) -> u64 {
+    fetched_by_clone_from(world, i, reattach, &world.origin)
+}
+
+/// [`fetched_by_clone`] from origin at `url`.
+fn fetched_by_clone_from(world: &World, i: usize, reattach: bool, url: &str) -> u64 {
     static PROGRESS: libremarkable_utils::progress::NoProgress =
         libremarkable_utils::progress::NoProgress;
-    let trace = world.root.join(format!("packs-{i}-{reattach}"));
+    let trace = world.root.join(format!(
+        "packs-{}",
+        uuid_like(&format!("{i}-{reattach}-{url}"))
+    ));
+    let _ = std::fs::remove_file(&trace);
     let hub = libremarkable_utils::hub::cycle::Hub::new(
         world.git.clone().env("GIT_TRACE_PACKFILE", &trace),
         world.device(i).cache.clone(),
@@ -3696,9 +3705,109 @@ fn fetched_by_clone(world: &World, i: usize, reattach: bool) -> u64 {
     .with_options(world.options.clone());
     let name =
         (!reattach).then(|| libremarkable_utils::hub::model::DeviceName::new("Tablet B").unwrap());
-    hub.clone_tablet(world.tablet(i), &world.origin, name, reattach)
+    hub.clone_tablet(world.tablet(i), url, name, reattach)
         .unwrap();
     std::fs::metadata(&trace).map_or(0, |meta| meta.len())
+}
+
+/// A file-name-safe tag for `text`.
+fn uuid_like(text: &str) -> String {
+    text.bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() {
+                b as char
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .chars()
+        .rev()
+        .take(60)
+        .collect()
+}
+
+/// An incompressible payload of `kib` KiB, so pack bytes show what moved.
+fn payload(kib: usize) -> Vec<u8> {
+    std::iter::successors(Some(0x2545_f491_4f6c_dd1du64), |x| {
+        let x = x ^ (x << 13);
+        let x = x ^ (x >> 7);
+        Some(x ^ (x << 17))
+    })
+    .take(kib * 128)
+    .flat_map(u64::to_le_bytes)
+    .collect()
+}
+
+/// Another repository at the URL a cache was recorded for: the first
+/// clone afterwards fetches the new library once (into the stale cache,
+/// which it then takes from locally), and that cache no longer records
+/// the URL, so it is not tried again.
+#[test]
+fn a_replaced_origin_is_fetched_once_and_its_old_cache_forgets_the_url() {
+    let (world, _, _) = two_notebooks();
+    let old_id = world.device(1).state().unwrap().repo_id;
+    let old_cache = world.device(1).cache.join(format!("{old_id}.git"));
+    let other = World::new(1);
+    let paper = other.create(0, Kind::Pdf, "Paper", "");
+    let library = payload(2048);
+    other
+        .device(0)
+        .tablet
+        .write_file(&format!("{paper}.pdf"), &library)
+        .unwrap();
+    other.clone_tablet(0).unwrap();
+    std::fs::remove_dir_all(&world.origin).unwrap();
+    world::copy_dir(Path::new(&other.origin), Path::new(&world.origin));
+    std::fs::remove_dir_all(world.device(1).tablet.state_dir()).unwrap();
+    let size = library.len() as u64;
+    let fetched = fetched_by_clone(&world, 1, true);
+    eprintln!("first clone after the replacement: {fetched} pack bytes for {size}");
+    assert!(
+        fetched >= size && fetched < size + size / 2,
+        "{fetched} for {size}"
+    );
+    let recorded = std::fs::read_to_string(old_cache.join("rmu-origin")).unwrap_or_default();
+    assert!(
+        !recorded.lines().any(|url| url == world.origin),
+        "{recorded:?}"
+    );
+    let refs = world::git_cli(
+        &world.root,
+        &[
+            &format!("--git-dir={}", old_cache.display()),
+            "for-each-ref",
+        ],
+    );
+    assert!(!refs.contains("refs/rmu/bootstrap"), "{refs}");
+    std::fs::remove_dir_all(world.device(1).tablet.state_dir()).unwrap();
+    assert_eq!(fetched_by_clone(&world, 1, true), 0);
+}
+
+/// One origin reached through two URLs: each is recorded, so going back
+/// to the first after a clone through the second fetches nothing again.
+#[test]
+fn a_cache_remembers_several_origin_urls() {
+    let world = World::new(2);
+    let paper = world.create(0, Kind::Pdf, "Paper", "");
+    let library = payload(1024);
+    world
+        .device(0)
+        .tablet
+        .write_file(&format!("{paper}.pdf"), &library)
+        .unwrap();
+    world.clone_tablet(0).unwrap();
+    let alias = world.root.join("alias.git");
+    std::os::unix::fs::symlink(&world.origin, &alias).unwrap();
+    let alias = alias.to_str().unwrap().to_string();
+    let size = library.len() as u64;
+    assert!(fetched_by_clone(&world, 1, false) >= size);
+    std::fs::remove_dir_all(world.device(1).tablet.state_dir()).unwrap();
+    // Through the alias: a URL this cache has not seen, fetched once.
+    assert!(fetched_by_clone_from(&world, 1, true, &alias) >= size);
+    std::fs::remove_dir_all(world.device(1).tablet.state_dir()).unwrap();
+    let back = fetched_by_clone_from(&world, 1, true, &world.origin);
+    assert!(back < size / 10, "{back} for {size}");
 }
 
 /// The library crosses the network once: a first clone on a computer with
