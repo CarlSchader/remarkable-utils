@@ -235,6 +235,33 @@ pub struct TreeEntry {
     pub path: Vec<u8>,
 }
 
+/// A commit and its parents, in order ([`Repo::rev_list_parents`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitParents {
+    pub commit: Oid,
+    pub parents: Vec<Oid>,
+}
+
+/// One entry of a raw diff ([`Repo::first_parent_changes`]). An absent
+/// side has mode 0 and the all-zero id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawChange {
+    pub old_mode: u32,
+    pub new_mode: u32,
+    pub old: Oid,
+    pub new: Oid,
+    /// `A`, `D`, `M`, `T`, ... (any score dropped).
+    pub status: u8,
+    pub path: Vec<u8>,
+}
+
+/// What one commit changed ([`Repo::first_parent_changes`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitChanges {
+    pub commit: Oid,
+    pub changes: Vec<RawChange>,
+}
+
 /// One ref advertised by [`Repo::ls_remote`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteRef {
@@ -633,6 +660,68 @@ impl Repo {
     /// is its newest.
     pub fn rev_list_topo(&self, revisions: &[&str]) -> Result<Vec<Oid>> {
         self.rev_list_with(revisions, &["--topo-order"])
+    }
+
+    /// Every commit reachable from `tip` with its parents, children before
+    /// their parents (`rev-list --topo-order --parents`).
+    pub fn rev_list_parents(&self, tip: &str) -> Result<Vec<CommitParents>> {
+        if tip.is_empty() || tip.starts_with('-') || tip.contains(char::is_control) {
+            return Err(Error::InvalidGitInput(format!("invalid revision {tip:?}")));
+        }
+        let mut cmd = self.command("rev-list");
+        cmd.args(["--topo-order", "--parents", "--end-of-options", tip]);
+        parse_rev_list_parents(&run("rev-list", &mut cmd)?)
+    }
+
+    /// What each of `commits` changed below `paths` against its first
+    /// parent (a root commit: against the empty tree), trees included
+    /// (`diff-tree --stdin -t --root`), in one process. Commits that
+    /// changed nothing there are left out.
+    pub fn first_parent_changes(
+        &self,
+        commits: &[CommitParents],
+        paths: &[&str],
+    ) -> Result<Vec<CommitChanges>> {
+        if let Some(bad) = paths.iter().find(|path| {
+            path.is_empty() || path.starts_with('-') || path.contains(char::is_control)
+        }) {
+            return Err(Error::InvalidGitInput(format!("invalid path {bad:?}")));
+        }
+        let request: Vec<u8> = commits
+            .iter()
+            .flat_map(|entry| match entry.parents.first() {
+                Some(parent) => format!("{} {parent}\n", entry.commit).into_bytes(),
+                None => format!("{}\n", entry.commit).into_bytes(),
+            })
+            .collect();
+        if request.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut cmd = self.command("diff-tree");
+        cmd.args(["--stdin", "-t", "--root", "--no-renames", "-z", "--"])
+            .args(paths);
+        let mut process = Process::spawn("diff-tree", &mut cmd)?;
+        let mut stdin = process.child.stdin.take().expect("stdin was piped");
+        let mut stdout = process.child.stdout.take().expect("stdout was piped");
+        // As in `object_sizes`: the output could fill its pipe while the
+        // request is still being written.
+        let (written, out) = thread::scope(|scope| {
+            let writer = scope.spawn(move || stdin.write_all(&request));
+            let mut out = Vec::new();
+            let read = stdout.read_to_end(&mut out);
+            (
+                writer
+                    .join()
+                    .unwrap_or_else(|_| Err(io::Error::other("writer panicked"))),
+                read.map(|_| out),
+            )
+        });
+        let status = process.wait_checked();
+        match (written, out, status) {
+            (_, _, Err(error)) => Err(error),
+            (Err(error), _, _) | (_, Err(error), _) => Err(error.into()),
+            (Ok(()), Ok(out), Ok(_)) => parse_diff_tree(&out),
+        }
     }
 
     /// The size of each of `oids` the repository has (absent ones are
@@ -1271,6 +1360,98 @@ fn parse_ls_remote(out: &[u8]) -> Result<Vec<RemoteRef>> {
 
 /// Parse `ls-tree -z --long` output:
 /// `<mode> SP <type> SP <oid> SP+ <size|-> TAB <path> NUL` per entry.
+/// Parse `rev-list --parents` output: one commit per line, its parents
+/// after it.
+pub fn parse_rev_list_parents(out: &[u8]) -> Result<Vec<CommitParents>> {
+    out.split(|&b| b == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let malformed = || {
+                output_error(
+                    "rev-list",
+                    format!("malformed line {:?}", String::from_utf8_lossy(line)),
+                )
+            };
+            let text = std::str::from_utf8(line).map_err(|_| malformed())?;
+            let mut ids = text.split(' ').map(|id| id.parse::<Oid>());
+            let commit = ids.next().ok_or_else(malformed)?.map_err(|_| malformed())?;
+            let parents = ids.collect::<Result<Vec<_>>>().map_err(|_| malformed())?;
+            Ok(CommitParents { commit, parents })
+        })
+        .collect()
+}
+
+/// Parse `diff-tree --stdin -z` raw output: a commit id, then its
+/// entries (`:<old mode> <new mode> <old id> <new id> <status>`, then the
+/// path), each NUL-terminated.
+pub fn parse_diff_tree(out: &[u8]) -> Result<Vec<CommitChanges>> {
+    let malformed = |what: &[u8]| {
+        output_error(
+            "diff-tree",
+            format!("malformed output {:?}", String::from_utf8_lossy(what)),
+        )
+    };
+    // The field after an entry header is its path, whatever it holds.
+    let (commits, pending) = out
+        .split(|&b| b == 0)
+        .filter(|field| !field.is_empty())
+        .try_fold(
+            (Vec::<CommitChanges>::new(), None::<&[u8]>),
+            |(mut commits, pending), field| -> Result<_> {
+                match (pending, field.strip_prefix(b":")) {
+                    (Some(header), _) => {
+                        let change =
+                            parse_raw_change(header, field).ok_or_else(|| malformed(header))?;
+                        commits
+                            .last_mut()
+                            .ok_or_else(|| malformed(header))?
+                            .changes
+                            .push(change);
+                        Ok((commits, None))
+                    }
+                    (None, Some(header)) => Ok((commits, Some(header))),
+                    (None, None) => {
+                        let commit = std::str::from_utf8(field)
+                            .ok()
+                            .and_then(|id| id.parse().ok())
+                            .ok_or_else(|| malformed(field))?;
+                        commits.push(CommitChanges {
+                            commit,
+                            changes: Vec::new(),
+                        });
+                        Ok((commits, None))
+                    }
+                }
+            },
+        )?;
+    match pending {
+        Some(header) => Err(malformed(header)),
+        None => Ok(commits),
+    }
+}
+
+fn parse_raw_change(header: &[u8], path: &[u8]) -> Option<RawChange> {
+    let header = std::str::from_utf8(header).ok()?;
+    let [old_mode, new_mode, old, new, status] =
+        header.split(' ').collect::<Vec<_>>().try_into().ok()?;
+    let mode = |mode: &str| {
+        Some(mode)
+            .filter(|mode| !mode.is_empty() && mode.bytes().all(|b| (b'0'..=b'7').contains(&b)))
+            .and_then(|mode| u32::from_str_radix(mode, 8).ok())
+    };
+    Some(RawChange {
+        old_mode: mode(old_mode)?,
+        new_mode: mode(new_mode)?,
+        old: old.parse().ok()?,
+        new: new.parse().ok()?,
+        status: *status
+            .as_bytes()
+            .first()
+            .filter(|b| b.is_ascii_uppercase())?,
+        path: Some(path).filter(|path| !path.is_empty())?.to_vec(),
+    })
+}
+
 fn parse_ls_tree(out: &[u8]) -> Result<Vec<TreeEntry>> {
     out.split(|&b| b == 0)
         .filter(|record| !record.is_empty())
@@ -2284,5 +2465,57 @@ mod tests {
         });
         // A SHA-1 tree read as SHA-256 runs out of id bytes.
         assert!(parse_tree(&entry("100644", b"f", A), ObjectFormat::Sha256).is_err());
+    }
+
+    #[test]
+    fn rev_list_parents_lines() {
+        let (a, b, c) = ("a".repeat(40), "b".repeat(40), "c".repeat(40));
+        let out = format!("{a} {b} {c}\n{b} {c}\n{c}\n");
+        let parsed = parse_rev_list_parents(out.as_bytes()).unwrap();
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0].commit.as_str(), a);
+        assert_eq!(
+            parsed[0].parents,
+            vec![b.parse().unwrap(), c.parse::<Oid>().unwrap()]
+        );
+        assert!(parsed[2].parents.is_empty());
+        assert!(parse_rev_list_parents(b"nothex\n").is_err());
+        assert!(parse_rev_list_parents(format!("{a}  {b}\n").as_bytes()).is_err());
+    }
+
+    #[test]
+    fn diff_tree_output() {
+        let (c1, c2) = ("1".repeat(40), "2".repeat(40));
+        let (zero, x, y) = ("0".repeat(40), "a".repeat(40), "b".repeat(40));
+        let out = [
+            format!("{c1}\0:000000 040000 {zero} {x} A\0docs/d\0"),
+            format!(":100644 100644 {x} {y} M\0:odd path\0"),
+            format!("{c2}\0:040000 000000 {x} {zero} D\0docs/d\0"),
+        ]
+        .concat();
+        let parsed = parse_diff_tree(out.as_bytes()).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].commit.as_str(), c1);
+        assert_eq!(parsed[0].changes.len(), 2);
+        let added = &parsed[0].changes[0];
+        assert_eq!(
+            (added.old_mode, added.new_mode, added.status),
+            (0, 0o040000, b'A')
+        );
+        assert_eq!(added.new.as_str(), x);
+        // A path is taken verbatim, even one starting with a colon.
+        assert_eq!(parsed[0].changes[1].path, b":odd path");
+        assert_eq!(parsed[1].changes[0].status, b'D');
+        assert!(parse_diff_tree(b"").unwrap().is_empty());
+        // An entry before any commit, a header without its path, a bad
+        // mode or status.
+        [
+            format!(":000000 040000 {zero} {x} A\0docs/d\0"),
+            format!("{c1}\0:000000 040000 {zero} {x} A\0"),
+            format!("{c1}\0:+00000 040000 {zero} {x} A\0p\0"),
+            format!("{c1}\0:000000 040000 {zero} {x} a\0p\0"),
+        ]
+        .iter()
+        .for_each(|bad| assert!(parse_diff_tree(bad.as_bytes()).is_err(), "{bad:?}"));
     }
 }

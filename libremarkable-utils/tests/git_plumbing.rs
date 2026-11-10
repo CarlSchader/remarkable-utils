@@ -1257,6 +1257,64 @@ fn rev_list_topo_lists_every_ancestor_children_first() {
 
 #[cfg(unix)]
 #[test]
+fn first_parent_changes_of_a_merged_history() {
+    let sandbox = Sandbox::new();
+    let cache = sandbox.init("cache.git");
+    let root = commit_files(&cache, &[], &[("docs/a/x", b"1"), ("top", b"t")], "root\n");
+    // Whole trees: each commit lists every file it has.
+    let side = commit_files(
+        &cache,
+        &[&root],
+        &[("docs/a/x", b"2"), ("top", b"t")],
+        "side\n",
+    );
+    let main = commit_files(
+        &cache,
+        &[&root],
+        &[("docs/a/x", b"1"), ("docs/b/y", b"3"), ("top", b"t")],
+        "main\n",
+    );
+    let merge = commit_files(
+        &cache,
+        &[&main, &side],
+        &[("docs/a/x", b"2"), ("docs/b/y", b"3"), ("top", b"t")],
+        "merge\n",
+    );
+    let commits = cache.rev_list_parents(merge.as_str()).unwrap();
+    assert_eq!(commits.len(), 4);
+    assert_eq!(commits[0].commit, merge);
+    assert_eq!(commits[0].parents, vec![main.clone(), side.clone()]);
+    let changes = cache.first_parent_changes(&commits, &["docs"]).unwrap();
+    let paths = |commit: &Oid| -> Vec<String> {
+        changes
+            .iter()
+            .find(|entry| entry.commit == *commit)
+            .map(|entry| {
+                entry
+                    .changes
+                    .iter()
+                    .map(|change| String::from_utf8_lossy(&change.path).into_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    // Against the first parent only, trees included, `top` left out.
+    assert_eq!(paths(&root), ["docs", "docs/a", "docs/a/x"]);
+    assert_eq!(paths(&main), ["docs", "docs/b", "docs/b/y"]);
+    assert_eq!(paths(&side), ["docs", "docs/a", "docs/a/x"]);
+    assert_eq!(paths(&merge), ["docs", "docs/a", "docs/a/x"]);
+    assert!(matches!(
+        cache.first_parent_changes(&commits, &["--all"]),
+        Err(Error::InvalidGitInput(_))
+    ));
+    assert!(matches!(
+        cache.rev_list_parents("--all"),
+        Err(Error::InvalidGitInput(_))
+    ));
+}
+
+#[cfg(unix)]
+#[test]
 fn deleting_a_remote_ref_is_leased() {
     let sandbox = Sandbox::new();
     let origin = sandbox.init("origin.git");
