@@ -3122,7 +3122,7 @@ fn unchanged_is_the_per_document_tables_no_change() {
 /// both sides (forks where both inked), renames, moves, deletions
 /// against edits, and folders trashed on each side above edited
 /// documents. Run in release with `--ignored --nocapture`; it prints the
-/// best of five runs and a fingerprint of the outcome (equal
+/// best of twenty runs and a fingerprint of the outcome (equal
 /// fingerprints: an identical merge).
 #[test]
 #[ignore]
@@ -3197,7 +3197,7 @@ fn merge_scale_1000_documents() {
         .go(&lib, &b, &o, &t)
         .unwrap()
     };
-    let (best, outcome) = (0..5)
+    let (best, outcome) = (0..20)
         .map(|_| {
             let started = std::time::Instant::now();
             let outcome = merge();
@@ -3207,7 +3207,7 @@ fn merge_scale_1000_documents() {
         .unwrap();
     let fingerprint = format!("{:x}", Sha256::digest(format!("{outcome:?}")));
     eprintln!(
-        "1000-document merge: best of 5 {best:?}; {} documents, {} forks, {} notes; outcome {}",
+        "1000-document merge: best of 20 {best:?}; {} documents, {} forks, {} notes; outcome {}",
         outcome.docs.len(),
         outcome.forks.len(),
         outcome.notes.len(),
