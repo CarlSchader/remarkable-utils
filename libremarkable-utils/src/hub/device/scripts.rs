@@ -20,6 +20,12 @@
 //! transfer into the run's own directory) checks the guard without it,
 //! and the watchdog never takes it, so a stuck script cannot keep
 //! xochitl down.
+//!
+//! The scripts live in two halves, re-exported here: `guard` (guard,
+//! lock, watchdog, xochitl) and `transfer` (stat pass, reads and hashes,
+//! state file, staging, apply).
+//!
+//! [`TabletPaths::guard_flock`]: super::TabletPaths::guard_flock
 
 mod guard;
 mod transfer;
