@@ -1315,6 +1315,26 @@ fn first_parent_changes_of_a_merged_history() {
 
 #[cfg(unix)]
 #[test]
+fn fetching_tips_brings_no_history() {
+    let sandbox = Sandbox::new();
+    let origin = sandbox.init("origin.git");
+    let url = origin.git_dir().to_str().unwrap();
+    let c1 = commit_files(&origin, &[], &[("f", b"1")], "c1\n");
+    let c2 = commit_files(&origin, &[&c1], &[("f", b"2")], "c2\n");
+    origin.update_ref(MAIN, &c2, None).unwrap();
+    let probe = sandbox.init("probe.git");
+    probe
+        .fetch_tips(url, &["+refs/heads/main:refs/remotes/origin/main"])
+        .unwrap();
+    assert_eq!(
+        probe.rev_parse("refs/remotes/origin/main").unwrap(),
+        Some(c2.clone())
+    );
+    assert!(probe.object_sizes([&c1]).unwrap().is_empty());
+}
+
+#[cfg(unix)]
+#[test]
 fn checkpointed_blobs_survive_an_aborted_writer() {
     let sandbox = Sandbox::new();
     let cache = sandbox.init("cache.git");
