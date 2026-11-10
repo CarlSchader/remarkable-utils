@@ -81,6 +81,30 @@ fn shown<'a>(docs: impl IntoIterator<Item = &'a DocId>) -> impl Iterator<Item = 
     docs.into_iter().take(LIST_LIMIT)
 }
 
+/// The names a report carries from origin's or the tablet's history
+/// (for documents the tablet no longer has): preferred over the
+/// tablet's own `.metadata`.
+pub fn report_names(report: &Report) -> Names {
+    match report {
+        Report::Clone(report) | Report::Sync(report) => report.names.clone(),
+        Report::Status(report) => report.names.clone(),
+        Report::DryRun(report) => report.status.names.clone(),
+        Report::Init { .. }
+        | Report::Backup(_)
+        | Report::Remote(_)
+        | Report::SetUrl(_)
+        | Report::Detach(_) => Names::new(),
+    }
+}
+
+/// The names an error carries (the deletion guard's documents).
+pub fn error_names(error: &Error) -> Names {
+    match error {
+        Error::HubCycle(CycleError::DeletionsNeedConsent { names, .. }) => names.clone(),
+        _ => Names::new(),
+    }
+}
+
 /// The documents whose names the human summary shows.
 pub fn named_docs(report: &Report) -> Vec<DocId> {
     let docs: Vec<&DocId> = match report {
@@ -120,8 +144,15 @@ fn status_docs(report: &StatusReport) -> impl Iterator<Item = &DocId> {
         .chain(shown(&report.guard.from_origin))
 }
 
-/// The human summary of a report.
+/// `preferred` names over `fallback` ones.
+fn merged(preferred: Names, fallback: &Names) -> Names {
+    fallback.clone().into_iter().chain(preferred).collect()
+}
+
+/// The human summary of a report. `names` (the tablet's own) fill in for
+/// documents the report carries no name for.
 pub fn human(report: &Report, names: &Names) -> Vec<String> {
+    let names = &merged(report_names(report), names);
     let lines = match report {
         Report::Init { origin, report } => vec![
             format!("Initialised origin {origin}"),
@@ -278,6 +309,10 @@ pub fn note_text(kind: &NoteKind) -> String {
             place(parent)
         ),
         NoteKind::Resurrected => "restored from history to hold a present item".to_string(),
+        NoteKind::ReturnedAfterDeletion => {
+            "came back: it was deleted earlier, but another tablet changed or restored it since"
+                .to_string()
+        }
         NoteKind::OrphanToRoot { missing_parent } => {
             format!("its folder {missing_parent} is gone; moved to the root")
         }
@@ -726,11 +761,13 @@ pub struct ErrorContext {
 /// by `--quiet`): what the deletion guard refused, and how to recover
 /// from an origin that does not match the tablet.
 pub fn error_details(error: &Error, context: &ErrorContext) -> Vec<String> {
+    let names = merged(error_names(error), &context.names);
     let lines = match error {
         Error::HubCycle(CycleError::DeletionsNeedConsent {
             from_origin,
             from_tablet,
             empty_snapshot,
+            ..
         }) => {
             let mut lines = Vec::new();
             if *empty_snapshot {
@@ -739,8 +776,7 @@ pub fn error_details(error: &Error, context: &ErrorContext) -> Vec<String> {
                         .to_string(),
                 );
             }
-            let labels =
-                |docs: &[DocId]| docs.iter().map(|doc| label(&context.names, doc)).collect();
+            let labels = |docs: &[DocId]| docs.iter().map(|doc| label(&names, doc)).collect();
             list(&mut lines, "Would delete from origin", labels(from_origin));
             list(
                 &mut lines,
@@ -755,7 +791,7 @@ pub fn error_details(error: &Error, context: &ErrorContext) -> Vec<String> {
         }
         Error::HubCycle(CycleError::OriginEmpty { url }) => origin_empty(url, context),
         Error::HubCycle(CycleError::DeviceRefConflict { .. }) => vec![
-            "This tablet's backups on origin were written by another tablet with the same device id (a copied hub state, say).".to_string(),
+            "Origin's record of this tablet's backups (its device ref) was rewritten or replaced since the tablet last synced; the tablet's documents are untouched.".to_string(),
             "`rmu hub clone <origin> --reattach` gives this tablet a fresh start on origin, keeping its documents.".to_string(),
         ],
         _ => Vec::new(),

@@ -85,6 +85,17 @@ fn guard() -> DeletionGuard {
     }
 }
 
+/// The names the library carries for `guard()`'s documents (from
+/// history: the tablet no longer has them).
+fn guard_names() -> BTreeMap<DocId, String> {
+    BTreeMap::from([
+        (doc(20), "Removed on this tablet".to_string()),
+        (doc(21), "Old draft".to_string()),
+        (doc(22), "Second draft".to_string()),
+        (doc(23), "Cleaned up elsewhere".to_string()),
+    ])
+}
+
 fn sync_report() -> SyncReport {
     SyncReport {
         update: MainUpdate::Merge(oid('c')),
@@ -122,6 +133,7 @@ fn sync_report() -> SyncReport {
             name: "Lecture notes (conflict Desk tablet 2026-11-09)".into(),
         }],
         deletions: guard(),
+        names: guard_names(),
         summary: Summary {
             unchanged: 40,
             changed_ours: 2,
@@ -172,6 +184,10 @@ fn status_report() -> StatusReport {
             allowed: false,
             ..guard()
         },
+        names: guard_names()
+            .into_iter()
+            .chain([(doc(3), "Gone notebook".to_string())])
+            .collect(),
         summary: Summary {
             added: 1,
             ..Summary::default()
@@ -285,5 +301,10 @@ fn guard_refusal() -> Error {
         from_origin: vec![doc(1), doc(2)],
         from_tablet: vec![doc(3)],
         empty_snapshot: true,
+        names: BTreeMap::from([
+            (doc(1), "Deleted paper".to_string()),
+            (doc(2), "Deleted notes".to_string()),
+            (doc(3), "Old draft".to_string()),
+        ]),
     })
 }

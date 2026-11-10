@@ -31,7 +31,9 @@ fn renders_sync_reports() {
             "Files without a .metadata",
             "  \"Kept book\" (8c1f0b9e-0000-4000-8000-000000000007): kept over a deletion: deleted on origin but changed on the other side",
             "  8c1f0b9e-0000-4000-8000-000000000008: restored from the trash to the root, so an edit is not lost",
-            "Deleted from the tablet (1):\n  8c1f0b9e-0000-4000-8000-000000000015\n",
+            "Deleted from origin (1):\n  \"Removed on this tablet\" (8c1f0b9e-0000-4000-8000-000000000014)\n",
+            "Deleted from the tablet (1):\n  \"Old draft\" (8c1f0b9e-0000-4000-8000-000000000015)\n",
+            "  \"Cleaned up elsewhere\" (8c1f0b9e-0000-4000-8000-000000000017)",
             "1 document also deleted from the tablet: origin deleted them with recorded consent",
             "These deletions are allowed by --allow-deletions",
             "Reconciled an interrupted sync: finished 1 document, 1 left for the next sync",
@@ -41,6 +43,13 @@ fn renders_sync_reports() {
         ],
     );
     assert!(!human.contains("Read "), "{human}");
+    // History's names win over the tablet's (a stale `.metadata`).
+    let stale = BTreeMap::from([(doc(21), "Stale tablet name".to_string())]);
+    let human = text(&render::human(&report, &stale));
+    assert!(
+        human.contains("\"Old draft\"") && !human.contains("Stale"),
+        "{human}"
+    );
 
     let Report::Sync(sync) = &report else {
         unreachable!()
@@ -114,7 +123,8 @@ fn renders_status_and_dry_run_reports() {
             "3 changes on the tablet since its last sync",
             "  added    \"New notebook\" (8c1f0b9e-0000-4000-8000-000000000001)",
             "  modified 8c1f0b9e-0000-4000-8000-000000000002",
-            "  deleted  8c1f0b9e-0000-4000-8000-000000000003",
+            "  deleted  \"Gone notebook\" (8c1f0b9e-0000-4000-8000-000000000003)",
+            "Would delete from origin (1):\n  \"Removed on this tablet\"",
             "Origin has 4 commits the tablet has not seen",
             "Open conflict copies (rename or delete a copy to close it) (1):",
             "Quarantined, malformed on the tablet",
@@ -344,23 +354,52 @@ fn ages() {
 
 #[test]
 fn renders_errors() {
+    // The documents to delete from origin are gone from the tablet: their
+    // names come from history, which the error carries.
     let error = guard_refusal();
-    // At a refusal nothing was deleted: the tablet still has its documents.
-    let names = BTreeMap::from([(doc(3), "Old draft".to_string())]);
     let details = text(&render::error_details(
         &error,
-        &render::ErrorContext {
-            names,
-            ..Default::default()
-        },
+        &render::ErrorContext::default(),
     ));
     assert!(details.contains("The tablet looks empty"));
     assert!(details.contains(&format!(
-        "Would delete from origin (2):\n  {}\n  {}",
+        "Would delete from origin (2):\n  \"Deleted paper\" ({})\n  \"Deleted notes\" ({})",
         doc(1),
         doc(2)
     )));
     assert!(details.contains("Would delete from the tablet (1):\n  \"Old draft\""));
+    // The tablet's names only fill in, never override history's.
+    let Error::HubCycle(CycleError::DeletionsNeedConsent {
+        from_origin,
+        from_tablet,
+        ..
+    }) = guard_refusal()
+    else {
+        unreachable!()
+    };
+    let partial = Error::HubCycle(CycleError::DeletionsNeedConsent {
+        from_origin,
+        from_tablet,
+        empty_snapshot: false,
+        names: BTreeMap::from([(doc(1), "Deleted paper".to_string())]),
+    });
+    let details = text(&render::error_details(
+        &partial,
+        &render::ErrorContext {
+            names: BTreeMap::from([
+                (doc(1), "Stale tablet name".to_string()),
+                (doc(3), "Still on the tablet".to_string()),
+            ]),
+            ..Default::default()
+        },
+    ));
+    assert!(details.contains("\"Deleted paper\""), "{details}");
+    assert!(!details.contains("Stale tablet name"), "{details}");
+    assert!(details.contains("\"Still on the tablet\""), "{details}");
+    assert!(
+        details.contains(&format!("\n  {}\n", doc(2))),
+        "no name anywhere: {details}"
+    );
     assert!(details.contains("--allow-deletions"));
     assert_eq!(render::error_docs(&error), vec![doc(3), doc(1), doc(2)]);
 
@@ -495,4 +534,24 @@ fn a_closed_stdout_after_success_is_not_an_error() {
         &mut ClosedPipe,
     );
     assert_eq!(exit_code(&result.unwrap_err()), 3);
+}
+
+#[test]
+fn a_document_back_after_its_deletion_is_noted() {
+    let report = SyncReport {
+        notes: vec![Note {
+            doc: doc(40),
+            kind: NoteKind::ReturnedAfterDeletion,
+        }],
+        ..sync_report()
+    };
+    let names = BTreeMap::from([(doc(40), "Field notes".to_string())]);
+    let human = text(&render::human(&Report::Sync(report), &names));
+    assert!(
+        human.contains(&format!(
+            "  \"Field notes\" ({}): came back: it was deleted earlier, but another tablet changed or restored it since",
+            doc(40)
+        )),
+        "{human}"
+    );
 }

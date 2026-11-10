@@ -2,6 +2,7 @@
 //! origin (hermetic git).
 
 use super::*;
+use libremarkable_utils::hub::model::{Journal, TabletState};
 
 /// A local origin, fake tablets and a cache, hermetic.
 struct World {
@@ -240,6 +241,12 @@ fn the_deletion_guard_exits_3_and_lists_the_documents() {
     let value: Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(value["error"]["kind"], "deletions_need_consent");
     assert_eq!(value["error"]["from_origin"].as_array().unwrap().len(), 12);
+    // The tablet no longer has them: their names come from history.
+    assert_eq!(value["error"]["names"][doc(3).to_string()], "Paper 3");
+    assert!(
+        stderr.contains(&format!("  \"Paper 3\" ({})", doc(3))),
+        "{stderr}"
+    );
     assert_eq!(value["error"]["empty_snapshot"], true);
     assert!(
         stderr.contains("Would delete from origin (12):"),
@@ -421,4 +428,135 @@ fn names_are_looked_up_on_the_tablet() {
     let names = lookup_names(&a, &[doc(1), doc(2), doc(3), doc(1)]);
     assert_eq!(names, BTreeMap::from([(doc(1), "Paper one".to_string())]));
     assert!(lookup_names(&a, &[]).is_empty());
+}
+
+/// Delete a PDF's files on a fake tablet, as the user would.
+fn delete_pdf(tablet: &FakeTablet, n: u64) {
+    ["metadata", "content", "pdf"]
+        .iter()
+        .for_each(|ext| tablet.remove_file(&format!("{}.{ext}", doc(n))).unwrap());
+}
+
+#[test]
+fn deletions_from_the_tablet_are_named() {
+    let world = World::new();
+    let origin = world.origin();
+    let a = world.tablet("a", |b| {
+        (1..=3).fold(b, |b, n| with_pdf(b, n, &format!("Paper {n}")))
+    });
+    let b = world.tablet("b", |b| b);
+    assert_eq!(world.json(&a, &["init", &origin]).1, 0);
+    assert_eq!(world.json(&a, &["clone", &origin]).1, 0);
+    assert_eq!(world.json(&b, &["clone", &origin]).1, 0);
+    delete_pdf(&a, 1);
+    delete_pdf(&a, 2);
+    let (value, code) = world.json(&a, &["sync"]);
+    assert_eq!(code, 0, "{value}");
+    assert_eq!(value["names"][doc(1).to_string()], "Paper 1");
+
+    // B loses them in its sync; the summary still names them.
+    let (value, code) = world.json(&b, &["sync", "--dry-run"]);
+    assert_eq!(code, 0, "{value}");
+    assert_eq!(value["status"]["names"][doc(2).to_string()], "Paper 2");
+    let (stdout, stderr, code) = world.run(&b, &["sync"], Output::Human);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(b.read_file(&format!("{}.pdf", doc(1))).is_none());
+    assert!(
+        stdout.contains(&format!(
+            "Deleted from the tablet (2):\n  \"Paper 1\" ({})\n  \"Paper 2\" ({})",
+            doc(1),
+            doc(2)
+        )),
+        "{stdout}"
+    );
+}
+
+/// Give a fake tablet's hub state a journal, as an interrupted sync
+/// leaves it.
+fn leave_journal(tablet: &FakeTablet, merge: &str) {
+    let path = tablet.paths().state_file();
+    let mut state = TabletState::parse(&std::fs::read(&path).unwrap()).unwrap();
+    state.journal = Some(Journal {
+        merge: merge.parse().unwrap(),
+        snapshot: state.device_ref.clone().expect("synced once"),
+    });
+    std::fs::write(&path, state.to_json()).unwrap();
+}
+
+#[test]
+fn detach_refuses_a_pending_journal_without_force() {
+    let world = World::new();
+    let origin = world.origin();
+    let a = world.tablet("a", |b| with_pdf(b, 1, "Paper"));
+    assert_eq!(world.json(&a, &["init", &origin]).1, 0);
+    let (value, _) = world.json(&a, &["clone", &origin]);
+    leave_journal(&a, value["base"].as_str().unwrap());
+
+    let (value, code) = world.json(&a, &["detach"]);
+    assert_eq!(code, 7, "{value}");
+    assert_eq!(value["error"]["kind"], "journal_pending");
+    let message = value["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("rmu hub sync") && message.contains("--force"),
+        "{message}"
+    );
+    assert_eq!(world.json(&a, &["status"]).1, 0, "still attached");
+
+    let (stdout, stderr, code) = world.run(&a, &["detach", "--force"], Output::Plain);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.is_empty());
+    assert!(
+        stderr.contains("warning: the journal of an interrupted sync was discarded"),
+        "{stderr}"
+    );
+    assert_eq!(world.json(&a, &["status"]).1, 1, "detached");
+}
+
+#[test]
+fn set_url_refuses_an_origin_without_the_journaled_merge() {
+    let world = World::new();
+    let origin = world.origin();
+    let a = world.tablet("a", |b| with_pdf(b, 1, "Paper one"));
+    let b = world.tablet("b", |b| b);
+    assert_eq!(world.json(&a, &["init", &origin]).1, 0);
+    assert_eq!(world.json(&a, &["clone", &origin]).1, 0);
+    assert_eq!(world.json(&b, &["clone", &origin]).1, 0);
+    // A copy of origin made now, then origin moves on.
+    let moved = world.scratch.join("moved.git").display().to_string();
+    let copied = std::process::Command::new("cp")
+        .args(["-R", &origin, &moved])
+        .status()
+        .unwrap();
+    assert!(copied.success());
+    let id = doc(2);
+    b.write_file(
+        &format!("{id}.metadata"),
+        json!({"parent": "", "type": "DocumentType", "visibleName": "Paper two"})
+            .to_string()
+            .as_bytes(),
+    )
+    .unwrap();
+    b.write_file(
+        &format!("{id}.content"),
+        libremarkable_utils::xochitl::document_content_json("pdf").as_bytes(),
+    )
+    .unwrap();
+    b.write_file(&format!("{id}.pdf"), b"%PDF-1.4 fabricated 2\n")
+        .unwrap();
+    let (value, code) = world.json(&b, &["sync"]);
+    assert_eq!(code, 0, "{value}");
+    // A was interrupted applying that merge, which the copy lacks.
+    leave_journal(&a, value["base"].as_str().unwrap());
+
+    let (value, code) = world.json(&a, &["remote", "set-url", &moved]);
+    assert_eq!(code, 7, "{value}");
+    assert_eq!(value["error"]["kind"], "journal_pending");
+    assert!(
+        value["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("run `rmu hub sync` against the current origin first"),
+        "{value}"
+    );
+    assert_eq!(world.json(&a, &["remote"]).0["origin"], origin.as_str());
 }

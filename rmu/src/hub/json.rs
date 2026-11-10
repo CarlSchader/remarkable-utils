@@ -4,11 +4,13 @@
 //! own (see `libremarkable_utils::hub::cycle`): documents by id, enums
 //! tagged by `kind` (`state` for the lock). Errors are `{"schema",
 //! "error": {"kind", "exit_code", "message"}}`, plus `from_origin`,
-//! `from_tablet` and `empty_snapshot` for the deletion guard.
+//! `from_tablet`, `empty_snapshot` and `names` for the deletion guard.
 //!
 //! **Unstable until device validation**: names will be settled then
 //! (and `schema` bumped). Until then, golden tests pin every shape, so
 //! a change in the library shows up here.
+
+use std::collections::BTreeMap;
 
 use libremarkable_utils::Error;
 use libremarkable_utils::hub::cycle::{CycleError, InitReport};
@@ -68,10 +70,12 @@ pub fn error(failure: Failure, message: &str, error: Option<&Error>) -> Value {
             from_origin,
             from_tablet,
             empty_snapshot,
+            names,
         })) => Some(GuardRefusal {
             from_origin,
             from_tablet,
             empty_snapshot: *empty_snapshot,
+            names,
         }),
         _ => None,
     };
@@ -107,4 +111,5 @@ struct GuardRefusal<'a> {
     from_origin: &'a [DocId],
     from_tablet: &'a [DocId],
     empty_snapshot: bool,
+    names: &'a BTreeMap<DocId, String>,
 }

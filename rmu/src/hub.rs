@@ -27,8 +27,8 @@ use clap::{Args, Subcommand};
 use libremarkable_utils::Error;
 use libremarkable_utils::git::Git;
 use libremarkable_utils::hub::cycle::{
-    self, BackupReport, CycleError, DetachReport, DryRunReport, Hub, HubOptions, InitReport,
-    RemoteReport, SetUrlReport, StatusReport, SyncReport,
+    self, BackupReport, CycleError, DetachOptions, DetachReport, DryRunReport, Hub, HubOptions,
+    InitReport, RemoteReport, SetUrlReport, StatusReport, SyncReport,
 };
 use libremarkable_utils::hub::device::{DeviceError, LockRequest, SshTablet, Tablet, TabletPaths};
 use libremarkable_utils::hub::model::{DeviceName, DocId, XochitlPath};
@@ -50,13 +50,14 @@ Exit status:
   4  the tablet is locked or busy with another rmu hub run, or the local
      cache with another run on this computer (retry later; if a tablet
      run is gone, --break-lock takes its lock over)
-  5  origin does not match the tablet: rewound or replaced, or another
-     tablet uses this device id (`rmu hub clone --reattach` attaches the
-     tablet to it deliberately); or origin lost its main branch (check the
-     URL, then restore origin from a backup or a computer's cache: the
-     error says how)
+  5  origin does not match the tablet: rewound or replaced, or the
+     tablet's backups on it were rewritten or are missing (`rmu hub clone
+     --reattach` attaches the tablet to it deliberately); or origin lost
+     its main branch (check the URL, then restore origin from a backup or
+     a computer's cache: the error says how)
   6  the tablet is paired with the reMarkable cloud (unpair it first)
   7  an interrupted sync must be finished first: run `rmu hub sync`
+     against the current origin (for `detach`, --force discards it)
 
 Output: stdout carries the result only: a summary on a terminal, JSON
 with --json, otherwise plain ids (the summary then goes to stderr).
@@ -64,9 +65,9 @@ Progress, warnings and error details go to stderr.
 
 JSON (\"schema\": 1) is unstable until the hub is validated on devices.
 Errors are {\"schema\": 1, \"error\": {\"kind\", \"exit_code\", \"message\"}};
-kind is error, deletions_need_consent (adds from_origin, from_tablet and
-empty_snapshot), lock_held, origin_mismatch, cloud_paired or
-journal_pending.";
+kind is error, deletions_need_consent (adds from_origin, from_tablet,
+empty_snapshot and the documents' names), lock_held, origin_mismatch,
+cloud_paired or journal_pending.";
 
 /// Why `--no-restart` is refused for `rmu hub`.
 pub const NO_RESTART_REFUSED: &str = "--no-restart does not apply to rmu hub: it stops and \
@@ -159,6 +160,11 @@ pub enum HubCommand {
         /// Also delete the tablet's device ref (its backups) from origin
         #[arg(long)]
         prune_ref: bool,
+        /// Detach even if an interrupted sync left a journal (documents
+        /// its apply was writing may stay half-updated on the tablet;
+        /// both versions stay in origin's history). Prefer `rmu hub sync`
+        #[arg(long)]
+        force: bool,
         #[command(flatten)]
         lock: LockArg,
         #[command(flatten)]
@@ -274,10 +280,15 @@ impl Failure {
                 CycleError::OriginRewound { .. }
                 | CycleError::RepoMismatch { .. }
                 | CycleError::OriginEmpty { .. }
-                | CycleError::DeviceRefConflict { .. },
+                | CycleError::DeviceRefConflict { .. }
+                | CycleError::DeviceRefMissing { .. },
             ) => Self::OriginMismatch,
             Error::HubCycle(CycleError::CloudPaired) => Self::CloudPaired,
-            Error::HubCycle(CycleError::JournalPending) => Self::JournalPending,
+            Error::HubCycle(
+                CycleError::JournalPending
+                | CycleError::DetachJournalPending
+                | CycleError::JournalMergeMissing { .. },
+            ) => Self::JournalPending,
             _ => Self::Error,
         }
     }
@@ -505,9 +516,17 @@ pub fn execute(
         } => hub
             .set_remote_url(tablet(), &absolute_origin(url))
             .map(Report::SetUrl),
-        HubCommand::Detach { prune_ref, .. } => {
-            hub.detach(tablet(), *prune_ref).map(Report::Detach)
-        }
+        HubCommand::Detach {
+            prune_ref, force, ..
+        } => hub
+            .detach(
+                tablet(),
+                DetachOptions {
+                    prune_device_ref: *prune_ref,
+                    force: *force,
+                },
+            )
+            .map(Report::Detach),
     }
 }
 
@@ -558,10 +577,17 @@ pub fn finish(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<()> {
-    let names = |docs: Vec<DocId>| {
+    // The tablet's `.metadata`, only for the documents the report or
+    // error carries no name for (those come from origin's or the
+    // tablet's history: the tablet may no longer have them).
+    let names = |known: render::Names, docs: Vec<DocId>| {
+        let missing: Vec<DocId> = docs
+            .into_iter()
+            .filter(|doc| !known.contains_key(doc))
+            .collect();
         context
             .tablet
-            .map(|tablet| lookup_names(tablet, &docs))
+            .map(|tablet| lookup_names(tablet, &missing))
             .unwrap_or_default()
     };
     match result {
@@ -579,7 +605,7 @@ pub fn finish(
             let details = render::error_details(
                 &error,
                 &render::ErrorContext {
-                    names: names(render::error_docs(&error)),
+                    names: names(render::error_names(&error), render::error_docs(&error)),
                     repo_id: context
                         .tablet
                         .and_then(|tablet| tablet.read_state().ok().flatten())
@@ -606,7 +632,7 @@ pub fn finish(
 fn write_report(
     report: &Report,
     context: &OutputContext<'_>,
-    names: &dyn Fn(Vec<DocId>) -> render::Names,
+    names: &dyn Fn(render::Names, Vec<DocId>) -> render::Names,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> std::io::Result<()> {
@@ -623,13 +649,13 @@ fn write_report(
             }
         }
         Output::Human => {
-            let names = names(render::named_docs(report));
+            let names = names(render::report_names(report), render::named_docs(report));
             print(stdout, &render::human(report, &names))?;
         }
         Output::Plain => {
             print(stdout, &render::plain(report))?;
             if !context.quiet {
-                let names = names(render::named_docs(report));
+                let names = names(render::report_names(report), render::named_docs(report));
                 print(stderr, &render::human(report, &names))?;
             }
         }

@@ -45,6 +45,12 @@ fn sync_report_json() {
                 }
             ],
             "inferred": {},
+            "names": {
+                "8c1f0b9e-0000-4000-8000-000000000014": "Removed on this tablet",
+                "8c1f0b9e-0000-4000-8000-000000000015": "Old draft",
+                "8c1f0b9e-0000-4000-8000-000000000016": "Second draft",
+                "8c1f0b9e-0000-4000-8000-000000000017": "Cleaned up elsewhere"
+            },
             "notes": [
                 {
                     "deleted_by": "theirs",
@@ -171,6 +177,12 @@ fn clone_report_json() {
             "inferred": {
                 "8c1f0b9e-0000-4000-8000-000000000001": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             },
+            "names": {
+                "8c1f0b9e-0000-4000-8000-000000000014": "Removed on this tablet",
+                "8c1f0b9e-0000-4000-8000-000000000015": "Old draft",
+                "8c1f0b9e-0000-4000-8000-000000000016": "Second draft",
+                "8c1f0b9e-0000-4000-8000-000000000017": "Cleaned up elsewhere"
+            },
             "notes": [
                 {
                     "deleted_by": "theirs",
@@ -268,6 +280,13 @@ fn status_report_json() {
                 },
                 "state": "held"
             },
+            "names": {
+                "8c1f0b9e-0000-4000-8000-000000000003": "Gone notebook",
+                "8c1f0b9e-0000-4000-8000-000000000014": "Removed on this tablet",
+                "8c1f0b9e-0000-4000-8000-000000000015": "Old draft",
+                "8c1f0b9e-0000-4000-8000-000000000016": "Second draft",
+                "8c1f0b9e-0000-4000-8000-000000000017": "Cleaned up elsewhere"
+            },
             "notes": [
                 {
                     "doc": "8c1f0b9e-0000-4000-8000-000000000002",
@@ -359,6 +378,13 @@ fn dry_run_report_json() {
                         "started_unix": 1790000000
                     },
                     "state": "held"
+                },
+                "names": {
+                    "8c1f0b9e-0000-4000-8000-000000000003": "Gone notebook",
+                    "8c1f0b9e-0000-4000-8000-000000000014": "Removed on this tablet",
+                    "8c1f0b9e-0000-4000-8000-000000000015": "Old draft",
+                    "8c1f0b9e-0000-4000-8000-000000000016": "Second draft",
+                    "8c1f0b9e-0000-4000-8000-000000000017": "Cleaned up elsewhere"
                 },
                 "notes": [
                     {
@@ -549,7 +575,12 @@ fn guard_refusal_json() {
                     "8c1f0b9e-0000-4000-8000-000000000003"
                 ],
                 "kind": "deletions_need_consent",
-                "message": "this sync would delete 2 document(s) from origin and 1 from the tablet (the tablet looks empty); nothing was pushed. Rerun with --allow-deletions if that is intended"
+                "message": "this sync would delete 2 document(s) from origin and 1 from the tablet (the tablet looks empty); nothing was pushed. Rerun with --allow-deletions if that is intended",
+                "names": {
+                    "8c1f0b9e-0000-4000-8000-000000000001": "Deleted paper",
+                    "8c1f0b9e-0000-4000-8000-000000000002": "Deleted notes",
+                    "8c1f0b9e-0000-4000-8000-000000000003": "Old draft"
+                }
             },
             "schema": 1
         })

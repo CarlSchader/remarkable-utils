@@ -209,9 +209,17 @@ Recovery:
   goes stale by itself once the tablet reboots or the watchdog fires;
   otherwise `--break-lock` takes it over once you are sure no other run
   is working on the tablet.
-- *An interrupted sync and then a reattach*: `clone --reattach` refuses
-  while the interrupted sync's journal is pending; run `rmu hub sync`
-  first.
+- *An interrupted sync and then a reattach, a new URL or a detach*:
+  `clone --reattach`, `remote set-url` (to an origin without the
+  interrupted merge) and `detach` refuse while the interrupted sync's
+  journal is pending; run `rmu hub sync` against the current origin
+  first. `detach --force` discards the journal (documents the
+  interrupted apply was writing may stay half-updated on the tablet;
+  both versions stay in origin's history).
+- *Origin moved without the tablets' backups*: copy them along with
+  `main` (`git push <new origin> 'refs/rmu/*:refs/rmu/*'`); otherwise
+  `rmu hub clone <origin> --reattach` starts the tablet's backup history
+  afresh.
 - *Origin rewound or replaced*: `rmu hub clone <origin> --reattach`
   attaches the tablet again, keeping its documents and device id;
   versions that match origin's history fast-forward, the rest merge as
@@ -268,8 +276,10 @@ is the command's report as the library serialises it, plus `schema` and
 with `kind` one of `error`, `deletions_need_consent`, `lock_held`,
 `origin_mismatch`, `cloud_paired` and `journal_pending`. A
 `deletions_need_consent` error also carries `from_origin` and
-`from_tablet` (document ids) and `empty_snapshot` (the tablet looked
-empty).
+`from_tablet` (document ids), `empty_snapshot` (the tablet looked
+empty) and `names` (id to visible name, from history: the tablet may no
+longer have these documents). Reports carry the same `names` for the
+documents they list as deleted.
 
 Exit statuses:
 
@@ -282,7 +292,7 @@ Exit statuses:
 | 4      | the tablet is locked or busy, or this computer's cache is in use by another run (see `--break-lock`) |
 | 5      | origin does not match the tablet (see `clone --reattach`), or lost its `main` (see Recovery) |
 | 6      | the tablet is paired with the reMarkable cloud                    |
-| 7      | an interrupted sync must be finished first (`rmu hub sync`)       |
+| 7      | an interrupted sync must be finished first (`rmu hub sync` against the current origin; `detach --force` discards it) |
 
 See `docs/hub-design.md` for the full design.
 

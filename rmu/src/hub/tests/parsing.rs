@@ -222,6 +222,7 @@ fn exit_codes() {
             from_origin: vec![doc(1)],
             from_tablet: Vec::new(),
             empty_snapshot: false,
+            names: BTreeMap::new(),
         })
     };
     assert_eq!(code(consent()), 3);
@@ -258,6 +259,20 @@ fn exit_codes() {
     );
     assert_eq!(code(Error::HubCycle(CycleError::CloudPaired)), 6);
     assert_eq!(code(Error::HubCycle(CycleError::JournalPending)), 7);
+    assert_eq!(code(Error::HubCycle(CycleError::DetachJournalPending)), 7);
+    assert_eq!(
+        code(Error::HubCycle(CycleError::JournalMergeMissing {
+            merge: oid('a')
+        })),
+        7
+    );
+    assert_eq!(
+        code(Error::HubCycle(CycleError::DeviceRefMissing {
+            reference: "refs/rmu/devices/x".into(),
+            recorded: oid('b'),
+        })),
+        5
+    );
     assert!(
         CycleError::JournalPending
             .to_string()
