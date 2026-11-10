@@ -434,6 +434,7 @@ fn run_sync(cli: &Cli, progress: Arc<dyn Progress>) -> Result<()> {
                 &progress,
                 &*endpoint,
                 &client,
+                &tablet_identity(&destination, &path),
                 &path,
                 &state_path,
                 true,
@@ -460,6 +461,7 @@ fn run_sync(cli: &Cli, progress: Arc<dyn Progress>) -> Result<()> {
                 &progress,
                 &*endpoint,
                 &client,
+                &tablet_identity(&destination, &path),
                 &path,
                 &state_path,
                 false,
@@ -634,6 +636,12 @@ fn run_docs_sync(
 
     let (snapshot_a, missing_a) = sync_tablet_snapshot(&client_a, &path_a, mode != Mode::Push)?;
     let (snapshot_b, missing_b) = sync_tablet_snapshot(&client_b, &path_b, mode != Mode::Pull)?;
+    if mode != Mode::Push {
+        warn_if_hub_attached(cli, &client_a, &id_a);
+    }
+    if mode != Mode::Pull {
+        warn_if_hub_attached(cli, &client_b, &id_b);
+    }
     let state_path = sync::pair_state_path(&id_a, &id_b);
     let mut state = sync::PairState::load(&state_path)?;
     let plan = sync::plan_docs(options, &snapshot_a, &snapshot_b, &state);
@@ -720,6 +728,7 @@ fn run_device_sync(
     progress: &Arc<dyn Progress>,
     fs_side: &dyn FsEndpoint,
     client: &Client,
+    tablet: &str,
     remote_path: &str,
     state_path: &Path,
     fs_is_src: bool,
@@ -744,6 +753,9 @@ fn run_device_sync(
         sync_tablet_snapshot(client, remote_path, mode != Mode::Pull)?;
     let mut state = sync::SyncState::load(state_path)?;
     warn_legacy_state(cli, fs_side);
+    if mode != Mode::Pull {
+        warn_if_hub_attached(cli, client, tablet);
+    }
 
     // Content hashes: local files stamp-gated against the archive
     // (unchanged files are never re-read), device payloads lazily,
@@ -982,6 +994,26 @@ fn warn_legacy_state(cli: &Cli, fs_side: &dyn FsEndpoint) {
                 fs_side.label(),
             ),
         );
+    }
+}
+
+/// `rmu sync` is about to write to a tablet attached to an `rmu hub`.
+fn hub_attached_warning(tablet: &str) -> String {
+    format!(
+        "warning: {tablet} is attached to an rmu hub: documents rmu sync copies onto it get new \
+         ids, so its next `rmu hub sync` adds them to the library as new documents (duplicates \
+         of any copies already there); `rmu hub` is the way to share documents between hub \
+         tablets"
+    )
+}
+
+/// Warn (stderr) when `rmu sync` writes to a hub-attached tablet. The
+/// answer comes from the look at the hub that rode along in the
+/// snapshot's listing; a failed look only skips the warning (a write
+/// then checks again, and fails loudly).
+fn warn_if_hub_attached(cli: &Cli, client: &Client, tablet: &str) {
+    if client.hub_attached().unwrap_or(false) {
+        info(cli, hub_attached_warning(tablet));
     }
 }
 

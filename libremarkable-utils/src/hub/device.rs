@@ -31,6 +31,7 @@
 mod apply;
 mod fake;
 mod lock;
+mod probe;
 mod scripts;
 mod ssh;
 
@@ -55,6 +56,7 @@ pub use fake::{Edit, FakeTablet, FakeTabletBuilder, Fault, OpKind};
 pub use lock::{
     HeldLock, LockDecision, LockOwner, LockRequest, LockState, StaleReason, describe_age,
 };
+pub use probe::{HubLock, HubProbe, parse_probe, probe_script};
 pub use ssh::SshTablet;
 
 /// rmu's directory on the tablet, outside the xochitl data dir and on the

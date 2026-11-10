@@ -79,7 +79,11 @@ This repository is **open source** (dual-licensed MIT OR Apache-2.0):
   resolution, glob matching/expansion, ambiguity rejection,
   conflict/cycle checks, rendering). Keep this module I/O-free so it
   stays unit-testable without a device.
-- `client.rs` — high-level operations composing the two. `list_items`
+- `client.rs` — high-level operations composing the two. Every write
+  (and the restart) first checks the `rmu hub` lock
+  (`Error::HubLocked`), with the read-only probe from `hub/device`
+  riding along in the listing; route new writes through `before_write`.
+  `list_items`
   fetches metadata in batched round trips (with a listing cache it is
   incremental: stat everything, cat only changes); keep new
   operations batched too.
@@ -137,7 +141,10 @@ This repository is **open source** (dual-licensed MIT OR Apache-2.0):
   redirection on a special builtin such as `:` or `exec` exits the
   shell), which is why scripts are run under both. Keep new device
   operations in that shape: pure script + parser, thin executor, fake
-  parity, a scenario.
+  parity, a scenario. `device/probe.rs` is the read-only probe the
+  other rmu commands check the hub lock with (lock, boot id, watchdog
+  marker, attachment; marker-sectioned and never exiting, so it rides
+  along in another script, and judged with the hub's own `decide`).
   `hub/cycle.rs` composes all of it into the operations behind
   `rmu hub` (`Hub`: `init`, `clone_tablet` with reattach, `sync`,
   `backup`, `status`, `dry_run`, `remote`, `set_remote_url`, `detach`;
