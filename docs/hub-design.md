@@ -365,17 +365,32 @@ while implementing it, beyond the steps above:
   back); keeping it next to the cache and extending it from its last
   tip is a follow-up.
 - **A clone fetches the library once.** Each cache records the origin
-  URL it was last opened with (`rmu-origin` in it). `clone` fetches into
-  the cache this computer keeps for its URL, if origin's `main` still
-  has that cache's repo id (otherwise that cache is left as it was);
-  else it fetches `main` once into a temporary repository, reads the
-  repo id there and renames it into place (or fetches from it locally
-  into an existing cache with that id). Measured with pack bytes
-  (`GIT_TRACE_PACKFILE`): a first clone on a computer with no cache
-  fetches 2.10 MB for a 2.10 MB library, and a reattach to an up-to-date
-  cache fetches nothing. Opening a cache under its `flock` also removes
-  the `.keep` files a killed `fast-import` left there (their content is
-  exactly `fast-import`).
+  URLs it was opened with (`rmu-origin` in it, the eight most recent:
+  one origin is often reached through several). `clone` fetches into a
+  cache this computer keeps for its URL, if that cache's object format
+  is the one origin advertises (another is skipped, never re-created: it
+  may hold the last copy of a replaced origin's history) and origin's
+  `main` still has its repo id: origin's `main` is fetched into a
+  separate ref first, and the cache's own `main` moves only once the id
+  matches. If it does not, that cache forgets the URL (its `main`
+  untouched), and what it fetched is borrowed (through `alternates`,
+  then repacked) by the temporary repository that becomes the new
+  cache, so the new library crosses the network once; other caches
+  recorded for the URL then only forget it, without a fetch, unless one
+  has the new repo id. With no
+  recorded cache, `main` is fetched once into a temporary repository,
+  which is renamed into place (or fetched from locally into an existing
+  cache with its repo id). A cache that holds refs is never deleted: one
+  whose object format differs from origin's is refused with an error
+  naming its directory (a repository cannot change format in place, so
+  another or a converted repository answers there), and a cache that
+  fails to open is an error, not a reason to re-create it. Measured with pack bytes
+  (`GIT_TRACE_PACKFILE`): a first clone on a computer with no cache, and
+  the first clone after origin was replaced at a recorded URL, each
+  fetch 2.10 MB for a 2.10 MB library; a reattach to an up-to-date cache,
+  through any recorded URL, fetches nothing. Opening a cache under its
+  `flock` also removes the `.keep` files a killed `fast-import` left
+  there (their content is exactly `fast-import`).
 - **Pure work after the start.** Validation, carry-forward, and (for
   `clone`) base inference run after step 6; while xochitl is stopped
   only the stat pass and downloads (streamed into `fast-import`) happen.

@@ -1450,3 +1450,30 @@ fn blobs_written_alone_join_the_tree_only_when_added() {
         Err(Error::BlobSizeMismatch { path, expected: 9, actual: Some(3) }) if path == "short"
     ));
 }
+
+#[cfg(unix)]
+#[test]
+fn refs_deleted_counted_and_borrowed_objects_repacked_in() {
+    let sandbox = Sandbox::new();
+    let lender = sandbox.init("lender.git");
+    let commit = commit_files(&lender, &[], &[("f", b"lent")], "lent\n");
+    let borrower = sandbox.init("borrower.git");
+    assert!(!borrower.has_refs().unwrap());
+    // Deleting an absent ref is fine.
+    borrower.delete_ref("refs/rmu/bootstrap").unwrap();
+    // Borrow through alternates, point a ref at the borrowed commit, then
+    // repack: the objects are copied in (no `-l`), so the alternates can go.
+    let info = borrower.git_dir().join("objects").join("info");
+    std::fs::create_dir_all(&info).unwrap();
+    let objects = std::fs::canonicalize(lender.git_dir().join("objects")).unwrap();
+    std::fs::write(info.join("alternates"), format!("{}\n", objects.display())).unwrap();
+    borrower
+        .update_ref("refs/remotes/origin/main", &commit, None)
+        .unwrap();
+    assert!(borrower.has_refs().unwrap());
+    borrower.repack_all().unwrap();
+    std::fs::remove_file(info.join("alternates")).unwrap();
+    assert_eq!(borrower.object_sizes([&commit]).unwrap().len(), 1);
+    borrower.delete_ref("refs/remotes/origin/main").unwrap();
+    assert!(!borrower.has_refs().unwrap());
+}
