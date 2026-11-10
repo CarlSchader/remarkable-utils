@@ -43,6 +43,7 @@ mod relative_path;
 pub mod ssh;
 pub mod status;
 pub mod sync;
+mod xdg;
 pub mod xochitl;
 mod xochitl_service;
 
