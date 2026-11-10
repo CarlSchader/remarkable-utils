@@ -34,14 +34,17 @@ const LOCK: &str = "__hub_lock__";
 const BOOT: &str = "__hub_boot__";
 const FIRED: &str = "__hub_fired__";
 const ATTACHED: &str = "__hub_attached__";
+const VERSION: &str = "__hub_version__";
 
 /// What the probe found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HubProbe {
     pub lock: LockState,
-    /// The owner record as read (empty for a free lock, or a missing
-    /// record), which a stale lock's write guard compares.
-    pub lock_record: String,
+    /// The owner record's version, a SHA-256 of its bytes computed on
+    /// the tablet (of nothing for a missing record; `None` for a free
+    /// lock), which a stale lock's write guard compares: bytes, not text,
+    /// so a record that is not UTF-8 compares too.
+    pub lock_version: Option<String>,
     /// The tablet's current boot id (`None` if it could not be read).
     pub boot_id: Option<String>,
     /// The watchdog marker is present.
@@ -100,12 +103,14 @@ impl HubProbe {
         let check = match self.hub_lock() {
             HubLock::Held(_) => return None,
             HubLock::Free => format!("[ ! -e {lock} ]"),
-            HubLock::Stale(_) => format!(
-                "{{ [ ! -e {lock} ] || [ \"$(cat -- {owner} 2>/dev/null)\" = {record} ]; }}",
-                owner = shell_quote(&paths.lock_owner()),
-                // `$(...)` drops trailing newlines.
-                record = shell_quote(self.lock_record.trim_end_matches('\n')),
-            ),
+            HubLock::Stale(_) => match &self.lock_version {
+                Some(version) => format!(
+                    "{{ [ ! -e {lock} ] || {{ h=$({version_of}); [ \"${{h%% *}}\" = {version} ]; }}; }}",
+                    version_of = version_command(paths),
+                ),
+                // Gone between the probe's reads: it must stay gone.
+                None => format!("[ ! -e {lock} ]"),
+            },
         };
         Some(format!(
             "if [ -d {state} ]; then\n\
@@ -159,6 +164,15 @@ impl ProbeCache {
     }
 }
 
+/// Prints `<sha256>  -` for the owner record's bytes (of nothing if it is
+/// missing), as the hub's takeover versions it.
+fn version_command(paths: &TabletPaths) -> String {
+    format!(
+        "{{ cat -- {} 2>/dev/null; true; }} | sha256sum",
+        shell_quote(&paths.lock_owner())
+    )
+}
+
 /// Print the probe's sections, each `\n<marker> <name>\n` then its body.
 /// Read-only, and it never exits, so it can precede another script.
 pub fn probe_script(paths: &TabletPaths, marker: &str) -> String {
@@ -168,7 +182,10 @@ pub fn probe_script(paths: &TabletPaths, marker: &str) -> String {
         "{lock}if [ -d {lock_dir} ]; then printf 'held\\n'; cat -- {owner} 2>/dev/null; else printf 'free\\n'; fi\n\
          {boot}cat -- {boot_id} 2>/dev/null\n\
          {fired}if [ -e {fired_marker} ]; then echo true; else echo false; fi\n\
-         {attached}if [ -e {state} ]; then echo true; else echo false; fi\n",
+         {attached}if [ -e {state} ]; then echo true; else echo false; fi\n\
+         {version}if [ -d {lock_dir} ]; then {version_of}; fi\n",
+        version = section(VERSION),
+        version_of = version_command(paths),
         lock = section(LOCK),
         boot = section(BOOT),
         fired = section(FIRED),
@@ -217,17 +234,21 @@ fn flag(marker: &str, output: &str, name: &str) -> Result<bool, DeviceError> {
 /// them are ignored).
 pub fn parse_probe(marker: &str, output: &str) -> Result<HubProbe, DeviceError> {
     let lock = section(marker, output, LOCK).ok_or_else(|| probe_error("no lock section"))?;
-    let (lock, lock_record) = match lock.split_once('\n').unwrap_or((lock, "")) {
-        ("free", "") => (LockState::Free, String::new()),
-        ("held", owner) => (LockState::Held(parse_owner(owner)), owner.to_string()),
+    let lock = match lock.split_once('\n').unwrap_or((lock, "")) {
+        ("free", "") => LockState::Free,
+        ("held", owner) => LockState::Held(parse_owner(owner)),
         _ => return Err(probe_error(format!("lock: {lock:?}"))),
     };
+    let lock_version = first_line(marker, output, VERSION)
+        .and_then(|line| line.split_whitespace().next())
+        .filter(|hash| hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map(str::to_string);
     let boot_id = first_line(marker, output, BOOT)
         .filter(|boot| !boot.is_empty())
         .map(str::to_string);
     Ok(HubProbe {
         lock,
-        lock_record,
+        lock_version,
         boot_id,
         watchdog_fired: flag(marker, output, FIRED)?,
         attached: flag(marker, output, ATTACHED)?,
@@ -248,9 +269,15 @@ mod tests {
     }
 
     /// Probe output as the script prints it, after some other output.
+    const VERSION_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
     fn output(lock: &str, boot: &str, fired: bool, attached: bool) -> String {
+        let version = match lock.starts_with("held") {
+            true => format!("{VERSION_HASH}  -\n"),
+            false => String::new(),
+        };
         format!(
-            "listing noise\n\n{MARKER} x.metadata\n{{}}\n\n{MARKER} {LOCK}\n{lock}\n{MARKER} {BOOT}\n{boot}\n\n{MARKER} {FIRED}\n{fired}\n\n{MARKER} {ATTACHED}\n{attached}\n"
+            "listing noise\n\n{MARKER} x.metadata\n{{}}\n\n{MARKER} {LOCK}\n{lock}\n{MARKER} {BOOT}\n{boot}\n\n{MARKER} {FIRED}\n{fired}\n\n{MARKER} {ATTACHED}\n{attached}\n\n{MARKER} {VERSION}\n{version}"
         )
     }
 
@@ -380,11 +407,11 @@ mod tests {
             false,
             true,
         );
+        assert_eq!(stale.lock_version.as_deref(), Some(VERSION_HASH));
         let guard = stale.write_guard(&paths).unwrap();
         assert!(
             guard.contains(&format!(
-                "{{ [ ! -e '/state dir/lock' ] || [ \"$(cat -- '/state dir/lock/owner' 2>/dev/null)\" = {} ]; }}",
-                shell_quote(owner_record("an-earlier-boot").trim_end_matches('\n'))
+                "{{ [ ! -e '/state dir/lock' ] || {{ h=$({{ cat -- '/state dir/lock/owner' 2>/dev/null; true; }} | sha256sum); [ \"${{h%% *}}\" = {VERSION_HASH} ]; }}; }}"
             )),
             "{guard}"
         );
@@ -399,7 +426,7 @@ mod tests {
 
     /// The guard, run by a real shell (and BusyBox `ash`), passes or
     /// fails as the lock changed; a write after it runs only if it passed.
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn write_guards_run() {
         let busybox = std::env::var_os("RMU_TEST_BUSYBOX");
@@ -408,7 +435,19 @@ mod tests {
             .for_each(write_guards_run_in);
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
+    fn shell(busybox: Option<&std::ffi::OsStr>) -> std::process::Command {
+        match busybox {
+            Some(busybox) => {
+                let mut shell = std::process::Command::new(busybox);
+                shell.arg("sh");
+                shell
+            }
+            None => std::process::Command::new("sh"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
     fn write_guards_run_in(busybox: Option<&std::ffi::OsStr>) {
         let scratch = super::super::harness::Scratch::new("guard");
         let state = scratch.0.join("state");
@@ -419,22 +458,24 @@ mod tests {
                 "{guard}: > {}\n",
                 shell_quote(&target.display().to_string())
             );
-            let mut shell = match busybox {
-                Some(busybox) => {
-                    let mut shell = std::process::Command::new(busybox);
-                    shell.arg("sh");
-                    shell
-                }
-                None => std::process::Command::new("sh"),
-            };
-            let status = shell.args(["-c", &script]).status().unwrap().code();
+            let status = shell(busybox)
+                .args(["-c", &script])
+                .status()
+                .unwrap()
+                .code();
             let written = target.exists();
             let _ = std::fs::remove_file(&target);
             (status, written)
         };
-        let free = probe("free", BOOT_ID, false, false)
-            .write_guard(&paths)
-            .unwrap();
+        // The look, taken by the real script.
+        let look = || {
+            let out = shell(busybox)
+                .args(["-c", &probe_script(&paths, MARKER)])
+                .output()
+                .unwrap();
+            parse_probe(MARKER, &String::from_utf8_lossy(&out.stdout)).unwrap()
+        };
+        let free = look().write_guard(&paths).unwrap();
         // No state dir (no hub ever ran): no flock, the check passes.
         assert_eq!(run(&free), (Some(0), true));
         std::fs::create_dir_all(&state).unwrap();
@@ -443,17 +484,65 @@ mod tests {
         std::fs::create_dir_all(state.join("lock")).unwrap();
         std::fs::write(state.join("lock/owner"), owner_record(BOOT_ID)).unwrap();
         assert_eq!(run(&free), (Some(EXIT_HUB_LOCK_CHANGED), false));
-        // A stale lock: unchanged passes, replaced fails, gone passes.
-        let stale_record = owner_record("an-earlier-boot");
+        // A stale lock (here, with a record that is not UTF-8): unchanged
+        // passes, replaced fails, gone passes.
+        let mut stale_record = owner_record("an-earlier-boot").into_bytes();
+        stale_record.extend_from_slice(b"host=caf\xe9\n");
         std::fs::write(state.join("lock/owner"), &stale_record).unwrap();
-        let stale = probe(&format!("held\n{stale_record}"), BOOT_ID, false, false)
-            .write_guard(&paths)
-            .unwrap();
+        // The host's boot id is not the record's: a stale lock.
+        let stale = look();
+        assert!(matches!(stale.hub_lock(), HubLock::Stale(_)), "{stale:?}");
+        let stale = stale.write_guard(&paths).unwrap();
         assert_eq!(run(&stale), (Some(0), true));
         std::fs::write(state.join("lock/owner"), owner_record(BOOT_ID)).unwrap();
         assert_eq!(run(&stale), (Some(EXIT_HUB_LOCK_CHANGED), false));
         std::fs::remove_dir_all(state.join("lock")).unwrap();
         assert_eq!(run(&stale), (Some(0), true));
+    }
+
+    /// The guard waits for the hub's guard `flock`: a write cannot land
+    /// while a hub operation holds it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn write_guards_wait_for_the_hub_flock() {
+        use std::time::Duration;
+        let scratch = super::super::harness::Scratch::new("guard-flock");
+        let state = scratch.0.join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let paths = paths(&state.display().to_string());
+        let target = scratch.0.join("written");
+        let held = scratch.0.join("held");
+        let mut holder = std::process::Command::new("sh")
+            .args(["-c", "exec 9>>\"$1\"; flock 9; : > \"$2\"; sleep 2", "hold"])
+            .arg(paths.guard_flock())
+            .arg(&held)
+            .spawn()
+            .unwrap();
+        assert!(
+            (0..200).any(|_| {
+                std::thread::sleep(Duration::from_millis(10));
+                held.exists()
+            }),
+            "the holder did not start"
+        );
+        let guard = probe("free", BOOT_ID, false, false)
+            .write_guard(&paths)
+            .unwrap();
+        let mut writer = std::process::Command::new("sh")
+            .args([
+                "-c",
+                &format!(
+                    "{guard}: > {}\n",
+                    shell_quote(&target.display().to_string())
+                ),
+            ])
+            .spawn()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(700));
+        assert!(!target.exists(), "written while the hub held its flock");
+        holder.wait().unwrap();
+        assert!(writer.wait().unwrap().success());
+        assert!(target.exists(), "written once the flock was free");
     }
 
     #[test]
@@ -490,7 +579,8 @@ mod tests {
     }
 
     /// The script, run by a real shell (and BusyBox `ash` when
-    /// `RMU_TEST_BUSYBOX` names one), prints what the parser reads.
+    /// `RMU_TEST_BUSYBOX` names one), prints what the parser reads, the
+    /// record's version included.
     #[cfg(unix)]
     #[test]
     fn the_script_and_the_parser_agree() {
@@ -530,6 +620,11 @@ mod tests {
         };
         let probe = run(&paths);
         assert!(probe.attached);
+        let version = probe
+            .lock_version
+            .clone()
+            .expect("a held lock has a version");
+        assert_eq!(version.len(), 64);
         assert!(matches!(probe.hub_lock(), HubLock::Held(Some(_))));
         std::fs::remove_dir_all(state.join("lock")).unwrap();
         std::fs::remove_file(state.join("hub.json")).unwrap();

@@ -297,26 +297,21 @@ fn a_lock_taken_after_the_look_stops_the_write() {
 }
 
 /// A lock taken after the writes, between the restart's fresh look and
-/// the restart itself, still stops the restart; that is not an error:
-/// the hub run restarts xochitl when it finishes.
+/// the restart itself, still stops the restart, and that stays an error
+/// (xochitl must reload what was written), even with --quiet.
 #[test]
 fn the_restart_checks_too() {
     let tablets = Tablets::new();
     let record = owner_record(BOOT_ID);
     let output = tablets.rmu_env(
-        &["mkdir", "Books"],
+        &["--quiet", "mkdir", "Books"],
         &[
             ("MOCK_LOCK_WHEN", "systemctl restart"),
             ("MOCK_LOCK_RECORD", &record),
         ],
     );
-    assert_success(&output);
-    assert_eq!(
-        stderr(&output),
-        "Created folder: Books/\nnote: xochitl was not restarted: an rmu hub run now holds the \
-         tablet (pid 7 on other-computer, started 5 min ago); it restarts xochitl itself when it \
-         finishes, and the changes appear then\n"
-    );
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(stderr(&output), NOT_RESTARTED);
     assert_eq!(
         tablets.files().len(),
         6,
@@ -334,10 +329,18 @@ fn the_restart_checks_too() {
             ("MOCK_LOCK_RECORD", &record),
         ],
     );
-    assert_success(&output);
-    assert!(stderr(&output).contains("note: xochitl was not restarted"));
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        stderr(&output),
+        format!("Created folder: Notes/\n{NOT_RESTARTED}")
+    );
     assert!(!tablets.restarted());
 }
+
+/// A refused restart after writes, as `main` prints it.
+const NOT_RESTARTED: &str = "Error: changes were written, but xochitl was not restarted: an rmu \
+     hub run now holds the tablet (pid 7 on other-computer, started 5 min ago). A hub sync \
+     restarts xochitl when it finishes; otherwise run `rmu restart` once the lock is free\n";
 
 /// The look at the hub rides along in the listing a write starts from,
 /// and in the restart's `reset-failed`: no round trip of its own.

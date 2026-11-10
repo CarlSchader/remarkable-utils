@@ -1036,7 +1036,14 @@ impl Client {
         };
         match attempt()? {
             Some(value) => Ok(value),
-            None => attempt()?.ok_or_else(|| DeviceError::LockContended.into()),
+            None => attempt()?.map_or_else(
+                // A third look names a holder, if there is one.
+                || match self.hub_probe()?.hub_lock() {
+                    HubLock::Held(owner) => Err(Error::HubLocked(owner)),
+                    HubLock::Free | HubLock::Stale(_) => Err(Error::HubLockUnsettled),
+                },
+                Ok,
+            ),
         }
     }
 

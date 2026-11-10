@@ -314,7 +314,6 @@ fn run_regular(cli: &Cli, progress: Arc<dyn Progress>) -> Result<()> {
             );
         } else {
             restart_after_writes(
-                cli,
                 &client,
                 "changes were written, but restarting xochitl failed",
             )?;
@@ -711,14 +710,12 @@ fn run_docs_sync(
     if !cli.no_restart {
         if outcome.modified_a {
             restart_after_writes(
-                cli,
                 &client_a,
                 "sync wrote changes to side A, but restarting xochitl failed",
             )?;
         }
         if outcome.modified_b {
             restart_after_writes(
-                cli,
                 &client_b,
                 "sync wrote changes to side B, but restarting xochitl failed",
             )?;
@@ -858,11 +855,7 @@ fn run_device_sync(
                 "note: xochitl not restarted (--no-restart); changes appear after restart",
             );
         } else {
-            restart_after_writes(
-                cli,
-                client,
-                "sync wrote changes, but restarting xochitl failed",
-            )?;
+            restart_after_writes(client, "sync wrote changes, but restarting xochitl failed")?;
         }
     }
     Ok(())
@@ -1040,23 +1033,20 @@ fn warn_if_hub_attached(cli: &Cli, client: &Client, tablet: &str, deletes: bool)
 }
 
 /// Restart xochitl after writes. A hub run that took the tablet since
-/// is not an error: it restarts xochitl itself when it finishes.
-fn restart_after_writes(cli: &Cli, client: &Client, context: &'static str) -> Result<()> {
+/// keeps it an error (xochitl must reload what was written), with what
+/// to do about it.
+fn restart_after_writes(client: &Client, context: &'static str) -> Result<()> {
     match client.restart_xochitl() {
         Err(libremarkable_utils::Error::HubLocked(owner)) => {
             let owner = owner.map_or_else(
                 || "its owner record is missing".to_string(),
                 |owner| owner.to_string(),
             );
-            info(
-                cli,
-                format!(
-                    "note: xochitl was not restarted: an rmu hub run now holds the tablet \
-                     ({owner}); it restarts xochitl itself when it finishes, and the changes \
-                     appear then"
-                ),
-            );
-            Ok(())
+            Err(anyhow::anyhow!(
+                "changes were written, but xochitl was not restarted: an rmu hub run now holds \
+                 the tablet ({owner}). A hub sync restarts xochitl when it finishes; otherwise run \
+                 `rmu restart` once the lock is free"
+            ))
         }
         other => other.context(context),
     }

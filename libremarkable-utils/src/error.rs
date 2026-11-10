@@ -165,6 +165,13 @@ pub enum Error {
     #[error("{}", hub_locked(.0.as_ref()))]
     HubLocked(Option<crate::hub::device::LockOwner>),
 
+    /// The hub lock changed under two writes in a row, and a third look
+    /// found nobody holding it: try again.
+    #[error(
+        "the tablet's hub lock kept changing while rmu was writing; nothing more was written; try again"
+    )]
+    HubLockUnsettled,
+
     /// `rmu hub` sync-cycle error (guards, identity and ancestry checks,
     /// the deletion guard, the local cache).
     #[error(transparent)]

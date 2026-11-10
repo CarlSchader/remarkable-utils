@@ -782,9 +782,12 @@ in an earlier first-parent ancestor of that base.
   carries a guard right before its commit point
   (`HubProbe::write_guard`): it takes the hub's guard `flock` (when the
   state directory exists) and exits 83 unless the lock is still as the
-  look saw it (absent; or, for a stale lock, its owner record unchanged
-  or the lock gone). That exit makes the write look again, then refuse,
-  or retry once when nobody holds the lock. The hub takes its lock and
+  look saw it (absent; or, for a stale lock, its owner record unchanged,
+  compared by a checksum computed on the tablet as the hub's takeover
+  does, or the lock gone). That exit makes the write look again, then refuse,
+  or retry once when nobody holds the lock. A restart refused after a
+  command's writes stays an error: xochitl must reload what was written,
+  and only a hub sync is sure to restart it when it finishes. The hub takes its lock and
   applies under that `flock`, and an old run's last guarded script holds
   it to its end, so the check and the write cannot interleave with any
   of them: while a hub run holds the lock, nothing else writes.
