@@ -83,19 +83,27 @@ pub struct LockOwner {
     pub boot_id: String,
 }
 
-/// "pid 4242 on laptop, started 3 min ago": `started` is the owner
-/// computer's clock, so a time ahead of this one is shown as is.
-impl fmt::Display for LockOwner {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
+impl LockOwner {
+    /// "pid 4242 on laptop, started 3 min ago", at unix time `now`.
+    /// `started` is the owner computer's clock, so a time ahead of `now`
+    /// is shown as is.
+    pub fn describe(&self, now: u64) -> String {
         let started = i64::try_from(self.started_unix).unwrap_or(i64::MAX);
         let ago = i64::try_from(now)
             .unwrap_or(i64::MAX)
             .saturating_sub(started);
         let when = describe_age(ago).unwrap_or_else(|| format!("at unix time {started}"));
-        write!(f, "pid {} on {}, started {when}", self.pid, self.host)
+        format!("pid {} on {}, started {when}", self.pid, self.host)
+    }
+}
+
+/// [`LockOwner::describe`] at the current time.
+impl fmt::Display for LockOwner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        f.write_str(&self.describe(now))
     }
 }
 
@@ -371,10 +379,7 @@ mod tests {
 
     #[test]
     fn owners_show_their_age() {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        let now = 1_790_000_000;
         let owner = |started_unix| LockOwner {
             run: "0".repeat(32),
             host: "laptop".into(),
@@ -383,13 +388,15 @@ mod tests {
             boot_id: "b".into(),
         };
         assert_eq!(
-            owner(now - 600).to_string(),
+            owner(now - 600).describe(now),
             "pid 4242 on laptop, started 10 min ago"
         );
         assert_eq!(
-            owner(now + 86_400).to_string(),
+            owner(now + 86_400).describe(now),
             format!("pid 4242 on laptop, started at unix time {}", now + 86_400)
         );
+        // Display is `describe` now: a lock taken in 2026 is days old.
+        assert!(owner(now).to_string().ends_with(" days ago"));
     }
 
     const RUN: &str = "0123456789abcdef0123456789abcdef";

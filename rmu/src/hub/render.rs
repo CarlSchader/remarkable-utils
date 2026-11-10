@@ -802,6 +802,12 @@ fn origin_empty(url: &str, context: &ErrorContext) -> Vec<String> {
         format!(
             "       git --git-dir {cache} push {quoted} 'refs/remotes/origin/devices/*:refs/rmu/devices/*'"
         ),
+        "     (An origin that keeps them under refs/heads/rmu/devices/*, as on forges that refuse"
+            .to_string(),
+        "     custom refs, takes 'refs/remotes/origin/devices/*:refs/heads/rmu/devices/*' instead."
+            .to_string(),
+        "     `rejected (non-fast-forward)` lines are harmless: a newer backup is already there.)"
+            .to_string(),
         "     A tablet whose backups are not restored needs `rmu hub clone <origin> --reattach`."
             .to_string(),
         "  3. Only as a last resort: `rmu hub init` origin again and `rmu hub clone <origin> --reattach`"

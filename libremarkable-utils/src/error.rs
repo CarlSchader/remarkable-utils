@@ -177,9 +177,9 @@ fn hub_locked(owner: Option<&crate::hub::device::LockOwner>) -> String {
         ToString::to_string,
     );
     format!(
-        "the tablet is busy: an rmu hub run holds its lock ({owner}); stopping before changing \
-         anything else. Try again once that run has finished; if it is gone (its computer \
-         crashed or was closed), `rmu hub sync --break-lock` frees the tablet"
+        "the tablet is busy: an rmu hub run holds its lock ({owner}); nothing more was written. \
+         Try again once that run has finished; if it is gone (its computer crashed or was \
+         closed), `rmu hub sync --break-lock` frees the tablet"
     )
 }
 

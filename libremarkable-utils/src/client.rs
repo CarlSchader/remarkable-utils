@@ -8,33 +8,36 @@
 //! **Hub lock.** Every write (and the restart) first checks that no
 //! `rmu hub` run holds the tablet's lock, and fails with
 //! [`Error::HubLocked`] if one does; a stale lock (the tablet rebooted,
-//! or the hub's watchdog fired) does not count. The check reads the
-//! hub's own lock files ([`crate::hub::device::probe_script`]); it rides
-//! along in the document listing that writes start from, so it costs no
-//! extra round trip there, and is repeated (one round trip) before a
-//! write when the last look is older than [`HUB_PROBE_TTL`]; the
-//! restart always looks again, in the round trip of its `reset-failed`.
-//! It is
-//! check-then-act: a hub run can take the lock right after the look.
-//! That window is safe by the hub's own guards (see "Watchdog and lock"
-//! in `docs/hub-design.md`): it reads the tablet with xochitl stopped
-//! and aborts on files that change while read, verifies every document
-//! against what it read before writing it (a changed one is skipped, not
-//! overwritten), and refuses to apply while xochitl runs (which a
-//! restart from here would cause).
+//! or the hub's watchdog fired) does not count. The look reads the hub's
+//! own lock files ([`crate::hub::device::probe_script`]); it rides along
+//! in the document listing that writes start from, so it costs no extra
+//! round trip there, and is repeated (one round trip) before a write
+//! when the last look is older than [`HUB_PROBE_TTL`]; the restart
+//! always looks again, in the round trip of its `reset-failed`. Each
+//! write also carries [`HubProbe::write_guard`] in its own command,
+//! right before its commit point: under the hub's guard `flock` it
+//! checks that the lock is still as the look saw it, and otherwise exits
+//! without writing, which makes the write look again (and refuse, or
+//! retry once). What remains of the check-then-act race (a tablet where
+//! no hub ever ran has no state directory, hence no `flock`) is covered
+//! by the hub's own guards; see "Watchdog and lock" in
+//! `docs/hub-design.md`.
 
 use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
 use crate::bundle;
 use crate::error::{Error, Result};
-use crate::hub::device::{HubLock, HubProbe, TabletPaths, parse_probe, probe_script};
+use crate::hub::device::{
+    DeviceError, EXIT_HUB_BUSY, EXIT_HUB_LOCK_CHANGED, HubLock, HubProbe, ProbeCache, TabletPaths,
+    parse_probe, probe_script,
+};
 use crate::progress::{NoProgress, Progress};
 use crate::ssh::{SshSession, shell_quote};
 use crate::status::{self, SystemStatus};
@@ -54,8 +57,8 @@ pub struct Client {
     listing_cache: Option<PathBuf>,
     /// Where the hub keeps its lock and state on the tablet.
     hub_paths: TabletPaths,
-    /// The last look at the hub lock, and when it was taken.
-    hub_probe: Mutex<Option<(Instant, HubProbe)>>,
+    /// The last look at the hub lock.
+    hub_probe: ProbeCache,
 }
 
 impl Client {
@@ -70,7 +73,7 @@ impl Client {
             dir,
             progress: Arc::new(NoProgress),
             listing_cache: None,
-            hub_probe: Mutex::new(None),
+            hub_probe: ProbeCache::new(HUB_PROBE_TTL),
         }
     }
 
@@ -323,17 +326,16 @@ impl Client {
         name: &str,
         file_type: &str,
     ) -> Result<Item> {
-        self.before_write()?;
         let doc_uuid = uuid::Uuid::new_v4().to_string();
         self.progress.step(&format!(
             "Uploading {}",
             local.file_name().unwrap_or_default().to_string_lossy()
         ));
-        self.session.upload_local_file(
-            local,
-            &self.remote_path(&format!("{doc_uuid}.{file_type}")),
-            &*self.progress,
-        )?;
+        let remote = self.remote_path(&format!("{doc_uuid}.{file_type}"));
+        self.write(|guard| {
+            self.session
+                .upload_local_file_guarded(local, &remote, &*self.progress, guard)
+        })?;
         let size = std::fs::metadata(local).ok().map(|m| m.len());
         self.register_document(
             doc_uuid,
@@ -353,14 +355,13 @@ impl Client {
         name: &str,
         file_type: &str,
     ) -> Result<Item> {
-        self.before_write()?;
         let doc_uuid = uuid::Uuid::new_v4().to_string();
         self.progress.step(&format!("Uploading '{name}'"));
-        self.session.write_remote_file_with_progress(
-            &self.remote_path(&format!("{doc_uuid}.{file_type}")),
-            data,
-            &*self.progress,
-        )?;
+        let remote = self.remote_path(&format!("{doc_uuid}.{file_type}"));
+        self.write(|guard| {
+            self.session
+                .write_remote_file_guarded(&remote, data, &*self.progress, guard)
+        })?;
         self.register_document(
             doc_uuid,
             name.to_string(),
@@ -389,11 +390,12 @@ impl Client {
             &format!("{doc_uuid}.content"),
             &xochitl::document_content_json(file_type),
         )?;
-        self.before_write()?;
-        self.session.run_checked(&format!(
-            "mkdir -p {}",
-            shell_quote(&self.remote_path(&doc_uuid))
-        ))?;
+        self.write(|guard| {
+            self.session.run_checked(&format!(
+                "{guard}mkdir -p {}",
+                shell_quote(&self.remote_path(&doc_uuid))
+            ))
+        })?;
         self.write_text(&format!("{doc_uuid}.pagedata"), "")?;
         self.write_text(
             &format!("{doc_uuid}.metadata"),
@@ -459,12 +461,13 @@ impl Client {
 
         let tar_bytes = bundle::rmdoc_to_tar(&rmdoc, &new_uuid)?;
         self.progress.step(&format!("Restoring bundle '{name}'"));
-        self.before_write()?;
-        self.session.run_checked_with_stdin(
-            &format!("cd {} && tar -xf -", shell_quote(&self.dir)),
-            &tar_bytes,
-            &*self.progress,
-        )?;
+        self.write(|guard| {
+            self.session.run_checked_with_stdin(
+                &format!("{guard}cd {} && tar -xf -", shell_quote(&self.dir)),
+                &tar_bytes,
+                &*self.progress,
+            )
+        })?;
         self.progress.finished();
 
         xochitl::item_from_metadata(&new_uuid, &rmdoc.metadata, rmdoc.content.as_ref(), None)
@@ -484,25 +487,25 @@ impl Client {
             "Updating {}",
             local.file_name().unwrap_or_default().to_string_lossy()
         ));
-        self.before_write()?;
-        self.session.upload_local_file(
-            local,
-            &self.remote_path(&format!("{uuid}.{file_type}")),
-            &*self.progress,
-        )?;
+        let remote = self.remote_path(&format!("{uuid}.{file_type}"));
+        self.write(|guard| {
+            self.session
+                .upload_local_file_guarded(local, &remote, &*self.progress, guard)
+        })?;
         self.touch_last_modified(uuid)
     }
 
     /// Overwrite an existing document's payload with in-memory bytes
-    /// (e.g. a regenerated EPUB) and bump `lastModified`.
+    /// (e.g. a regenerated EPUB) and bump `lastModified`. (The CLI
+    /// reaches this only from sync paths its tests do not drive; the hub
+    /// check covers it by construction, through [`Self::write`].)
     pub fn update_payload_bytes(&self, uuid: &str, file_type: &str, data: &[u8]) -> Result<i64> {
         self.progress.step("Updating document");
-        self.before_write()?;
-        self.session.write_remote_file_with_progress(
-            &self.remote_path(&format!("{uuid}.{file_type}")),
-            data,
-            &*self.progress,
-        )?;
+        let remote = self.remote_path(&format!("{uuid}.{file_type}"));
+        self.write(|guard| {
+            self.session
+                .write_remote_file_guarded(&remote, data, &*self.progress, guard)
+        })?;
         self.touch_last_modified(uuid)
     }
 
@@ -529,6 +532,8 @@ impl Client {
     /// No conflict checks — callers must have verified the name is
     /// free. The copy happens before registration, so an interruption
     /// leaves an invisible orphan payload, never a broken document.
+    /// (The CLI's tests do not reach this sync path; the hub check covers
+    /// it by construction, through [`Self::write`].)
     pub fn copy_payload_on_device(
         &self,
         from_uuid: &str,
@@ -540,12 +545,13 @@ impl Client {
         let doc_uuid = uuid::Uuid::new_v4().to_string();
         self.progress
             .step(&format!("Copying payload on device for '{name}'"));
-        self.before_write()?;
-        self.session.run_checked(&format!(
-            "cp -f {from} {to}",
-            from = shell_quote(&self.remote_path(&format!("{from_uuid}.{file_type}"))),
-            to = shell_quote(&self.remote_path(&format!("{doc_uuid}.{file_type}"))),
-        ))?;
+        self.write(|guard| {
+            self.session.run_checked(&format!(
+                "{guard}cp -f {from} {to}",
+                from = shell_quote(&self.remote_path(&format!("{from_uuid}.{file_type}"))),
+                to = shell_quote(&self.remote_path(&format!("{doc_uuid}.{file_type}"))),
+            ))
+        })?;
         self.register_document(
             doc_uuid,
             name.to_string(),
@@ -906,18 +912,29 @@ impl Client {
         // Starting xochitl while a hub run has it stopped would make the
         // run fail (its apply refuses while xochitl is active), so the
         // restart always looks at the lock afresh, in the round trip of
-        // its `reset-failed` (whose status, as before, does not matter).
+        // its `reset-failed` (whose status, as before, does not matter),
+        // and carries the write guard itself.
         let marker = format!("===RMU:{}===", uuid::Uuid::new_v4().simple());
         let reset = self.session.run(&format!(
             "{}systemctl reset-failed xochitl.service\n",
             probe_script(&self.hub_paths, &marker)
         ))?;
-        let probe = parse_probe(&marker, &String::from_utf8_lossy(&reset.stdout))?;
-        *self.hub_probe.lock().expect("hub probe mutex") = Some((Instant::now(), probe.clone()));
-        if let HubLock::Held(owner) = probe.hub_lock() {
-            return Err(Error::HubLocked(owner));
-        }
-        let restart = self.session.run("systemctl restart xochitl.service")?;
+        self.hub_probe.store(parse_probe(
+            &marker,
+            &String::from_utf8_lossy(&reset.stdout),
+        )?);
+        let restart = self.guarded(|guard| {
+            let output = self
+                .session
+                .run(&format!("{guard}systemctl restart xochitl.service"))?;
+            match output.status.code() {
+                Some(status @ (EXIT_HUB_LOCK_CHANGED | EXIT_HUB_BUSY)) => Err(Error::Remote {
+                    status,
+                    stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+                }),
+                _ => Ok(output),
+            }
+        })?;
         if restart.status.success() {
             self.progress.finished();
             return Ok(());
@@ -971,48 +988,71 @@ impl Client {
     }
 
     fn hub_probe(&self) -> Result<HubProbe> {
-        let mut cached = self.hub_probe.lock().expect("hub probe mutex");
-        match cached.as_ref() {
-            Some((at, probe)) if at.elapsed() < HUB_PROBE_TTL => Ok(probe.clone()),
-            _ => {
-                let marker = format!("===RMU:{}===", uuid::Uuid::new_v4().simple());
-                let output = self
-                    .session
-                    .run_checked(&probe_script(&self.hub_paths, &marker))?;
-                let probe = parse_probe(&marker, &output)?;
-                *cached = Some((Instant::now(), probe.clone()));
-                Ok(probe)
-            }
+        if let Some(probe) = self.hub_probe.get() {
+            return Ok(probe);
         }
+        let marker = format!("===RMU:{}===", uuid::Uuid::new_v4().simple());
+        let output = self
+            .session
+            .run_checked(&probe_script(&self.hub_paths, &marker))?;
+        let probe = parse_probe(&marker, &output)?;
+        self.hub_probe.store(probe.clone());
+        Ok(probe)
     }
 
     /// Keep the probe that rode along in a listing (a garbled one is
     /// dropped: the next write then looks again, and fails loudly).
     fn remember_probe(&self, marker: &str, output: &str) {
-        let probe = parse_probe(marker, output).ok();
-        *self.hub_probe.lock().expect("hub probe mutex") =
-            probe.map(|probe| (Instant::now(), probe));
-    }
-
-    /// Refuse while an `rmu hub` run holds the tablet.
-    fn check_hub_lock(&self) -> Result<()> {
-        match self.hub_lock()? {
-            HubLock::Held(owner) => Err(Error::HubLocked(owner)),
-            HubLock::Free | HubLock::Stale(_) => Ok(()),
+        match parse_probe(marker, output) {
+            Ok(probe) => self.hub_probe.store(probe),
+            Err(_) => self.hub_probe.forget(),
         }
     }
 
-    /// Before any write: the hub lock check, then the listing cache is
-    /// dropped.
-    fn before_write(&self) -> Result<()> {
-        self.check_hub_lock()?;
-        self.invalidate_listing_cache()
+    /// Run a write under the hub lock check (see the module docs):
+    /// refuse while a hub run holds the lock, else hand `write` the
+    /// guard to run right before its commit point. A guard that found
+    /// the lock changed makes the write look again: then it refuses, or
+    /// (the lock changed but nobody holds it) retries once.
+    fn guarded<T>(&self, write: impl Fn(&str) -> Result<T>) -> Result<T> {
+        let attempt = || -> Result<Option<T>> {
+            let probe = self.hub_probe()?;
+            if let HubLock::Held(owner) = probe.hub_lock() {
+                return Err(Error::HubLocked(owner));
+            }
+            let guard = probe
+                .write_guard(&self.hub_paths)
+                .expect("a lock nobody holds has a write guard");
+            match write(&guard) {
+                Err(Error::Remote { status, .. }) if status == EXIT_HUB_LOCK_CHANGED => {
+                    self.hub_probe.forget();
+                    Ok(None)
+                }
+                Err(Error::Remote { status, .. }) if status == EXIT_HUB_BUSY => {
+                    Err(DeviceError::Busy.into())
+                }
+                other => other.map(Some),
+            }
+        };
+        match attempt()? {
+            Some(value) => Ok(value),
+            None => attempt()?.ok_or_else(|| DeviceError::LockContended.into()),
+        }
+    }
+
+    /// A write to the tablet: the listing cache is dropped first, then
+    /// [`Self::guarded`].
+    fn write<T>(&self, write: impl Fn(&str) -> Result<T>) -> Result<T> {
+        self.invalidate_listing_cache()?;
+        self.guarded(write)
     }
 
     fn write_text(&self, name: &str, text: &str) -> Result<()> {
-        self.before_write()?;
-        self.session
-            .write_remote_file(&self.remote_path(name), text.as_bytes())
+        let remote = self.remote_path(name);
+        self.write(|guard| {
+            self.session
+                .write_remote_file_guarded(&remote, text.as_bytes(), &NoProgress, guard)
+        })
     }
 
     fn read_json(&self, name: &str) -> Result<Value> {
@@ -1079,12 +1119,13 @@ impl Client {
     /// deliberately outside the quotes; `rm -f` is silent when the
     /// glob matches nothing.
     fn delete_artifacts(&self, uuid: &str) -> Result<()> {
-        self.before_write()?;
         let quoted = shell_quote(uuid);
-        self.session.run_checked(&format!(
-            "cd {} && rm -rf -- {quoted} {quoted}.*",
-            shell_quote(&self.dir)
-        ))?;
+        self.write(|guard| {
+            self.session.run_checked(&format!(
+                "{guard}cd {} && rm -rf -- {quoted} {quoted}.*",
+                shell_quote(&self.dir)
+            ))
+        })?;
         Ok(())
     }
 }

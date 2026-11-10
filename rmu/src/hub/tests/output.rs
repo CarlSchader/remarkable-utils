@@ -413,6 +413,8 @@ fn renders_errors() {
             "2. Restore origin from a backup, or from the local cache of the computer that synced",
             "git --git-dir /home/user/.cache/rmu/hub/0f0e0d0c-0000-4000-8000-0000000000a1.git push ssh://git@example.invalid/library.git refs/remotes/origin/main:refs/heads/main",
             "git --git-dir /home/user/.cache/rmu/hub/0f0e0d0c-0000-4000-8000-0000000000a1.git push ssh://git@example.invalid/library.git 'refs/remotes/origin/devices/*:refs/rmu/devices/*'",
+            "takes 'refs/remotes/origin/devices/*:refs/heads/rmu/devices/*' instead.",
+            "`rejected (non-fast-forward)` lines are harmless",
             "A tablet whose backups are not restored needs `rmu hub clone <origin> --reattach`",
             "3. Only as a last resort",
         ],

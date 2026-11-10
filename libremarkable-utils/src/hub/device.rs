@@ -56,7 +56,9 @@ pub use fake::{Edit, FakeTablet, FakeTabletBuilder, Fault, OpKind};
 pub use lock::{
     HeldLock, LockDecision, LockOwner, LockRequest, LockState, StaleReason, describe_age,
 };
-pub use probe::{HubLock, HubProbe, parse_probe, probe_script};
+pub use probe::{
+    EXIT_HUB_BUSY, EXIT_HUB_LOCK_CHANGED, HubLock, HubProbe, ProbeCache, parse_probe, probe_script,
+};
 pub use ssh::SshTablet;
 
 /// rmu's directory on the tablet, outside the xochitl data dir and on the

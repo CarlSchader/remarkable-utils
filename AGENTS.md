@@ -82,7 +82,9 @@ This repository is **open source** (dual-licensed MIT OR Apache-2.0):
 - `client.rs` — high-level operations composing the two. Every write
   (and the restart) first checks the `rmu hub` lock
   (`Error::HubLocked`), with the read-only probe from `hub/device`
-  riding along in the listing; route new writes through `before_write`.
+  riding along in the listing, and carries the probe's write guard in
+  its own command right before its commit point; route new writes
+  through `Client::write`.
   `list_items`
   fetches metadata in batched round trips (with a listing cache it is
   incremental: stat everything, cat only changes); keep new

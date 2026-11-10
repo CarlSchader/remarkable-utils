@@ -760,42 +760,48 @@ in an earlier first-parent ancestor of that base.
   when its target tablet is attached to a hub (fresh-UUID copies would
   become duplicates in the library). As built: `Client` checks before
   every write and before restarting xochitl, so every command built on
-  it is covered and reads never are. The check is a read-only probe
+  it is covered and reads never are. The look is a read-only probe
   (`hub::device::probe_script`: the lock directory and owner record,
   the boot id, the watchdog marker, whether the state file exists) that
   rides along in the document listing a write starts from, so it costs
   no round trip there; a write whose last look is older than 30 s looks
-  again. A lock counts only while the hub itself would refuse it
-  (`lock::decide` without a run of its own or `--break-lock`): one from
-  an earlier boot, or whose watchdog fired, cannot change anything any
-  more and does not hold other commands back; one without a readable
-  owner record does. The refusal names the owner and the lock's age,
-  and points at `rmu hub sync --break-lock` only for an owner that is
-  gone. Restarting xochitl always looks afresh, in the round trip of
-  its `reset-failed`.
-- **The check races, safely.** It is check-then-act: a hub run can take
-  the lock just after another command looked (within the 30 s, or
-  during one long write). The hub's own guards cover that window. It
-  reads the tablet with xochitl stopped and aborts on a file whose size
-  changes between the stat pass and the read (a same-size change moves
-  the stat, so the next run reads it again); it verifies every planned
-  document against what it read before writing it, and skips one that
-  changed (base override, no overwrite); new documents (uploads get
-  fresh UUIDs) are not in its plan at all; and its apply refuses while
-  xochitl runs, so another command's restart makes the run fail safely
-  (the journal covers it). A restart in the instant between its fresh
-  look and the `restart` itself can also let xochitl run during the
-  hub's stopped read: a size change then aborts the run, and a same-size
-  change moves the stat, so the next run reads it again. A lock whose
-  watchdog fired counts as free at once, though the old run's last
-  guarded script may still be finishing (seconds: the watchdog takes no
-  `flock`), and the same applies to it. What remains is a write landing in the
-  seconds between that verification and the apply's moves, on a
-  document the apply writes: a concurrent rename, move or payload
-  update of that document is overwritten, or a document `rm` deleted
-  gets some of its files back (the next snapshot quarantines it, never
-  deletes it). No ink is lost: other commands never write the pages of
-  an existing document, and xochitl, which does, is stopped.
+  again, and the restart always looks afresh, in the round trip of its
+  `reset-failed`. A lock counts only while the hub itself would refuse
+  it (`lock::decide` without a run of its own or `--break-lock`): one
+  from an earlier boot, or whose watchdog fired, cannot change anything
+  any more and does not hold other commands back; one without a
+  readable owner record does, across reboots too (there is no boot id
+  to compare), until `--break-lock`, as for the hub. The refusal names
+  the owner and the lock's age, and points at `rmu hub sync
+  --break-lock` only for an owner that is gone. `rmu sync` warns only
+  when its plan writes to the attached tablet, and says so when the
+  plan deletes there (deletions reach the library, hence every tablet).
+- **Each write checks again, in its own command.** The look alone is
+  check-then-act, so every write's own shell command (the staged
+  upload's final `mv`, `rm`, `tar -x`, `cp`, `mkdir`, the restart)
+  carries a guard right before its commit point
+  (`HubProbe::write_guard`): it takes the hub's guard `flock` (when the
+  state directory exists) and exits 83 unless the lock is still as the
+  look saw it (absent; or, for a stale lock, its owner record unchanged
+  or the lock gone). That exit makes the write look again, then refuse,
+  or retry once when nobody holds the lock. The hub takes its lock and
+  applies under that `flock`, and an old run's last guarded script holds
+  it to its end, so the check and the write cannot interleave with any
+  of them: while a hub run holds the lock, nothing else writes.
+- **What remains**, safely. On a tablet where no hub ever ran there is
+  no state directory and so no `flock`: a write can land in the
+  milliseconds after the first hub run created its state directory and
+  lock, which is before that run reads the tablet, so it is covered like
+  any edit made before a sync. A command with several writes can stop
+  between two of them when a hub run takes the lock in between (an
+  upload's payload without its `.metadata` is an orphan the hub reports
+  and leaves alone). Beyond that, the hub's own guards stand regardless:
+  it reads the tablet with xochitl stopped and aborts on a file whose
+  size changes while read, verifies every planned document before
+  writing it and skips one that changed, never plans new documents
+  (uploads get fresh UUIDs), and refuses to apply while xochitl runs. No
+  ink is lost either way: other commands never write the pages of an
+  existing document.
 
 ### Restartability
 

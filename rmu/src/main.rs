@@ -25,7 +25,8 @@ use libremarkable_utils::ssh::{
     Auth, DEFAULT_SSH_USER, DEFAULT_USB_HOST, SshOptions, SshSession, maybe_run_askpass,
 };
 use libremarkable_utils::sync::{
-    self, ConflictPolicy, Endpoint, FsEndpoint, LocalFs, Mode, SshFs, SyncOptions,
+    self, ConflictPolicy, DocSide, Endpoint, FsEndpoint, LocalFs, Mode, SshFs, SyncAction,
+    SyncOptions,
 };
 use libremarkable_utils::xochitl::{self, Item, XOCHITL_DATA_DIR};
 
@@ -312,9 +313,11 @@ fn run_regular(cli: &Cli, progress: Arc<dyn Progress>) -> Result<()> {
                 "note: xochitl not restarted (--no-restart); changes appear after restart",
             );
         } else {
-            client
-                .restart_xochitl()
-                .context("changes were written, but restarting xochitl failed")?;
+            restart_after_writes(
+                cli,
+                &client,
+                "changes were written, but restarting xochitl failed",
+            )?;
         }
     }
     Ok(())
@@ -636,15 +639,19 @@ fn run_docs_sync(
 
     let (snapshot_a, missing_a) = sync_tablet_snapshot(&client_a, &path_a, mode != Mode::Push)?;
     let (snapshot_b, missing_b) = sync_tablet_snapshot(&client_b, &path_b, mode != Mode::Pull)?;
-    if mode != Mode::Push {
-        warn_if_hub_attached(cli, &client_a, &id_a);
-    }
-    if mode != Mode::Pull {
-        warn_if_hub_attached(cli, &client_b, &id_b);
-    }
     let state_path = sync::pair_state_path(&id_a, &id_b);
     let mut state = sync::PairState::load(&state_path)?;
     let plan = sync::plan_docs(options, &snapshot_a, &snapshot_b, &state);
+    [
+        (DocSide::A, &client_a, &id_a, missing_a),
+        (DocSide::B, &client_b, &id_b, missing_b),
+    ]
+    .into_iter()
+    .filter(|(side, .., missing)| *missing || plan.iter().any(|action| action.writes(*side)))
+    .for_each(|(side, client, id, _)| {
+        let deletes = plan.iter().any(|action| action.deletes(side));
+        warn_if_hub_attached(cli, client, id, deletes);
+    });
 
     info(cli, format!("A = {id_a}, B = {id_b}"));
     if dry_run {
@@ -703,14 +710,18 @@ fn run_docs_sync(
 
     if !cli.no_restart {
         if outcome.modified_a {
-            client_a
-                .restart_xochitl()
-                .context("sync wrote changes to side A, but restarting xochitl failed")?;
+            restart_after_writes(
+                cli,
+                &client_a,
+                "sync wrote changes to side A, but restarting xochitl failed",
+            )?;
         }
         if outcome.modified_b {
-            client_b
-                .restart_xochitl()
-                .context("sync wrote changes to side B, but restarting xochitl failed")?;
+            restart_after_writes(
+                cli,
+                &client_b,
+                "sync wrote changes to side B, but restarting xochitl failed",
+            )?;
         }
     } else if outcome.modified_a || outcome.modified_b {
         info(
@@ -753,9 +764,6 @@ fn run_device_sync(
         sync_tablet_snapshot(client, remote_path, mode != Mode::Pull)?;
     let mut state = sync::SyncState::load(state_path)?;
     warn_legacy_state(cli, fs_side);
-    if mode != Mode::Pull {
-        warn_if_hub_attached(cli, client, tablet);
-    }
 
     // Content hashes: local files stamp-gated against the archive
     // (unchanged files are never re-read), device payloads lazily,
@@ -767,6 +775,10 @@ fn run_device_sync(
     sync::attach_payload_hashes(&mut snapshot, &payload_hashes);
 
     let plan = sync::plan(options, &fs_entries, &snapshot, &state);
+    if missing_remote || plan.actions.iter().any(SyncAction::writes_remote) {
+        let deletes = plan.actions.iter().any(SyncAction::deletes_remote);
+        warn_if_hub_attached(cli, client, tablet, deletes);
+    }
 
     if dry_run {
         // The plan *is* the output in dry-run mode.
@@ -846,9 +858,11 @@ fn run_device_sync(
                 "note: xochitl not restarted (--no-restart); changes appear after restart",
             );
         } else {
-            client
-                .restart_xochitl()
-                .context("sync wrote changes, but restarting xochitl failed")?;
+            restart_after_writes(
+                cli,
+                client,
+                "sync wrote changes, but restarting xochitl failed",
+            )?;
         }
     }
     Ok(())
@@ -997,23 +1011,54 @@ fn warn_legacy_state(cli: &Cli, fs_side: &dyn FsEndpoint) {
     }
 }
 
-/// `rmu sync` is about to write to a tablet attached to an `rmu hub`.
-fn hub_attached_warning(tablet: &str) -> String {
+/// `rmu sync` is about to write to a tablet attached to an `rmu hub`
+/// (`deletes`: and to delete there).
+fn hub_attached_warning(tablet: &str, deletes: bool) -> String {
+    let deletions = match deletes {
+        true => {
+            ", and the documents it deletes there are deleted from the library, on every hub \
+             tablet"
+        }
+        false => "",
+    };
     format!(
         "warning: {tablet} is attached to an rmu hub: documents rmu sync copies onto it get new \
          ids, so its next `rmu hub sync` adds them to the library as new documents (duplicates \
-         of any copies already there); `rmu hub` is the way to share documents between hub \
-         tablets"
+         of any copies already there){deletions}; `rmu hub` is the way to share documents \
+         between hub tablets"
     )
 }
 
-/// Warn (stderr) when `rmu sync` writes to a hub-attached tablet. The
-/// answer comes from the look at the hub that rode along in the
-/// snapshot's listing; a failed look only skips the warning (a write
+/// Warn (stderr) when `rmu sync`'s plan writes to a hub-attached
+/// tablet. The answer comes from the look at the hub that rode along in
+/// the snapshot's listing; a failed look only skips the warning (a write
 /// then checks again, and fails loudly).
-fn warn_if_hub_attached(cli: &Cli, client: &Client, tablet: &str) {
+fn warn_if_hub_attached(cli: &Cli, client: &Client, tablet: &str, deletes: bool) {
     if client.hub_attached().unwrap_or(false) {
-        info(cli, hub_attached_warning(tablet));
+        info(cli, hub_attached_warning(tablet, deletes));
+    }
+}
+
+/// Restart xochitl after writes. A hub run that took the tablet since
+/// is not an error: it restarts xochitl itself when it finishes.
+fn restart_after_writes(cli: &Cli, client: &Client, context: &'static str) -> Result<()> {
+    match client.restart_xochitl() {
+        Err(libremarkable_utils::Error::HubLocked(owner)) => {
+            let owner = owner.map_or_else(
+                || "its owner record is missing".to_string(),
+                |owner| owner.to_string(),
+            );
+            info(
+                cli,
+                format!(
+                    "note: xochitl was not restarted: an rmu hub run now holds the tablet \
+                     ({owner}); it restarts xochitl itself when it finishes, and the changes \
+                     appear then"
+                ),
+            );
+            Ok(())
+        }
+        other => other.context(context),
     }
 }
 

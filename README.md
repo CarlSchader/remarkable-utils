@@ -243,8 +243,13 @@ Recovery:
   git --git-dir ~/.cache/rmu/hub/<repo-id>.git push <origin> 'refs/remotes/origin/devices/*:refs/rmu/devices/*'
   ```
 
-  A tablet whose backups are not restored stops with exit 5 at its next
-  sync and needs `rmu hub clone <origin> --reattach`. Running `rmu hub init` on it again is a last resort: it starts a new
+  On an origin that keeps backups under `refs/heads/rmu/devices/*` (as
+  on forges that refuse custom refs), push to
+  `refs/heads/rmu/devices/*` instead. `rejected (non-fast-forward)`
+  lines are harmless: another computer's cache already restored a newer
+  backup there. A tablet whose backups are not restored stops with exit
+  5 at its next sync and needs `rmu hub clone <origin> --reattach`.
+  Running `rmu hub init` on it again is a last resort: it starts a new
   repository, so every tablet then needs `clone --reattach` and the old
   history stays behind.
 - *Getting a deleted document back*: its files stay in origin's history.
