@@ -926,8 +926,8 @@ impl CatFile {
     }
 
     /// Read whole objects, as [`Self::read`] does for each of `oids`, in
-    /// order, with the requests pipelined ([`READ_MANY_CHUNK`] at a time):
-    /// a round trip per chunk, not per object.
+    /// order, with the requests pipelined (in chunks small enough for any
+    /// pipe buffer): a round trip per chunk, not per object.
     pub fn read_many(&mut self, oids: &[Oid]) -> Result<Vec<Option<RawObject>>> {
         self.skip_pending()?;
         oids.chunks(READ_MANY_CHUNK).try_fold(
