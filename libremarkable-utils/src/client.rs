@@ -43,6 +43,7 @@ use crate::progress::{NoProgress, Progress};
 use crate::ssh::{SshSession, shell_quote};
 use crate::status::{self, SystemStatus};
 use crate::xochitl::{self, Item, ItemKind};
+use crate::xochitl_service;
 
 /// How long a look at the hub lock is trusted before a write checks
 /// again (see the module docs).
@@ -917,8 +918,9 @@ impl Client {
         // and carries the write guard itself.
         let marker = marked::new_marker();
         let reset = self.session.run(&format!(
-            "{}systemctl reset-failed xochitl.service\n",
-            probe_script(&self.hub_paths, &marker)
+            "{}{}\n",
+            probe_script(&self.hub_paths, &marker),
+            xochitl_service::RESET_FAILED
         ))?;
         self.hub_probe.store(parse_probe(
             &marker,
@@ -927,7 +929,7 @@ impl Client {
         let restart = self.guarded(|guard| {
             let output = self
                 .session
-                .run(&format!("{guard}systemctl restart xochitl.service"))?;
+                .run(&format!("{guard}{}", xochitl_service::RESTART))?;
             match output.status.code() {
                 Some(status @ (EXIT_HUB_LOCK_CHANGED | EXIT_HUB_BUSY)) => Err(Error::Remote {
                     status,
@@ -943,8 +945,8 @@ impl Client {
         // Device-side restarts can transiently drop the command channel
         // even though xochitl comes back; verify before failing.
         thread::sleep(Duration::from_secs(1));
-        let status = self.session.run("systemctl is-active xochitl.service")?;
-        if status.status.success() && String::from_utf8_lossy(&status.stdout).trim() == "active" {
+        let status = self.session.run(xochitl_service::IS_ACTIVE)?;
+        if status.status.success() && xochitl_service::state(&status.stdout) == "active" {
             self.progress.finished();
             return Ok(());
         }
@@ -953,7 +955,7 @@ impl Client {
             restart.status.code(),
             String::from_utf8_lossy(&restart.stderr).trim(),
             status.status.code(),
-            String::from_utf8_lossy(&status.stdout).trim(),
+            xochitl_service::state(&status.stdout),
         )))
     }
 

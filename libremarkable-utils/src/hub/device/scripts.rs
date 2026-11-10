@@ -26,6 +26,7 @@ use super::lock::{AcquireProbe, LockRequest, LockState, owner_fields, parse_owne
 use super::{DeviceError, StatEntry, StatListing, TabletPaths, WATCHDOG_UNIT};
 use crate::hub::model::{DocId, StatSignature};
 use crate::ssh::shell_quote;
+use crate::xochitl_service::{RESET_FAILED, START};
 
 /// Exit status of a guarded script whose watchdog fired.
 pub(super) const EXIT_WATCHDOG_FIRED: i32 = 75;
@@ -342,7 +343,7 @@ pub(super) fn parse_bool(operation: &'static str, output: &str) -> Result<bool, 
 /// builtin `:`, so a failed redirection cannot end the shell).
 pub(super) fn fire_command(paths: &TabletPaths) -> String {
     format!(
-        "true > {} 2>/dev/null; systemctl reset-failed xochitl.service; systemctl start xochitl.service",
+        "true > {} 2>/dev/null; {RESET_FAILED}; {START}",
         q(&paths.watchdog_marker())
     )
 }
@@ -537,8 +538,8 @@ pub(super) fn start_script(paths: &TabletPaths, run: &str) -> String {
         "{fns}rmu_main() {{\n\
          {check}\n\
          date +%s\n\
-         systemctl reset-failed xochitl.service 2>/dev/null\n\
-         systemctl start xochitl.service\n\
+         {RESET_FAILED} 2>/dev/null\n\
+         {START}\n\
          }}\n\
          rmu_main </dev/null\n",
         fns = guard_fns(paths, run),
@@ -554,8 +555,6 @@ pub(super) fn start_allowed_script(paths: &TabletPaths, run: &str) -> String {
         check = start_check(paths),
     )
 }
-
-pub(super) const IS_ACTIVE_SCRIPT: &str = "systemctl is-active xochitl.service\n";
 
 /// Unix seconds as nanoseconds.
 pub(super) fn parse_device_time(operation: &'static str, output: &str) -> Result<i64, DeviceError> {

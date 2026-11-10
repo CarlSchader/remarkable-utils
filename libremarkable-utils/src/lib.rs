@@ -44,6 +44,7 @@ pub mod ssh;
 pub mod status;
 pub mod sync;
 pub mod xochitl;
+mod xochitl_service;
 
 pub use client::Client;
 pub use error::{Error, Result};

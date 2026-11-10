@@ -21,6 +21,7 @@ use crate::hub::model::{TabletState, XochitlPath};
 use crate::progress::{NoProgress, Progress};
 use crate::ssh::SshSession;
 use crate::status;
+use crate::xochitl_service;
 
 /// The device layer over SSH.
 pub struct SshTablet {
@@ -360,8 +361,10 @@ impl Tablet for SshTablet {
     }
 
     fn xochitl_active(&self) -> Result<bool> {
-        let output = self.session.run_script(scripts::IS_ACTIVE_SCRIPT)?;
-        let state = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let output = self
+            .session
+            .run_script(&format!("{}\n", xochitl_service::IS_ACTIVE))?;
+        let state = xochitl_service::state(&output.stdout);
         // `is-active` exits non-zero for every state but `active`; 255 is
         // ssh's own failure.
         if output.status.code() == Some(255) || state.is_empty() {
