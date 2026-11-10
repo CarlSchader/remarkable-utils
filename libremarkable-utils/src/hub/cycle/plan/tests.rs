@@ -738,7 +738,9 @@ fn reconciliation_only_finishes_or_trusts_documents_a_run_planned() {
             forks: &[],
             json: &blobs.0,
         })
-        .unwrap()[&doc(1)]
+        .unwrap()
+        .remove(&doc(1))
+        .unwrap()
     };
     let planned = [StagedRun {
         planned: [doc(1)].into(),
@@ -1108,7 +1110,7 @@ fn reconciliation_judges_and_finishes_a_partly_applied_edited_document() {
         json: &case.blobs.0,
     };
     let judged = verdicts(&journaled).unwrap();
-    assert_eq!(judged[&doc(1)], Verdict::Partial);
+    assert!(matches!(judged[&doc(1)], Verdict::Partial(_)), "{judged:?}");
     let (planned, skipped) = finish(&Finish {
         journaled: &journaled,
         verdicts: &judged,
@@ -1233,7 +1235,7 @@ fn a_partial_finish_the_live_tree_refuses_is_kept() {
         json: &blobs.0,
     };
     let judged = verdicts(&journaled).unwrap();
-    assert_eq!(judged[&doc(1)], Verdict::Partial);
+    assert!(matches!(judged[&doc(1)], Verdict::Partial(_)), "{judged:?}");
     let (planned, skipped) = finish(&Finish {
         journaled: &journaled,
         verdicts: &judged,
@@ -1280,4 +1282,122 @@ fn a_user_change_to_a_pending_file_is_never_kept_while_another_is_pending() {
     )
     .unwrap();
     assert!(target.is_none(), "{target:?}");
+}
+
+#[test]
+fn a_user_revert_of_a_written_file_is_kept() {
+    // The apply wrote page 1 (no longer staged); the user then reverted
+    // it to the snapshot's version: their change, kept.
+    let mut case = half_applied();
+    case.tablet.insert(page(1), oid(10));
+    let target = case.target().expect("finishable");
+    assert_eq!(target.files[&page(1)].id, oid(10));
+}
+
+#[test]
+fn a_finish_never_targets_a_document_without_metadata() {
+    let mut case = half_applied();
+    case.tablet.remove(&DocFile::Metadata);
+    assert!(case.target().is_none());
+}
+
+#[test]
+fn a_conflict_copy_is_finished_with_its_partial_original() {
+    let mut case = half_applied();
+    let copy = notebook(&mut case.blobs, "Diary (conflict)", "", &[(3, 30)]);
+    let merge = RepoTree {
+        docs: [(doc(1), case.merge.clone()), (doc(2), copy)].into(),
+        extra: Default::default(),
+    };
+    let snapshot = RepoTree {
+        docs: [(doc(1), case.snapshot.clone())].into(),
+        extra: Default::default(),
+    };
+    // The copy's page is written; its `.metadata` and `.content` pending.
+    let tablet = [
+        (doc(1), case.tablet.clone()),
+        (doc(2), [(page(3), oid(30))].into()),
+    ]
+    .into();
+    let pending: BTreeSet<String> = case
+        .pending
+        .iter()
+        .cloned()
+        .chain([
+            DocFile::Metadata.xochitl_path(&doc(2)),
+            DocFile::Content.xochitl_path(&doc(2)),
+        ])
+        .collect();
+    let staged = [StagedRun {
+        planned: [doc(1), doc(2)].into(),
+        pending,
+    }];
+    let judged = verdicts(&Journaled {
+        rules: rules(),
+        merge: &merge,
+        snapshot: &snapshot,
+        tablet: &tablet,
+        staged: &staged,
+        forks: &[(doc(1), doc(2))],
+        json: &case.blobs.0,
+    })
+    .unwrap();
+    assert!(matches!(judged[&doc(1)], Verdict::Partial(_)), "{judged:?}");
+    assert_eq!(judged[&doc(2)], Verdict::Mixed);
+}
+
+#[test]
+fn a_partial_finish_checks_the_tree_with_the_users_own_metadata() {
+    // The user moved the half-applied diary into folder 5, which this
+    // finish deletes (an interrupted deletion): the diary would be
+    // orphaned on the live tablet, so the deletion is skipped.
+    let mut case = half_applied();
+    let moved = case
+        .blobs
+        .json(metadata("Diary", doc(5).as_str(), "DocumentType"));
+    case.tablet.insert(DocFile::Metadata, moved);
+    let target = case.target().expect("finishable");
+    let folder = version(vec![(
+        DocFile::Metadata,
+        case.blobs.json(metadata("Box", "", "CollectionType")),
+    )]);
+    let merge = RepoTree {
+        docs: [(doc(1), case.merge.clone())].into(),
+        extra: Default::default(),
+    };
+    let snapshot = RepoTree {
+        docs: [(doc(1), case.snapshot.clone()), (doc(5), folder)].into(),
+        extra: Default::default(),
+    };
+    let tablet = [(doc(1), case.tablet.clone()), (doc(5), BTreeMap::new())].into();
+    let journaled = Journaled {
+        rules: rules(),
+        merge: &merge,
+        snapshot: &snapshot,
+        tablet: &tablet,
+        staged: &[],
+        forks: &[],
+        json: &case.blobs.0,
+    };
+    let judged: BTreeMap<DocId, Verdict> =
+        [(doc(1), Verdict::Partial(target)), (doc(5), Verdict::Mixed)].into();
+    let (planned, skipped) = finish(&Finish {
+        journaled: &journaled,
+        verdicts: &judged,
+        local: &BTreeMap::new(),
+        current: &[
+            (doc(1), item(doc(5).as_str(), false)),
+            (doc(5), item("", true)),
+        ]
+        .into(),
+        merged: &[(doc(1), item("", false))].into(),
+    })
+    .unwrap();
+    assert!(skipped.contains(&doc(5)), "{planned:?} / {skipped:?}");
+    assert!(
+        !planned
+            .iter()
+            .any(|entry| entry.doc == doc(5) && entry.change == Change::Delete),
+        "{planned:?}"
+    );
 }

@@ -596,7 +596,7 @@ fn trash_blame<'a>(
 
 /// Where an interrupted run left one document whose merge and snapshot
 /// versions differ (see "Restartability").
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Verdict {
     /// Every file is at the merge version: base = merge.
     AtMerge,
@@ -608,9 +608,10 @@ pub(super) enum Verdict {
     Mixed,
     /// The apply stopped inside this document and the user changed it
     /// since, but only in files the merge leaves alone or the apply had
-    /// already written: finish the files still pending, keep the user's
-    /// ([`partial_target`]), then base = merge.
-    Partial,
+    /// already written: finish it to this version (the files still
+    /// pending from the merge, the user's elsewhere: [`partial_target`]),
+    /// then base = merge.
+    Partial(DocVersion),
     /// Anything else (the user changed it): base override = snapshot.
     Other,
 }
@@ -945,10 +946,8 @@ pub(super) fn verdicts(input: &Journaled) -> Result<BTreeMap<DocId, Verdict>> {
                     })?;
                     if finished {
                         Verdict::AtMerge
-                    } else if partial_of(input, doc, files)?.is_some() {
-                        Verdict::Partial
                     } else {
-                        Verdict::Other
+                        partial_of(input, doc, files)?.map_or(Verdict::Other, Verdict::Partial)
                     }
                 }
                 other => other,
@@ -963,10 +962,13 @@ pub(super) fn verdicts(input: &Journaled) -> Result<BTreeMap<DocId, Verdict>> {
         .fold(verdicts, |mut verdicts, (original, copy)| {
             let original_done = matches!(
                 verdicts.get(original),
-                None | Some(Verdict::AtMerge | Verdict::Mixed | Verdict::Partial)
+                None | Some(Verdict::AtMerge | Verdict::Mixed | Verdict::Partial(_))
             );
             if !original_done
-                && matches!(verdicts.get(copy), Some(Verdict::Mixed | Verdict::Partial))
+                && matches!(
+                    verdicts.get(copy),
+                    Some(Verdict::Mixed | Verdict::Partial(_))
+                )
             {
                 verdicts.insert(copy.clone(), Verdict::Other);
             }
@@ -1000,30 +1002,31 @@ pub(super) fn finish(input: &Finish) -> Result<(Vec<Planned>, BTreeSet<DocId>)> 
     let planned: Vec<(Planned, bool)> = input
         .verdicts
         .iter()
-        .filter(|(_, verdict)| matches!(verdict, Verdict::Mixed | Verdict::Partial))
+        .filter(|(_, verdict)| matches!(verdict, Verdict::Mixed | Verdict::Partial(_)))
         .map(|(doc, verdict)| -> Result<Option<(Planned, bool)>> {
             let files = journaled.tablet.get(doc).unwrap_or(&no_files);
-            let target = match verdict {
-                Verdict::Partial => partial_of(journaled, doc, files)?,
-                _ => journaled
-                    .merge
-                    .docs
-                    .get(doc)
-                    .filter(|v| v.is_present())
-                    .cloned(),
+            let (target, own_metadata) = match verdict {
+                // The user's own `.metadata` stays when the target keeps it.
+                Verdict::Partial(target) => (
+                    target,
+                    target.files.get(&DocFile::Metadata).map(|entry| &entry.id)
+                        == files.get(&DocFile::Metadata),
+                ),
+                _ => match journaled.merge.docs.get(doc).filter(|v| v.is_present()) {
+                    Some(target) => (target, false),
+                    // An interrupted deletion (`.metadata` goes first):
+                    // finish it, leftovers included.
+                    None => {
+                        return Ok(Some((
+                            Planned {
+                                doc: doc.clone(),
+                                change: Change::Delete,
+                            },
+                            false,
+                        )));
+                    }
+                },
             };
-            let Some(target) = target else {
-                return Ok(Some((
-                    Planned {
-                        doc: doc.clone(),
-                        change: Change::Delete,
-                    },
-                    false,
-                )));
-            };
-            let own_metadata = *verdict == Verdict::Partial
-                && target.files.get(&DocFile::Metadata).map(|entry| &entry.id)
-                    == files.get(&DocFile::Metadata);
             let current = journaled.tablet.get(doc).map(|files| DocVersion {
                 files: files
                     .iter()
@@ -1034,7 +1037,7 @@ pub(super) fn finish(input: &Finish) -> Result<(Vec<Planned>, BTreeSet<DocId>)> 
             Ok(plan_doc(
                 journaled.rules,
                 doc,
-                Some(&target),
+                Some(target),
                 current.as_ref(),
                 input.local.get(doc).unwrap_or(&empty),
                 journaled.json,
