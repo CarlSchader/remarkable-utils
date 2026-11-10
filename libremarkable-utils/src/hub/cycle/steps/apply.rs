@@ -362,9 +362,10 @@ impl Hub<'_> {
         p.state.manifest = plan::manifest(&plan::ManifestInput {
             read: &p.read.stats(),
             // A single-stop sync starts xochitl only after this: the
-            // apply's device time is before that start (and 0, nothing
-            // kept, if all it planned was skipped).
-            read_reference_ns: p.started_at.get().unwrap_or(applied.written_at),
+            // apply's device time is before that start (0 if all it
+            // planned was skipped: coarse-mtime entries are then left
+            // out, fine ones kept).
+            read_reference_ns: s.started_at().unwrap_or(applied.written_at),
             before_apply: applied.before.as_ref(),
             written: &applied.written,
             removed: &applied.removed,
@@ -420,16 +421,11 @@ impl Hub<'_> {
         let Some(limits) = self.options.single_stop.filter(|_| s.deferring()) else {
             return Ok(());
         };
-        if planned.is_empty() {
-            return self.end_single_stop(s, p, "nothing to apply");
-        }
         let contents = staged_contents(planned)?;
         let size_of = content_sizes(&p.origin.store, &contents)?;
         let bytes: u64 = contents.iter().map(|(_, content)| size_of(content)).sum();
-        if planned.len() > limits.max_docs || bytes > limits.max_bytes {
-            return self.end_single_stop(s, p, "more to apply than a small sync");
-        }
-        self.check_single_stop(s, p)
+        let why = plan::single_stop_at_plan(&limits, planned.len(), bytes, s.stopped_for());
+        self.end_single_stop(s, why)
     }
 
     /// Steps 12–14 for a non-empty plan.
@@ -462,16 +458,19 @@ impl Hub<'_> {
         s.arm()?;
         s.tablet.clear_staging(s.lock())?;
         let mut sizes = self.stage(s, store, &planned, Some(&pushed.base))?;
-        // 13.
-        self.check_single_stop(s, p)?;
-        if !s.deferring() {
+        // 13. A sync that kept xochitl stopped has no network work left:
+        // it applies stopped, under a fresh timer (starting xochitl now
+        // would only stop it again during its start-up).
+        if s.deferring() {
+            s.arm()?;
+        } else {
             self.progress.step("Stopping xochitl");
             s.stop()?;
         }
         // 14. Re-read, verify, check the live tree.
         self.progress.step("Applying changes");
         let planned_docs: BTreeSet<DocId> = planned.iter().map(|entry| entry.doc.clone()).collect();
-        let recheck = self.recheck(s, rules, &p.read, p.started_at.get(), &planned_docs)?;
+        let recheck = self.recheck(s, rules, &p.read, s.started_at(), &planned_docs)?;
         let before = p.read.doc_files();
         let sha256: HashMap<Oid, String> = recheck
             .moved

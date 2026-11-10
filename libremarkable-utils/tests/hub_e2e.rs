@@ -4914,6 +4914,13 @@ fn a_small_sync_stops_xochitl_once() {
     assert!(stop < apply && apply < start, "{ops:?}");
     let window = &ops[stop..start];
     let journal = first_op(window, OpKind::WriteState);
+    // Armed for the single-stop timeout as soon as it is decided, then
+    // again before the push attempt.
+    assert_eq!(
+        count_ops(&window[..journal], OpKind::ArmWatchdog),
+        2,
+        "{window:?}"
+    );
     let stage = first_op(window, OpKind::Stage);
     let recheck = window[..apply - stop]
         .iter()
@@ -4946,12 +4953,13 @@ fn a_large_sync_keeps_two_windows() {
     assert_eq!(report.unwrap().applied, vec![big.clone()]);
     assert_eq!(count_ops(&ops, OpKind::StopXochitl), 2, "{ops:?}");
     assert_eq!(count_ops(&ops, OpKind::StartXochitl), 2, "{ops:?}");
-    // Staging with the UI up: between the two windows.
-    let starts: Vec<usize> = (0..ops.len())
-        .filter(|at| ops[*at] == OpKind::StartXochitl)
-        .collect();
-    let stage = first_op(&ops, OpKind::Stage);
-    assert!(starts[0] < stage, "{ops:?}");
+    // Started at step 6, before anything is written (the estimate saw
+    // it), and staging with the UI up, between the two windows.
+    let stop = first_op(&ops, OpKind::StopXochitl);
+    let first_write = stop + first_op(&ops[stop..], OpKind::WriteState);
+    let first_start = first_op(&ops, OpKind::StartXochitl);
+    assert!(first_start < first_write, "{ops:?}");
+    assert!(first_start < first_op(&ops, OpKind::Stage), "{ops:?}");
     world.converge();
 
     let (mut world, _) = small_apply();
@@ -5040,5 +5048,338 @@ fn a_plan_larger_than_its_estimate_falls_back_to_two_windows() {
         "kept stopped through the merge: {ops:?}"
     );
     assert!(first_start < first_op(&ops, OpKind::Stage), "{ops:?}");
+    // Armed again at once, and for the run's own timeout from then on:
+    // the step-13 stop leaves it pending for the apply.
+    assert_eq!(ops[first_start + 1], OpKind::ArmWatchdog, "{ops:?}");
     world.converge();
+    let (mut world, _) = same_page_conflict();
+    world.options.single_stop = Some(SingleStop {
+        max_docs: 1,
+        ..SingleStop::default()
+    });
+    world
+        .tablet(1)
+        .inject(Fault::DisconnectAtOp(first_op(&ops, OpKind::Apply) + 1));
+    assert!(world.sync(1).is_err());
+    assert_eq!(
+        world.tablet(1).watchdog_armed(),
+        Some(world.options.watchdog)
+    );
+}
+
+/// A clone keeps the two-window cycle whatever its size: two starts, and
+/// the run's own watchdog pending after its step-13 stop (never the
+/// single-stop one).
+#[test]
+fn a_clone_keeps_two_windows() {
+    [None, Some(1)].into_iter().for_each(|max_bytes| {
+        let mut template = clone_template();
+        if let Some(max_bytes) = max_bytes {
+            template.options.single_stop = Some(SingleStop {
+                max_bytes,
+                ..SingleStop::default()
+            });
+        }
+        let probe = template.duplicate();
+        let start = probe.tablet(1).ops().len();
+        probe.clone_tablet(1).unwrap();
+        let ops = probe.tablet(1).ops()[start..].to_vec();
+        assert_eq!(
+            count_ops(&ops, OpKind::StartXochitl),
+            2,
+            "{max_bytes:?}: {ops:?}"
+        );
+        assert_eq!(
+            count_ops(&ops, OpKind::StopXochitl),
+            2,
+            "{max_bytes:?}: {ops:?}"
+        );
+        let world = template.duplicate();
+        world
+            .tablet(1)
+            .inject(Fault::DisconnectAtOp(first_op(&ops, OpKind::Apply) + 1));
+        assert!(world.clone_tablet(1).is_err());
+        assert_eq!(
+            world.tablet(1).watchdog_armed(),
+            Some(world.options.watchdog),
+            "{max_bytes:?}"
+        );
+    });
+}
+
+/// A budget spent while staging: the run applies stopped, under a fresh
+/// timer. Starting xochitl there would only stop it again during its
+/// start-up.
+#[test]
+fn a_budget_spent_while_staging_still_applies_stopped() {
+    let (mut template, _) = small_apply();
+    template.options.single_stop = Some(SingleStop {
+        budget: Duration::from_millis(300),
+        ..SingleStop::default()
+    });
+    let (_, reference) = sync_ops(&template.duplicate());
+    let world = template.duplicate();
+    world.tablet(0).inject(Fault::SlowOp(
+        first_op(&reference, OpKind::Stage) + 1,
+        Duration::from_millis(400),
+    ));
+    let (report, ops) = sync_ops(&world);
+    report.unwrap();
+    assert_eq!(count_ops(&ops, OpKind::StartXochitl), 1, "{ops:?}");
+    assert_eq!(count_ops(&ops, OpKind::StopXochitl), 1, "{ops:?}");
+    let apply = first_op(&ops, OpKind::Apply);
+    assert_eq!(ops[apply - 1], OpKind::ArmWatchdog, "{ops:?}");
+    world.converge();
+}
+
+/// Runs a hook the first time a run reports `on` as its step.
+struct StepHook {
+    on: &'static str,
+    hook: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+impl StepHook {
+    fn leak(on: &'static str, hook: impl FnOnce() + Send + 'static) -> &'static Self {
+        Box::leak(Box::new(Self {
+            on,
+            hook: std::sync::Mutex::new(Some(Box::new(hook))),
+        }))
+    }
+}
+
+impl libremarkable_utils::progress::Progress for StepHook {
+    fn step(&self, message: &str) {
+        let hook = (message == self.on)
+            .then(|| self.hook.lock().unwrap().take())
+            .flatten();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+    fn bytes(&self, _: u64, _: Option<u64>) {}
+    fn bytes_done(&self) {}
+    fn finished(&self) {}
+}
+
+/// Tablet `i`'s sync with `hook` at its step `on`, and its operations.
+fn sync_hooked(
+    world: &World,
+    i: usize,
+    on: &'static str,
+    hook: impl FnOnce() + Send + 'static,
+) -> (SyncReport, Vec<OpKind>) {
+    let start = world.tablet(i).ops().len();
+    let report = world
+        .hub_with_progress(i, world.options.clone(), StepHook::leak(on, hook))
+        .sync(world.tablet(i))
+        .unwrap();
+    (report, world.tablet(i).ops()[start..].to_vec())
+}
+
+/// Another computer pushes while a small sync is about to: the push is
+/// retried with xochitl still stopped (one start). With a budget the
+/// other push outlasts, xochitl starts before the retry's journal.
+#[test]
+fn a_small_sync_retries_its_push_stopped_or_within_budget() {
+    [None, Some(Duration::from_millis(300))]
+        .into_iter()
+        .for_each(|budget| {
+            let (mut world, lib) = small_apply();
+            if let Some(budget) = budget {
+                world.options.single_stop = Some(SingleStop {
+                    budget,
+                    ..SingleStop::default()
+                });
+            }
+            // A changes something of its own (so it pushes); B renames
+            // another document, pushed while A is about to push.
+            let page = world.pages(0, &lib.sketch)[0].clone();
+            world.ink(0, &lib.sketch, &page);
+            world.rename(1, &lib.paper, "Paper (renamed on B)");
+            let other = world.hub_parts(1);
+            let (report, ops) = sync_hooked(&world, 0, "Pushing to origin", move || {
+                other.sync().unwrap();
+                if let Some(budget) = budget {
+                    std::thread::sleep(budget + Duration::from_millis(100));
+                }
+            });
+            assert_eq!(report.push_attempts, 2, "{report:?}");
+            let stop = first_op(&ops, OpKind::StopXochitl);
+            // Device ref recorded, then a journal per attempt.
+            let writes: Vec<usize> = (stop..ops.len())
+                .filter(|at| ops[*at] == OpKind::WriteState)
+                .collect();
+            let first_start = first_op(&ops, OpKind::StartXochitl);
+            match budget {
+                None => assert_eq!(count_ops(&ops, OpKind::StartXochitl), 1, "{ops:?}"),
+                Some(_) => assert!(
+                    writes[1] < first_start && first_start < writes[2],
+                    "before the second attempt's journal: {ops:?}"
+                ),
+            }
+            world.converge();
+        });
+}
+
+/// Origin moves between the lock and the sync's fetch, by more than a
+/// small sync may apply (a 2 MiB page): xochitl, kept stopped on the
+/// estimate, is started before staging.
+#[test]
+fn origin_moving_past_the_limit_mid_sync_starts_xochitl_before_staging() {
+    let (world, _) = small_apply();
+    let big = world.create(1, Kind::Notebook { pages: 1 }, "Big", "");
+    let page = world.pages(1, &big)[0].clone();
+    let path = format!("{big}/{page}.rm");
+    let mut bytes = world.device(1).file(&path).unwrap();
+    bytes.extend_from_slice(&vec![b'x'; 2 * 1024 * 1024]);
+    world.device(1).tablet.write_file(&path, &bytes).unwrap();
+    let other = world.hub_parts(1);
+    let (report, ops) = sync_hooked(&world, 0, "Fetching origin", move || {
+        other.sync().unwrap();
+    });
+    assert!(report.applied.contains(&big), "{report:?}");
+    assert_eq!(count_ops(&ops, OpKind::StartXochitl), 2, "{ops:?}");
+    let stop = first_op(&ops, OpKind::StopXochitl);
+    let journal = stop + first_op(&ops[stop..], OpKind::WriteState);
+    let first_start = first_op(&ops, OpKind::StartXochitl);
+    assert!(
+        journal < first_start,
+        "kept stopped through the merge: {ops:?}"
+    );
+    assert!(first_start < first_op(&ops, OpKind::Stage), "{ops:?}");
+    world.converge();
+}
+
+/// The watchdog fires before each operation of a sync, in both shapes of
+/// the cycle: the run ends (or finishes), xochitl is up, and the next run
+/// converges.
+#[test]
+fn watchdog_fires_before_every_operation() {
+    for_both_cycles(|template, reference| {
+        (1..=reference.ops.len()).for_each(|k| {
+            let what = format!(
+                "single stop {}: watchdog fires before op {k} ({:?})",
+                template.options.single_stop.is_some(),
+                reference.ops[k - 1]
+            );
+            let world = template.duplicate();
+            world.tablet(0).inject(Fault::FireWatchdogBefore(k));
+            let result = world.sync(0);
+            world::no_contract_violation(&result);
+            assert!(world.tablet(0).is_running(), "{what}: {result:?}");
+            recover(&world, reference, &what);
+        });
+    });
+}
+
+/// A small sync whose device-ref backup runs long (its record is slow)
+/// starts xochitl before its first push attempt, before the journal.
+#[test]
+fn a_slow_backup_starts_xochitl_before_the_merge() {
+    let (mut template, lib) = small_apply();
+    template.options.single_stop = Some(SingleStop {
+        budget: Duration::from_millis(300),
+        ..SingleStop::default()
+    });
+    let page = template.pages(0, &lib.sketch)[0].clone();
+    template.ink(0, &lib.sketch, &page);
+    let (_, reference) = sync_ops(&template.duplicate());
+    let stop = first_op(&reference, OpKind::StopXochitl);
+    let record = stop + first_op(&reference[stop..], OpKind::WriteState);
+    let world = template.duplicate();
+    world
+        .tablet(0)
+        .inject(Fault::SlowOp(record + 1, Duration::from_millis(400)));
+    let (report, ops) = sync_ops(&world);
+    report.unwrap();
+    let writes: Vec<usize> = (stop..ops.len())
+        .filter(|at| ops[*at] == OpKind::WriteState)
+        .collect();
+    let first_start = first_op(&ops, OpKind::StartXochitl);
+    assert!(
+        writes[0] < first_start && first_start < writes[1],
+        "after the device ref's record, before the journal: {ops:?}"
+    );
+    world.converge();
+}
+
+/// Records when each progress step began.
+#[derive(Default)]
+struct StepTimes(std::sync::Mutex<Vec<(String, std::time::Instant)>>);
+
+impl libremarkable_utils::progress::Progress for StepTimes {
+    fn step(&self, message: &str) {
+        self.0
+            .lock()
+            .unwrap()
+            .push((message.to_string(), std::time::Instant::now()));
+    }
+    fn bytes(&self, _: u64, _: Option<u64>) {}
+    fn bytes_done(&self) {}
+    fn finished(&self) {}
+}
+
+impl StepTimes {
+    /// From the stop to the step-6 decision (start, or keep stopped).
+    fn stopped_until_step_6(&self) -> Duration {
+        let times = self.0.lock().unwrap();
+        let at = |prefix: &str| {
+            times
+                .iter()
+                .find(|(step, _)| step.starts_with(prefix))
+                .map(|(_, at)| *at)
+                .unwrap_or_else(|| panic!("no {prefix:?} step"))
+        };
+        let decided = times
+            .iter()
+            .find(|(step, _)| step == "Starting xochitl" || step.starts_with("Keeping"))
+            .map(|(_, at)| *at)
+            .unwrap();
+        decided - at("Stopping xochitl")
+    }
+}
+
+/// What the step-6 estimate adds to the snapshot window, on a library of
+/// 1000 notebooks: a sync after origin moved (one rename on the other
+/// tablet: the estimate reads the base and origin's trees) against one
+/// with origin unchanged (no estimate). Both read only what moved.
+#[test]
+#[ignore = "scale measurement; run in release with --ignored --nocapture"]
+fn single_stop_estimate_scale() {
+    let world = World::new(2);
+    let docs: Vec<_> = (0..1000)
+        .map(|k| world.create(0, Kind::Notebook { pages: 2 }, &format!("Doc {k}"), ""))
+        .collect();
+    world.clone_tablet(0).unwrap();
+    world.clone_tablet(1).unwrap();
+    world.converge();
+    let timed = |world: &World| {
+        let times: &'static StepTimes = Box::leak(Box::default());
+        let started = std::time::Instant::now();
+        world
+            .hub_with_progress(0, world.options.clone(), times)
+            .sync(world.tablet(0))
+            .unwrap();
+        (times.stopped_until_step_6(), started.elapsed())
+    };
+    let best = |prepare: &dyn Fn(&World)| {
+        (0..5)
+            .map(|_| {
+                let copy = world.duplicate();
+                prepare(&copy);
+                timed(&copy)
+            })
+            .min()
+            .unwrap()
+    };
+    let unchanged = best(&|_| {});
+    let moved = best(&|copy| {
+        copy.rename(1, &docs[500], "Doc 500 (renamed on B)");
+        copy.sync(1).unwrap();
+    });
+    println!(
+        "1000 notebooks: stopped until step 6 {:?} with origin unchanged, {:?} after origin moved \
+         (whole syncs {:?}, {:?})",
+        unchanged.0, moved.0, unchanged.1, moved.1
+    );
 }

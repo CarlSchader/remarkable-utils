@@ -213,7 +213,7 @@ impl Hub<'_> {
                 state,
                 read,
                 writer: Some(writer),
-                started_at: std::cell::Cell::new(Some(started_at)),
+                fetch_took: std::time::Duration::ZERO,
                 info,
                 took_over,
                 reconciled: None,

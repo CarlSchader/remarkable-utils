@@ -23,6 +23,10 @@ pub(super) struct Session<'t> {
     /// Keeping xochitl stopped past step 6 (single-stop): the watchdog
     /// timeout meanwhile, cleared by a start.
     deferred: Option<Duration>,
+    /// Device time of the session's first start. Every run reads the
+    /// tablet once, stopped, before any start, so this is the read's
+    /// racy-entry reference; `None` while xochitl has not started since.
+    started_at: Option<i64>,
 }
 
 impl<'t> Session<'t> {
@@ -34,6 +38,7 @@ impl<'t> Session<'t> {
             maybe_stopped: false,
             stopped_at: None,
             deferred: None,
+            started_at: None,
         }
     }
 
@@ -80,17 +85,25 @@ impl<'t> Session<'t> {
         self.tablet.stop_xochitl(self.lock())
     }
 
-    /// Start xochitl; the device time just before the start.
+    /// Start xochitl; the device time just before the start (the first
+    /// one is kept, [`Self::started_at`]).
     pub(super) fn start(&mut self) -> Result<i64> {
         let time = self.tablet.start_xochitl(self.lock())?;
         self.maybe_stopped = false;
         self.deferred = None;
+        self.started_at.get_or_insert(time);
         Ok(time)
+    }
+
+    /// Device time of the first start after the read (see the field).
+    pub(super) fn started_at(&self) -> Option<i64> {
+        self.started_at
     }
 
     /// Keep xochitl stopped past step 6, re-arming the watchdog for `cap`
     /// now and at every later arming until the next start.
     pub(super) fn defer_start(&mut self, cap: Duration) -> Result<()> {
+        debug_assert!(self.maybe_stopped, "only a stopped xochitl stays stopped");
         self.deferred = Some(cap);
         self.arm()
     }

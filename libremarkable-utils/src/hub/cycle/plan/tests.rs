@@ -1465,3 +1465,67 @@ fn the_network_estimate_counts_what_origin_changed_and_the_tablet_lacks() {
     assert_eq!(estimate.apply_blobs, BTreeSet::from([oid(2), oid(3)]));
     assert_eq!(estimate.tablet_bytes, 100 + 2 * 100, "push + copy");
 }
+
+#[test]
+fn a_sync_keeps_xochitl_stopped_only_within_every_bound() {
+    use std::time::Duration;
+    let limits = super::super::SingleStop {
+        max_bytes: 1000,
+        max_docs: 2,
+        budget: Duration::from_secs(8),
+        watchdog: Duration::from_secs(60),
+    };
+    let estimate = |docs: usize, tablet_bytes: u64| NetworkEstimate {
+        apply_docs: docs,
+        apply_blobs: BTreeSet::new(),
+        tablet_bytes,
+    };
+    let (quick, fetch) = (Duration::from_secs(1), Duration::from_secs(1));
+    let at_start = |docs, tablet, apply, stopped, fetch| {
+        single_stop_at_start(&limits, &estimate(docs, tablet), apply, stopped, fetch)
+    };
+    // Within every bound (the limits themselves included): kept stopped.
+    assert_eq!(at_start(2, 400, 600, quick, Duration::from_secs(2)), None);
+    // Each bound on its own.
+    assert_eq!(
+        at_start(0, 0, 0, quick, fetch),
+        Some(StartNow::NothingToApply)
+    );
+    assert_eq!(at_start(3, 0, 0, quick, fetch), Some(StartNow::TooLarge));
+    assert_eq!(
+        at_start(1, 401, 600, quick, fetch),
+        Some(StartNow::TooLarge)
+    );
+    assert_eq!(at_start(1, 0, 1001, quick, fetch), Some(StartNow::TooLarge));
+    assert_eq!(
+        at_start(1, u64::MAX, 1, quick, fetch),
+        Some(StartNow::TooLarge)
+    );
+    assert_eq!(
+        at_start(1, 0, 0, quick, Duration::from_millis(2001)),
+        Some(StartNow::SlowOrigin)
+    );
+    assert_eq!(
+        at_start(1, 0, 0, Duration::from_secs(8), fetch),
+        Some(StartNow::Overdue)
+    );
+    // Before staging, against the plan.
+    let at_plan = |docs, bytes, stopped| single_stop_at_plan(&limits, docs, bytes, stopped);
+    assert_eq!(at_plan(2, 1000, quick), None);
+    assert_eq!(at_plan(0, 0, quick), Some(StartNow::NothingToApply));
+    assert_eq!(at_plan(3, 10, quick), Some(StartNow::TooLarge));
+    assert_eq!(at_plan(1, 1001, quick), Some(StartNow::TooLarge));
+    assert_eq!(
+        at_plan(1, 10, Duration::from_secs(9)),
+        Some(StartNow::Overdue)
+    );
+    // Between steps, the budget alone.
+    assert_eq!(
+        single_stop_overdue(&limits, Duration::from_millis(7999)),
+        None
+    );
+    assert_eq!(
+        single_stop_overdue(&limits, Duration::from_secs(8)),
+        Some(StartNow::Overdue)
+    );
+}

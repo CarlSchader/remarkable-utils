@@ -256,6 +256,30 @@ impl DeskParts {
     }
 }
 
+/// What a run on tablet `i`'s computer needs, owned, to run it from
+/// another run's progress hook (another computer acting mid-run).
+pub struct HubParts {
+    pub git: Git,
+    pub cache: PathBuf,
+    pub options: HubOptions,
+    pub tablet: Arc<FakeTablet>,
+}
+
+impl HubParts {
+    /// A sync of that tablet.
+    pub fn sync(self) -> Result<SyncReport> {
+        static PROGRESS: NoProgress = NoProgress;
+        Hub::new(
+            self.git,
+            self.cache,
+            LockRequest::for_this_process("other-host"),
+            &PROGRESS,
+        )
+        .with_options(self.options)
+        .sync(&*self.tablet)
+    }
+}
+
 /// The world (see the module docs).
 pub struct World {
     /// Everything lives here; removed on drop.
@@ -355,6 +379,38 @@ impl World {
             origin: Some(self.origin.clone()),
             ..options
         })
+    }
+
+    /// A hub for tablet `i` that reports progress to `progress`.
+    pub fn hub_with_progress(
+        &self,
+        i: usize,
+        options: HubOptions,
+        progress: &'static dyn libremarkable_utils::progress::Progress,
+    ) -> Hub<'static> {
+        Hub::new(
+            self.git.clone(),
+            self.devices[i].cache.clone(),
+            LockRequest::for_this_process("test-host"),
+            progress,
+        )
+        .with_options(HubOptions {
+            origin: Some(self.origin.clone()),
+            ..options
+        })
+    }
+
+    /// [`HubParts`] for tablet `i`.
+    pub fn hub_parts(&self, i: usize) -> HubParts {
+        HubParts {
+            git: self.git.clone(),
+            cache: self.devices[i].cache.clone(),
+            options: HubOptions {
+                origin: Some(self.origin.clone()),
+                ..self.options.clone()
+            },
+            tablet: Arc::clone(&self.devices[i].tablet),
+        }
     }
 
     /// A hub on a computer that has no tablet (`log`, `restore`, `add`

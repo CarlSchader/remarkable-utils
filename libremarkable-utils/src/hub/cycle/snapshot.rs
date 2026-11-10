@@ -145,6 +145,19 @@ impl TabletRead {
         )
     }
 
+    /// [`Self::doc_files`] with each file's size.
+    pub fn doc_blobs_sized(&self) -> BTreeMap<DocId, BTreeMap<DocFile, (Oid, u64)>> {
+        self.files.values().fold(
+            BTreeMap::new(),
+            |mut docs: BTreeMap<_, BTreeMap<_, _>>, read| {
+                docs.entry(read.file.doc.clone())
+                    .or_default()
+                    .insert(read.file.file.clone(), (read.blob.clone(), read.stat.size));
+                docs
+            },
+        )
+    }
+
     /// Parsed `.metadata`/`.content` per document (unparsable ones left
     /// out), for the view-state overlay.
     pub fn local_json(&self) -> BTreeMap<DocId, LocalJson> {

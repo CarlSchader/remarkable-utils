@@ -132,6 +132,9 @@ pub enum Fault {
     /// The `n`th operation of any kind takes this much longer (a slow
     /// link), whether xochitl runs or not.
     SlowOp(usize, Duration),
+    /// The watchdog fires (as [`FakeTablet::fire_watchdog`]) right before
+    /// the `n`th operation of any kind, whether xochitl runs or not.
+    FireWatchdogBefore(usize),
 }
 
 /// What happens to a mutating operation.
@@ -156,6 +159,7 @@ enum Pending {
     Op(usize, OpFault),
     EditBefore(usize, Edit),
     Slow(usize, Duration),
+    Fire(usize),
 }
 
 /// The armed watchdog: its timeout and the run that armed it.
@@ -217,6 +221,7 @@ impl FakeState {
             }
             Fault::EditBefore(n, edit) => Pending::EditBefore(self.ops + n, edit),
             Fault::SlowOp(n, delay) => Pending::Slow(self.ops + n, delay),
+            Fault::FireWatchdogBefore(n) => Pending::Fire(self.ops + n),
         };
         self.pending.push(pending);
     }
@@ -238,9 +243,20 @@ impl FakeState {
         due.into_iter()
             .filter_map(|pending| match pending {
                 Pending::EditBefore(_, edit) => Some(edit),
-                Pending::Mutation(..) | Pending::Op(..) | Pending::Slow(..) => None,
+                Pending::Mutation(..) | Pending::Op(..) | Pending::Slow(..) | Pending::Fire(..) => {
+                    None
+                }
             })
             .collect()
+    }
+
+    /// Take a watchdog firing planned before operation `op`, if any.
+    fn due_fire(&mut self, op: usize) -> bool {
+        let position = self
+            .pending
+            .iter()
+            .position(|pending| matches!(pending, Pending::Fire(at) if *at == op));
+        position.map(|at| self.pending.remove(at)).is_some()
     }
 
     /// Take the delay planned for operation `op`, if any.
@@ -263,7 +279,10 @@ impl FakeState {
             .position(|pending| matches!(pending, Pending::Op(at, _) if *at == op))?;
         match self.pending.remove(position) {
             Pending::Op(_, fault) => Some(fault),
-            Pending::Mutation(..) | Pending::EditBefore(..) | Pending::Slow(..) => None,
+            Pending::Mutation(..)
+            | Pending::EditBefore(..)
+            | Pending::Slow(..)
+            | Pending::Fire(..) => None,
         }
     }
 
@@ -275,7 +294,9 @@ impl FakeState {
             .position(|pending| matches!(pending, Pending::Mutation(at, _) if *at == n))?;
         match self.pending.remove(position) {
             Pending::Mutation(_, fault) => Some(fault),
-            Pending::Op(..) | Pending::EditBefore(..) | Pending::Slow(..) => None,
+            Pending::Op(..) | Pending::EditBefore(..) | Pending::Slow(..) | Pending::Fire(..) => {
+                None
+            }
         }
     }
 }
@@ -680,6 +701,14 @@ impl FakeTablet {
 
     /// Count the operation, run due edits, apply injected faults.
     fn begin(&self, kind: OpKind) -> Result<Ack> {
+        let fire = {
+            let mut state = self.state();
+            let op = state.ops + 1;
+            state.due_fire(op)
+        };
+        if fire {
+            self.fire_watchdog();
+        }
         let (edits, delay, outcome) = {
             let mut state = self.state();
             state.ops += 1;

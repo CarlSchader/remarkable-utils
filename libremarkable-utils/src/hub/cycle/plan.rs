@@ -1328,6 +1328,81 @@ pub(super) fn network_estimate(
     }
 }
 
+/// Why a sync starts xochitl rather than keep it stopped through step 16.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StartNow {
+    /// Nothing to apply: the network work goes better with the UI up.
+    NothingToApply,
+    /// More to send or apply than a small sync may.
+    TooLarge,
+    /// The budget is spent.
+    Overdue,
+    /// The fetch under the lock took long (a slow origin, or credentials
+    /// prompted for): the later network steps would too.
+    SlowOrigin,
+}
+
+impl std::fmt::Display for StartNow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NothingToApply => "nothing to apply",
+            Self::TooLarge => "more than a small sync",
+            Self::Overdue => "the sync is taking long",
+            Self::SlowOrigin => "origin is slow to answer",
+        })
+    }
+}
+
+/// Step 6: whether a sync keeps xochitl stopped, given the estimate, the
+/// size of its origin blobs (`apply_bytes`), how long xochitl has been
+/// stopped and how long the fetch under the lock took. `None`: keep it
+/// stopped. A fetch that took over a quarter of the budget counts as
+/// slow. Pure.
+pub(super) fn single_stop_at_start(
+    limits: &super::SingleStop,
+    estimate: &NetworkEstimate,
+    apply_bytes: u64,
+    stopped_for: std::time::Duration,
+    fetch_took: std::time::Duration,
+) -> Option<StartNow> {
+    if estimate.apply_docs == 0 {
+        Some(StartNow::NothingToApply)
+    } else if estimate.apply_docs > limits.max_docs
+        || estimate.tablet_bytes.saturating_add(apply_bytes) > limits.max_bytes
+    {
+        Some(StartNow::TooLarge)
+    } else if fetch_took > limits.budget / 4 {
+        Some(StartNow::SlowOrigin)
+    } else {
+        single_stop_overdue(limits, stopped_for)
+    }
+}
+
+/// Before staging: whether a sync that kept xochitl stopped goes on, given
+/// its plan's documents and bytes to stage. Pure.
+pub(super) fn single_stop_at_plan(
+    limits: &super::SingleStop,
+    docs: usize,
+    bytes: u64,
+    stopped_for: std::time::Duration,
+) -> Option<StartNow> {
+    if docs == 0 {
+        Some(StartNow::NothingToApply)
+    } else if docs > limits.max_docs || bytes > limits.max_bytes {
+        Some(StartNow::TooLarge)
+    } else {
+        single_stop_overdue(limits, stopped_for)
+    }
+}
+
+/// Between network steps: whether the budget is spent. Pure.
+pub(super) fn single_stop_overdue(
+    limits: &super::SingleStop,
+    stopped_for: std::time::Duration,
+) -> Option<StartNow> {
+    (stopped_for >= limits.budget).then_some(StartNow::Overdue)
+}
+
 // ---- the manifest --------------------------------------------------------------------
 
 /// What the manifest is recorded from.
