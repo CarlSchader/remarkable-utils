@@ -132,70 +132,14 @@ pub(crate) mod local_ssh {
     use super::*;
     use crate::ssh::{SshOptions, SshSession, shell_quote};
     use std::process::{Child, Command};
-
-    /// Tools the scripts may run; everything else is absent from `PATH`.
-    const TOOLS: &[&str] = &[
-        "sh",
-        "cat",
-        "mkdir",
-        "mv",
-        "rm",
-        "stat",
-        "find",
-        "tar",
-        "sha256sum",
-        "grep",
-        "date",
-        "wc",
-        "sync",
-        "touch",
-        "sleep",
-        "sed",
-        "mktemp",
-        "printf",
-        "chmod",
-        "chown",
-        "head",
-        "flock",
-        "setsid",
-        "kill",
-        "true",
-        "false",
-        "uname",
-        "df",
-    ];
-
-    fn which(tool: &str) -> Option<PathBuf> {
-        std::env::var_os("PATH")
-            .iter()
-            .flat_map(std::env::split_paths)
-            .map(|dir| dir.join(tool))
-            .find(|candidate| candidate.is_file())
-    }
-
-    /// Where the tools come from.
-    #[derive(Clone, Copy)]
-    pub(crate) enum Tools<'a> {
-        /// The host's (GNU) tools.
-        Host,
-        /// BusyBox applets, `sh` included.
-        BusyBox(&'a Path),
-    }
-
-    /// The BusyBox binary from `RMU_TEST_BUSYBOX`, if set.
-    pub(crate) fn busybox() -> Option<PathBuf> {
-        std::env::var_os("RMU_TEST_BUSYBOX").map(PathBuf::from)
-    }
-
-    fn q(path: &Path) -> String {
-        shell_quote(&path.to_string_lossy())
-    }
+    use test_support::tablet::TabletTools;
+    pub(crate) use test_support::tablet::Toolset;
 
     /// Run `check` with the host's tools and, if available, BusyBox.
     pub(crate) fn on_both(systemd_run: bool, check: impl Fn(&SshHarness)) {
-        check(&SshHarness::new(Tools::Host, systemd_run));
-        match busybox() {
-            Some(busybox) => check(&SshHarness::new(Tools::BusyBox(&busybox), systemd_run)),
+        check(&SshHarness::new(&Toolset::Host, systemd_run));
+        match Toolset::busybox() {
+            Some(busybox) => check(&SshHarness::new(&busybox, systemd_run)),
             None => eprintln!("RMU_TEST_BUSYBOX is not set; skipping the BusyBox run"),
         }
     }
@@ -204,93 +148,34 @@ pub(crate) mod local_ssh {
     pub(crate) struct SshHarness {
         tablet: SshTablet,
         root: PathBuf,
-        bin: PathBuf,
-        sys: PathBuf,
+        tools: TabletTools,
         boot_file: PathBuf,
-        /// The real `mv` command (for wrapping it).
-        real_mv: String,
         _scratch: Scratch,
     }
 
     impl SshHarness {
-        /// `systemd_run`: install the `systemd-run` stub (else the sleep
+        /// `systemd_run`: keep the `systemd-run` stub (else the sleep
         /// fallback runs).
-        pub(crate) fn new(tools: Tools<'_>, systemd_run: bool) -> Self {
+        pub(crate) fn new(toolset: &Toolset, systemd_run: bool) -> Self {
             let scratch = Scratch::new("ssh");
             // Hostile directory names: quotes, spaces, `$()`, a newline.
             let root = scratch.0.join("it's a $(dir) `x`");
             let xochitl = root.join("xochitl data");
             let state = root.join("state;dir&\nnext");
-            let bin = scratch.0.join("bin");
-            let sys = scratch.0.join("sys");
-            [&xochitl, &state, &bin, &sys]
+            [&xochitl, &state]
                 .iter()
                 .for_each(|dir| fs::create_dir_all(dir).unwrap());
-            let real_mv = match tools {
-                Tools::Host => {
-                    TOOLS.iter().for_each(|tool| {
-                        if let Some(found) = which(tool) {
-                            std::os::unix::fs::symlink(found, bin.join(tool)).unwrap();
-                        }
-                    });
-                    q(&which("mv").expect("mv"))
-                }
-                Tools::BusyBox(busybox) => {
-                    let output = Command::new(busybox).arg("--list").output().unwrap();
-                    let applets = String::from_utf8(output.stdout).unwrap();
-                    TOOLS
-                        .iter()
-                        .filter(|tool| applets.lines().any(|applet| applet == **tool))
-                        .for_each(|tool| {
-                            std::os::unix::fs::symlink(busybox, bin.join(tool)).unwrap();
-                        });
-                    format!("{} mv", q(busybox))
-                }
-            };
-            test_support::write_script(
-                &bin.join("systemctl"),
-                &format!(
-                    "printf '%s\\n' \"$*\" >> {log}\n\
-                     case \"$*\" in\n\
-                     'stop xochitl.service') rm -f {running} ;;\n\
-                     'start xochitl.service') : > {running} ;;\n\
-                     'is-active xochitl.service') if [ -e {running} ]; then echo active; else echo inactive; exit 3; fi ;;\n\
-                     'is-active --quiet xochitl.service') [ -e {running} ] || exit 3 ;;\n\
-                     'is-active --quiet '*'.timer') u=${{3%.timer}}; [ -e {sys}/watchdog-\"$u\" ] || exit 3 ;;\n\
-                     'stop '*'.timer') u=${{2%.timer}}; rm -f {sys}/watchdog-\"$u\" ;;\n\
-                     esac\n\
-                     exit 0\n",
-                    log = q(&sys.join("systemctl.log")),
-                    running = q(&sys.join("running")),
-                    sys = q(&sys),
-                ),
-            );
-            if systemd_run {
-                test_support::write_script(
-                    &bin.join("systemd-run"),
-                    &format!(
-                        "printf '%s\\n' \"$*\" >> {log}\n\
-                         unit=\n\
-                         while [ $# -gt 0 ]; do case \"$1\" in --unit=*) unit=${{1#--unit=}}; shift ;; --*) shift ;; *) break ;; esac; done\n\
-                         for a do printf '%s\\0' \"$a\"; done > {sys}/watchdog-\"$unit\"\n",
-                        log = q(&sys.join("systemd-run.log")),
-                        sys = q(&sys),
-                    ),
-                );
+            let tools =
+                TabletTools::install(&scratch.0.join("bin"), &scratch.0.join("sys"), toolset);
+            if !systemd_run {
+                fs::remove_file(tools.bin().join("systemd-run")).unwrap();
             }
-            fs::write(sys.join("running"), b"").unwrap();
             let boot_file = root.join("boot id");
             fs::write(&boot_file, format!("{}\n", uuid::Uuid::new_v4())).unwrap();
             let conf = root.join("xochitl.conf");
             fs::write(&conf, "[General]\ndevicetoken=@Invalid()\n").unwrap();
             let ssh = scratch.0.join("ssh");
-            test_support::write_script(
-                &ssh,
-                &format!(
-                    "for cmd do :; done\nPATH={bin}; export PATH\nexec sh -c \"$cmd\"\n",
-                    bin = q(&bin)
-                ),
-            );
+            test_support::write_script(&ssh, &tools.direct_ssh());
             let mut session = SshSession::new(SshOptions {
                 destination: "mock.invalid".into(),
                 multiplex: false,
@@ -307,10 +192,8 @@ pub(crate) mod local_ssh {
             Self {
                 tablet: SshTablet::new(session).with_paths(paths),
                 root,
-                bin,
-                sys,
+                tools,
                 boot_file,
-                real_mv,
                 _scratch: scratch,
             }
         }
@@ -320,31 +203,20 @@ pub(crate) mod local_ssh {
         }
 
         pub(crate) fn systemctl_log(&self) -> String {
-            fs::read_to_string(self.sys.join("systemctl.log")).unwrap_or_default()
+            self.tools.systemctl_log()
         }
 
         pub(crate) fn systemd_run_log(&self) -> String {
-            fs::read_to_string(self.sys.join("systemd-run.log")).unwrap_or_default()
+            self.tools.systemd_run_log()
         }
 
         /// Watchdogs the `systemd-run` stub has armed and not stopped.
         pub(crate) fn armed_units(&self) -> Vec<PathBuf> {
-            let mut units: Vec<PathBuf> = fs::read_dir(&self.sys)
-                .unwrap()
-                .map(|entry| entry.unwrap().path())
-                .filter(|path| {
-                    path.file_name()
-                        .unwrap()
-                        .to_string_lossy()
-                        .starts_with("watchdog-")
-                })
-                .collect();
-            units.sort();
-            units
+            self.tools.armed_units()
         }
 
         pub(crate) fn running(&self) -> bool {
-            self.sys.join("running").exists()
+            self.tools.running()
         }
 
         pub(crate) fn conf(&self) -> PathBuf {
@@ -356,22 +228,22 @@ pub(crate) mod local_ssh {
         }
 
         pub(crate) fn has_tool(&self, tool: &str) -> bool {
-            self.bin.join(tool).exists()
+            self.tools.has_tool(tool)
         }
 
         /// Make the watchdog marker appear right after the next `mv` the
         /// tablet runs (as if the watchdog fired mid-apply).
         pub(crate) fn marker_after_next_move(&self) {
-            let mv = self.bin.join("mv");
-            let trigger = self.sys.join("marker-after-move");
+            let mv = self.tools.bin().join("mv");
+            let trigger = self.tools.sys().join("marker-after-move");
             let _ = fs::remove_file(&mv);
             test_support::write_script(
                 &mv,
                 &format!(
                     "{real} \"$@\" || exit $?\n\
                      if [ -e {trigger} ]; then rm -f {trigger}; true > {marker}; fi\n",
-                    real = self.real_mv,
-                    trigger = q(&trigger),
+                    real = self.tools.real_command("mv"),
+                    trigger = shell_quote(&trigger.to_string_lossy()),
                     marker = shell_quote(&self.tablet.paths().watchdog_marker()),
                 ),
             );
@@ -382,8 +254,8 @@ pub(crate) mod local_ssh {
         /// harness's own tools) until `then` (a shell snippet) finishes.
         /// Returns once the lock is held.
         pub(crate) fn hold_guard_flock(&self, then: &str) -> Child {
-            let held = self.sys.join("flock-held");
-            let child = Command::new(self.bin.join("sh"))
+            let held = self.tools.sys().join("flock-held");
+            let child = Command::new(self.tools.bin().join("sh"))
                 .args([
                     "-c",
                     &format!("exec 9>>\"$1\"; flock 9; : > \"$2\"; {then}"),
@@ -391,7 +263,7 @@ pub(crate) mod local_ssh {
                 ])
                 .arg(self.tablet.paths().guard_flock())
                 .arg(&held)
-                .env("PATH", &self.bin)
+                .env("PATH", self.tools.bin())
                 .spawn()
                 .unwrap();
             let waited = (0..200).any(|_| {
@@ -424,21 +296,7 @@ pub(crate) mod local_ssh {
 
         /// Run the command of the one armed `systemd-run` watchdog.
         fn fire_watchdog(&self) {
-            let units = self.armed_units();
-            assert_eq!(units.len(), 1, "armed watchdogs: {units:?}");
-            let recorded = fs::read(&units[0]).unwrap();
-            fs::remove_file(&units[0]).unwrap();
-            let args: Vec<String> = recorded
-                .split(|&b| b == 0)
-                .filter(|arg| !arg.is_empty())
-                .map(|arg| String::from_utf8(arg.to_vec()).unwrap())
-                .collect();
-            let status = Command::new(&args[0])
-                .args(&args[1..])
-                .env("PATH", &self.bin)
-                .status()
-                .unwrap();
-            assert!(status.success(), "the watchdog's command failed");
+            self.tools.fire_watchdog();
         }
 
         fn reboot(&self) {

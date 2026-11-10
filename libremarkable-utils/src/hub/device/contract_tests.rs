@@ -1065,10 +1065,10 @@ fn fake_builder_seeds_files_state_and_device() {
 
 #[cfg(target_os = "linux")]
 mod ssh_tablet {
-    use super::super::harness::local_ssh::{SshHarness, Tools, busybox, on_both};
+    use super::super::harness::local_ssh::{SshHarness, Toolset, on_both};
     use super::*;
 
-    fn run_contract(tools: Tools<'_>, label: &str) {
+    fn run_contract(tools: &Toolset, label: &str) {
         SCENARIOS.iter().for_each(|(name, scenario)| {
             eprintln!("{label}: {name}");
             let harness = SshHarness::new(tools, true);
@@ -1104,21 +1104,21 @@ mod ssh_tablet {
 
     #[test]
     fn honours_the_contract() {
-        run_contract(Tools::Host, "ssh");
+        run_contract(&Toolset::Host, "ssh");
     }
 
     #[test]
     fn honours_the_contract_on_busybox() {
-        let Some(busybox) = busybox() else {
+        let Some(busybox) = Toolset::busybox() else {
             eprintln!("RMU_TEST_BUSYBOX is not set; skipping the BusyBox contract run");
             return;
         };
-        run_contract(Tools::BusyBox(&busybox), "busybox");
+        run_contract(&busybox, "busybox");
     }
 
     #[test]
     fn rearms_before_removing_the_old_watchdog() {
-        let harness = SshHarness::new(Tools::Host, true);
+        let harness = SshHarness::new(&Toolset::Host, true);
         let t = harness.ssh_tablet();
         let lock = t.acquire_lock(&request(), false).unwrap();
         t.arm_watchdog(&lock, WATCHDOG).unwrap();
@@ -1239,7 +1239,7 @@ mod ssh_tablet {
         // The takeover replaces the record only if its checksum is still
         // the one inspected: a record that changed meanwhile is never
         // overwritten.
-        let harness = SshHarness::new(Tools::Host, true);
+        let harness = SshHarness::new(&Toolset::Host, true);
         let t = harness.ssh_tablet();
         let paths = t.paths().clone();
         let held = t.acquire_lock(&request(), false).unwrap();

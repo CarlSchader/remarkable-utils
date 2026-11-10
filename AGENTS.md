@@ -40,8 +40,8 @@ This repository is **open source** (dual-licensed MIT OR Apache-2.0):
 | `nix/lib/git-hooks.nix` | Pre-commit hooks: treefmt + clippy (offline vendored)  |
 | `libremarkable-utils/`  | Library crate (see module map below)                   |
 | `rmu/`                  | `rmu` CLI binary crate (clap; all config via flags, no config file) |
-| `rmu/src/hub.rs`, `rmu/src/hub/` | `rmu hub` over the library's `Hub`: arguments, `wants_tablet` (`log`, `restore` and `add` skip the tablet with `--origin` unless a flag naming it, `--host` or another SSH flag, is given; `main.rs` records whether one was), `execute` (runs a command on any `&dyn Tablet`, or none for those), exit statuses (`Failure`), `finish` (output and error details); pure `render.rs` (human summary, plain ids) and `json.rs` (`--json`, `"schema": 1`, unstable until device validation: the library's serialised reports plus `schema` and `command`, and the error object). Tests: `hub/tests.rs` (fabricated reports) with `hub/tests/` (`parsing`, `output`, `golden`: one exact JSON per report type and error shape, update them deliberately; `commands`: against the fake tablet), and `rmu/tests/hub_cli.rs` (the real binary over a mock `ssh` that rewrites the tablet's paths into a scratch dir) |
-| `test-support/`         | Unpublished dev-dependency: helpers shared by tests (`Scratch` temp dirs with mock `bin/` + `PATH`, `write_script`, `rerun_test`, `assert_success`, `set_modified`, `pdf`: a fabricated N-page PDF) |
+| `rmu/src/hub.rs`, `rmu/src/hub/` | `rmu hub` over the library's `Hub`: arguments, `wants_tablet` (`log`, `restore` and `add` skip the tablet with `--origin` unless a flag naming it, `--host` or another SSH flag, is given; `main.rs` records whether one was), `execute` (runs a command on any `&dyn Tablet`, or none for those), exit statuses (`Failure`), `finish` (output and error details); pure `render.rs` (human summary, plain ids) and `json.rs` (`--json`, `"schema": 1`, unstable until device validation: the library's serialised reports plus `schema` and `command`, and the error object). Tests: `hub/tests.rs` (fabricated reports) with `hub/tests/` (`parsing`, `output`, `golden`: one exact JSON per report type and error shape, update them deliberately; `commands`: against the fake tablet), and `rmu/tests/hub_cli.rs` (the real binary against a `test_support::tablet::SimulatedTablet`) |
+| `test-support/`         | Unpublished dev-dependency: helpers shared by tests (`Scratch` temp dirs with mock `bin/` + `PATH`, `write_script`, `rerun_test`, `assert_success`, `set_modified`, `pdf`: a fabricated N-page PDF; `tablet`: the one simulated tablet host for tests running rmu's device scripts: curated `TOOLS` from the host or BusyBox (`Toolset`), stub `systemctl`/`systemd-run` (`TabletTools`), and `SimulatedTablet` with `REWRITING_SSH`, a mock `ssh` mapping the tablet's fixed paths into a device dir) |
 | `Cargo.toml`            | Workspace root; shared deps in `[workspace.dependencies]` |
 
 ### `libremarkable-utils` module map
@@ -164,7 +164,8 @@ This repository is **open source** (dual-licensed MIT OR Apache-2.0):
   apply ordering (`device/apply.rs`). Contract scenarios in
   `device/contract_tests.rs` run against both; on Linux the real one
   runs its scripts locally through a mock `ssh` with stub
-  `systemctl`/`systemd-run` and a curated `PATH` (GNU tools, and BusyBox
+  `systemctl`/`systemd-run` and a curated `PATH` (`test_support::tablet`,
+  shared with the `rmu` binary's tests: GNU tools, and BusyBox
   `ash` + applets when `RMU_TEST_BUSYBOX` is set, as the dev shell and
   `nix flake check` do), so tests never reach the host's systemd or a
   tablet. The harnesses (`device/harness.rs`, `#[cfg(test)]`) serve the
@@ -172,14 +173,15 @@ This repository is **open source** (dual-licensed MIT OR Apache-2.0):
   tools, then BusyBox); test what a script does by running it there,
   not by comparing its text (keep the quoting tests); the fake itself
   is public, so the sync cycle's end-to-end tests drive it directly.
-  BusyBox `ash` differs from bash in ways that matter (its `kill` rejects `--`; a failed
-  redirection on a special builtin such as `:` or `exec` exits the
-  shell), which is why scripts are run under both. Keep new device
-  operations in that shape: pure script + parser, thin executor, fake
-  parity, a scenario. `device/probe.rs` is the read-only probe the
-  other rmu commands check the hub lock with (lock, boot id, watchdog
-  marker, attachment; marker-sectioned and never exiting, so it rides
-  along in another script, and judged with the hub's own `decide`).
+  BusyBox `ash` differs from bash in ways that matter (its `kill`
+  rejects `--`; a failed redirection on a special builtin such as `:` or
+  `exec` exits the shell), which is why scripts are run under both. Keep
+  new device operations in that shape: pure script + parser, thin
+  executor, fake parity, a scenario. `device/probe.rs` is the read-only
+  probe the other rmu commands check the hub lock with (lock, boot id,
+  watchdog marker, attachment; marker-sectioned and never exiting, so it
+  rides along in another script, and judged with the hub's own
+  `decide`).
   `hub/cycle.rs` composes all of it into the operations behind
   `rmu hub` (`Hub`: `init`, `clone_tablet` with reattach, `sync`,
   `backup`, `status`, `dry_run`, `remote`, `set_remote_url`, `detach`;
@@ -317,7 +319,9 @@ nix build .#rmu                    # build the CLI via crane
   another thread spawns makes exec fail with "Text file busy".
   `test_support::Scratch` (`mock_command` + `mock_path`) does this for
   the usual scratch-dir-with-`bin/` layout; reuse it and the other
-  `test-support` helpers instead of adding per-file fixture copies.
+  `test-support` helpers instead of adding per-file fixture copies. A
+  test that runs device scripts uses `test_support::tablet` (its tool
+  list, stubs and mock `ssh`), never a copy of them.
 
 ## Testing against real devices
 

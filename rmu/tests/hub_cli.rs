@@ -1,12 +1,11 @@
 //! `rmu hub` end to end: the real binary against a local bare origin and
-//! a "tablet" that is a scratch directory behind a mock `ssh`. The mock
-//! runs every remote command locally with a curated `PATH` (the host's
-//! tools plus stub `systemctl`/`systemd-run`, so nothing reaches the
-//! host's systemd) and rewrites the tablet's fixed paths (`/home/root/…`,
-//! the boot id, model and firmware files) into the scratch directory.
-//! Scripts arrive on stdin (`sh -s`) and are rewritten there; other
-//! commands are rewritten on the command line, leaving their stdin
-//! (tar streams, state files) untouched. With `RMU_TEST_BUSYBOX` set (as
+//! a simulated tablet (`test_support::tablet::SimulatedTablet`): a
+//! scratch directory behind a mock `ssh` that runs every remote command
+//! locally with a curated `PATH` (the host's tools plus stub
+//! `systemctl`/`systemd-run`, so nothing reaches the host's systemd),
+//! after rewriting the tablet's fixed paths (`/home/root/…`, the boot id,
+//! model and firmware files) into the scratch directory. With
+//! `RMU_TEST_BUSYBOX` set (as
 //! in the dev shell and `nix flake check`), every scenario also runs with
 //! BusyBox applets and `ash`, as on a tablet. Git is hermetic. Every name
 //! and id is fabricated.
@@ -17,164 +16,29 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use serde_json::{Value, json};
+use test_support::tablet::{REWRITING_SSH, SimulatedTablet, Toolset};
 use test_support::{Scratch, assert_success};
-
-/// Tools the tablet scripts may run (as in the library's device tests).
-const TOOLS: &[&str] = &[
-    "sh",
-    "cat",
-    "mkdir",
-    "mv",
-    "rm",
-    "stat",
-    "find",
-    "tar",
-    "sha256sum",
-    "grep",
-    "date",
-    "wc",
-    "sync",
-    "touch",
-    "sleep",
-    "sed",
-    "mktemp",
-    "printf",
-    "chmod",
-    "chown",
-    "head",
-    "flock",
-    "setsid",
-    "kill",
-    "true",
-    "false",
-    "uname",
-    "df",
-];
-
-const MOCK_SSH: &str = r#"while [ "$#" -gt 0 ] && [ "$1" != -- ]; do shift; done
-[ "$#" -ge 3 ] || { echo "mock ssh: unexpected arguments" >&2; exit 90; }
-shift 2
-PATH=$MOCK_TOOLS
-export PATH
-# The scratch directory, escaped for a sed replacement.
-dev=$(printf '%s\n' "$MOCK_DEVICE" | sed 's/[\\&#]/\\&/g')
-rewrite() {
-    sed -e "s#/home/root/#$dev/home/root/#g" \
-        -e "s#/proc/sys/kernel/random/boot_id#$dev/boot_id#g" \
-        -e "s#/sys/devices/soc0/machine#$dev/machine#g" \
-        -e "s#/proc/device-tree/#$dev/device-tree/#g" \
-        -e "s#/etc/os-release#$dev/os-release#g" \
-        -e "s#/etc/version#$dev/version#g" \
-        -e "s#/usr/share/remarkable/#$dev/usr-share/#g"
-}
-command=$(printf '%s\n' "$1" | rewrite)
-printf '%s\n' "$command" | head -n 1 >> "$MOCK_DEVICE/ssh.log"
-if [ "$command" = "sh -s" ]; then
-    rewrite | sh -s
-    exit $?
-fi
-exec sh -c "$command"
-"#;
-
-fn which(tool: &str) -> Option<PathBuf> {
-    std::env::var_os("PATH")
-        .iter()
-        .flat_map(std::env::split_paths)
-        .map(|dir| dir.join(tool))
-        .find(|candidate| candidate.is_file())
-}
-
-/// Where the tablet's tools come from: the host, or BusyBox.
-fn tool_sets() -> Vec<Option<PathBuf>> {
-    std::iter::once(None)
-        .chain(std::env::var_os("RMU_TEST_BUSYBOX").map(|busybox| Some(PathBuf::from(busybox))))
-        .collect()
-}
 
 struct World {
     scratch: Scratch,
+    tablet: SimulatedTablet,
 }
 
 impl World {
-    fn new(busybox: Option<&Path>) -> Self {
+    fn new(toolset: &Toolset) -> Self {
         let scratch = Scratch::new("hub-cli");
-        let device = scratch.join("device");
-        let tools = scratch.join("tools");
-        [
-            device.join("home/root/.local/share/remarkable/xochitl"),
-            device.join("home/root/.local/share/rmu"),
-            device.join("home/root/.config/remarkable"),
-            tools.clone(),
-            scratch.join("home"),
-        ]
-        .iter()
-        .for_each(|dir| fs::create_dir_all(dir).unwrap());
-        match busybox {
-            None => TOOLS.iter().for_each(|tool| {
-                let found = which(tool).unwrap_or_else(|| panic!("{tool} is not on PATH"));
-                std::os::unix::fs::symlink(found, tools.join(tool)).unwrap();
-            }),
-            Some(busybox) => {
-                let applets = Command::new(busybox).arg("--list").output().unwrap();
-                let applets = String::from_utf8(applets.stdout).unwrap();
-                TOOLS
-                    .iter()
-                    .filter(|tool| applets.lines().any(|applet| applet == **tool))
-                    .for_each(|tool| {
-                        std::os::unix::fs::symlink(busybox, tools.join(tool)).unwrap()
-                    });
-            }
-        }
-        let sys = device.join("sys");
-        fs::create_dir_all(&sys).unwrap();
-        let sys = sys.display().to_string();
-        test_support::write_script(
-            &tools.join("systemctl"),
-            &format!(
-                "printf '%s\\n' \"$*\" >> '{sys}/systemctl.log'\n\
-                 case \"$*\" in\n\
-                 'stop xochitl.service') rm -f '{sys}/running' ;;\n\
-                 'start xochitl.service') : > '{sys}/running' ;;\n\
-                 'is-active xochitl.service'|'is-active xochitl') if [ -e '{sys}/running' ]; then echo active; else echo inactive; exit 3; fi ;;\n\
-                 'is-active --quiet xochitl.service') [ -e '{sys}/running' ] || exit 3 ;;\n\
-                 'is-active --quiet '*'.timer') u=${{3%.timer}}; [ -e '{sys}'/watchdog-\"$u\" ] || exit 3 ;;\n\
-                 'stop '*'.timer') u=${{2%.timer}}; rm -f '{sys}'/watchdog-\"$u\" ;;\n\
-                 esac\n\
-                 exit 0\n"
-            ),
-        );
-        test_support::write_script(
-            &tools.join("systemd-run"),
-            &format!(
-                "unit=\n\
-                 while [ $# -gt 0 ]; do case \"$1\" in --unit=*) unit=${{1#--unit=}}; shift ;; --*) shift ;; *) break ;; esac; done\n\
-                 : > '{sys}'/watchdog-\"$unit\"\n"
-            ),
-        );
-        fs::write(device.join("sys/running"), b"").unwrap();
-        fs::write(
-            device.join("boot_id"),
-            "0f0e0d0c-0000-4000-8000-0000000000b1\n",
-        )
-        .unwrap();
-        fs::write(device.join("machine"), "reMarkable Fake\n").unwrap();
-        fs::write(device.join("os-release"), "IMG_VERSION=\"3.28.0\"\n").unwrap();
-        fs::write(
-            device.join("home/root/.config/remarkable/xochitl.conf"),
-            "[General]\ndevicetoken=\n",
-        )
-        .unwrap();
-        scratch.mock_command("ssh", MOCK_SSH);
-        Self { scratch }
+        fs::create_dir_all(scratch.join("home")).unwrap();
+        let tablet = SimulatedTablet::new(&scratch.join("device"), toolset);
+        scratch.mock_command("ssh", REWRITING_SSH);
+        Self { scratch, tablet }
     }
 
     fn device(&self) -> PathBuf {
-        self.scratch.join("device")
+        self.tablet.device().to_path_buf()
     }
 
     fn xochitl(&self) -> PathBuf {
-        self.device()
-            .join("home/root/.local/share/remarkable/xochitl")
+        self.tablet.xochitl()
     }
 
     fn origin(&self) -> String {
@@ -216,7 +80,6 @@ impl World {
         command
             .current_dir(dir)
             .env("PATH", self.scratch.mock_path())
-            .env("MOCK_TOOLS", self.scratch.join("tools"))
             .env("MOCK_DEVICE", self.device())
             .env("HOME", self.scratch.join("home"))
             .env("XDG_CONFIG_HOME", self.scratch.join("home"))
@@ -263,11 +126,11 @@ impl World {
     }
 
     fn ssh_log(&self) -> String {
-        fs::read_to_string(self.device().join("ssh.log")).unwrap_or_default()
+        self.tablet.ssh_log()
     }
 
     fn running(&self) -> bool {
-        self.device().join("sys/running").exists()
+        self.tablet.tools().running()
     }
 }
 
@@ -296,13 +159,11 @@ fn stderr(output: &Output) -> String {
 
 #[test]
 fn every_command_over_ssh() {
-    tool_sets()
-        .iter()
-        .for_each(|busybox| every_command(busybox.as_deref()));
+    Toolset::all().iter().for_each(every_command);
 }
 
-fn every_command(busybox: Option<&Path>) {
-    let world = World::new(busybox);
+fn every_command(toolset: &Toolset) {
+    let world = World::new(toolset);
     let origin = world.origin();
     let first = world.put_pdf(1, "Paper one");
 
@@ -422,16 +283,14 @@ fn every_command(busybox: Option<&Path>) {
 
 #[test]
 fn history_commands_over_ssh() {
-    tool_sets()
-        .iter()
-        .for_each(|busybox| history_commands(busybox.as_deref()));
+    Toolset::all().iter().for_each(history_commands);
 }
 
 /// `log`, `restore` and `add`: with `--origin` alone the tablet is never
 /// contacted; without it, it supplies its stored origin; with `--host`
 /// as well, it is the commit's author.
-fn history_commands(busybox: Option<&Path>) {
-    let world = World::new(busybox);
+fn history_commands(toolset: &Toolset) {
+    let world = World::new(toolset);
     let origin = world.origin();
     let paper = world.put_pdf(1, "Paper one");
     assert_success(&world.rmu(&["init", &origin]));
@@ -484,13 +343,11 @@ fn history_commands(busybox: Option<&Path>) {
 
 #[test]
 fn exit_codes_over_ssh() {
-    tool_sets()
-        .iter()
-        .for_each(|busybox| exit_codes(busybox.as_deref()));
+    Toolset::all().iter().for_each(exit_codes);
 }
 
-fn exit_codes(busybox: Option<&Path>) {
-    let world = World::new(busybox);
+fn exit_codes(toolset: &Toolset) {
+    let world = World::new(toolset);
     let origin = world.origin();
     world.put_pdf(1, "Paper one");
     assert_eq!(code(&world.rmu(&["sync", "--dry-run", "--break-lock"])), 2);
@@ -552,14 +409,12 @@ fn exit_codes(busybox: Option<&Path>) {
 
 #[test]
 fn a_custom_xochitl_dir_over_ssh() {
-    tool_sets()
-        .iter()
-        .for_each(|busybox| custom_xochitl_dir(busybox.as_deref()));
+    Toolset::all().iter().for_each(custom_xochitl_dir);
 }
 
 /// `--xochitl-dir` reaches every tablet script (the default stays empty).
-fn custom_xochitl_dir(busybox: Option<&Path>) {
-    let world = World::new(busybox);
+fn custom_xochitl_dir(toolset: &Toolset) {
+    let world = World::new(toolset);
     let origin = world.origin();
     let custom = world.device().join("custom xochitl");
     fs::create_dir_all(&custom).unwrap();

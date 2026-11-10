@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::SystemTime;
 
+pub mod tablet;
+
 /// A uniquely named directory under the system temporary directory,
 /// removed together with its contents on drop.
 pub struct Scratch(PathBuf);
@@ -41,10 +43,17 @@ impl Scratch {
     /// [mock commands](Self::mock_command) shadow the real ones. Pass it to
     /// child processes only; tests never change their own environment.
     pub fn mock_path(&self) -> OsString {
-        let path = std::env::var_os("PATH").unwrap_or_default();
-        std::env::join_paths(std::iter::once(self.join("bin")).chain(std::env::split_paths(&path)))
-            .unwrap()
+        path_with_first(self.join("bin"), std::env::var_os("PATH"))
     }
+}
+
+/// `PATH` for a child process with `first` ahead of `path` (this
+/// process's `PATH` in [`Scratch::mock_path`]). An unset or empty
+/// `path` adds nothing: an empty entry would mean the current directory.
+fn path_with_first(first: PathBuf, path: Option<OsString>) -> OsString {
+    let rest = path.filter(|path| !path.is_empty());
+    std::env::join_paths(std::iter::once(first).chain(rest.iter().flat_map(std::env::split_paths)))
+        .unwrap()
 }
 
 impl Drop for Scratch {
@@ -170,4 +179,128 @@ pub fn pdf(pages: usize) -> Vec<u8> {
         .as_bytes(),
     );
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    use super::*;
+
+    fn os(text: &str) -> Option<OsString> {
+        Some(OsString::from(text))
+    }
+
+    #[test]
+    fn mock_path_puts_bin_first_and_keeps_the_rest_in_order() {
+        let bin = PathBuf::from("/mock/bin");
+        assert_eq!(
+            path_with_first(bin.clone(), os("/usr/bin:/bin")),
+            "/mock/bin:/usr/bin:/bin"
+        );
+        // Empty entries inside a PATH are the caller's, kept as they were.
+        assert_eq!(
+            path_with_first(bin.clone(), os("/a::/b")),
+            "/mock/bin:/a::/b"
+        );
+        let scratch = Scratch::new("mock-path");
+        let path = scratch.mock_path();
+        assert_eq!(
+            std::env::split_paths(&path).next(),
+            Some(scratch.join("bin"))
+        );
+    }
+
+    #[test]
+    fn mock_path_adds_no_empty_entry_for_an_empty_path() {
+        // An empty entry would put the current directory on the PATH.
+        let bin = PathBuf::from("/mock/bin");
+        assert_eq!(path_with_first(bin.clone(), os("")), "/mock/bin");
+        assert_eq!(path_with_first(bin, None), "/mock/bin");
+    }
+
+    fn running_as_root() -> bool {
+        let scratch = Scratch::new("uid");
+        fs::write(scratch.join("probe"), b"").unwrap();
+        fs::metadata(scratch.join("probe")).unwrap().uid() == 0
+    }
+
+    /// A scratch dir its owner cannot empty: a file in a read-only
+    /// subdirectory. Returns the dir's path and the subdirectory.
+    fn undeletable() -> (Scratch, PathBuf) {
+        let scratch = Scratch::new("undeletable");
+        let locked = scratch.join("locked");
+        fs::create_dir(&locked).unwrap();
+        fs::write(locked.join("file"), b"").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o500)).unwrap();
+        (scratch, locked)
+    }
+
+    fn clean_up(path: &Path, locked: &Path) {
+        fs::set_permissions(locked, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn scratch_dirs_are_removed_on_drop() {
+        let scratch = Scratch::new("drop");
+        fs::create_dir_all(scratch.join("a/b")).unwrap();
+        fs::write(scratch.join("a/b/c"), b"x").unwrap();
+        let path = scratch.path().to_path_buf();
+        assert!(path.starts_with(std::env::temp_dir()));
+        drop(scratch);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_failed_cleanup_panics_but_never_during_another_panic() {
+        if running_as_root() {
+            eprintln!("running as root: permissions do not stop removal; skipping");
+            return;
+        }
+        let (scratch, locked) = undeletable();
+        let path = scratch.path().to_path_buf();
+        let error = catch_unwind(AssertUnwindSafe(|| drop(scratch))).unwrap_err();
+        let message = error.downcast_ref::<String>().unwrap();
+        assert!(message.starts_with("failed to remove"), "{message}");
+        clean_up(&path, &locked);
+        // Unwinding from another panic: that panic is what comes out.
+        let (scratch, locked) = undeletable();
+        let path = scratch.path().to_path_buf();
+        let error = catch_unwind(AssertUnwindSafe(|| {
+            let _scratch = scratch;
+            panic!("the original failure");
+        }))
+        .unwrap_err();
+        assert_eq!(error.downcast_ref::<&str>(), Some(&"the original failure"));
+        clean_up(&path, &locked);
+    }
+
+    #[test]
+    fn scripts_are_executable_and_replaced_whole() {
+        let scratch = Scratch::new("script");
+        scratch.mock_command("hello", "echo one\n");
+        let run = || Command::new(scratch.join("bin/hello")).output().unwrap();
+        assert_eq!(run().stdout, b"one\n");
+        scratch.mock_command("hello", "echo two\n");
+        assert_eq!(run().stdout, b"two\n");
+        let mode = fs::metadata(scratch.join("bin/hello"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700);
+        // No temporary siblings are left behind.
+        assert_eq!(fs::read_dir(scratch.join("bin")).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn modification_times_are_set() {
+        let scratch = Scratch::new("mtime");
+        let file = scratch.join("f");
+        fs::write(&file, b"").unwrap();
+        let time = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        set_modified(&file, time);
+        assert_eq!(fs::metadata(&file).unwrap().modified().unwrap(), time);
+    }
 }
