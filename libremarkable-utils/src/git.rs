@@ -118,6 +118,16 @@ impl ObjectFormat {
             Self::Sha256 => "sha256",
         }
     }
+
+    /// The id of the empty tree, which git treats as always present.
+    pub fn empty_tree(self) -> Oid {
+        Oid(match self {
+            Self::Sha1 => "4b825dc642cb6eb9a060e54bf8d69288fbee4904".to_string(),
+            Self::Sha256 => {
+                "6ef19b41225c5369f1c104d45d8d85efa9b057b53b14b4b9b939dd74decc5321".to_string()
+            }
+        })
+    }
 }
 
 impl FromStr for Oid {
@@ -242,8 +252,8 @@ pub struct CommitParents {
     pub parents: Vec<Oid>,
 }
 
-/// One entry of a raw diff ([`Repo::first_parent_changes`]). An absent
-/// side has mode 0 and the all-zero id.
+/// One entry of a raw diff ([`Repo::tree_diffs`]). An absent side has
+/// mode 0 and the all-zero id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawChange {
     pub old_mode: u32,
@@ -255,7 +265,11 @@ pub struct RawChange {
     pub path: Vec<u8>,
 }
 
-/// What one commit changed ([`Repo::first_parent_changes`]).
+/// One pair of trees and the entries that differ between them
+/// ([`parse_tree_diffs`]).
+pub type TreeDiff = ((Oid, Oid), Vec<RawChange>);
+
+/// What one commit changed against its first parent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitChanges {
     pub commit: Oid,
@@ -688,51 +702,76 @@ impl Repo {
         parse_rev_list_parents(&run("rev-list", &mut cmd)?)
     }
 
-    /// What each of `commits` changed below `paths` against its first
-    /// parent (a root commit: against the empty tree), trees included
-    /// (`diff-tree --stdin -t --root`), in one process. Commits that
-    /// changed nothing there are left out.
-    pub fn first_parent_changes(
-        &self,
-        commits: &[CommitParents],
-        paths: &[&str],
-    ) -> Result<Vec<CommitChanges>> {
-        if let Some(bad) = paths.iter().find(|path| {
-            path.is_empty() || path.starts_with('-') || path.contains(char::is_control)
-        }) {
-            return Err(Error::InvalidGitInput(format!("invalid path {bad:?}")));
-        }
-        let request: Vec<u8> = commits
+    /// The object each of `names` (`<commit>:<path>` and the like) names,
+    /// in order, by one `cat-file --batch-check`: `None` where it names
+    /// nothing.
+    pub fn resolve(&self, names: &[String]) -> Result<Vec<Option<(Oid, ObjectKind)>>> {
+        if let Some(bad) = names
             .iter()
-            .flat_map(|entry| match entry.parents.first() {
-                Some(parent) => format!("{} {parent}\n", entry.commit).into_bytes(),
-                None => format!("{}\n", entry.commit).into_bytes(),
-            })
+            .find(|name| name.is_empty() || name.contains(char::is_control))
+        {
+            return Err(Error::InvalidGitInput(format!(
+                "invalid object name {bad:?}"
+            )));
+        }
+        let request: Vec<u8> = names
+            .iter()
+            .flat_map(|name| format!("{name}\n").into_bytes())
             .collect();
-        if request.is_empty() {
+        let found: Vec<Option<(Oid, ObjectKind)>> = self
+            .piped("cat-file", &["--batch-check"], request)?
+            .split_inclusive(|&b| b == b'\n')
+            .map(|line| {
+                parse_batch_header(line).map(|header| match header {
+                    BatchHeader::Found { oid, kind, .. } => Some((oid, kind)),
+                    BatchHeader::Missing(_) => None,
+                })
+            })
+            .collect::<Result<_>>()?;
+        if found.len() != names.len() {
+            return Err(output_error("cat-file", "not one reply per requested name"));
+        }
+        Ok(found)
+    }
+
+    /// The top-level entries that differ between each pair of trees, in
+    /// order (no recursion: a subtree that changed is one entry), by one
+    /// `diff-tree --stdin` process. Every pair must come back: one
+    /// diff-tree skipped (it reports a bad input line without failing)
+    /// would read as unchanged.
+    pub fn tree_diffs(&self, pairs: &[(Oid, Oid)]) -> Result<Vec<Vec<RawChange>>> {
+        if pairs.is_empty() {
             return Ok(Vec::new());
         }
-        let mut cmd = self.command("diff-tree");
-        cmd.args([
-            "--stdin",
-            "--always",
-            "-t",
-            "--root",
-            "--no-renames",
-            "-z",
-            "--",
-        ])
-        .args(paths);
-        let mut process = Process::spawn("diff-tree", &mut cmd)?;
+        let request: Vec<u8> = pairs
+            .iter()
+            .flat_map(|(old, new)| format!("{old} {new}\n").into_bytes())
+            .collect();
+        let out = self.piped("diff-tree", &["--stdin", "--no-renames", "-z"], request)?;
+        let parsed = parse_tree_diffs(&out)?;
+        if !parsed.iter().map(|(pair, _)| pair).eq(pairs.iter()) {
+            return Err(output_error(
+                "diff-tree",
+                "the output does not list every requested pair",
+            ));
+        }
+        Ok(parsed.into_iter().map(|(_, changes)| changes).collect())
+    }
+
+    /// Run `git <subcommand> <args>` with `request` on its standard input
+    /// (fed from a thread: the output could fill its pipe while the
+    /// request is still being written) and return its output.
+    fn piped(&self, subcommand: &'static str, args: &[&str], request: Vec<u8>) -> Result<Vec<u8>> {
+        let mut cmd = self.command(subcommand);
+        cmd.args(args);
+        let mut process = Process::spawn(subcommand, &mut cmd)?;
         let mut stdin = process.child.stdin.take().expect("stdin was piped");
         let mut stdout = process.child.stdout.take().expect("stdout was piped");
-        // As in `object_sizes`: the output could fill its pipe while the
-        // request is still being written.
         let (written, out) = thread::scope(|scope| {
             let writer = scope.spawn(move || stdin.write_all(&request));
             let mut out = Vec::new();
             let read = stdout.read_to_end(&mut out);
-            // A failed read must not leave diff-tree blocked on a full
+            // A failed read must not leave the process blocked on a full
             // pipe while the writer waits on it.
             drop(stdout);
             (
@@ -746,23 +785,7 @@ impl Repo {
         match (written, out, status) {
             (_, _, Err(error)) => Err(error),
             (Err(error), _, _) | (_, Err(error), _) => Err(error.into()),
-            (Ok(()), Ok(out), Ok(_)) => {
-                // `--always` lists every commit, changes or not: one that
-                // is missing was skipped (diff-tree reports a bad input
-                // line without failing), and would read as unchanged.
-                let parsed = parse_diff_tree(&out)?;
-                let listed = parsed.iter().map(|entry| &entry.commit);
-                if !listed.eq(commits.iter().map(|entry| &entry.commit)) {
-                    return Err(output_error(
-                        "diff-tree",
-                        "the output does not list every requested commit",
-                    ));
-                }
-                Ok(parsed
-                    .into_iter()
-                    .filter(|entry| !entry.changes.is_empty())
-                    .collect())
-            }
+            (Ok(()), Ok(out), Ok(_)) => Ok(out),
         }
     }
 
@@ -780,30 +803,7 @@ impl Repo {
         if request.is_empty() {
             return Ok(HashMap::new());
         }
-        let mut cmd = self.command("cat-file");
-        cmd.arg("--batch-check");
-        let mut process = Process::spawn("cat-file", &mut cmd)?;
-        let mut stdin = process.child.stdin.take().expect("stdin was piped");
-        let mut stdout = process.child.stdout.take().expect("stdout was piped");
-        // Feed the request from a thread: the replies could otherwise fill
-        // the pipe while the request is still being written.
-        let (written, out) = thread::scope(|scope| {
-            let writer = scope.spawn(move || stdin.write_all(&request));
-            let mut out = Vec::new();
-            let read = stdout.read_to_end(&mut out);
-            (
-                writer
-                    .join()
-                    .unwrap_or_else(|_| Err(io::Error::other("writer panicked"))),
-                read.map(|_| out),
-            )
-        });
-        let status = process.wait_checked();
-        let out = match (written, out, status) {
-            (_, _, Err(error)) => return Err(error),
-            (Err(error), _, _) | (_, Err(error), _) => return Err(error.into()),
-            (Ok(()), Ok(out), Ok(_)) => out,
-        };
+        let out = self.piped("cat-file", &["--batch-check"], request)?;
         out.split_inclusive(|&b| b == b'\n')
             .map(parse_batch_header)
             .filter_map(|header| match header {
@@ -1474,53 +1474,59 @@ pub fn parse_rev_list_parents(out: &[u8]) -> Result<Vec<CommitParents>> {
         .collect()
 }
 
-/// Parse `diff-tree --stdin -z` raw output: a commit id, then its
-/// entries (`:<old mode> <new mode> <old id> <new id> <status>`, then the
-/// path), each NUL-terminated.
-pub fn parse_diff_tree(out: &[u8]) -> Result<Vec<CommitChanges>> {
+/// Parse `diff-tree --stdin -z` output for tree pairs: per pair, a
+/// `<old> <new>` line (newline-terminated), then its entries
+/// (`:<old mode> <new mode> <old id> <new id> <status>`, then the path,
+/// each NUL-terminated; a path may hold any byte but NUL).
+pub fn parse_tree_diffs(out: &[u8]) -> Result<Vec<TreeDiff>> {
     let malformed = |what: &[u8]| {
         output_error(
             "diff-tree",
             format!("malformed output {:?}", String::from_utf8_lossy(what)),
         )
     };
-    // The field after an entry header is its path, whatever it holds.
-    let (commits, pending) = out
-        .split(|&b| b == 0)
-        .filter(|field| !field.is_empty())
-        .try_fold(
-            (Vec::<CommitChanges>::new(), None::<&[u8]>),
-            |(mut commits, pending), field| -> Result<_> {
-                match (pending, field.strip_prefix(b":")) {
-                    (Some(header), _) => {
-                        let change =
-                            parse_raw_change(header, field).ok_or_else(|| malformed(header))?;
-                        commits
-                            .last_mut()
-                            .ok_or_else(|| malformed(header))?
-                            .changes
-                            .push(change);
-                        Ok((commits, None))
-                    }
-                    (None, Some(header)) => Ok((commits, Some(header))),
-                    (None, None) => {
-                        let commit = std::str::from_utf8(field)
-                            .ok()
-                            .and_then(|id| id.parse().ok())
-                            .ok_or_else(|| malformed(field))?;
-                        commits.push(CommitChanges {
-                            commit,
-                            changes: Vec::new(),
-                        });
-                        Ok((commits, None))
-                    }
-                }
-            },
-        )?;
-    match pending {
-        Some(header) => Err(malformed(header)),
-        None => Ok(commits),
-    }
+    // Split off everything up to `end`, which must be there.
+    let take = |rest: &mut &[u8], end: u8| -> Result<Vec<u8>> {
+        let at = rest
+            .iter()
+            .position(|&b| b == end)
+            .ok_or_else(|| malformed(rest))?;
+        let field = rest[..at].to_vec();
+        *rest = &rest[at + 1..];
+        Ok(field)
+    };
+    // One item: a pair's header line, or an entry of the pair before it.
+    let next = |rest: &mut &[u8]| -> Result<std::result::Result<(Oid, Oid), RawChange>> {
+        if rest.first() == Some(&b':') {
+            let header = take(rest, 0)?;
+            let path = take(rest, 0)?;
+            let change = parse_raw_change(&header[1..], &path).ok_or_else(|| malformed(&header))?;
+            Ok(Err(change))
+        } else {
+            let line = take(rest, b'\n')?;
+            let pair = std::str::from_utf8(&line)
+                .ok()
+                .and_then(|line| line.split_once(' '))
+                .and_then(|(old, new)| Some((old.parse().ok()?, new.parse().ok()?)))
+                .ok_or_else(|| malformed(&line))?;
+            Ok(Ok(pair))
+        }
+    };
+    let mut rest = out;
+    std::iter::from_fn(|| (!rest.is_empty()).then(|| next(&mut rest))).try_fold(
+        Vec::new(),
+        |mut pairs: Vec<TreeDiff>, item| {
+            match item? {
+                Ok(pair) => pairs.push((pair, Vec::new())),
+                Err(change) => pairs
+                    .last_mut()
+                    .ok_or_else(|| malformed(&change.path))?
+                    .1
+                    .push(change),
+            }
+            Ok(pairs)
+        },
+    )
 }
 
 fn parse_raw_change(header: &[u8], path: &[u8]) -> Option<RawChange> {
@@ -2577,38 +2583,40 @@ mod tests {
     }
 
     #[test]
-    fn diff_tree_output() {
-        let (c1, c2) = ("1".repeat(40), "2".repeat(40));
+    fn tree_diff_output() {
+        let (t1, t2, t3) = ("1".repeat(40), "2".repeat(40), "3".repeat(40));
         let (zero, x, y) = ("0".repeat(40), "a".repeat(40), "b".repeat(40));
         let out = [
-            format!("{c1}\0:000000 040000 {zero} {x} A\0docs/d\0"),
-            format!(":100644 100644 {x} {y} M\0:odd path\0"),
-            format!("{c2}\0:040000 000000 {x} {zero} D\0docs/d\0"),
+            format!("{t1} {t2}\n:000000 040000 {zero} {x} A\0d1\0"),
+            format!(":040000 040000 {x} {y} M\0odd\nname\0"),
+            format!("{t2} {t2}\n"),
+            format!("{t2} {t3}\n:040000 000000 {x} {zero} D\0d1\0"),
         ]
         .concat();
-        let parsed = parse_diff_tree(out.as_bytes()).unwrap();
-        assert_eq!(parsed.len(), 2);
-        assert_eq!(parsed[0].commit.as_str(), c1);
-        assert_eq!(parsed[0].changes.len(), 2);
-        let added = &parsed[0].changes[0];
+        let parsed = parse_tree_diffs(out.as_bytes()).unwrap();
+        assert_eq!(parsed.len(), 3);
+        let ((old, new), changes) = &parsed[0];
+        assert_eq!((old.as_str(), new.as_str()), (t1.as_str(), t2.as_str()));
+        assert_eq!(changes.len(), 2);
         assert_eq!(
-            (added.old_mode, added.new_mode, added.status),
+            (changes[0].old_mode, changes[0].new_mode, changes[0].status),
             (0, 0o040000, b'A')
         );
-        assert_eq!(added.new.as_str(), x);
-        // A path is taken verbatim, even one starting with a colon.
-        assert_eq!(parsed[0].changes[1].path, b":odd path");
-        assert_eq!(parsed[1].changes[0].status, b'D');
-        assert!(parse_diff_tree(b"").unwrap().is_empty());
-        // An entry before any commit, a header without its path, a bad
-        // mode or status.
+        // A path is taken verbatim, newlines included.
+        assert_eq!(changes[1].path, b"odd\nname");
+        assert!(parsed[1].1.is_empty());
+        assert_eq!(parsed[2].1[0].status, b'D');
+        assert!(parse_tree_diffs(b"").unwrap().is_empty());
+        // An entry before any pair, a header without its path, a bad mode
+        // or status, a header line that is not a pair.
         [
-            format!(":000000 040000 {zero} {x} A\0docs/d\0"),
-            format!("{c1}\0:000000 040000 {zero} {x} A\0"),
-            format!("{c1}\0:+00000 040000 {zero} {x} A\0p\0"),
-            format!("{c1}\0:000000 040000 {zero} {x} a\0p\0"),
+            format!(":000000 040000 {zero} {x} A\0d1\0"),
+            format!("{t1} {t2}\n:000000 040000 {zero} {x} A\0"),
+            format!("{t1} {t2}\n:+00000 040000 {zero} {x} A\0p\0"),
+            format!("{t1} {t2}\n:000000 040000 {zero} {x} a\0p\0"),
+            format!("{t1}\n"),
         ]
         .iter()
-        .for_each(|bad| assert!(parse_diff_tree(bad.as_bytes()).is_err(), "{bad:?}"));
+        .for_each(|bad| assert!(parse_tree_diffs(bad.as_bytes()).is_err(), "{bad:?}"));
     }
 }

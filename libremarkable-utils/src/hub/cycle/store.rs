@@ -32,7 +32,8 @@ use super::history::HistoryIndex;
 use super::plan::JsonBlobs;
 use crate::error::{Error, Result};
 use crate::git::{
-    self, CatFile, CommitObject, Expected, Git, ObjectFormat, ObjectKind, Oid, Repo, TreeEntry,
+    self, CatFile, CommitChanges, CommitObject, Expected, Git, ObjectFormat, ObjectKind, Oid,
+    RawChange, Repo, TreeEntry,
 };
 use crate::hub::merge::{BlobSource, History};
 use crate::hub::model::{
@@ -665,7 +666,59 @@ impl Store {
             return Ok(Rc::clone(found));
         }
         let commits = self.repo.rev_list_parents(tip.as_str())?;
-        let changes = self.repo.first_parent_changes(&commits, &["docs"])?;
+        // Each commit's `docs` tree, then the `docs/<uuid>` entries that
+        // differ from its first parent's: one entry per changed document,
+        // however many files changed in it.
+        let names: Vec<String> = commits
+            .iter()
+            .map(|entry| format!("{}:docs", entry.commit))
+            .collect();
+        let docs: HashMap<&Oid, Oid> = commits
+            .iter()
+            .zip(self.repo.resolve(&names)?)
+            .filter_map(|(entry, found)| match found {
+                Some((tree, ObjectKind::Tree)) => Some((&entry.commit, tree)),
+                _ => None,
+            })
+            .collect();
+        let empty = self.format.empty_tree();
+        let docs_of = |commit: Option<&Oid>| {
+            commit
+                .and_then(|commit| docs.get(commit))
+                .unwrap_or(&empty)
+                .clone()
+        };
+        let pairs: Vec<(usize, (Oid, Oid))> = commits
+            .iter()
+            .enumerate()
+            .map(|(at, entry)| {
+                (
+                    at,
+                    (docs_of(entry.parents.first()), docs_of(Some(&entry.commit))),
+                )
+            })
+            .filter(|(_, (old, new))| old != new)
+            .collect();
+        let diffs = self.repo.tree_diffs(
+            &pairs
+                .iter()
+                .map(|(_, pair)| pair.clone())
+                .collect::<Vec<_>>(),
+        )?;
+        let changes: Vec<CommitChanges> = pairs
+            .iter()
+            .zip(diffs)
+            .map(|((at, _), changes)| CommitChanges {
+                commit: commits[*at].commit.clone(),
+                changes: changes
+                    .into_iter()
+                    .map(|change| RawChange {
+                        path: [&b"docs/"[..], &change.path].concat(),
+                        ..change
+                    })
+                    .collect(),
+            })
+            .collect();
         let index = Rc::new(HistoryIndex::build(&commits, &changes)?);
         *self.history.borrow_mut() = Some(Rc::clone(&index));
         Ok(index)
@@ -959,6 +1012,90 @@ mod tests {
 
     fn oid(n: u32) -> Oid {
         format!("{n:040x}").parse().unwrap()
+    }
+
+    /// This process's peak resident set size in KiB (Linux), after
+    /// `reset` cleared it.
+    fn peak_rss_kib(reset: bool) -> Option<u64> {
+        if reset {
+            let _ = fs::write("/proc/self/clear_refs", "5");
+        }
+        fs::read_to_string("/proc/self/status")
+            .ok()?
+            .lines()
+            .find_map(|line| line.strip_prefix("VmHWM:"))
+            .and_then(|value| value.trim().trim_end_matches("kB").trim().parse().ok())
+    }
+
+    /// Building the index of a history whose commits change every file
+    /// of a big library (2000 notebooks of 100 pages: 204,000 files):
+    /// time and memory must follow documents, not files.
+    /// `cargo test --release -p libremarkable-utils --lib -- --ignored
+    /// --nocapture index_of_a_history_with_many_files`.
+    #[test]
+    #[ignore = "measurement; run in release with --ignored --nocapture"]
+    fn index_of_a_history_with_many_files() {
+        let scratch = Scratch::new("history-files");
+        let git = crate::git::Git::new()
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", scratch.path());
+        let repo = git
+            .init_bare(&scratch.path().join("r.git"), ObjectFormat::Sha1)
+            .unwrap();
+        let who = Signature {
+            name: "Test".to_string(),
+            email: "test@example.invalid".to_string(),
+            time: 1_800_000_000,
+            offset_minutes: 0,
+        };
+        let library = |parent: Option<&Oid>, ink: &str| -> Oid {
+            let mut writer = repo
+                .commit_writer(&crate::progress::NoProgress, None)
+                .unwrap();
+            let page = writer
+                .write_blob("page", ink.len() as u64, &mut ink.as_bytes())
+                .unwrap();
+            let json = writer.write_blob("json", 2, &mut &b"{}"[..]).unwrap();
+            (0..2000u32).for_each(|n| {
+                let d = doc(n);
+                [("metadata", &json), ("content", &json)]
+                    .into_iter()
+                    .for_each(|(name, blob)| {
+                        writer
+                            .add_existing(format!("docs/{d}/{name}"), FileMode::Regular, blob)
+                            .unwrap();
+                    });
+                (0..100).for_each(|p| {
+                    writer
+                        .add_existing(format!("docs/{d}/pages/p{p}.rm"), FileMode::Regular, &page)
+                        .unwrap();
+                });
+            });
+            writer
+                .commit(&CommitMeta {
+                    parents: parent.into_iter().cloned().collect(),
+                    author: who.clone(),
+                    committer: who.clone(),
+                    message: "library\n".to_string(),
+                })
+                .unwrap()
+        };
+        let first = library(None, "ink 1");
+        let tip = library(Some(&first), "ink 2");
+        let store = Store::new(repo).unwrap();
+        let before = peak_rss_kib(true);
+        let started = std::time::Instant::now();
+        let index = store.history(&tip).unwrap();
+        let took = started.elapsed();
+        let grew = peak_rss_kib(false)
+            .zip(before)
+            .map(|(after, before)| after.saturating_sub(before));
+        eprintln!(
+            "index of 2 commits x 204,000 files: {took:.2?}, peak RSS +{} KiB",
+            grew.map_or("?".to_string(), |kib| kib.to_string())
+        );
+        assert_eq!(index.versions(&doc(7)).len(), 2);
     }
 
     #[test]

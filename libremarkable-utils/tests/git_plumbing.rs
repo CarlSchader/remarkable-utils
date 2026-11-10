@@ -1257,73 +1257,72 @@ fn rev_list_topo_lists_every_ancestor_children_first() {
 
 #[cfg(unix)]
 #[test]
-fn first_parent_changes_of_a_merged_history() {
+fn trees_resolved_and_diffed_one_level_deep() {
     let sandbox = Sandbox::new();
     let cache = sandbox.init("cache.git");
     let root = commit_files(&cache, &[], &[("docs/a/x", b"1"), ("top", b"t")], "root\n");
-    // Whole trees: each commit lists every file it has.
-    let side = commit_files(
+    let next = commit_files(
         &cache,
         &[&root],
-        &[("docs/a/x", b"2"), ("top", b"t")],
-        "side\n",
+        &[("docs/a/x", b"2"), ("docs/b/y/z", b"3"), ("top", b"t")],
+        "next\n",
     );
-    let main = commit_files(
-        &cache,
-        &[&root],
-        &[("docs/a/x", b"1"), ("docs/b/y", b"3"), ("top", b"t")],
-        "main\n",
+    let commits = cache.rev_list_parents(next.as_str()).unwrap();
+    assert_eq!(commits.len(), 2);
+    assert_eq!(commits[0].commit, next);
+    assert_eq!(commits[0].parents, vec![root.clone()]);
+    let names = [
+        format!("{root}:docs"),
+        format!("{next}:docs"),
+        format!("{root}:top"),
+        format!("{root}:nothing"),
+    ];
+    let found = cache.resolve(&names).unwrap();
+    let kinds: Vec<Option<ObjectKind>> =
+        found.iter().map(|f| f.as_ref().map(|(_, k)| *k)).collect();
+    assert_eq!(
+        kinds,
+        [
+            Some(ObjectKind::Tree),
+            Some(ObjectKind::Tree),
+            Some(ObjectKind::Blob),
+            None
+        ]
     );
-    let merge = commit_files(
-        &cache,
-        &[&main, &side],
-        &[("docs/a/x", b"2"), ("docs/b/y", b"3"), ("top", b"t")],
-        "merge\n",
-    );
-    let commits = cache.rev_list_parents(merge.as_str()).unwrap();
-    assert_eq!(commits.len(), 4);
-    assert_eq!(commits[0].commit, merge);
-    assert_eq!(commits[0].parents, vec![main.clone(), side.clone()]);
-    let changes = cache.first_parent_changes(&commits, &["docs"]).unwrap();
-    let paths = |commit: &Oid| -> Vec<String> {
+    let (old, new) = (found[0].clone().unwrap().0, found[1].clone().unwrap().0);
+    let empty = cache.object_format().unwrap().empty_tree();
+    let diffs = cache
+        .tree_diffs(&[
+            (old.clone(), new.clone()),
+            (empty, old.clone()),
+            (new.clone(), new.clone()),
+        ])
+        .unwrap();
+    let names = |changes: &Vec<libremarkable_utils::git::RawChange>| -> Vec<String> {
         changes
             .iter()
-            .find(|entry| entry.commit == *commit)
-            .map(|entry| {
-                entry
-                    .changes
-                    .iter()
-                    .map(|change| String::from_utf8_lossy(&change.path).into_owned())
-                    .collect()
-            })
-            .unwrap_or_default()
+            .map(|change| String::from_utf8_lossy(&change.path).into_owned())
+            .collect()
     };
-    // Against the first parent only, trees included, `top` left out.
-    assert_eq!(paths(&root), ["docs", "docs/a", "docs/a/x"]);
-    assert_eq!(paths(&main), ["docs", "docs/b", "docs/b/y"]);
-    assert_eq!(paths(&side), ["docs", "docs/a", "docs/a/x"]);
-    assert_eq!(paths(&merge), ["docs", "docs/a", "docs/a/x"]);
-    assert!(matches!(
-        cache.first_parent_changes(&commits, &["--all"]),
-        Err(Error::InvalidGitInput(_))
-    ));
+    // One entry per changed subtree, however deep its changes.
+    assert_eq!(names(&diffs[0]), ["a", "b"]);
+    assert_eq!(names(&diffs[1]), ["a"]);
+    assert!(diffs[2].is_empty());
+    // A pair diff-tree cannot read is an error, never "unchanged".
+    let missing: Oid = "e".repeat(40).parse().unwrap();
+    assert!(
+        cache
+            .tree_diffs(&[(old, new), (missing.clone(), missing)])
+            .is_err()
+    );
     assert!(matches!(
         cache.rev_list_parents("--all"),
         Err(Error::InvalidGitInput(_))
     ));
-}
-
-#[test]
-fn only_fast_imports_own_keep_files_are_removed() {
-    let sandbox = Sandbox::new();
-    let cache = sandbox.init("cache.git");
-    let pack_dir = cache.git_dir().join("objects").join("pack");
-    std::fs::create_dir_all(&pack_dir).unwrap();
-    std::fs::write(pack_dir.join("pack-a.keep"), b"fast-import\n").unwrap();
-    std::fs::write(pack_dir.join("pack-b.keep"), b"kept by hand\n").unwrap();
-    assert_eq!(cache.remove_fast_import_keeps().unwrap(), 1);
-    assert!(!pack_dir.join("pack-a.keep").exists());
-    assert!(pack_dir.join("pack-b.keep").exists());
+    assert!(matches!(
+        cache.resolve(&["a\nb".to_string()]),
+        Err(Error::InvalidGitInput(_))
+    ));
 }
 
 #[cfg(unix)]
