@@ -607,14 +607,18 @@ pub fn finish(
             // Best effort: a failed write must not replace the error (and
             // its exit status).
             let failure = Failure::of(&error);
+            // Only the recovery from an empty origin names the tablet's
+            // repository: any other error, a tablet that stopped
+            // answering above all (another timeout), is not worth a read.
+            let repo_id = matches!(error, Error::HubCycle(CycleError::OriginEmpty { .. }))
+                .then(|| context.tablet?.read_state().ok().flatten())
+                .flatten()
+                .map(|state| state.repo_id);
             let details = render::error_details(
                 &error,
                 &render::ErrorContext {
                     names: names(render::error_names(&error), render::error_docs(&error)),
-                    repo_id: context
-                        .tablet
-                        .and_then(|tablet| tablet.read_state().ok().flatten())
-                        .map(|state| state.repo_id),
+                    repo_id,
                     cache_dir: context.cache_dir.map(Path::to_path_buf),
                 },
             );

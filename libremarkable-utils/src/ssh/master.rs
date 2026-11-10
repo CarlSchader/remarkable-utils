@@ -56,7 +56,12 @@ pub(super) enum Master {
     Unavailable,
     /// An open failed for another reason than an unreachable tablet (a
     /// refused key, a wrong password): commands connect themselves rather
-    /// than try again, so each authenticates once.
+    /// than try again, so each authenticates once. Sticky for the session,
+    /// even after a transient failure (`Connection refused` while the
+    /// tablet's sshd restarts): the first later command then becomes an
+    /// implicit master (`ControlMaster=auto`) whose log is /dev/null, so
+    /// a later death of it surfaces as a silent `Error::Remote` 255, not
+    /// `Error::Unreachable`. Waits stay bounded by the timeouts either way.
     Failed,
 }
 

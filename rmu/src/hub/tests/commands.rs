@@ -335,6 +335,58 @@ fn a_cloud_paired_tablet_exits_6() {
     assert!(a.is_running(), "xochitl is back");
 }
 
+/// A tablet that stops answering: exit 8, and writing the error asks
+/// it nothing more (each try would wait for another timeout).
+#[test]
+fn an_unanswering_tablet_exits_8_without_another_try() {
+    use libremarkable_utils::hub::device::Fault;
+    let world = World::new();
+    let origin = world.origin();
+    let a = world.tablet("a", |b| with_pdf(b, 1, "Paper"));
+    assert_eq!(world.json(&a, &["init", &origin]).1, 0);
+    assert_eq!(world.json(&a, &["clone", &origin]).1, 0);
+    ["status", "sync"].iter().for_each(|command| {
+        a.reconnect();
+        let before = a.ops().len();
+        a.inject(Fault::SleepAtOp(1));
+        let (value, code) = world.json(&a, &[command]);
+        assert_eq!(code, 8, "{command}: {value}");
+        assert_eq!(value["error"]["kind"], "unreachable");
+        assert_eq!(
+            a.ops().len(),
+            before + 1,
+            "{command}: only the unanswered operation: {:?}",
+            &a.ops()[before..]
+        );
+    });
+}
+
+/// An origin that lost `main`: the recovery names this computer's cache
+/// of the tablet's repository, read from the tablet for that error.
+#[test]
+fn an_empty_origin_names_the_tablets_cache() {
+    let world = World::new();
+    let origin = world.origin();
+    let a = world.tablet("a", |b| with_pdf(b, 1, "Paper"));
+    assert_eq!(world.json(&a, &["init", &origin]).1, 0);
+    assert_eq!(world.json(&a, &["clone", &origin]).1, 0);
+    let repo = a.read_state().unwrap().unwrap().repo_id;
+    std::fs::remove_file(Path::new(&origin).join("refs/heads/main")).unwrap();
+    let packed = Path::new(&origin).join("packed-refs");
+    if let Ok(text) = std::fs::read_to_string(&packed) {
+        let kept: String = text
+            .lines()
+            .filter(|line| !line.ends_with(" refs/heads/main"))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        std::fs::write(&packed, kept).unwrap();
+    }
+    let (_, stderr, code) = world.run(&a, &["sync"], Output::Human);
+    assert_eq!(code, 5, "{stderr}");
+    assert!(stderr.contains("has no main branch"), "{stderr}");
+    assert!(stderr.contains(&format!("{repo}.git")), "{stderr}");
+}
+
 #[test]
 fn other_errors_exit_1() {
     let world = World::new();
