@@ -1,8 +1,8 @@
 # Design: `rmu hub` — git-backed multi-tablet sync
 
-Status: **phase 1 implemented in the library** (git plumbing, data
-model, merge engine, device layer, sync cycle with clone, backup, status
-and `--dry-run`); the CLI and device validation are next (see
+Status: **phase 1 implemented** (git plumbing, data model, merge
+engine, device layer, sync cycle with clone, backup, status and
+`--dry-run`, and the `rmu hub` CLI); device validation is next (see
 "Implementation plan"). This document is the plan of record; update it
 as phases land and as device experiments confirm or refute its
 assumptions.
@@ -1378,7 +1378,8 @@ Each item is one reviewed PR; items on the same line run in parallel.
    `libremarkable-utils/tests/hub_e2e.rs`).
 6. **CLI** (`init`, `clone`, `sync`, `backup`, `status`, `--dry-run`,
    `remote`, `detach`), output discipline, progress; README and
-   AGENTS.md module map.
+   AGENTS.md module map (done: `rmu/src/hub.rs`, exit statuses and
+   `--json` in `rmu hub --help` and the README).
 7. **Device validation** on a real tablet (questions 5–7) and fixes.
    Requires the owner's go-ahead.
 8. **Refactor checkpoint**: shared code between `sync` and `hub`
