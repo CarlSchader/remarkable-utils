@@ -433,9 +433,9 @@ pub struct DocLogEntry {
     pub time: i64,
     pub subject: String,
     pub events: Vec<DocEvent>,
-    /// The document's subtree after the commit (`None`: absent), the
-    /// version `restore --at <commit>` brings back (for a deletion: the
-    /// version before it).
+    /// The document's subtree after the commit (`None`: absent): the
+    /// version `restore --at <commit>` brings back (after a deletion, it
+    /// brings back the version before it).
     pub version: Option<Oid>,
 }
 

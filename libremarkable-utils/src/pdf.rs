@@ -14,7 +14,7 @@
 //! cyclic tree) is `None`, never a guess. Every loop and allocation is
 //! bounded, so a hostile file cannot make it run away.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::rc::Rc;
@@ -24,7 +24,9 @@ const MAX_NESTING: usize = 64;
 /// Cross-reference sections followed through `/Prev` and `/XRefStm`.
 const MAX_SECTIONS: usize = 256;
 /// Bytes a decoded stream may grow to.
-const MAX_DECODED: u64 = 256 * 1024 * 1024;
+const MAX_DECODED: u64 = 64 * 1024 * 1024;
+/// Bytes of object streams kept decoded at once.
+const MAX_CACHED: usize = 256 * 1024 * 1024;
 /// Hops through indirect references to reach a value.
 const MAX_HOPS: usize = 32;
 /// Nodes of the page tree visited.
@@ -411,11 +413,13 @@ fn unpredict(data: &[u8], params: Option<&Dict>) -> Option<Vec<u8>> {
     if !(10..=15).contains(&predictor) {
         return None;
     }
-    let bits = usize::try_from(param(b"Colors", 1) * param(b"BitsPerComponent", 8)).ok()?;
+    let bits =
+        usize::try_from(param(b"Colors", 1).checked_mul(param(b"BitsPerComponent", 8))?).ok()?;
     let columns = usize::try_from(param(b"Columns", 1)).ok()?;
     let bpp = (bits / 8).max(1);
     let row = bits.checked_mul(columns)?.div_ceil(8);
-    if row == 0 {
+    // A row longer than the data cannot be (and must not allocate).
+    if row == 0 || row > data.len() {
         return None;
     }
     let mut out = Vec::with_capacity(data.len());
@@ -758,6 +762,8 @@ struct Resolver<'a> {
     pdf: &'a [u8],
     xref: Xref,
     streams: RefCell<HashMap<u32, Option<Rc<ObjectStream>>>>,
+    /// Decoded bytes the cached object streams hold.
+    cached: Cell<usize>,
 }
 
 impl<'a> Resolver<'a> {
@@ -766,6 +772,7 @@ impl<'a> Resolver<'a> {
             pdf,
             xref,
             streams: RefCell::new(HashMap::new()),
+            cached: Cell::new(0),
         }
     }
 
@@ -800,6 +807,11 @@ impl<'a> Resolver<'a> {
                 return None;
             };
             let data = decode_stream(dict, object.stream?)?;
+            let cached = self.cached.get().checked_add(data.len())?;
+            if cached > MAX_CACHED {
+                return None;
+            }
+            self.cached.set(cached);
             let members = object_stream_header(dict, &data)?;
             Some(Rc::new(ObjectStream { data, members }))
         })();
@@ -1123,10 +1135,21 @@ mod tests {
             [5, 6, 7, 6, 7, 8, 5, 8, 10, 6, 9, 11]
         );
         assert_eq!(
-            unpredict(&[9, 1], Some(&params)),
+            unpredict(&[9, 1, 1, 1], Some(&params)),
             None,
             "an unknown row filter"
         );
+        // Hostile parameters: no overflow, no huge allocation.
+        let hostile = |colors: i64, columns: i64| -> Dict {
+            vec![
+                (b"Predictor".to_vec(), Obj::Int(12)),
+                (b"Colors".to_vec(), Obj::Int(colors)),
+                (b"Columns".to_vec(), Obj::Int(columns)),
+            ]
+        };
+        assert_eq!(unpredict(&data, Some(&hostile(i64::MAX, 1))), None);
+        assert_eq!(unpredict(&data, Some(&hostile(1, 1 << 40))), None);
+        assert_eq!(unpredict(&data, Some(&hostile(1, -1))), None);
     }
 
     /// Damaged input never panics: every truncation and a sweep of byte

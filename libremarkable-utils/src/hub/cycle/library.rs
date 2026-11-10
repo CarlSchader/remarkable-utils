@@ -6,10 +6,11 @@
 //! rejection, a lost acknowledgement resolved by fetching).
 
 use std::collections::{BTreeMap, HashMap};
+use std::ops::ControlFlow;
 
 use serde_json::Value;
 
-use super::history::HistoryIndex;
+use super::history::{DocStep, HistoryIndex};
 use super::origin::OriginCtx;
 use super::plan::JsonBlobs;
 use super::store::{self, Store};
@@ -134,65 +135,89 @@ impl Hub<'_> {
         decide: &mut dyn FnMut(&OriginCtx, &RepoTree) -> Result<Decided<T>>,
     ) -> Result<(Oid, usize, T)> {
         let attempts = self.options.push_attempts.max(1);
-        for attempt in 1..=attempts {
-            let origin = &mut library.origin;
-            let theirs = origin.store.tree_of(origin.rules, &origin.main)?;
-            if theirs.docs.contains_key(&new.doc) {
-                return Err(Error::InvalidGitInput(format!(
-                    "document {} already exists on origin",
-                    new.doc
-                )));
+        let outcome = (1..=attempts).try_fold((), |(), attempt| {
+            match self.attempt_new_doc(library, new, decide) {
+                Ok(Some((commit, outcome))) => ControlFlow::Break(Ok((commit, attempt, outcome))),
+                Ok(None) => ControlFlow::Continue(()),
+                Err(error) => ControlFlow::Break(Err(error)),
             }
-            let decided = decide(origin, &theirs)?;
-            let mut writer = origin.cache.repo.commit_writer(self.progress, None)?;
-            theirs.to_listing().iter().try_for_each(|(path, entry)| {
-                writer.add_existing(path.as_str(), entry.mode, &entry.id)
+        });
+        match outcome {
+            ControlFlow::Break(result) => result,
+            ControlFlow::Continue(()) => Err(CycleError::PushRetriesExhausted(attempts).into()),
+        }
+    }
+
+    /// One attempt of [`Self::push_new_doc`]; `None` when the push lost
+    /// to another writer (origin fetched again).
+    fn attempt_new_doc<T>(
+        &self,
+        library: &mut Library,
+        new: &NewDoc,
+        decide: &mut dyn FnMut(&OriginCtx, &RepoTree) -> Result<Decided<T>>,
+    ) -> Result<Option<(Oid, T)>> {
+        let origin = &library.origin;
+        let theirs = origin.store.tree_of(origin.rules, &origin.main)?;
+        if theirs.docs.contains_key(&new.doc) {
+            return Err(Error::InvalidGitInput(format!(
+                "document {} already exists on origin",
+                new.doc
+            )));
+        }
+        let decided = decide(origin, &theirs)?;
+        let mut writer = origin.cache.repo.commit_writer(self.progress, None)?;
+        theirs.to_listing().iter().try_for_each(|(path, entry)| {
+            writer.add_existing(path.as_str(), entry.mode, &entry.id)
+        })?;
+        let prefix = format!("docs/{}", new.doc);
+        new.files
+            .iter()
+            .filter(|(file, _)| **file != DocFile::Metadata)
+            .map(|(file, entry)| (file.repo_name(), entry))
+            .chain(new.other.iter().map(|(name, entry)| (name.clone(), entry)))
+            .try_for_each(|(name, entry)| {
+                writer.add_existing(format!("{prefix}/{name}"), entry.mode, &entry.id)
             })?;
-            let prefix = format!("docs/{}", new.doc);
-            new.files
-                .iter()
-                .filter(|(file, _)| **file != DocFile::Metadata)
-                .map(|(file, entry)| (file.repo_name(), entry))
-                .chain(new.other.iter().map(|(name, entry)| (name.clone(), entry)))
-                .try_for_each(|(name, entry)| {
-                    writer.add_existing(format!("{prefix}/{name}"), entry.mode, &entry.id)
-                })?;
-            writer.add_bytes(
-                format!("{prefix}/metadata"),
-                FileMode::Regular,
-                &decided.metadata,
-            )?;
-            let time = unix_now();
-            let commit = writer.commit(&CommitMeta {
-                parents: vec![origin.main.clone()],
-                author: library.author(time),
-                committer: rmu_signature(time),
-                message: decided.message,
-            })?;
-            let origin = &mut library.origin;
-            self.progress.step("Pushing to origin");
-            match store::push(
-                &origin.cache.repo,
-                &origin.url,
-                &commit,
-                store::MAIN,
-                None,
-                store::LOCAL_MAIN,
-            ) {
-                Ok(()) => return Ok((commit, attempt, decided.outcome)),
-                Err(Error::PushRejected { .. }) => origin.refresh_main()?,
-                Err(error) => {
-                    // The acknowledgement may be what was lost.
-                    let landed = origin.refresh_main().is_ok()
-                        && origin.store.is_ancestor(&commit, &origin.main)?;
-                    return match landed {
-                        true => Ok((commit, attempt, decided.outcome)),
-                        false => Err(error),
-                    };
+        writer.add_bytes(
+            format!("{prefix}/metadata"),
+            FileMode::Regular,
+            &decided.metadata,
+        )?;
+        let time = unix_now();
+        let commit = writer.commit(&CommitMeta {
+            parents: vec![origin.main.clone()],
+            author: library.author(time),
+            committer: rmu_signature(time),
+            message: decided.message,
+        })?;
+        let origin = &mut library.origin;
+        self.progress.step("Pushing to origin");
+        match store::push(
+            &origin.cache.repo,
+            &origin.url,
+            &commit,
+            store::MAIN,
+            None,
+            store::LOCAL_MAIN,
+        ) {
+            Ok(()) => Ok(Some((commit, decided.outcome))),
+            Err(Error::PushRejected { .. }) => {
+                origin.refresh_main()?;
+                Ok(None)
+            }
+            Err(error) => {
+                // The acknowledgement may be what was lost: origin decides.
+                let landed = origin.refresh_main().is_ok()
+                    && origin
+                        .store
+                        .is_ancestor(&commit, &origin.main)
+                        .unwrap_or(false);
+                match landed {
+                    true => Ok(Some((commit, decided.outcome))),
+                    false => Err(error),
                 }
             }
         }
-        Err(CycleError::PushRetriesExhausted(attempts).into())
     }
 }
 
@@ -319,27 +344,24 @@ pub(super) fn resolve_doc(
     let chain = index
         .chain(from)
         .ok_or_else(|| CycleError::NotOnMain(from.clone()))?;
-    let mut metadata: BTreeMap<DocId, Oid> = store
+    // Each document's `.metadata` blob at the commit being looked at.
+    let metadata: BTreeMap<DocId, Oid> = store
         .tree_of(rules, from)?
         .docs
         .into_iter()
         .filter_map(|(doc, version)| Some((doc, version.files.get(&DocFile::Metadata)?.id.clone())))
         .collect();
     let resolve = |metadata: &BTreeMap<DocId, Oid>| -> Result<Option<DocId>> {
-        let tree = RepoTree {
-            docs: metadata
-                .iter()
-                .map(|(doc, id)| {
-                    let version = DocVersion {
-                        files: [(DocFile::Metadata, ListingEntry::regular(id.clone()))].into(),
-                        other: BTreeMap::new(),
-                    };
-                    (doc.clone(), version)
-                })
-                .collect(),
-            extra: BTreeMap::new(),
-        };
-        match xochitl::resolve_item_ref(&items_of(&tree, store)?, reference) {
+        let items = metadata
+            .iter()
+            .map(|(doc, id)| {
+                Ok(store.json(id)?.and_then(|metadata| {
+                    xochitl::item_from_metadata(doc.as_str(), &metadata, None, None)
+                }))
+            })
+            .filter_map(Result::transpose)
+            .collect::<Result<Vec<Item>>>()?;
+        match xochitl::resolve_item_ref(&items, reference) {
             Ok(item) => Ok(Some(DocId::new(item.uuid.as_str())?)),
             Err(Error::PathNotFound(_)) => Ok(None),
             Err(error) => Err(error),
@@ -349,29 +371,45 @@ pub(super) fn resolve_doc(
         return Ok(found);
     }
     // Walk back: each step turns the state at a commit into the state at
-    // its first parent.
-    for step in &chain {
-        let mut moved = false;
-        for (doc, before, _) in &step.changes {
-            let id = match before {
-                Some(subtree) => store
-                    .doc_version(rules, doc, subtree)?
-                    .files
-                    .get(&DocFile::Metadata)
-                    .map(|entry| entry.id.clone()),
-                None => None,
+    // its first parent; resolve again whenever a `.metadata` moved.
+    let step_back = |mut metadata: BTreeMap<DocId, Oid>, changes: &[DocStep<'_>]| {
+        changes
+            .iter()
+            .try_fold(false, |moved, (doc, before, _)| -> Result<bool> {
+                let id = match before {
+                    Some(subtree) => store
+                        .doc_version(rules, doc, subtree)?
+                        .files
+                        .get(&DocFile::Metadata)
+                        .map(|entry| entry.id.clone()),
+                    None => None,
+                };
+                let previous = match &id {
+                    Some(id) => metadata.insert((*doc).clone(), id.clone()),
+                    None => metadata.remove(*doc),
+                };
+                Ok(moved || previous != id)
+            })
+            .map(|moved| (metadata, moved))
+    };
+    let found = chain.iter().try_fold(metadata, |metadata, step| {
+        let found = step_back(metadata, &step.changes).and_then(|(metadata, moved)| {
+            let found = match moved {
+                true => resolve(&metadata)?,
+                false => None,
             };
-            let previous = match &id {
-                Some(id) => metadata.insert((*doc).clone(), id.clone()),
-                None => metadata.remove(*doc),
-            };
-            moved |= previous != id;
+            Ok((metadata, found))
+        });
+        match found {
+            Ok((_, Some(doc))) => ControlFlow::Break(Ok(doc)),
+            Ok((metadata, None)) => ControlFlow::Continue(metadata),
+            Err(error) => ControlFlow::Break(Err(error)),
         }
-        if moved && let Some(found) = resolve(&metadata)? {
-            return Ok(found);
-        }
+    });
+    match found {
+        ControlFlow::Break(result) => result,
+        ControlFlow::Continue(_) => Err(Error::PathNotFound(reference.to_string())),
     }
-    Err(Error::PathNotFound(reference.to_string()))
 }
 
 #[cfg(test)]

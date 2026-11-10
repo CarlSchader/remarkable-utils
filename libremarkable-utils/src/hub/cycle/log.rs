@@ -241,33 +241,27 @@ impl Hub<'_> {
         let index = store.history(main)?;
         let doc = resolve_doc(store, rules, &index, main, reference)?;
         let mut events = doc_events(store, rules, &index, main, &doc)?;
-        let mut name = None;
-        let mut entries = Vec::new();
-        for commit in index
+        let entries = index
             .chain(main)
             .unwrap_or_default()
             .into_iter()
-            .map(|step| step.commit)
-        {
-            let info = commit_info(store, commit)?;
-            let mut found = events.remove(commit).unwrap_or_default();
-            found.extend(trailer_events(&info.trailers, &doc));
-            if found.is_empty() {
-                continue;
-            }
-            if name.is_none() {
-                name = newest_name(&found);
-            }
-            entries.push(DocLogEntry {
-                commit: commit.clone(),
-                kind: info.kind,
-                author: info.author,
-                time: info.time,
-                subject: info.subject,
-                events: found,
-                version: index.subtree_at(commit, &doc).flatten().cloned(),
-            });
-        }
+            .map(|step| -> Result<Option<DocLogEntry>> {
+                let info = commit_info(store, step.commit)?;
+                let mut found = events.remove(step.commit).unwrap_or_default();
+                found.extend(trailer_events(&info.trailers, &doc));
+                Ok((!found.is_empty()).then(|| DocLogEntry {
+                    commit: step.commit.clone(),
+                    kind: info.kind,
+                    author: info.author,
+                    time: info.time,
+                    subject: info.subject,
+                    events: found,
+                    version: index.subtree_at(step.commit, &doc).flatten().cloned(),
+                }))
+            })
+            .filter_map(Result::transpose)
+            .collect::<Result<Vec<_>>>()?;
+        let name = entries.iter().find_map(|entry| newest_name(&entry.events));
         let at_main = present(store, rules, &doc, index.subtree_at(main, &doc).flatten())?;
         let place = at_main
             .as_ref()
