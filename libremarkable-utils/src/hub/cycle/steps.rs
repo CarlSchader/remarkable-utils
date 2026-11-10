@@ -922,11 +922,13 @@ impl Hub<'_> {
         self.progress.step("Merging");
         let run = self.run_merge(&p.origin, &p.state, base_tree, snapshot, &p.read)?;
         let outcome = run.outcome;
+        let names = run.names;
         if outcome.guard.blocked() {
             return Err(CycleError::DeletionsNeedConsent {
                 from_origin: outcome.guard.from_origin.iter().cloned().collect(),
                 from_tablet: outcome.guard.from_tablet.iter().cloned().collect(),
                 empty_snapshot: outcome.guard.empty_snapshot,
+                names,
             }
             .into());
         }
@@ -944,6 +946,7 @@ impl Hub<'_> {
                 merged: run.theirs,
                 outcome,
                 attempts: attempt,
+                names,
             }));
         }
         // The tablet has no changes of its own: origin's tree is applied
@@ -963,6 +966,7 @@ impl Hub<'_> {
                 merged: run.theirs,
                 outcome,
                 attempts: attempt,
+                names,
             }));
         }
         let record = MergeRecord {
@@ -1012,6 +1016,7 @@ impl Hub<'_> {
             merged,
             outcome,
             attempts: attempt,
+            names,
         };
         match store::push(
             &p.origin.cache.repo,
@@ -1269,6 +1274,7 @@ impl Hub<'_> {
             forks: pushed.outcome.forks.clone(),
             summary: pushed.outcome.summary(),
             deletions: pushed.outcome.guard.clone(),
+            names: pushed.names,
             reconciled: p.reconciled.take(),
             push_attempts: pushed.attempts,
             took_over: p.took_over.take(),

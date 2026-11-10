@@ -72,13 +72,20 @@ impl Hub<'_> {
     }
 
     /// `rmu hub detach`: forget the hub state on the tablet, under the
-    /// lock. Documents are untouched; the staging directories go too. A
-    /// pending journal is discarded with the state (a warning: a
-    /// document an interrupted apply stopped inside stays as it is). With
+    /// lock. Documents are untouched; the staging directories go too.
+    /// While an interrupted sync's journal is pending it refuses
+    /// (`DetachJournalPending`: documents its apply was writing may be
+    /// half-updated, and `sync` would finish them) unless `force`, which
+    /// discards the journal with a warning. With
     /// `prune_ref`, the tablet's device ref is then deleted from origin
     /// (the URL as for a sync), leased on the value just advertised; a
     /// failure there is a warning, and the ref can be deleted by hand.
-    pub fn detach(&self, tablet: &dyn Tablet, prune_ref: bool) -> Result<DetachReport> {
+    pub fn detach(
+        &self,
+        tablet: &dyn Tablet,
+        prune_ref: bool,
+        force: bool,
+    ) -> Result<DetachReport> {
         let (mut report, warnings) = self.session(tablet, |s| {
             self.progress.step("Locking the tablet");
             let took_over = s.acquire(&self.request, self.options.break_lock)?;
@@ -86,6 +93,9 @@ impl Hub<'_> {
             let state = s.tablet.read_state()?.ok_or(CycleError::NotAttached)?;
             let mut warnings = Vec::new();
             if state.journal.is_some() {
+                if !force {
+                    return Err(CycleError::DetachJournalPending.into());
+                }
                 warnings.push(Warning::JournalDiscarded);
             }
             if let Err(error) = s.tablet.clear_staging(s.lock()) {

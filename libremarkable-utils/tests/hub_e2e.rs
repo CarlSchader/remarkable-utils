@@ -10,6 +10,7 @@
 mod world;
 
 use libremarkable_utils::hub::cycle::{MainUpdate, Warning};
+use libremarkable_utils::hub::merge::NoteKind;
 use world::{Kind, World};
 
 #[test]
@@ -264,6 +265,28 @@ fn the_deletion_guard_needs_consent_which_other_tablets_honour() {
         )),
         "{refused}"
     );
+    // The refusal names the books, which the tablet no longer has.
+    let named = |names: &std::collections::BTreeMap<_, String>, docs: &[_]| {
+        docs.iter().enumerate().all(|(n, book)| {
+            names.get(book).map(String::as_str) == Some(format!("Book {n}").as_str())
+        })
+    };
+    assert!(
+        is_cycle(&refused, |e| matches!(
+            e,
+            CycleError::DeletionsNeedConsent { names, .. } if names.len() == 55
+        )),
+        "{refused:?}"
+    );
+    if let libremarkable_utils::error::Error::HubCycle(CycleError::DeletionsNeedConsent {
+        names,
+        ..
+    }) = &refused
+    {
+        assert!(named(names, &books[..55]), "{names:?}");
+    }
+    let status = world.status(1).unwrap();
+    assert!(named(&status.names, &books[..55]), "{:?}", status.names);
     assert_eq!(world.origin_docs().len(), before.len());
     world.check_idle(1);
     // With consent the deletions go to origin, recorded in a trailer...
@@ -277,15 +300,33 @@ fn the_deletion_guard_needs_consent_which_other_tablets_honour() {
         )
         .unwrap();
     assert_eq!(report.deletions.consented().len(), 55);
-    // ...and A applies them without being asked again.
+    assert!(named(&report.names, &books[..55]), "{:?}", report.names);
+    // ...and A applies them without being asked again, and names them
+    // after deleting them.
     let report = world.sync(0).unwrap();
     assert_eq!(report.applied.len(), 55);
     assert_eq!(report.deletions.exempt.len(), 55);
+    assert!(named(&report.names, &books[..55]), "{:?}", report.names);
     world.converge();
     assert_eq!(world.device(0).docs().len(), 6);
     // Below the threshold no consent is needed.
     books[55..].iter().for_each(|book| world.delete(0, book));
     world.sync(0).unwrap();
+    let dry = world.dry_run(1).unwrap();
+    assert_eq!(dry.deletes.len(), 5, "{dry:?}");
+    assert!(
+        dry.deletes
+            .iter()
+            .all(|doc| dry.status.names.contains_key(doc)),
+        "{dry:?}"
+    );
+    let report = world.sync(1).unwrap();
+    assert_eq!(report.deletions.from_tablet.len(), 5, "{report:?}");
+    let names: Vec<&str> = report.names.values().map(String::as_str).collect();
+    assert_eq!(
+        names,
+        ["Book 55", "Book 56", "Book 57", "Book 58", "Book 59"]
+    );
     world.converge();
     assert_eq!(world.origin_docs().len(), 1);
 }
@@ -314,8 +355,74 @@ fn an_empty_tablet_never_wipes_origin() {
         )),
         "{refused}"
     );
+    // Every document the empty tablet would delete is named, from
+    // origin's history.
+    let expected: std::collections::BTreeMap<_, String> = [
+        (&lib.folder, "Projects"),
+        (&lib.notes, "Notes"),
+        (&lib.sketch, "Sketch"),
+        (&lib.paper, "Paper"),
+        (&lib.archive, "Archive"),
+        (&lib.diary, "Diary"),
+    ]
+    .into_iter()
+    .map(|(doc, name)| (doc.clone(), name.to_string()))
+    .collect();
+    assert!(
+        matches!(
+            &refused,
+            libremarkable_utils::error::Error::HubCycle(CycleError::DeletionsNeedConsent {
+                names,
+                ..
+            }) if *names == expected
+        ),
+        "{refused:?}"
+    );
+    let status = world.status(1).unwrap();
+    assert_eq!(status.names, expected);
+    assert!(
+        status
+            .changes
+            .values()
+            .all(|change| *change == libremarkable_utils::hub::cycle::DocChange::Deleted)
+    );
     assert_eq!(world.origin_docs().len(), 6);
     world.check_idle(1);
+}
+
+/// A deletes the notes while B inks them; A's deletion reaches origin
+/// first, B's sync keeps the inked notes over it, and A's next sync, a
+/// pull, brings them back with a note saying why.
+#[test]
+fn a_document_this_tablet_deleted_comes_back_with_a_note() {
+    let (world, lib) = two_tablets();
+    world.delete(0, &lib.notes);
+    let page = world.pages(1, &lib.notes)[0].clone();
+    world.ink(1, &lib.notes, &page);
+    world.sync(0).unwrap();
+    let kept = world.sync(1).unwrap();
+    assert!(
+        kept.notes
+            .iter()
+            .any(|note| note.doc == lib.notes
+                && matches!(note.kind, NoteKind::KeptOverDeletion { .. })),
+        "{kept:?}"
+    );
+    // B's own new notebook reaches A as a plain addition: no note.
+    let fresh = world.create(1, Kind::Notebook { pages: 1 }, "Fresh", "");
+    world.sync(1).unwrap();
+    let back = world.sync(0).unwrap();
+    assert_eq!(back.update, MainUpdate::Pulled, "{back:?}");
+    let returned: Vec<_> = back
+        .notes
+        .iter()
+        .filter(|note| note.kind == NoteKind::ReturnedAfterDeletion)
+        .map(|note| &note.doc)
+        .collect();
+    assert_eq!(returned, vec![&lib.notes], "{back:?}");
+    assert!(!back.notes.iter().any(|note| note.doc == fresh));
+    assert!(world.device(0).metadata(&lib.notes).is_some());
+    world.converge();
 }
 
 #[test]
@@ -2539,7 +2646,7 @@ fn detach_forgets_the_hub_state_and_can_prune_the_device_ref() {
     let repo = world.git.open(Path::new(&world.origin)).unwrap();
     assert!(repo.rev_parse(&device_ref).unwrap().is_some());
     let docs = world.device(0).docs();
-    let report = world.hub(0).detach(world.tablet(0), true).unwrap();
+    let report = world.hub(0).detach(world.tablet(0), true, false).unwrap();
     assert_eq!(report.pruned.as_deref(), Some(device_ref.as_str()));
     assert_eq!(report.repo_id, state.repo_id);
     assert!(report.warnings.is_empty(), "{report:?}");
@@ -2548,7 +2655,7 @@ fn detach_forgets_the_hub_state_and_can_prune_the_device_ref() {
     assert_eq!(repo.rev_parse(&device_ref).unwrap(), None);
     world.check_idle(0);
     assert!(matches!(
-        world.hub(0).detach(world.tablet(0), false),
+        world.hub(0).detach(world.tablet(0), false, false),
         Err(e) if is_cycle(&e, |e| matches!(e, CycleError::NotAttached))
     ));
     // Attached again: a new device id, and nothing forks.
@@ -2559,8 +2666,12 @@ fn detach_forgets_the_hub_state_and_can_prune_the_device_ref() {
     assert!(world.conflicts().is_empty());
 }
 
+/// With an interrupted sync's journal pending, detach refuses (the
+/// interrupted apply may have left documents half-updated; sync finishes
+/// them) and changes nothing; with `force` it discards the journal, with
+/// a warning.
 #[test]
-fn detach_discards_a_pending_journal_with_a_warning() {
+fn detach_refuses_a_pending_journal_unless_forced() {
     let template = crash_template();
     let (kill, _) = kill_leaving_a_half_applied_document(&template);
     let world = crashed_by(&template, Fault::KillApplyAfter(kill));
@@ -2571,7 +2682,15 @@ fn detach_discards_a_pending_journal_with_a_warning() {
     }
     let state = world.device(0).state().unwrap();
     assert!(state.journal.is_some());
-    let report = world.hub(0).detach(tablet, false).unwrap();
+    let result = world.hub(0).detach(tablet, true, false);
+    assert!(
+        matches!(&result, Err(e) if is_cycle(e, |e| matches!(e, CycleError::DetachJournalPending))),
+        "{result:?}"
+    );
+    assert!(result.unwrap_err().to_string().contains("rmu hub sync"));
+    assert_eq!(world.device(0).state(), Some(state.clone()));
+    world.check_idle(0);
+    let report = world.hub(0).detach(tablet, false, true).unwrap();
     assert_eq!(report.pruned, None);
     assert_eq!(report.warnings, vec![Warning::JournalDiscarded]);
     assert!(world.device(0).state().is_none());
@@ -2778,6 +2897,7 @@ fn reports_serialise_to_json() {
             .any(|note| note["kind"] == "forked" && note["doc"] == lib.notes.as_str()),
         "{json}"
     );
+    assert!(json["names"].is_object(), "{json}");
     let quiet = serde_json::to_value(world.sync(1).unwrap()).unwrap();
     assert_eq!(quiet["update"], serde_json::json!({ "kind": "up_to_date" }));
     let backup = serde_json::to_value(world.backup(0).unwrap()).unwrap();

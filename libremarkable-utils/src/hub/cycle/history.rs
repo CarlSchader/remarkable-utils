@@ -159,6 +159,21 @@ impl HistoryIndex {
         )
     }
 
+    /// Whether `doc` is absent from `commit` but some first-parent
+    /// ancestor of it held it (`None` if the index lacks the commit).
+    pub fn deleted_at(&self, commit: &Oid, doc: &DocId) -> Option<bool> {
+        let start = *self.position.get(commit)?;
+        let touches = self.touches.get(doc).map(Vec::as_slice).unwrap_or_default();
+        let mut held = std::iter::successors(Some(start), |&index| self.first_parent[index])
+            .filter_map(|index| {
+                touches
+                    .binary_search_by_key(&index, |(at, _)| *at)
+                    .ok()
+                    .map(|found| touches[found].1.is_some())
+            });
+        Some(held.next() == Some(false) && held.any(|present| present))
+    }
+
     /// `doc`'s distinct versions (`None`: absent) in the order of the
     /// newest commit holding each, with that commit: the tip's version
     /// first, then each older one as `--topo-order` first meets it.
@@ -317,6 +332,12 @@ mod tests {
         assert_eq!(index.subtree_at(&oid(9), &doc(2)), Some(None));
         assert_eq!(index.subtree_at(&oid(1), &doc(3)), Some(None));
         assert_eq!(index.subtree_at(&oid(6), &doc(1)), None);
+        // Document 2 was deleted at 8, so at 9 too; never at 5 or 1.
+        assert_eq!(index.deleted_at(&oid(8), &doc(2)), Some(true));
+        assert_eq!(index.deleted_at(&oid(9), &doc(2)), Some(true));
+        assert_eq!(index.deleted_at(&oid(5), &doc(2)), Some(false));
+        assert_eq!(index.deleted_at(&oid(1), &doc(3)), Some(false));
+        assert_eq!(index.deleted_at(&oid(6), &doc(2)), None);
     }
 
     #[test]

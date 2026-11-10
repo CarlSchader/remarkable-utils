@@ -475,8 +475,11 @@ while implementing it, beyond the steps above:
   `--prune-ref` it then deletes the device ref on origin, leased on the
   value origin just advertised (a failure there is a warning; state
   first, so a crash in between leaves an unreferenced device ref, not a
-  state whose device ref is gone). A pending journal is discarded with
-  the state, with a warning. A failed `init` removes the bare
+  state whose device ref is gone). While an interrupted sync's journal
+  is pending it refuses (`DetachJournalPending`: documents that apply
+  was writing may be half-updated on the tablet, and `sync` would finish
+  them) unless forced (`force`), which discards the journal with a
+  warning. A failed `init` removes the bare
   repository it created only if it has no `main` (a concurrent `init`
   of the same path may have won).
 - **Cache maintenance** (`git maintenance run --auto`, the user's
@@ -574,6 +577,21 @@ count as documents. The percentage is of origin's library for
 deletions from origin and of the tablet's for deletions from the
 tablet. With `--allow-deletions`, the trailer lists this merge's
 deletions from origin.
+
+The documents listed are by definition ones the tablet no longer has
+(deleted from origin) or is about to lose (deleted from the tablet), so
+the refusal (`DeletionsNeedConsent`), the sync report, `status` and
+`--dry-run` carry each one's `visibleName` (`names`), taken from the
+trees the merge already reads: origin's, then the tablet's snapshot,
+then the document's base. `status` also names the documents the tablet
+deleted since its base, and `--dry-run` those it would delete.
+
+A document this tablet's history deleted can come back: another tablet
+changed it after the deletion, so its merge kept it (`KeptOverDeletion`
+there). The pull that brings it back to this tablet notes it
+(`ReturnedAfterDeletion`): the merge adds it (absent from the snapshot
+and from the document's base), and the history index shows it present
+in an earlier first-parent ancestor of that base.
 
 ### Stage and apply (steps 12–14)
 

@@ -74,7 +74,7 @@ use crate::hub::device::{
 };
 use crate::hub::merge::{
     self, DeletionGuard, Fork, GuardThresholds, MergeInput, MergeOutcome, MergeParams, MergedEntry,
-    Note, Summary, TreeItem,
+    Note, NoteKind, Summary, TreeItem,
 };
 use crate::hub::model::{
     DeviceId, DeviceName, DocFile, DocId, DocVersion, ListingEntry, MirrorRules, RepoConfig,
@@ -96,6 +96,13 @@ pub enum CycleError {
         "an interrupted sync left a journal on the tablet that origin can still finish; run `rmu hub sync` first (`rmu hub detach` then `rmu hub clone` would attach the tablet afresh, without it)"
     )]
     JournalPending,
+
+    /// `detach` while an interrupted sync's journal is pending (without
+    /// `force`).
+    #[error(
+        "an interrupted sync left a journal on the tablet: documents its apply was writing may be half-updated there (both versions stay in origin's history); run `rmu hub sync` first, or detach with --force to discard it"
+    )]
+    DetachJournalPending,
 
     /// `clone` on a tablet that already has hub state.
     #[error(
@@ -161,6 +168,9 @@ pub enum CycleError {
         from_origin: Vec<DocId>,
         from_tablet: Vec<DocId>,
         empty_snapshot: bool,
+        /// The visible name of each document listed, from origin's or the
+        /// tablet's history (the tablet may no longer have it).
+        names: BTreeMap<DocId, String>,
     },
 
     /// Origin kept moving.
@@ -411,6 +421,10 @@ pub struct SyncReport {
     pub notes: Vec<Note>,
     pub forks: Vec<Fork>,
     pub deletions: DeletionGuard,
+    /// The visible name of every document `deletions` lists, from
+    /// origin's or the tablet's history: the tablet no longer has (or is
+    /// about to lose) these.
+    pub names: BTreeMap<DocId, String>,
     pub summary: Summary,
     pub reconciled: Option<Reconciled>,
     pub push_attempts: usize,
@@ -468,6 +482,12 @@ pub struct StatusReport {
     pub open_conflicts: Vec<OpenConflict>,
     /// What a sync would decide about deletions.
     pub guard: DeletionGuard,
+    /// The visible name of every document `guard` lists, of every
+    /// [`DocChange::Deleted`] document, and (for `--dry-run`) of every
+    /// document the sync would delete, from origin's or the tablet's
+    /// history: the tablet no longer has these. [`DryRunReport`] has its
+    /// names here.
+    pub names: BTreeMap<DocId, String>,
     pub summary: Summary,
     pub notes: Vec<Note>,
     pub forks: Vec<Fork>,
@@ -479,7 +499,8 @@ pub struct DryRunReport {
     pub status: StatusReport,
     /// Documents the sync would write on the tablet.
     pub writes: Vec<DocId>,
-    /// Documents the sync would delete from the tablet.
+    /// Documents the sync would delete from the tablet (named in
+    /// `status.names`).
     pub deletes: Vec<DocId>,
     /// Whether the sync would push to origin `main` (it would not when
     /// the tablet already agrees with origin, or has no changes of its
@@ -865,6 +886,80 @@ fn consented_deletions(
         })
 }
 
+/// The `visibleName` of each of `docs`, from the first of `trees` whose
+/// version of it has one (documents with none are left out).
+fn names_of<'a>(
+    docs: impl IntoIterator<Item = &'a DocId>,
+    trees: &[&RepoTree],
+    json: &dyn JsonBlobs,
+) -> Result<BTreeMap<DocId, String>> {
+    let name_in = |tree: &RepoTree, doc: &DocId| -> Result<Option<String>> {
+        let Some(entry) = tree
+            .docs
+            .get(doc)
+            .and_then(|version| version.files.get(&DocFile::Metadata))
+        else {
+            return Ok(None);
+        };
+        Ok(json.json(&entry.id)?.and_then(|metadata| {
+            metadata
+                .get("visibleName")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        }))
+    };
+    docs.into_iter()
+        .map(|doc| -> Result<Option<(DocId, String)>> {
+            let name = trees
+                .iter()
+                .map(|tree| name_in(tree, doc))
+                .find_map(Result::transpose)
+                .transpose()?;
+            Ok(name.map(|name| (doc.clone(), name)))
+        })
+        .filter_map(Result::transpose)
+        .collect()
+}
+
+/// Notes for documents the merge brings to the tablet that its own
+/// history had deleted: absent from the snapshot and from the document's
+/// base, but present in an earlier first-parent ancestor of that base.
+/// Another tablet kept (or re-added) such a document; without a note it
+/// would come back unexplained.
+fn returned_after_deletion(
+    store: &Store,
+    main: &Oid,
+    state: &TabletState,
+    base_tree: &RepoTree,
+    snapshot: &Snapshot,
+    outcome: &MergeOutcome,
+) -> Result<Vec<Note>> {
+    let present =
+        |tree: &RepoTree, doc: &DocId| tree.docs.get(doc).is_some_and(DocVersion::is_present);
+    let candidates: Vec<(&DocId, &Oid)> = outcome
+        .docs
+        .iter()
+        .filter(|(doc, version)| {
+            version.files.contains_key(&DocFile::Metadata)
+                && !present(&snapshot.tree, doc)
+                && !present(base_tree, doc)
+        })
+        .filter_map(|(doc, _)| Some((doc, state.base_for(doc)?)))
+        .collect();
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let index = store.history(main)?;
+    Ok(candidates
+        .into_iter()
+        .filter(|(doc, base)| index.deleted_at(base, doc) == Some(true))
+        .map(|(doc, _)| Note {
+            doc: doc.clone(),
+            kind: NoteKind::ReturnedAfterDeletion,
+        })
+        .collect())
+}
+
 /// Every document of either tree has equivalent versions in both.
 fn trees_equivalent(
     rules: &MirrorRules,
@@ -1073,6 +1168,8 @@ struct MergeRun<'p> {
     /// The tablet has no changes of its own (every document equals its
     /// base version) and the merge is origin's tree: nothing to push.
     pull_only: bool,
+    /// The visible names of the documents the deletion guard lists.
+    names: BTreeMap<DocId, String>,
 }
 
 /// What steps 8–11 decided.
@@ -1082,6 +1179,7 @@ struct Pushed {
     merged: RepoTree,
     outcome: MergeOutcome,
     attempts: usize,
+    names: BTreeMap<DocId, String>,
 }
 
 impl<'a> Hub<'a> {
@@ -1221,10 +1319,23 @@ impl<'a> Hub<'a> {
                 consented_deletions: &consented,
             },
         )?;
+        let mut outcome = outcome;
+        let returned = returned_after_deletion(store, main, state, base_tree, snapshot, &outcome)?;
+        outcome.notes.extend(returned);
         let mut writer = origin.cache.repo.commit_writer(self.progress, None)?;
         let (merged, new_blobs) = realise(&mut writer, &outcome)?;
         let merged_json = Overlay::new_blobs(&new_blobs, store);
         let json = Overlay::read(read, &merged_json);
+        let guard = &outcome.guard;
+        let names = names_of(
+            guard
+                .from_origin
+                .iter()
+                .chain(&guard.from_tablet)
+                .chain(&guard.exempt),
+            &[&theirs, &snapshot.tree, base_tree],
+            &json,
+        )?;
         let left_alone = plan::left_alone(rules, &merged, &tablet_versions(read), &json)?;
         let except: BTreeSet<DocId> = snapshot
             .quarantined
@@ -1246,6 +1357,7 @@ impl<'a> Hub<'a> {
             writer,
             up_to_date,
             pull_only,
+            names,
         })
     }
 
