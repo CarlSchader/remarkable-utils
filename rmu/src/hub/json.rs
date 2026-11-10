@@ -1,6 +1,7 @@
 //! `--json` output, schema 1: the library's reports as they serialise,
 //! with a top-level `schema` and `command` naming the subcommand (`init`
-//! also carries the `origin` it initialised). The layout is the reports'
+//! also carries the `origin` it initialised; `log` is the library's
+//! history, or with a `doc` field one document's). The layout is the reports'
 //! own (see `libremarkable_utils::hub::cycle`): documents by id, enums
 //! tagged by `kind` (`state` for the lock). Errors are `{"schema",
 //! "error": {"kind", "exit_code", "message"}}`, plus `from_origin`,
@@ -59,6 +60,10 @@ pub fn report(report: &Report) -> Value {
         Report::Remote(report) => tagged("remote", report),
         Report::SetUrl(report) => tagged("remote set-url", report),
         Report::Detach(report) => tagged("detach", report),
+        Report::Log(report) => tagged("log", report),
+        Report::DocLog(report) => tagged("log", report),
+        Report::Restore(report) => tagged("restore", report),
+        Report::Add(report) => tagged("add", report),
     }
     .expect("reports serialise")
 }

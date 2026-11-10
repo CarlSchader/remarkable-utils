@@ -2,6 +2,11 @@
 //! allowlist of file kinds, the view-state, derived and model-specific
 //! JSON paths, normalisation for "changed?" comparisons and the
 //! view-state overlay used on apply.
+//!
+//! The path-mapping methods of [`MirrorRules`] (`classify`,
+//! `parse_repo_path`, `xochitl_to_repo`, `repo_to_xochitl`) live with the
+//! layout they map, in `layout.rs`; `group_tree` in `grouping.rs` and
+//! `validate_snapshot` in `snapshot.rs`.
 
 use std::fmt;
 

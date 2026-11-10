@@ -612,3 +612,266 @@ fn other_error_json() {
         })
     );
 }
+
+/// The library's history.
+#[test]
+fn log_report_json() {
+    let value = json::report(&Report::Log(log_report()));
+    assert_eq!(
+        value,
+        json!({
+            "command": "log",
+            "entries": [
+                {
+                    "added": [
+                        "8c1f0b9e-0000-4000-8000-000000000004"
+                    ],
+                    "author": "rmu",
+                    "changed": [],
+                    "commit": "dddddddddddddddddddddddddddddddddddddddd",
+                    "consented": [],
+                    "deleted": [],
+                    "device": null,
+                    "forks": [],
+                    "kind": "restore",
+                    "names": {
+                        "8c1f0b9e-0000-4000-8000-000000000003": "Old",
+                        "8c1f0b9e-0000-4000-8000-000000000004": "Old (restored 2026-11-09)"
+                    },
+                    "notes": [],
+                    "restored": [
+                        {
+                            "copy": "8c1f0b9e-0000-4000-8000-000000000004",
+                            "from": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                            "original": "8c1f0b9e-0000-4000-8000-000000000003"
+                        }
+                    ],
+                    "subject": "rmu hub: restore \"Old (restored 2026-11-09)\"",
+                    "time": 1794233000
+                },
+                {
+                    "added": [
+                        "8c1f0b9e-0000-4000-8000-000000000002"
+                    ],
+                    "author": "Desk tablet",
+                    "changed": [
+                        "8c1f0b9e-0000-4000-8000-000000000001"
+                    ],
+                    "commit": "cccccccccccccccccccccccccccccccccccccccc",
+                    "consented": [
+                        "8c1f0b9e-0000-4000-8000-000000000003"
+                    ],
+                    "deleted": [
+                        "8c1f0b9e-0000-4000-8000-000000000003"
+                    ],
+                    "device": {
+                        "firmware": "3.28.0",
+                        "id": "0f0e0d0c-0000-4000-8000-0000000000c1",
+                        "model": "reMarkable Fake",
+                        "name": "Desk tablet"
+                    },
+                    "forks": [
+                        {
+                            "copy": "8c1f0b9e-0000-4000-8000-000000000002",
+                            "original": "8c1f0b9e-0000-4000-8000-000000000001"
+                        }
+                    ],
+                    "kind": "sync",
+                    "names": {
+                        "8c1f0b9e-0000-4000-8000-000000000001": "Notes",
+                        "8c1f0b9e-0000-4000-8000-000000000002": "Notes (conflict Desk tablet 2026-11-09)",
+                        "8c1f0b9e-0000-4000-8000-000000000003": "Old"
+                    },
+                    "notes": [
+                        "8c1f0b9e-0000-4000-8000-000000000001: \"visibleName\" changed on both sides"
+                    ],
+                    "restored": [],
+                    "subject": "rmu hub: sync Desk tablet",
+                    "time": 1794233000
+                },
+                {
+                    "added": [],
+                    "author": "rmu",
+                    "changed": [],
+                    "commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "consented": [],
+                    "deleted": [],
+                    "device": null,
+                    "forks": [],
+                    "kind": "init",
+                    "names": {},
+                    "notes": [],
+                    "restored": [],
+                    "subject": "rmu hub: init",
+                    "time": 1794233000
+                }
+            ],
+            "main": "dddddddddddddddddddddddddddddddddddddddd",
+            "more": 5,
+            "origin": "ssh://git@example.invalid/library.git",
+            "repo_id": "0f0e0d0c-0000-4000-8000-0000000000a1",
+            "schema": 1,
+            "tablet": {
+                "base": "cccccccccccccccccccccccccccccccccccccccc",
+                "device_id": "0f0e0d0c-0000-4000-8000-0000000000c1",
+                "device_name": "Desk tablet",
+                "overrides": 2
+            }
+        })
+    );
+}
+
+/// A document's history.
+#[test]
+fn doc_log_report_json() {
+    let value = json::report(&Report::DocLog(doc_log_report()));
+    assert_eq!(
+        value,
+        json!({
+            "command": "log",
+            "doc": "8c1f0b9e-0000-4000-8000-000000000001",
+            "entries": [
+                {
+                    "author": "Desk tablet",
+                    "commit": "dddddddddddddddddddddddddddddddddddddddd",
+                    "events": [
+                        {
+                            "kind": "changed"
+                        },
+                        {
+                            "copy": "8c1f0b9e-0000-4000-8000-000000000002",
+                            "kind": "forked_into"
+                        }
+                    ],
+                    "kind": "sync",
+                    "subject": "rmu hub: sync Desk tablet",
+                    "time": 1794233000,
+                    "version": "9999999999999999999999999999999999999999"
+                },
+                {
+                    "author": "Desk tablet",
+                    "commit": "cccccccccccccccccccccccccccccccccccccccc",
+                    "events": [
+                        {
+                            "from": "Draft",
+                            "kind": "renamed",
+                            "to": "Notes"
+                        },
+                        {
+                            "from": {
+                                "parent": "",
+                                "path": "/"
+                            },
+                            "kind": "moved",
+                            "to": {
+                                "parent": "8c1f0b9e-0000-4000-8000-000000000028",
+                                "path": "/Projects"
+                            }
+                        }
+                    ],
+                    "kind": "sync",
+                    "subject": "rmu hub: sync Desk tablet",
+                    "time": 1794233000,
+                    "version": "9999999999999999999999999999999999999999"
+                },
+                {
+                    "author": "Desk tablet",
+                    "commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "events": [
+                        {
+                            "copy": "8c1f0b9e-0000-4000-8000-000000000004",
+                            "from": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                            "kind": "restored_as"
+                        }
+                    ],
+                    "kind": "sync",
+                    "subject": "rmu hub: sync Desk tablet",
+                    "time": 1794233000,
+                    "version": "9999999999999999999999999999999999999999"
+                },
+                {
+                    "author": "Desk tablet",
+                    "commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "events": [
+                        {
+                            "kind": "added",
+                            "name": "Draft",
+                            "place": {
+                                "parent": "",
+                                "path": "/"
+                            }
+                        }
+                    ],
+                    "kind": "sync",
+                    "subject": "rmu hub: sync Desk tablet",
+                    "time": 1794233000,
+                    "version": "9999999999999999999999999999999999999999"
+                }
+            ],
+            "main": "dddddddddddddddddddddddddddddddddddddddd",
+            "name": "Notes",
+            "origin": "ssh://git@example.invalid/library.git",
+            "place": {
+                "parent": "8c1f0b9e-0000-4000-8000-000000000028",
+                "path": "/Projects"
+            },
+            "repo_id": "0f0e0d0c-0000-4000-8000-0000000000a1",
+            "schema": 1,
+            "tablet": {
+                "base": "cccccccccccccccccccccccccccccccccccccccc",
+                "device_id": "0f0e0d0c-0000-4000-8000-0000000000c1",
+                "device_name": "Desk tablet",
+                "overrides": 2
+            }
+        })
+    );
+}
+
+/// What `restore` committed.
+#[test]
+fn restore_report_json() {
+    let value = json::report(&Report::Restore(restore_report()));
+    assert_eq!(
+        value,
+        json!({
+            "at": "dddddddddddddddddddddddddddddddddddddddd",
+            "command": "restore",
+            "commit": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "copy": "8c1f0b9e-0000-4000-8000-000000000004",
+            "from": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "name": "Old (restored 2026-11-09)",
+            "original": "8c1f0b9e-0000-4000-8000-000000000003",
+            "original_name": "Old",
+            "place": {
+                "parent": "8c1f0b9e-0000-4000-8000-000000000028",
+                "path": "/Projects"
+            },
+            "push_attempts": 2,
+            "schema": 1
+        })
+    );
+}
+
+/// What `add` committed.
+#[test]
+fn add_report_json() {
+    let value = json::report(&Report::Add(add_report(Some(3))));
+    assert_eq!(
+        value,
+        json!({
+            "bytes": 2048,
+            "command": "add",
+            "commit": "ffffffffffffffffffffffffffffffffffffffff",
+            "doc": "8c1f0b9e-0000-4000-8000-000000000005",
+            "file_type": "pdf",
+            "name": "Report",
+            "pages": 3,
+            "place": {
+                "parent": "",
+                "path": "/"
+            },
+            "push_attempts": 1,
+            "schema": 1
+        })
+    );
+}

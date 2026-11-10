@@ -12,8 +12,10 @@ use indicatif::HumanBytes;
 use libremarkable_utils::Error;
 use libremarkable_utils::git::Oid;
 use libremarkable_utils::hub::cycle::{
-    BackupReport, CycleError, DetachReport, DocChange, DryRunReport, MainUpdate, ReadSummary,
-    Reconciled, RemoteReport, SetUrlReport, StatusReport, SyncReport, TakeOver, Warning,
+    self, AddReport, BackupReport, CommitKind, CycleError, DetachReport, DocChange, DocEvent,
+    DocLogReport, DryRunReport, LogEntry, LogReport, MainUpdate, Place, ReadSummary, Reconciled,
+    RemoteReport, RestoreReport, SetUrlReport, StatusReport, SyncReport, TabletBase, TakeOver,
+    Warning,
 };
 use libremarkable_utils::hub::device::{LockOwner, LockState, StaleReason};
 use libremarkable_utils::hub::merge::{DeletionGuard, Fork, Note, NoteKind, Summary};
@@ -94,7 +96,11 @@ pub fn report_names(report: &Report) -> Names {
         | Report::Backup(_)
         | Report::Remote(_)
         | Report::SetUrl(_)
-        | Report::Detach(_) => Names::new(),
+        | Report::Detach(_)
+        | Report::Log(_)
+        | Report::DocLog(_)
+        | Report::Restore(_)
+        | Report::Add(_) => Names::new(),
     }
 }
 
@@ -109,9 +115,15 @@ pub fn error_names(error: &Error) -> Names {
 /// The documents whose names the human summary shows.
 pub fn named_docs(report: &Report) -> Vec<DocId> {
     let docs: Vec<&DocId> = match report {
-        Report::Init { .. } | Report::Remote(_) | Report::SetUrl(_) | Report::Detach(_) => {
-            Vec::new()
-        }
+        // The history commands carry their own names (from origin).
+        Report::Init { .. }
+        | Report::Remote(_)
+        | Report::SetUrl(_)
+        | Report::Detach(_)
+        | Report::Log(_)
+        | Report::DocLog(_)
+        | Report::Restore(_)
+        | Report::Add(_) => Vec::new(),
         Report::Clone(report) | Report::Sync(report) => {
             let updates = match report.applied.len() <= NAMED_UPDATES {
                 true => report.applied.as_slice(),
@@ -173,6 +185,10 @@ pub fn human(report: &Report, names: &Names) -> Vec<String> {
         Report::Remote(report) => remote(report),
         Report::SetUrl(report) => set_url(report),
         Report::Detach(report) => detach(report),
+        Report::Log(report) => log(report),
+        Report::DocLog(report) => doc_log(report),
+        Report::Restore(report) => restore(report),
+        Report::Add(report) => add(report),
     };
     lines.iter().map(|line| escape_controls(line)).collect()
 }
@@ -195,6 +211,18 @@ pub fn plain(report: &Report) -> Vec<String> {
         Report::Remote(report) => vec![report.origin.clone()],
         Report::SetUrl(report) => vec![report.remote.origin.clone()],
         Report::Detach(report) => report.pruned.iter().cloned().collect(),
+        Report::Log(report) => report
+            .entries
+            .iter()
+            .map(|e| e.commit.to_string())
+            .collect(),
+        Report::DocLog(report) => report
+            .entries
+            .iter()
+            .map(|e| e.commit.to_string())
+            .collect(),
+        Report::Restore(report) => vec![report.copy.to_string()],
+        Report::Add(report) => vec![report.doc.to_string()],
     }
 }
 
@@ -205,7 +233,14 @@ pub fn warnings(report: &Report) -> Vec<String> {
         Report::Backup(report) => &report.warnings,
         Report::SetUrl(report) => &report.warnings,
         Report::Detach(report) => &report.warnings,
-        Report::Init { .. } | Report::DryRun(_) | Report::Status(_) | Report::Remote(_) => &[],
+        Report::Init { .. }
+        | Report::DryRun(_)
+        | Report::Status(_)
+        | Report::Remote(_)
+        | Report::Log(_)
+        | Report::DocLog(_)
+        | Report::Restore(_)
+        | Report::Add(_) => &[],
     };
     warnings
         .iter()
@@ -706,6 +741,286 @@ fn detach(report: &DetachReport) -> Vec<String> {
     lines.push("`rmu hub clone <origin>` attaches it again".to_string());
     took_over(&mut lines, &report.took_over);
     warning_lines(&mut lines, &report.warnings);
+    lines
+}
+
+// ---- log, restore, add ---------------------------------------------------------
+
+/// Names inline in a history entry: at most this many per list.
+pub const INLINE_NAMES: usize = 5;
+
+/// A time for humans: `yyyy-mm-dd HH:MM` (UTC).
+pub fn when(time: i64) -> String {
+    let seconds = time.rem_euclid(86_400);
+    format!(
+        "{} {:02}:{:02}",
+        cycle::civil_date(time),
+        seconds / 3600,
+        seconds % 3600 / 60
+    )
+}
+
+fn kind_word(kind: CommitKind) -> &'static str {
+    match kind {
+        CommitKind::Init => "init",
+        CommitKind::Sync | CommitKind::Snapshot => "sync",
+        CommitKind::Restore => "restore",
+        CommitKind::Add => "add",
+        CommitKind::Other => "commit",
+    }
+}
+
+/// A folder for humans: `the root`, or its path.
+fn folder(place: &Place) -> String {
+    match place.path.as_str() {
+        "/" => "the root".to_string(),
+        "trash" => "the trash".to_string(),
+        path => path.to_string(),
+    }
+}
+
+/// Up to [`INLINE_NAMES`] documents, labelled, the rest counted.
+fn inline(names: &Names, docs: &[DocId]) -> String {
+    let shown: Vec<String> = docs
+        .iter()
+        .take(INLINE_NAMES)
+        .map(|doc| label(names, doc))
+        .collect();
+    match docs.len().saturating_sub(INLINE_NAMES) {
+        0 => shown.join(", "),
+        more => format!("{} and {more} more", shown.join(", ")),
+    }
+}
+
+fn tablet_line(tablet: &TabletBase, what: &str) -> String {
+    match &tablet.base {
+        Some(base) => format!(
+            "Tablet \"{}\" has {what} as of {}",
+            tablet.device_name,
+            short(base)
+        ),
+        None => format!(
+            "Tablet \"{}\" has no base for {what} yet",
+            tablet.device_name
+        ),
+    }
+}
+
+fn log_entry(lines: &mut Vec<String>, entry: &LogEntry, tablet: Option<&TabletBase>) {
+    let who = match (&entry.device, entry.kind) {
+        (_, CommitKind::Other) => format!("{}: {}", entry.author, entry.subject),
+        (Some(device), _) => {
+            let about: Vec<&str> = [device.model.as_deref(), device.firmware.as_deref()]
+                .into_iter()
+                .flatten()
+                .collect();
+            let name = device.name.as_deref().unwrap_or(&entry.author);
+            match about.is_empty() {
+                true => name.to_string(),
+                false => format!("{name} ({})", about.join(", ")),
+            }
+        }
+        (None, _) => entry.author.clone(),
+    };
+    let here = match tablet.and_then(|tablet| tablet.base.as_ref()) {
+        Some(base) if *base == entry.commit => "  <- the tablet's base",
+        _ => "",
+    };
+    lines.push(format!(
+        "{}  {}  {:<7}  {who}{here}",
+        short(&entry.commit),
+        when(entry.time),
+        kind_word(entry.kind)
+    ));
+    let counts: Vec<String> = [
+        (entry.added.len(), "added"),
+        (entry.changed.len(), "changed"),
+        (entry.deleted.len(), "deleted"),
+    ]
+    .into_iter()
+    .filter(|(count, _)| *count > 0)
+    .map(|(count, what)| format!("{count} {what}"))
+    .collect();
+    if !counts.is_empty() {
+        lines.push(format!("    {}", counts.join(", ")));
+    }
+    let names = &entry.names;
+    if !entry.added.is_empty() && entry.added.len() <= INLINE_NAMES {
+        lines.push(format!("    added: {}", inline(names, &entry.added)));
+    }
+    if !entry.deleted.is_empty() {
+        lines.push(format!("    deleted: {}", inline(names, &entry.deleted)));
+    }
+    lines.extend(entry.forks.iter().map(|fork| {
+        format!(
+            "    conflict copy {} of {}",
+            label(names, &fork.copy),
+            label(names, &fork.original)
+        )
+    }));
+    lines.extend(entry.restored.iter().map(|restored| {
+        format!(
+            "    restored {} as of {} as {}",
+            label(names, &restored.original),
+            short(&restored.from),
+            label(names, &restored.copy)
+        )
+    }));
+    if !entry.consented.is_empty() {
+        lines.push(format!(
+            "    {} deleted with --allow-deletions",
+            docs(entry.consented.len())
+        ));
+    }
+    let more = entry.notes.len().saturating_sub(LIST_LIMIT);
+    lines.extend(
+        entry
+            .notes
+            .iter()
+            .take(LIST_LIMIT)
+            .map(|note| format!("    note: {note}")),
+    );
+    if more > 0 {
+        lines.push(format!("    ... and {more} more notes"));
+    }
+}
+
+fn log(report: &LogReport) -> Vec<String> {
+    let mut lines = vec![format!(
+        "History of origin {} (repository {}), newest first",
+        report.origin, report.repo_id
+    )];
+    if let Some(tablet) = &report.tablet {
+        let overrides = match tablet.overrides {
+            0 => String::new(),
+            n => format!(" ({} at a base of their own)", docs(n)),
+        };
+        lines.push(format!("{}{overrides}", tablet_line(tablet, "the library")));
+    }
+    report
+        .entries
+        .iter()
+        .for_each(|entry| log_entry(&mut lines, entry, report.tablet.as_ref()));
+    if report.more > 0 {
+        lines.push(format!(
+            "... and {} older {} (-n sets how many are shown)",
+            report.more,
+            if report.more == 1 { "entry" } else { "entries" }
+        ));
+    }
+    lines
+}
+
+fn event_text(event: &DocEvent) -> String {
+    let name = |name: &Option<String>| {
+        name.as_deref()
+            .map_or_else(|| "(no name)".to_string(), |name| format!("\"{name}\""))
+    };
+    match event {
+        DocEvent::Added { name: named, place } => {
+            format!("added as {} in {}", name(named), folder(place))
+        }
+        DocEvent::Changed => "changed".to_string(),
+        DocEvent::Renamed { from, to } => format!("renamed from {} to {}", name(from), name(to)),
+        DocEvent::Moved { from, to } => format!("moved from {} to {}", folder(from), folder(to)),
+        DocEvent::Deleted => "deleted".to_string(),
+        DocEvent::ForkedInto { copy } => format!("conflict copy {copy} made from it"),
+        DocEvent::ForkOf { original } => format!("made as a conflict copy of {original}"),
+        DocEvent::RestoredAs { copy, from } => {
+            format!("its version as of {} restored as {copy}", short(from))
+        }
+        DocEvent::RestoredFrom { original, from } => {
+            format!("restored from {original} as of {}", short(from))
+        }
+    }
+}
+
+fn doc_log(report: &DocLogReport) -> Vec<String> {
+    let title = match &report.name {
+        Some(name) => format!("\"{name}\" ({})", report.doc),
+        None => report.doc.to_string(),
+    };
+    let mut lines = vec![match &report.place {
+        Some(place) => format!("{title}, in {}", folder(place)),
+        None => format!("{title}, deleted on origin"),
+    }];
+    lines.extend(report.entries.iter().map(|entry| {
+        let events: Vec<String> = entry.events.iter().map(event_text).collect();
+        format!(
+            "{}  {}  {}: {}",
+            short(&entry.commit),
+            when(entry.time),
+            entry.author,
+            events.join("; ")
+        )
+    }));
+    if let Some(tablet) = &report.tablet {
+        lines.push(tablet_line(tablet, "it"));
+    }
+    lines.push(format!(
+        "To bring a version back as a new document: rmu hub restore {} --at <commit>",
+        report.doc
+    ));
+    lines
+}
+
+fn restore(report: &RestoreReport) -> Vec<String> {
+    let from = match report.from == report.at {
+        true => format!("as of {}", short(&report.from)),
+        false => format!(
+            "as of {}, just before its deletion (asked for {})",
+            short(&report.from),
+            short(&report.at)
+        ),
+    };
+    let mut lines = vec![
+        format!(
+            "Restored \"{}\" ({}) {from} as \"{}\" ({}) in {}",
+            report.original_name,
+            report.original,
+            report.name,
+            report.copy,
+            folder(&report.place)
+        ),
+        format!(
+            "Pushed to origin ({}); every tablet gets it at its next sync",
+            short(&report.commit)
+        ),
+    ];
+    if report.push_attempts > 1 {
+        lines.push(format!(
+            "(after {} push attempts: origin moved meanwhile)",
+            report.push_attempts
+        ));
+    }
+    lines
+}
+
+fn add(report: &AddReport) -> Vec<String> {
+    let pages = match report.pages {
+        Some(pages) => format!(", {} (page list written)", plural(pages, "page", "pages")),
+        None => ", page list left to the tablet's first open".to_string(),
+    };
+    let mut lines = vec![
+        format!(
+            "Added \"{}\" ({}) to {}: {}, {}{pages}",
+            report.name,
+            report.doc,
+            folder(&report.place),
+            report.file_type,
+            HumanBytes(report.bytes)
+        ),
+        format!(
+            "Pushed to origin ({}); every tablet gets it at its next sync",
+            short(&report.commit)
+        ),
+    ];
+    if report.push_attempts > 1 {
+        lines.push(format!(
+            "(after {} push attempts: origin moved meanwhile)",
+            report.push_attempts
+        ));
+    }
     lines
 }
 

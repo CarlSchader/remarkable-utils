@@ -191,6 +191,15 @@ pub(crate) mod local_ssh {
         shell_quote(&path.to_string_lossy())
     }
 
+    /// Run `check` with the host's tools and, if available, BusyBox.
+    pub(crate) fn on_both(systemd_run: bool, check: impl Fn(&SshHarness)) {
+        check(&SshHarness::new(Tools::Host, systemd_run));
+        match busybox() {
+            Some(busybox) => check(&SshHarness::new(Tools::BusyBox(&busybox), systemd_run)),
+            None => eprintln!("RMU_TEST_BUSYBOX is not set; skipping the BusyBox run"),
+        }
+    }
+
     /// The real tablet over the mock transport.
     pub(crate) struct SshHarness {
         tablet: SshTablet,

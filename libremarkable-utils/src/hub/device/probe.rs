@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 use super::lock::{LockDecision, LockOwner, LockState, StaleReason, decide, parse_owner};
 use super::scripts::{EXIT_BUSY, take_flock};
 use super::{DeviceError, TabletPaths};
+use crate::marked::section;
 use crate::ssh::shell_quote;
 
 /// Exit status of a write whose guard found the hub lock changed since
@@ -202,17 +203,6 @@ pub fn probe_script(paths: &TabletPaths, marker: &str) -> String {
         fired_marker = shell_quote(&paths.watchdog_marker()),
         state = shell_quote(&paths.state_file()),
     )
-}
-
-/// The body of section `name` in `output` (sections as printed by
-/// [`probe_script`]); `None` if it is missing.
-fn section<'a>(marker: &str, output: &'a str, name: &str) -> Option<&'a str> {
-    let header = format!("\n{marker} {name}\n");
-    let start = output.find(&header)? + header.len();
-    let body = &output[start..];
-    // The newline before the next header belongs to that header.
-    let end = body.find(&format!("\n{marker} ")).unwrap_or(body.len());
-    Some(&body[..end])
 }
 
 fn probe_error(detail: impl Into<String>) -> DeviceError {

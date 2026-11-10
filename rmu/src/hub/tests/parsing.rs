@@ -313,3 +313,160 @@ fn no_restart_is_refused_for_hub() {
     // Other commands still take it.
     assert!(crate::parse_cli(["rmu", "--no-restart", "mkdir", "Books"]).is_ok());
 }
+
+#[test]
+fn parses_log_restore_and_add() {
+    match hub_args(&["log"]).command {
+        HubCommand::Log {
+            doc: None,
+            max_count: None,
+            origin,
+        } => assert_eq!(origin, OriginArg::default()),
+        other => panic!("{other:?}"),
+    }
+    assert!(matches!(
+        hub_args(&["log", "-n", "3", "--origin", "laptop:lib.git"]).command,
+        HubCommand::Log { max_count: Some(3), origin: OriginArg { origin: Some(url) }, .. }
+            if url == "laptop:lib.git"
+    ));
+    assert!(matches!(
+        hub_args(&["log", "Books/Notes"]).command,
+        HubCommand::Log { doc: Some(doc), .. } if doc == "Books/Notes"
+    ));
+    match hub_args(&["restore", "Books/Notes", "--at", "main~2"]).command {
+        HubCommand::Restore { doc, at, origin } => {
+            assert_eq!((doc.as_str(), at.as_str()), ("Books/Notes", "main~2"));
+            assert_eq!(origin.origin, None);
+        }
+        other => panic!("{other:?}"),
+    }
+    match hub_args(&["add", "paper.pdf", "Books", "--name", "Paper", "--json"]).command {
+        HubCommand::Add {
+            file, folder, name, ..
+        } => {
+            assert_eq!(file, PathBuf::from("paper.pdf"));
+            assert_eq!(folder.as_deref(), Some("Books"));
+            assert_eq!(name.as_deref(), Some("Paper"));
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(matches!(
+        hub_args(&["add", "paper.pdf"]).command,
+        HubCommand::Add {
+            folder: None,
+            name: None,
+            ..
+        }
+    ));
+    use clap::error::ErrorKind;
+    assert_eq!(
+        parse_error(&["log", "Books/Notes", "-n", "2"]),
+        ErrorKind::ArgumentConflict
+    );
+    assert_eq!(
+        parse_error(&["restore", "Books/Notes"]),
+        ErrorKind::MissingRequiredArgument
+    );
+    assert_eq!(parse_error(&["add"]), ErrorKind::MissingRequiredArgument);
+    assert_eq!(
+        parse_error(&["log", "-n", "many"]),
+        ErrorKind::ValueValidation
+    );
+}
+
+/// `log`, `restore` and `add` contact the tablet without `--origin`, or
+/// with an explicit `--host` (before or after the subcommand); with
+/// `--origin` alone they do not. Every other command always does.
+#[test]
+fn history_commands_contact_the_tablet_only_when_needed() {
+    let parsed = |argv: &[&str]| {
+        let cli = crate::parse_cli(argv.iter().copied()).unwrap();
+        let crate::Command::Hub(args) = &cli.command else {
+            unreachable!()
+        };
+        wants_tablet(&args.command, cli.tablet_given)
+    };
+    assert!(parsed(&["rmu", "hub", "log"]));
+    assert!(!parsed(&["rmu", "hub", "log", "--origin", "/srv/lib.git"]));
+    // Any flag naming the tablet or how to reach it counts as naming it.
+    [
+        &["--user", "admin"][..],
+        &["--port", "2222"],
+        &["-i", "/keys/tablet"],
+        &["-o", "ConnectTimeout=5"],
+        &["--password-file", "/run/pw"],
+        &["--password"],
+    ]
+    .iter()
+    .for_each(|flag| {
+        let argv: Vec<&str> = ["rmu", "hub", "log", "--origin", "/srv/lib.git"]
+            .iter()
+            .chain(flag.iter())
+            .copied()
+            .collect();
+        assert!(parsed(&argv), "{flag:?}");
+    });
+    assert!(parsed(&[
+        "rmu",
+        "hub",
+        "log",
+        "--origin",
+        "/srv/lib.git",
+        "--host",
+        "tablet"
+    ]));
+    assert!(parsed(&[
+        "rmu",
+        "--host",
+        "tablet",
+        "hub",
+        "add",
+        "a.pdf",
+        "--origin",
+        "/srv/lib.git"
+    ]));
+    assert!(!parsed(&[
+        "rmu",
+        "hub",
+        "restore",
+        "x",
+        "--at",
+        "main",
+        "--origin",
+        "/srv/lib.git"
+    ]));
+    assert!(parsed(&["rmu", "hub", "restore", "x", "--at", "main"]));
+    assert!(!parsed(&[
+        "rmu",
+        "--host",
+        "tablet",
+        "hub",
+        "init",
+        "/srv/lib.git"
+    ]));
+    assert!(parsed(&[
+        "rmu",
+        "hub",
+        "status",
+        "--origin",
+        "/srv/lib.git"
+    ]));
+    // The default host is not "given".
+    let cli = crate::parse_cli(["rmu", "hub", "log"]).unwrap();
+    assert!(!cli.tablet_given);
+}
+
+#[test]
+fn history_commands_take_the_origin_flag() {
+    ["log", "restore x --at main", "add a.pdf"]
+        .iter()
+        .for_each(|command| {
+            let mut args: Vec<&str> = command.split(' ').collect();
+            args.extend(["--origin", "laptop:lib.git"]);
+            assert_eq!(
+                options(&hub_args(&args).command).origin.as_deref(),
+                Some("laptop:lib.git"),
+                "{command}"
+            );
+        });
+}

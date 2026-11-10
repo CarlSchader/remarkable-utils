@@ -14,7 +14,9 @@ use super::store::{Store, StoreHistory};
 use super::{Hub, Overlay, tablet_versions};
 use crate::error::Result;
 use crate::git::{CommitWriter, Oid};
-use crate::hub::merge::{self, MergeInput, MergeOutcome, MergeParams, MergedEntry, Note, NoteKind};
+use crate::hub::merge::{
+    self, MergeInput, MergeOutcome, MergeParams, MergedEntry, Note, NoteKind, Summary,
+};
 use crate::hub::model::{
     DocFile, DocId, DocVersion, ListingEntry, MirrorRules, RepoTree, TabletState,
 };
@@ -37,6 +39,9 @@ pub(super) struct MergeRun<'p> {
     pub(super) pull_only: bool,
     /// The visible names of the documents the deletion guard lists.
     pub(super) names: BTreeMap<DocId, String>,
+    /// The merge's summary as reported: documents whose merged version
+    /// is equivalent to their base count as unchanged.
+    pub(super) summary: Summary,
 }
 
 impl<'a> Hub<'a> {
@@ -104,6 +109,9 @@ impl<'a> Hub<'a> {
             merge_is_theirs && trees_equivalent(rules, &snapshot.tree, &theirs, &json, &except)?;
         let pull_only =
             merge_is_theirs && trees_equivalent(rules, &snapshot.tree, base_tree, &json, &none)?;
+        let summary = outcome.summary_with(|doc| {
+            plan::versions_equivalent(rules, base_tree.docs.get(doc), merged.docs.get(doc), &json)
+        })?;
         drop(json);
         Ok(MergeRun {
             theirs,
@@ -113,6 +121,7 @@ impl<'a> Hub<'a> {
             up_to_date,
             pull_only,
             names,
+            summary,
         })
     }
 }
