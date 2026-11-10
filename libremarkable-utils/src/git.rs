@@ -203,6 +203,14 @@ pub enum FileMode {
 }
 
 impl FileMode {
+    /// Every mode git writes for a non-tree entry.
+    pub const ALL: [FileMode; 4] = [
+        Self::Regular,
+        Self::Executable,
+        Self::Symlink,
+        Self::Gitlink,
+    ];
+
     /// The mode as git writes it in trees.
     pub fn bits(self) -> u32 {
         match self {
@@ -216,14 +224,7 @@ impl FileMode {
     /// The mode for a [`TreeEntry::mode`], unless it is a tree (or a
     /// mode git does not write).
     pub fn from_bits(mode: u32) -> Option<Self> {
-        [
-            Self::Regular,
-            Self::Executable,
-            Self::Symlink,
-            Self::Gitlink,
-        ]
-        .into_iter()
-        .find(|m| m.bits() == mode)
+        Self::ALL.into_iter().find(|m| m.bits() == mode)
     }
 
     /// Regular or executable: content that can be written to a file.
@@ -2042,6 +2043,15 @@ mod tests {
         ]
         .into_iter()
         .for_each(|mode| assert_eq!(FileMode::from_bits(mode.bits()), Some(mode)));
+        assert_eq!(
+            FileMode::ALL,
+            [
+                FileMode::Regular,
+                FileMode::Executable,
+                FileMode::Symlink,
+                FileMode::Gitlink
+            ]
+        );
         assert_eq!(FileMode::from_bits(0o160000), Some(FileMode::Gitlink));
         assert_eq!(FileMode::from_bits(0o040000), None);
         assert_eq!(FileMode::from_bits(0o100664), None);
