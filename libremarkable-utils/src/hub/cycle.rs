@@ -93,9 +93,16 @@ pub enum CycleError {
     /// sync's journal, whose merge origin has, is pending: `sync`
     /// reconciles it first.
     #[error(
-        "an interrupted sync left a journal on the tablet that origin can still finish; run `rmu hub sync` first (`rmu hub detach` then `rmu hub clone` would attach the tablet afresh, without it)"
+        "an interrupted sync left a journal on the tablet that origin can still finish; run `rmu hub sync` first (`rmu hub detach --force` then `rmu hub clone` would attach the tablet afresh, discarding it)"
     )]
     JournalPending,
+
+    /// `remote set-url` to an origin that lacks the merge of a pending
+    /// journal (where `sync` could no longer finish it).
+    #[error(
+        "the new origin does not have merge {merge}, which an interrupted sync on this tablet is waiting to finish; run `rmu hub sync` against the current origin first, then set the URL"
+    )]
+    JournalMergeMissing { merge: Oid },
 
     /// `detach` while an interrupted sync's journal is pending (without
     /// `force`).
@@ -518,6 +525,16 @@ pub struct RemoteReport {
     pub origin: String,
     /// The URL this invocation uses ([`HubOptions::origin`] if set).
     pub effective: String,
+}
+
+/// How `detach` goes about it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DetachOptions {
+    /// Also delete the tablet's device ref on origin (`--prune-ref`).
+    pub prune_device_ref: bool,
+    /// Detach even while an interrupted sync's journal is pending,
+    /// discarding it (`--force`).
+    pub force: bool,
 }
 
 /// What `remote set-url` changed.

@@ -305,10 +305,14 @@ impl Hub<'_> {
                 .into());
             }
             pending_journal(before.as_ref(), &config.repo_id, &probe, &main)?;
+            let destination = s.tablet.destination();
             let saved = store::pre_read_path(
                 &self.cache_dir,
                 &config.repo_id,
-                before.as_ref().map(|state| &state.device_id),
+                match before.as_ref() {
+                    Some(state) => store::PreReadOf::Device(&state.device_id),
+                    None => store::PreReadOf::Destination(&destination),
+                },
             );
             let pre = if self.may_pre_read(s.tablet)? {
                 self.pre_read(
@@ -509,7 +513,11 @@ impl Hub<'_> {
         if s.tablet.cloud_paired()? {
             return Err(CycleError::CloudPaired.into());
         }
-        let saved = store::pre_read_path(&self.cache_dir, &first.repo_id, Some(&first.device_id));
+        let saved = store::pre_read_path(
+            &self.cache_dir,
+            &first.repo_id,
+            store::PreReadOf::Device(&first.device_id),
+        );
         let pre = if self.may_pre_read(s.tablet)? {
             self.pre_read(
                 s.tablet,

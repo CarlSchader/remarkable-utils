@@ -9,7 +9,7 @@
 #[path = "hub_e2e/world.rs"]
 mod world;
 
-use libremarkable_utils::hub::cycle::{MainUpdate, Warning};
+use libremarkable_utils::hub::cycle::{DetachOptions, MainUpdate, Warning};
 use libremarkable_utils::hub::merge::NoteKind;
 use world::{Kind, World};
 
@@ -2383,10 +2383,19 @@ fn reattach_refuses_a_pending_journal_of_the_same_repository() {
     let (kill, _) = kill_leaving_a_half_applied_document(&template);
     let world = crashed_by(&template, Fault::KillApplyAfter(kill));
     assert!(world.device(0).state().unwrap().journal.is_some());
+    let before = world.tablet(0).ops().len();
     let result = world.reattach(0);
     assert!(
         matches!(&result, Err(e) if is_cycle(e, |e| matches!(e, CycleError::JournalPending))),
         "{result:?}"
+    );
+    assert!(result.unwrap_err().to_string().contains("detach --force"));
+    // Refused read-only, before any pre-read.
+    let ops = world.tablet(0).ops()[before..].to_vec();
+    assert!(
+        !ops.iter()
+            .any(|op| matches!(op, OpKind::StatAll | OpKind::Download)),
+        "{ops:?}"
     );
     world.check_idle(0);
     // Once `sync` has reconciled it, the reattach goes ahead.
@@ -2646,7 +2655,16 @@ fn detach_forgets_the_hub_state_and_can_prune_the_device_ref() {
     let repo = world.git.open(Path::new(&world.origin)).unwrap();
     assert!(repo.rev_parse(&device_ref).unwrap().is_some());
     let docs = world.device(0).docs();
-    let report = world.hub(0).detach(world.tablet(0), true, false).unwrap();
+    let report = world
+        .hub(0)
+        .detach(
+            world.tablet(0),
+            DetachOptions {
+                prune_device_ref: true,
+                ..DetachOptions::default()
+            },
+        )
+        .unwrap();
     assert_eq!(report.pruned.as_deref(), Some(device_ref.as_str()));
     assert_eq!(report.repo_id, state.repo_id);
     assert!(report.warnings.is_empty(), "{report:?}");
@@ -2655,7 +2673,7 @@ fn detach_forgets_the_hub_state_and_can_prune_the_device_ref() {
     assert_eq!(repo.rev_parse(&device_ref).unwrap(), None);
     world.check_idle(0);
     assert!(matches!(
-        world.hub(0).detach(world.tablet(0), false, false),
+        world.hub(0).detach(world.tablet(0), DetachOptions::default()),
         Err(e) if is_cycle(&e, |e| matches!(e, CycleError::NotAttached))
     ));
     // Attached again: a new device id, and nothing forks.
@@ -2682,7 +2700,13 @@ fn detach_refuses_a_pending_journal_unless_forced() {
     }
     let state = world.device(0).state().unwrap();
     assert!(state.journal.is_some());
-    let result = world.hub(0).detach(tablet, true, false);
+    let result = world.hub(0).detach(
+        tablet,
+        DetachOptions {
+            prune_device_ref: true,
+            ..DetachOptions::default()
+        },
+    );
     assert!(
         matches!(&result, Err(e) if is_cycle(e, |e| matches!(e, CycleError::DetachJournalPending))),
         "{result:?}"
@@ -2690,7 +2714,16 @@ fn detach_refuses_a_pending_journal_unless_forced() {
     assert!(result.unwrap_err().to_string().contains("rmu hub sync"));
     assert_eq!(world.device(0).state(), Some(state.clone()));
     world.check_idle(0);
-    let report = world.hub(0).detach(tablet, false, true).unwrap();
+    let report = world
+        .hub(0)
+        .detach(
+            tablet,
+            DetachOptions {
+                force: true,
+                ..DetachOptions::default()
+            },
+        )
+        .unwrap();
     assert_eq!(report.pruned, None);
     assert_eq!(report.warnings, vec![Warning::JournalDiscarded]);
     assert!(world.device(0).state().is_none());
@@ -3091,6 +3124,17 @@ fn the_next_run_reuses_a_cut_pre_read() {
         assert!(clone_with(&world, options.clone()).is_err());
         world.tablet(0).reconnect();
         world.check_idle(0);
+        // Saved for this tablet (by where it is reached: it has no device
+        // id yet), not for every tablet cloned from this computer.
+        let saved: Vec<String> = std::fs::read_dir(&world.device(0).cache)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".pre-read-"))
+            .collect();
+        assert!(
+            saved.len() == 1 && saved[0].contains(".pre-read-at-"),
+            "{saved:?}"
+        );
         world.tablet(0).inject(fault);
         let report = clone_with(&world, options.clone()).unwrap();
         assert_eq!(
@@ -3162,8 +3206,165 @@ fn a_locked_tablet_gets_no_pre_read() {
             .any(|op| matches!(op, OpKind::StatAll | OpKind::Download)),
         "{ops:?}"
     );
-    libremarkable_utils::hub::device::Tablet::release_lock(tablet, &held).unwrap();
-    world.sync(0).unwrap();
+    // Breaking it, the run pre-reads (two stat passes) and goes ahead.
+    let before = tablet.ops().len();
+    let report = world
+        .sync_with(
+            0,
+            HubOptions {
+                break_lock: true,
+                ..world.options.clone()
+            },
+        )
+        .unwrap();
+    assert!(report.took_over.is_some(), "{report:?}");
+    let stat_passes = tablet.ops()[before..]
+        .iter()
+        .filter(|op| **op == OpKind::StatAll)
+        .count();
+    assert_eq!(stat_passes, 2);
+    assert!(libremarkable_utils::hub::device::Tablet::release_lock(tablet, &held).is_err());
+}
+
+/// A tablet paired with the cloud after it was attached: `sync` refuses
+/// before reading anything.
+#[test]
+fn a_paired_tablet_gets_no_pre_read_on_sync() {
+    let (world, _, _) = two_notebooks();
+    let paired = libremarkable_utils::hub::device::FakeTablet::builder(&world.device(0).dir)
+        .cloud_paired(true)
+        .build()
+        .unwrap();
+    let result = world.hub(0).sync(&paired);
+    assert!(
+        matches!(&result, Err(e) if is_cycle(e, |e| matches!(e, CycleError::CloudPaired))),
+        "{result:?}"
+    );
+    assert!(
+        !paired
+            .ops()
+            .iter()
+            .any(|op| matches!(op, OpKind::StatAll | OpKind::Download)),
+        "{:?}",
+        paired.ops()
+    );
+}
+
+/// While a journal is pending, `set-url` requires the new origin to have
+/// its merge (only there can `sync` finish it): a copy of origin rewound
+/// to before the merge is refused, before the lock and (a journal that
+/// appears meanwhile) under it; an intact copy is accepted.
+#[test]
+fn set_url_requires_a_pending_journals_merge() {
+    let template = crash_template();
+    let before_merge = world::git_cli(
+        &template.root,
+        &[
+            &format!("--git-dir={}", template.origin),
+            "rev-parse",
+            "refs/heads/main",
+        ],
+    );
+    let (kill, _) = kill_leaving_a_half_applied_document(&template);
+    let world = crashed_by(&template, Fault::KillApplyAfter(kill));
+    let tablet = world.tablet(0);
+    tablet.reconnect();
+    if tablet.watchdog_armed().is_some() {
+        tablet.fire_watchdog();
+    }
+    let journal = world.device(0).state().unwrap().journal.unwrap();
+    let copy = |name: &str, main: Option<&str>| -> String {
+        let path = world.root.join(name).to_str().unwrap().to_string();
+        world::git_cli(
+            &world.root,
+            &["clone", "-q", "--mirror", &world.origin, &path],
+        );
+        if let Some(main) = main {
+            world::git_cli(
+                &world.root,
+                &[
+                    &format!("--git-dir={path}"),
+                    "update-ref",
+                    "refs/heads/main",
+                    main,
+                ],
+            );
+        }
+        path
+    };
+    let hub = hub_without_origin(&world, 0);
+    let stored = world.device(0).state().unwrap().origin;
+    let rewound = copy("rewound.git", Some(&before_merge));
+    let ops_before = tablet.ops().len();
+    let result = hub.set_remote_url(tablet, &rewound);
+    // Refused before the lock is even taken.
+    assert!(
+        !tablet.ops()[ops_before..].contains(&OpKind::AcquireLock),
+        "{:?}",
+        tablet.ops()
+    );
+    assert!(
+        matches!(
+            &result,
+            Err(libremarkable_utils::error::Error::HubCycle(CycleError::JournalMergeMissing { merge }))
+                if *merge == journal.merge
+        ),
+        "{result:?}"
+    );
+    assert_eq!(world.device(0).state().unwrap().origin, stored);
+    world.check_idle(0);
+    // Under the lock: the journal is only there once the lock is taken.
+    let mut state = world.device(0).state().unwrap();
+    state.journal = None;
+    world.device(0).set_state(&state);
+    let lock = op_index(&world, 0, OpKind::AcquireLock, 1, |w| {
+        hub_without_origin(w, 0)
+            .set_remote_url(w.tablet(0), &rewound)
+            .unwrap();
+    });
+    let state_file = world.device(0).tablet.paths().state_file();
+    let pending = journal.clone();
+    tablet.inject(Fault::EditBefore(
+        lock,
+        Box::new(move |_: &Path| {
+            let mut state = libremarkable_utils::hub::model::TabletState::parse(
+                &std::fs::read(&state_file).unwrap(),
+            )
+            .unwrap();
+            state.journal = Some(pending);
+            std::fs::write(&state_file, state.to_json()).unwrap();
+        }),
+    ));
+    let result = hub.set_remote_url(tablet, &rewound);
+    assert!(
+        matches!(&result, Err(e) if is_cycle(e, |e| matches!(e, CycleError::JournalMergeMissing { .. }))),
+        "{result:?}"
+    );
+    assert_eq!(world.device(0).state().unwrap().origin, stored);
+    world.check_idle(0);
+    // A copy that has the merge is fine.
+    let intact = copy("intact.git", None);
+    hub.set_remote_url(tablet, &intact).unwrap();
+    assert_eq!(world.device(0).state().unwrap().origin, intact);
+}
+
+/// A deletion the merge does not carry to origin (another tablet changed
+/// the document, so it is kept) is not in the guard's list: `status`
+/// still names it, from its base.
+#[test]
+fn status_names_a_deletion_kept_over_by_origin() {
+    let (world, notes, _) = two_notebooks();
+    let page = world.pages(1, &notes)[0].clone();
+    world.ink(1, &notes, &page);
+    world.sync(1).unwrap();
+    world.delete(0, &notes);
+    let status = world.status(0).unwrap();
+    assert_eq!(
+        status.changes.get(&notes),
+        Some(&libremarkable_utils::hub::cycle::DocChange::Deleted)
+    );
+    assert!(!status.guard.from_origin.contains(&notes), "{status:?}");
+    assert_eq!(status.names.get(&notes).map(String::as_str), Some("Notes"));
 }
 
 /// A journal is pending and origin is rewound past its merge: `sync`

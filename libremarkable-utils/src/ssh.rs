@@ -148,6 +148,11 @@ impl SshSession {
         self.opts.destination.clone()
     }
 
+    /// The ssh port, if one was given.
+    pub fn port(&self) -> Option<u16> {
+        self.opts.port
+    }
+
     /// ssh invocation with all options and env set, but no destination.
     fn base_command(&self) -> Command {
         let mut cmd = Command::new("ssh");

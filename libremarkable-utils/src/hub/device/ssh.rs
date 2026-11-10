@@ -375,6 +375,14 @@ impl Tablet for SshTablet {
         Ok(state == "active")
     }
 
+    fn destination(&self) -> String {
+        let port = self
+            .session
+            .port()
+            .map_or_else(String::new, |port| format!(":{port}"));
+        format!("ssh:{}{port}", self.session.target())
+    }
+
     fn cloud_paired(&self) -> Result<bool> {
         Ok(scripts::parse_bool(
             "cloud pairing check",

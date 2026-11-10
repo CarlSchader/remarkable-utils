@@ -4,11 +4,26 @@
 use super::steps::device_ref;
 use super::store;
 use super::{
-    CycleError, DetachReport, Hub, OriginCtx, RemoteReport, SetUrlReport, Warning, check_url,
+    CycleError, DetachOptions, DetachReport, Hub, OriginCtx, RemoteReport, SetUrlReport, Warning,
+    check_url,
 };
 use crate::error::Result;
 use crate::hub::device::Tablet;
 use crate::hub::model::TabletState;
+
+/// While a journal is pending, the origin must have its merge: only
+/// there can `sync` finish it.
+fn journal_merge_in(origin: &OriginCtx, state: &TabletState) -> Result<()> {
+    match &state.journal {
+        Some(journal) if !origin.store.is_ancestor(&journal.merge, &origin.main)? => {
+            Err(CycleError::JournalMergeMissing {
+                merge: journal.merge.clone(),
+            }
+            .into())
+        }
+        _ => Ok(()),
+    }
+}
 
 fn remote_report(state: &TabletState, effective: String) -> RemoteReport {
     RemoteReport {
@@ -47,6 +62,7 @@ impl Hub<'_> {
                 OriginCtx::new(cache, url.to_string(), Some(&first.device_id), Some(refs))?;
             origin.check(&first)?;
             device_ref(&origin, &first)?;
+            journal_merge_in(&origin, &first)?;
             self.progress.step("Locking the tablet");
             let took_over = s.acquire(&self.request, self.options.break_lock)?;
             s.arm()?;
@@ -57,6 +73,7 @@ impl Hub<'_> {
             origin.refresh(&state.device_id)?;
             origin.check(&state)?;
             device_ref(&origin, &state)?;
+            journal_merge_in(&origin, &state)?;
             let previous = std::mem::replace(&mut state.origin, url.to_string());
             s.write_state(&state)?;
             let report = SetUrlReport {
@@ -80,12 +97,11 @@ impl Hub<'_> {
     /// `prune_ref`, the tablet's device ref is then deleted from origin
     /// (the URL as for a sync), leased on the value just advertised; a
     /// failure there is a warning, and the ref can be deleted by hand.
-    pub fn detach(
-        &self,
-        tablet: &dyn Tablet,
-        prune_ref: bool,
-        force: bool,
-    ) -> Result<DetachReport> {
+    pub fn detach(&self, tablet: &dyn Tablet, options: DetachOptions) -> Result<DetachReport> {
+        let DetachOptions {
+            prune_device_ref: prune_ref,
+            force,
+        } = options;
         let (mut report, warnings) = self.session(tablet, |s| {
             self.progress.step("Locking the tablet");
             let took_over = s.acquire(&self.request, self.options.break_lock)?;
@@ -111,7 +127,7 @@ impl Hub<'_> {
             let _ = std::fs::remove_file(store::pre_read_path(
                 &self.cache_dir,
                 &state.repo_id,
-                Some(&state.device_id),
+                store::PreReadOf::Device(&state.device_id),
             ));
             let pruned = if prune_ref {
                 self.progress.step("Deleting the device ref from origin");

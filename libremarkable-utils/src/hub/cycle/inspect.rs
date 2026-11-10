@@ -129,7 +129,11 @@ impl Hub<'_> {
             &state.manifest,
             &origin.cache.repo,
             &origin.store,
-            &store::pre_read_path(&self.cache_dir, &state.repo_id, Some(&state.device_id)),
+            &store::pre_read_path(
+                &self.cache_dir,
+                &state.repo_id,
+                store::PreReadOf::Device(&state.device_id),
+            ),
         );
         let known = snapshot::known_from_manifest(&state.manifest)
             .into_iter()

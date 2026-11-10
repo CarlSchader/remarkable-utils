@@ -75,12 +75,25 @@ pub(super) struct Remote {
     pub device: Option<RemoteRef>,
 }
 
-/// Where the last pre-read of a tablet (`device`, or `None` before it has
-/// a device id) against the cache of `repo_id` keeps what it read: next
-/// to the cache, under its `flock`.
-pub(super) fn pre_read_path(root: &Path, repo_id: &RepoId, device: Option<&DeviceId>) -> PathBuf {
-    let tablet = device.map_or_else(|| "new".to_string(), ToString::to_string);
-    root.join(format!("{repo_id}.pre-read-{tablet}.json"))
+/// Where the last pre-read of a tablet against the cache of `repo_id`
+/// keeps what it read: next to the cache, under its `flock`.
+pub(super) fn pre_read_path(root: &Path, repo_id: &RepoId, tablet: PreReadOf) -> PathBuf {
+    let key = match tablet {
+        PreReadOf::Device(device) => device.to_string(),
+        PreReadOf::Destination(destination) => {
+            let digest = Sha256::digest(destination.as_bytes());
+            let hex: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
+            format!("at-{hex}")
+        }
+    };
+    root.join(format!("{repo_id}.pre-read-{key}.json"))
+}
+
+/// Whose pre-read: an attached tablet's (its device id), or one not
+/// attached yet (where this computer reaches it, [`Tablet::destination`]).
+pub(super) enum PreReadOf<'a> {
+    Device(&'a DeviceId),
+    Destination(&'a str),
 }
 
 /// A saved pre-read (see [`save_pre_read`]); empty if there is none or
@@ -452,11 +465,16 @@ impl<V: Clone> Bounded<V> {
     }
 }
 
-/// Cache bounds: commits by count, trees by entries, JSON by the bytes it
-/// was parsed from.
+/// Cache bounds: commits by count, trees by entries, JSON by an estimate
+/// of its parsed size ([`PARSED_JSON_FACTOR`] times its source bytes).
 const COMMIT_CACHE: usize = 16 * 1024;
 const TREE_CACHE: usize = 256 * 1024;
 const JSON_CACHE: usize = 64 * 1024 * 1024;
+
+/// A parsed `serde_json::Value` takes about this many times its source
+/// bytes (measured: a 700-page PDF's 168 KB `.content` parses into about
+/// 2.7 MB, a node per small register).
+const PARSED_JSON_FACTOR: usize = 16;
 
 pub(super) struct Store {
     pub repo: Repo,
@@ -840,9 +858,11 @@ impl JsonBlobs for Store {
         }
         let bytes = self.blob(id)?;
         let parsed = serde_json::from_slice::<Value>(&bytes).ok().map(Rc::new);
-        self.json
-            .borrow_mut()
-            .insert(id.clone(), parsed.clone(), bytes.len() + 1);
+        self.json.borrow_mut().insert(
+            id.clone(),
+            parsed.clone(),
+            bytes.len() * PARSED_JSON_FACTOR + 1,
+        );
         Ok(parsed)
     }
 }
@@ -940,10 +960,11 @@ mod tests {
             &[&a],
             &[meta(&d1, "1a"), meta(&d2, "2"), blob(&d3, "x")],
         );
+        // The side's version of d1 is on no first-parent commit.
         let side = commit(
             &repo,
             &[&root],
-            &[meta(&d1, "1s"), meta(&d2, "2"), meta(&d3, "3")],
+            &[meta(&d1, "1x"), meta(&d2, "2"), meta(&d3, "3")],
         );
         let merge = commit(
             &repo,
@@ -992,6 +1013,20 @@ mod tests {
                 .cloned()
                 .collect();
             assert_eq!(indexed, stretches, "{d}");
+            // The merge's history: those stretches' present versions,
+            // never a version only a merged side line has.
+            let rules = MirrorRules::latest();
+            let history = StoreHistory {
+                store: &store,
+                rules,
+                tip: &tip,
+            };
+            let present: Vec<DocVersion> = stretches
+                .iter()
+                .map(|subtree| store.doc_version(rules, d, subtree).unwrap())
+                .filter(DocVersion::is_present)
+                .collect();
+            assert_eq!(history.present_versions(d).unwrap(), present, "{d}");
         });
         // The ancestry check: from the index of `tip`, and for another
         // tip from one rev-list (the index stays `tip`'s).
