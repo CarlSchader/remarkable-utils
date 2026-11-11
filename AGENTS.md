@@ -262,6 +262,10 @@ This repository is **open source** (dual-licensed MIT OR Apache-2.0):
   no home there is no directory: never fall back to the current one.
 - `relative_path.rs` — the pure safe relative-path splitter shared by
   `sync.rs` and `hub/model.rs`.
+- `copy.rs` — the one chunked copy loop (retries `EINTR`, optional
+  bound with over-long detection, the sink reports progress), behind
+  `ssh::copy_with_progress` and git's blob writes. Copy through it
+  rather than writing another read/write loop.
 
 ## reMarkable domain knowledge
 
@@ -357,8 +361,8 @@ nix build .#rmu                    # build the CLI via crane
   walks (see `ancestor_chain` in `xochitl.rs`) over imperative `for`
   loops with mutable state. Local mutation *inside* a fold accumulator
   or builder closure is fine; threading mutable state *across* loop
-  iterations is what to avoid. Low-level I/O pumps (`copy_with_progress`
-  in `ssh.rs`) are the accepted exception.
+  iterations is what to avoid. Low-level I/O pumps (the chunked copy
+  loop in `copy.rs`) are the accepted exception.
 - Parallelism (rayon) only for **measured** CPU-bound hot spots, never
   by default — this repo's workloads are dominated by SSH round trips.
   Measured: parsing 10k metadata JSONs takes ~7 ms sequentially

@@ -1264,30 +1264,23 @@ impl CommitWriter<'_> {
         Ok(oid)
     }
 
+    /// Copy at most `size` bytes of `reader` into the stream (the shared
+    /// bounded [`copy::copy`](crate::copy::copy)); a count above `size`
+    /// means the reader is longer. A failed read kills fast-import.
     fn copy_blob(&mut self, reader: &mut dyn Read, size: u64) -> Result<u64> {
-        let mut buffer = vec![0u8; 64 * 1024];
-        let mut copied = 0u64;
-        // Read one byte past `size` so an over-long reader is detected.
-        while copied <= size {
-            let want = buffer
-                .len()
-                .min(usize::try_from(size - copied + 1).unwrap_or(usize::MAX));
-            let n = match reader.read(&mut buffer[..want]) {
-                Ok(0) => break,
-                Ok(n) => n,
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(error) => {
-                    self.abort();
-                    return Err(error.into());
-                }
-            };
-            let to_write = n.min(usize::try_from(size - copied).unwrap_or(usize::MAX));
-            self.write(&buffer[..to_write])?;
-            copied += n as u64;
-            self.transferred += to_write as u64;
+        let copied = crate::copy::copy(reader, Some(size), |chunk| {
+            self.write(chunk)?;
+            self.transferred += chunk.len() as u64;
             self.progress.bytes(self.transferred, self.total);
-        }
-        Ok(copied)
+            Ok(())
+        });
+        copied.map_err(|error| match error {
+            crate::copy::CopyError::Read(error) => {
+                self.abort();
+                error.into()
+            }
+            crate::copy::CopyError::Write(error) => error,
+        })
     }
 
     fn write(&mut self, data: &[u8]) -> Result<()> {

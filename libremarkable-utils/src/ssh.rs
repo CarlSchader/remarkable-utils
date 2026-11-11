@@ -960,24 +960,23 @@ fn staged_write_command(remote_path: &str, total: u64, pre_commit: &str) -> Stri
     )
 }
 
-/// `io::copy` with per-chunk progress callbacks.
+/// `io::copy` with per-chunk progress callbacks (the shared
+/// [`copy::copy`](crate::copy::copy), unbounded: interrupted reads are
+/// retried).
 fn copy_with_progress(
     reader: &mut impl Read,
     writer: &mut impl Write,
     total: Option<u64>,
     progress: &dyn Progress,
 ) -> std::io::Result<u64> {
-    let mut buffer = [0u8; 64 * 1024];
     let mut transferred = 0u64;
-    loop {
-        let n = reader.read(&mut buffer)?;
-        if n == 0 {
-            return Ok(transferred);
-        }
-        writer.write_all(&buffer[..n])?;
-        transferred += n as u64;
+    crate::copy::copy(reader, None, |chunk| {
+        writer.write_all(chunk)?;
+        transferred += chunk.len() as u64;
         progress.bytes(transferred, total);
-    }
+        Ok(())
+    })
+    .map_err(crate::copy::CopyError::into_io)
 }
 
 /// `output` if its command succeeded, else [`remote_error`].
@@ -1324,6 +1323,41 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[0], (64 * 1024, Some(100 * 1024)));
         assert_eq!(events[1], (100 * 1024, Some(100 * 1024)));
+    }
+
+    /// A read a signal interrupted (`EINTR`) is retried, not a failed
+    /// transfer, and the progress events are those of a clean read.
+    #[test]
+    fn copy_retries_interrupted_reads() {
+        use std::cell::{Cell, RefCell};
+
+        struct Interrupting<'a>(&'a [u8], Cell<bool>);
+        impl Read for Interrupting<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if !self.1.replace(!self.1.get()) {
+                    return Err(std::io::ErrorKind::Interrupted.into());
+                }
+                self.0.read(buf)
+            }
+        }
+        struct Recorder(RefCell<Vec<u64>>);
+        impl crate::progress::Progress for Recorder {
+            fn step(&self, _: &str) {}
+            fn bytes(&self, transferred: u64, _: Option<u64>) {
+                self.0.borrow_mut().push(transferred);
+            }
+            fn bytes_done(&self) {}
+            fn finished(&self) {}
+        }
+
+        let data = vec![3u8; 100 * 1024];
+        let recorder = Recorder(RefCell::new(Vec::new()));
+        let mut out = Vec::new();
+        let mut reader = Interrupting(&data, Cell::new(false));
+        let copied = copy_with_progress(&mut reader, &mut out, None, &recorder).unwrap();
+        assert_eq!(copied, data.len() as u64);
+        assert_eq!(out, data);
+        assert_eq!(*recorder.0.borrow(), [64 * 1024, 100 * 1024]);
     }
 
     #[test]
