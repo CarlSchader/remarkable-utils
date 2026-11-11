@@ -331,13 +331,25 @@ fn make_session(cli: &Cli, destination: &str) -> Result<SshSession> {
     })?)
 }
 
+/// `client` with its listing cache in rmu's state directory; without one
+/// (no `$XDG_STATE_HOME` or `$HOME`), uncached: the cache only saves
+/// round trips, and the current directory is never used instead.
+fn listing_cache(client: Client, destination: &str, xochitl_dir: &str) -> Client {
+    match sync::listing_cache_path(destination, xochitl_dir) {
+        Some(path) => client.with_listing_cache(path),
+        None => client,
+    }
+}
+
 /// All commands except `sync`: one device, addressed by --host/--user.
 fn run_regular(cli: &Cli, progress: Arc<dyn Progress>) -> Result<()> {
     let destination = format!("{}@{}", cli.user, cli.host);
     let session = make_session(cli, &destination)?;
-    let client = Client::new(session, cli.xochitl_dir.clone())
-        .with_progress(progress.clone())
-        .with_listing_cache(sync::listing_cache_path(&destination, &cli.xochitl_dir));
+    let client = listing_cache(
+        Client::new(session, cli.xochitl_dir.clone()).with_progress(progress.clone()),
+        &destination,
+        &cli.xochitl_dir,
+    );
 
     let modified = run_command(&client, cli)?;
     if modified {
@@ -400,14 +412,12 @@ fn build_side(
             };
             if is_tablet {
                 Ok(BuiltSide::Tablet {
-                    client: Box::new(
+                    client: Box::new(listing_cache(
                         Client::new(session, cli.xochitl_dir.clone())
-                            .with_progress(progress.clone())
-                            .with_listing_cache(sync::listing_cache_path(
-                                &destination,
-                                &cli.xochitl_dir,
-                            )),
-                    ),
+                            .with_progress(progress.clone()),
+                        &destination,
+                        &cli.xochitl_dir,
+                    )),
                     path,
                     destination,
                 })
@@ -461,7 +471,7 @@ fn run_sync(cli: &Cli, progress: Arc<dyn Progress>) -> Result<()> {
             },
         ) => {
             let state_path =
-                sync::sync_state_path(&identity, &tablet_identity(&destination, &path));
+                sync::sync_state_path(&identity, &tablet_identity(&destination, &path))?;
             run_device_sync(
                 cli,
                 &progress,
@@ -488,7 +498,7 @@ fn run_sync(cli: &Cli, progress: Arc<dyn Progress>) -> Result<()> {
             },
         ) => {
             let state_path =
-                sync::sync_state_path(&identity, &tablet_identity(&destination, &path));
+                sync::sync_state_path(&identity, &tablet_identity(&destination, &path))?;
             run_device_sync(
                 cli,
                 &progress,
@@ -669,7 +679,7 @@ fn run_docs_sync(
 
     let (snapshot_a, missing_a) = sync_tablet_snapshot(&client_a, &path_a, mode != Mode::Push)?;
     let (snapshot_b, missing_b) = sync_tablet_snapshot(&client_b, &path_b, mode != Mode::Pull)?;
-    let state_path = sync::pair_state_path(&id_a, &id_b);
+    let state_path = sync::pair_state_path(&id_a, &id_b)?;
     let mut state = sync::PairState::load(&state_path)?;
     let plan = sync::plan_docs(options, &snapshot_a, &snapshot_b, &state);
     [
@@ -911,7 +921,7 @@ fn run_files_sync(
     } else {
         src_local
     };
-    let old_state_path = sync::sync_state_path(&src_id, &dst_id);
+    let old_state_path = sync::sync_state_path(&src_id, &dst_id)?;
     // Older same-kind archives did not record which endpoint was A.
     // Isolate the stable-role format rather than guessing that orientation
     // (or letting older binaries interpret our newly ordered stamps).

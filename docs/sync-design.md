@@ -121,6 +121,16 @@ archive. Never inside the synced tree: no git pollution, no accidental
 deletion, overlapping roots each get their own archive. tablet↔tablet
 pair-state files live in the same directory (`sync-pair-<hash>.json`).
 
+Empty `$XDG_STATE_HOME` and `$HOME` count as unset, as the XDG Base
+Directory specification says (the hub's cache directory follows the
+same rule). With neither, `rmu sync` refuses before touching either side
+and names both variables: an archive is never written into the current
+directory. (Before, an empty variable counted as set, so the archive
+could land in `./rmu/` or `./.local/state/rmu/`. Such a file is no
+longer read; the next sync with a proper state directory starts without
+an archive, which is benign: identical files re-pair by content hash.
+Delete it, or move it into the state directory to keep its history.)
+
 For local↔local and SSH↔SSH filesystem pairs, side A is the
 lexicographically smaller endpoint identity, independent of argument
 order. SSH filesystem identities retain `/` for the filesystem root:
@@ -262,7 +272,8 @@ notes.
 
 `Client::list_items` with a listing cache
 (`$XDG_STATE_HOME/rmu/listing-<hash>.json`, keyed by ssh destination +
-xochitl dir) provides change-scaled read-only listings, Unison-archive style:
+xochitl dir) provides change-scaled read-only listings, Unison-archive style
+(without a state directory, listings simply run uncached):
 
 1. Round trip 1: `stat -c '%Y %s %n'` over every
    `.metadata`/`.content`/payload file — tiny output, one exec.

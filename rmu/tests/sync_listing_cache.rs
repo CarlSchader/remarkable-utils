@@ -386,3 +386,60 @@ fn failed_authoritative_sync_listing_never_uses_warm_cache() {
         }
     }
 }
+
+/// Empty `$XDG_STATE_HOME` and `$HOME` count as unset (as the XDG spec
+/// says): `rmu sync` refuses before writing anything, naming the
+/// variables, and listings run uncached. Nothing lands in the current
+/// directory, where an empty variable used to put the state.
+#[test]
+fn empty_state_variables_never_mean_the_current_directory() {
+    let fixture = Fixture::new();
+    fixture.folder("b", ROOT, "AAAA");
+    fs::write(fixture.0.join("local/keep.pdf"), ORIGINAL).unwrap();
+    let cwd = fixture.0.join("cwd");
+    fs::create_dir(&cwd).unwrap();
+    let before = fs::read_dir(fixture.0.join("b/device")).unwrap().count();
+    let run = |args: &[&str]| {
+        fixture
+            .command()
+            .current_dir(&cwd)
+            .env("XDG_STATE_HOME", "")
+            .env("HOME", "")
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let local = local_path(&fixture);
+    let sync = run(&[
+        "sync",
+        "--remote-kind",
+        "remarkable",
+        &local,
+        "root@b.invalid:/AAAA",
+    ]);
+    assert!(!sync.status.success());
+    let stderr = String::from_utf8_lossy(&sync.stderr);
+    assert!(
+        stderr.contains("XDG_STATE_HOME and HOME are both unset or empty"),
+        "{stderr}"
+    );
+    assert_eq!(
+        fs::read_dir(fixture.0.join("b/device")).unwrap().count(),
+        before,
+        "nothing written to the tablet"
+    );
+    assert_success(&run(&[
+        "--host",
+        "b.invalid",
+        "--user",
+        "root",
+        "ls",
+        "--json",
+    ]));
+    assert_eq!(fs::read_dir(&cwd).unwrap().count(), 0, "nothing in the cwd");
+    assert_eq!(
+        fs::read_dir(fixture.0.join("state")).unwrap().count(),
+        0,
+        "nor in the state dir the fixture otherwise uses"
+    );
+}

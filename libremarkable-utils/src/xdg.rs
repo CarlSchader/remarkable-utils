@@ -5,21 +5,17 @@ use std::path::PathBuf;
 
 /// `explicit` (an `$XDG_*_HOME` value) if given, else `home` joined with
 /// `under_home` (the spec's default, e.g. `.cache`); `None` without
-/// either. Callers decide which values count as given (an empty one, by
-/// the spec, should not).
+/// either. An empty value counts as not given, as the XDG Base Directory
+/// specification says: it never means the current directory.
 pub(crate) fn base_dir(
     explicit: Option<OsString>,
     home: Option<OsString>,
     under_home: &str,
 ) -> Option<PathBuf> {
-    explicit
+    let given = |value: Option<OsString>| value.filter(|value| !value.is_empty());
+    given(explicit)
         .map(PathBuf::from)
-        .or_else(|| home.map(|home| PathBuf::from(home).join(under_home)))
-}
-
-/// An environment variable, unless it is unset or empty.
-pub(crate) fn non_empty_var(name: &str) -> Option<OsString> {
-    std::env::var_os(name).filter(|value| !value.is_empty())
+        .or_else(|| given(home).map(|home| PathBuf::from(home).join(under_home)))
 }
 
 #[cfg(test)]
@@ -41,10 +37,20 @@ mod tests {
             Some(PathBuf::from("/home/u/.local/state"))
         );
         assert_eq!(base_dir(None, None, ".cache"), None);
-        // Empty values are the caller's to filter out.
+    }
+
+    #[test]
+    fn empty_values_count_as_unset() {
         assert_eq!(
-            base_dir(os(""), os("/home/u"), ".cache"),
-            Some(PathBuf::new())
+            base_dir(os(""), os("/home/u"), ".local/state"),
+            Some(PathBuf::from("/home/u/.local/state"))
         );
+        assert_eq!(
+            base_dir(os("/x/state"), os(""), ".local/state"),
+            Some(PathBuf::from("/x/state"))
+        );
+        assert_eq!(base_dir(os(""), os(""), ".local/state"), None);
+        assert_eq!(base_dir(None, os(""), ".cache"), None);
+        assert_eq!(base_dir(os(""), None, ".cache"), None);
     }
 }

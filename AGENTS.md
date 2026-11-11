@@ -258,7 +258,8 @@ This repository is **open source** (dual-licensed MIT OR Apache-2.0):
   shared by `Client::restart_xochitl` and the hub (reset-failed first,
   always; see below).
 - `xdg.rs` — XDG base-dir lookup for rmu's files on this computer (the
-  hub's cache, sync's state).
+  hub's cache, sync's state). Empty variables count as unset, and with
+  no home there is no directory: never fall back to the current one.
 - `relative_path.rs` — the pure safe relative-path splitter shared by
   `sync.rs` and `hub/model.rs`.
 

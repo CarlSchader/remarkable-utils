@@ -8,6 +8,7 @@
 //! interrupted sync resumes cleanly.
 
 use std::collections::{BTreeMap, HashMap};
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -538,9 +539,10 @@ fn write_atomically(path: &Path, data: &[u8]) -> Result<()> {
 /// Where the archive for a pair of sync endpoints lives:
 /// `$XDG_STATE_HOME/rmu/` (or `~/.local/state/rmu/`), keyed
 /// order-independently by the two endpoint labels so `push` and
-/// `pull` over the same pair share state.
-pub fn sync_state_path(label_a: &str, label_b: &str) -> PathBuf {
-    state_dir().join(format!("sync-{}.json", pair_key_hash(label_a, label_b)))
+/// `pull` over the same pair share state. [`Error::NoStateDir`] without
+/// either variable (see [`state_dir`]).
+pub fn sync_state_path(label_a: &str, label_b: &str) -> Result<PathBuf> {
+    Ok(state_dir()?.join(format!("sync-{}.json", pair_key_hash(label_a, label_b))))
 }
 
 // ---------------------------------------------------------------------------
@@ -3523,34 +3525,41 @@ impl PairState {
 
 /// Where the pair-state for two tablet endpoints lives on the
 /// initiating computer: `$XDG_STATE_HOME/rmu/` (or `~/.local/state/rmu/`),
-/// keyed order-independently by the endpoint pair.
-pub fn pair_state_path(endpoint_a: &str, endpoint_b: &str) -> PathBuf {
-    state_dir().join(format!(
+/// keyed order-independently by the endpoint pair. [`Error::NoStateDir`]
+/// without either variable (see [`state_dir`]).
+pub fn pair_state_path(endpoint_a: &str, endpoint_b: &str) -> Result<PathBuf> {
+    Ok(state_dir()?.join(format!(
         "sync-pair-{}.json",
         pair_key_hash(endpoint_a, endpoint_b)
-    ))
+    )))
 }
 
 /// Where the incremental listing cache for a device lives (keyed by
-/// ssh destination + xochitl dir, so profiles never collide).
-pub fn listing_cache_path(destination: &str, xochitl_dir: &str) -> PathBuf {
-    state_dir().join(format!(
-        "listing-{:016x}.json",
-        fnv1a(&format!("{destination}\n{xochitl_dir}"))
-    ))
+/// ssh destination + xochitl dir, so profiles never collide). `None`
+/// without a state directory (see [`state_dir`]): the cache only saves
+/// round trips, so listings then run uncached rather than fail.
+pub fn listing_cache_path(destination: &str, xochitl_dir: &str) -> Option<PathBuf> {
+    state_dir().ok().map(|dir| {
+        dir.join(format!(
+            "listing-{:016x}.json",
+            fnv1a(&format!("{destination}\n{xochitl_dir}"))
+        ))
+    })
 }
 
 /// The rmu state directory: `$XDG_STATE_HOME/rmu` (or
-/// `~/.local/state/rmu`).
-fn state_dir() -> PathBuf {
-    // Empty variables count as set here (unlike the hub's cache dir).
-    xdg::base_dir(
-        std::env::var_os("XDG_STATE_HOME"),
-        std::env::var_os("HOME"),
-        ".local/state",
-    )
-    .unwrap_or_else(|| PathBuf::from("."))
-    .join("rmu")
+/// `~/.local/state/rmu`). Empty variables count as unset, as the XDG
+/// spec says (and as for the hub's cache directory); with neither, it is
+/// [`Error::NoStateDir`], never the current directory.
+fn state_dir() -> Result<PathBuf> {
+    state_dir_from(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"))
+}
+
+/// [`state_dir`] given the two variables' values. Pure.
+fn state_dir_from(state_home: Option<OsString>, home: Option<OsString>) -> Result<PathBuf> {
+    xdg::base_dir(state_home, home, ".local/state")
+        .map(|dir| dir.join("rmu"))
+        .ok_or(Error::NoStateDir)
 }
 
 /// Order-independent stable hash of an endpoint pair.
@@ -5113,16 +5122,52 @@ mod tests {
         );
     }
 
+    // The archive paths key on `pair_key_hash` (the directory comes from
+    // the environment: see `state_dir_from`).
     #[test]
     fn sync_state_path_is_order_independent() {
         assert_eq!(
-            sync_state_path("/home/u/books", "rm:/Books"),
-            sync_state_path("rm:/Books", "/home/u/books")
+            pair_key_hash("/home/u/books", "rm:/Books"),
+            pair_key_hash("rm:/Books", "/home/u/books")
         );
         assert_ne!(
-            sync_state_path("/home/u/books", "rm:/Books"),
-            sync_state_path("/home/u/books", "rm:/Other")
+            pair_key_hash("/home/u/books", "rm:/Books"),
+            pair_key_hash("/home/u/books", "rm:/Other")
         );
+    }
+
+    #[test]
+    fn state_dir_ignores_empty_variables_and_never_falls_back_to_cwd() {
+        let os = |text: &str| Some(OsString::from(text));
+        let dir = |state, home| state_dir_from(state, home).map_err(|e| e.to_string());
+        assert_eq!(
+            dir(os("/x/state"), os("/home/u")),
+            Ok(PathBuf::from("/x/state/rmu"))
+        );
+        assert_eq!(
+            dir(os(""), os("/home/u")),
+            Ok(PathBuf::from("/home/u/.local/state/rmu"))
+        );
+        assert_eq!(
+            dir(None, os("/home/u")),
+            Ok(PathBuf::from("/home/u/.local/state/rmu"))
+        );
+        // Without either, an error naming both variables, not `./rmu`
+        // or `./.local/state/rmu`.
+        [
+            (None, None),
+            (os(""), None),
+            (None, os("")),
+            (os(""), os("")),
+        ]
+        .into_iter()
+        .for_each(|(state, home)| {
+            let error = dir(state, home).unwrap_err();
+            assert!(
+                error.contains("XDG_STATE_HOME") && error.contains("HOME"),
+                "{error}"
+            );
+        });
     }
 
     // ---- moves and copies ---------------------------------------------------
@@ -7525,10 +7570,10 @@ mod tests {
 
     #[test]
     fn pair_state_path_is_order_independent() {
-        let one = pair_state_path("rm1:/a", "rm2:/b");
-        let two = pair_state_path("rm2:/b", "rm1:/a");
+        let one = pair_key_hash("rm1:/a", "rm2:/b");
+        let two = pair_key_hash("rm2:/b", "rm1:/a");
         assert_eq!(one, two);
-        assert_ne!(one, pair_state_path("rm1:/a", "rm2:/c"));
+        assert_ne!(one, pair_key_hash("rm1:/a", "rm2:/c"));
     }
 
     // ---- ssh fs listing parsing ---------------------------------------------

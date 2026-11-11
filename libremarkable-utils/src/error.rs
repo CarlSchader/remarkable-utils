@@ -21,6 +21,15 @@ pub enum Error {
     )]
     Unreachable(String),
 
+    /// `rmu sync` has nowhere to keep its archives: `$XDG_STATE_HOME` and
+    /// `$HOME` are both unset or empty. Never the current directory.
+    #[error(
+        "no state directory for rmu's sync archives: XDG_STATE_HOME and HOME are both unset \
+         or empty; set one of them (archives go to $XDG_STATE_HOME/rmu or \
+         $HOME/.local/state/rmu)"
+    )]
+    NoStateDir,
+
     /// Local I/O failure (spawning ssh, reading/writing local files).
     #[error(transparent)]
     Io(#[from] io::Error),
