@@ -41,7 +41,7 @@ This repository is **open source** (dual-licensed MIT OR Apache-2.0):
 | `libremarkable-utils/`  | Library crate (see module map below)                   |
 | `rmu/`                  | `rmu` CLI binary crate (clap; all config via flags, no config file) |
 | `rmu/src/hub.rs`, `rmu/src/hub/` | `rmu hub` over the library's `Hub`: arguments, `wants_tablet` (`log`, `restore` and `add` skip the tablet with `--origin` unless a flag naming it, `--host` or another SSH flag, is given; `main.rs` records whether one was), `execute` (runs a command on any `&dyn Tablet`, or none for those), exit statuses (`Failure`), `finish` (output and error details); pure `render.rs` (human summary, plain ids) and `json.rs` (`--json`, `"schema": 1`, unstable until device validation: the library's serialised reports plus `schema` and `command`, and the error object). Tests: `hub/tests.rs` (fabricated reports) with `hub/tests/` (`parsing`, `output`, `golden`: one exact JSON per report type and error shape, update them deliberately; `commands`: against the fake tablet), and `rmu/tests/hub_cli.rs` (the real binary against a `test_support::tablet::SimulatedTablet`) |
-| `test-support/`         | Unpublished dev-dependency: helpers shared by tests (`Scratch` temp dirs with mock `bin/` + `PATH`, `write_script`, `rerun_test`, `assert_success`, `set_modified`, `pdf`: a fabricated N-page PDF; `tablet`: the one simulated tablet host for tests running rmu's device scripts: curated `TOOLS` from the host or BusyBox (`Toolset`), stub `systemctl`/`systemd-run` (`TabletTools`), and `SimulatedTablet` with `REWRITING_SSH`, a mock `ssh` mapping the tablet's fixed paths into a device dir) |
+| `test-support/`         | Unpublished dev-dependency: helpers shared by tests (`Scratch` temp dirs with mock `bin/` + `PATH`, `write_script`, `rerun_test`, `assert_success`, `set_modified`, `pdf`: a fabricated N-page PDF; `tablet`: the one simulated tablet host for tests running rmu's device scripts: curated `TOOLS` from the host or BusyBox (`Toolset`), stub `systemctl`/`systemd-run` (`TabletTools`; `systemctl_arms` injects failures), and `SimulatedTablet` with `REWRITING_SSH`, a mock `ssh` mapping the tablet's fixed paths into a device dir) |
 | `Cargo.toml`            | Workspace root; shared deps in `[workspace.dependencies]` |
 
 ### `libremarkable-utils` module map
@@ -256,7 +256,11 @@ This repository is **open source** (dual-licensed MIT OR Apache-2.0):
   batched scripts rather than another parser.
 - `xochitl_service.rs` — the systemctl commands for the xochitl unit,
   shared by `Client::restart_xochitl` and the hub (reset-failed first,
-  always; see below).
+  always; see below), and the shared steps after a failed start or
+  restart (`came_back`: no second try at an unreachable tablet, one
+  look after `RECHECK_DELAY`; `active`: ssh's exit 255 is
+  `Error::Unreachable`, never "not active"). The client `restart`s and
+  the hub `start`s on purpose; the module docs say why.
 - `xdg.rs` — XDG base-dir lookup for rmu's files on this computer (the
   hub's cache, sync's state). Empty variables count as unset, and with
   no home there is no directory: never fall back to the current one.

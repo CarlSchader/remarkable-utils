@@ -250,6 +250,11 @@ pub(crate) mod local_ssh {
             fs::write(trigger, b"").unwrap();
         }
 
+        /// See [`TabletTools::systemctl_arms`].
+        pub(crate) fn systemctl_arms(&self, arms: &str) {
+            self.tools.systemctl_arms(arms);
+        }
+
         /// Hold the guard `flock` from another process (with the
         /// harness's own tools) until `then` (a shell snippet) finishes.
         /// Returns once the lock is held.

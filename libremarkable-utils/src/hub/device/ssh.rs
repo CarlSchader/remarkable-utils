@@ -339,18 +339,22 @@ impl Tablet for SshTablet {
                     &String::from_utf8_lossy(&output.stdout),
                 )?);
             }
-            // A tablet that stopped answering would not answer the check
-            // below either; trying costs another timeout.
-            if guard_error(output.status.code()).is_some() || crate::ssh::is_unreachable(&output) {
+            if guard_error(output.status.code()).is_some() {
                 return Err(remote_error(&output));
             }
-            // As in `Client::restart_xochitl`: the command channel can
-            // drop while xochitl comes back; check (the lock too, in case
-            // the script never ran) before failing. The time printed
-            // before the start is lost then, and a later one would not be
+            // The flow shared with `Client::restart_xochitl`: a tablet that
+            // stopped answering is not asked again (that costs another
+            // timeout); otherwise the command channel can drop while
+            // xochitl comes back, so look (at the lock too, in case the
+            // script never ran) before failing. The time printed before
+            // the start is lost then, and a later one would not be
             // conservative: report the earliest possible.
-            self.script(&scripts::start_allowed_script(&self.paths, lock.run()))?;
-            if self.xochitl_active()? {
+            let came_back =
+                xochitl_service::came_back(&output, xochitl_service::RECHECK_DELAY, || {
+                    self.script(&scripts::start_allowed_script(&self.paths, lock.run()))?;
+                    self.xochitl_active()
+                })?;
+            if came_back {
                 return Ok(0);
             }
             Err(DeviceError::XochitlStart(format!(
@@ -362,17 +366,14 @@ impl Tablet for SshTablet {
         })
     }
 
+    /// [`xochitl_service::active`]: ssh's own failure (exit 255) is the
+    /// tablet not answering, never "not active".
     fn xochitl_active(&self) -> Result<bool> {
-        let output = self
-            .session
-            .run_script(&format!("{}\n", xochitl_service::IS_ACTIVE))?;
-        let state = xochitl_service::state(&output.stdout);
-        // `is-active` exits non-zero for every state but `active`; 255 is
-        // ssh's own failure.
-        if output.status.code() == Some(255) || state.is_empty() {
-            return Err(remote_error(&output));
-        }
-        Ok(state == "active")
+        xochitl_service::active(
+            &self
+                .session
+                .run_script(&format!("{}\n", xochitl_service::IS_ACTIVE))?,
+        )
     }
 
     fn destination(&self) -> String {

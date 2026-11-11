@@ -27,7 +27,6 @@ use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
@@ -902,6 +901,11 @@ impl Client {
     /// start-limit-hit and trigger the device emergency target, which
     /// reboots the whole tablet. Reset the unit's failure state first
     /// so maintenance restarts do not accumulate against that counter.
+    ///
+    /// A `restart`, not the hub's `start`: xochitl is running and must
+    /// read the changed files again. After a failure, the flow shared
+    /// with the hub ([`xochitl_service::came_back`]): a tablet that did
+    /// not answer is [`Error::Unreachable`], not a failed restart.
     pub fn restart_xochitl(&self) -> Result<()> {
         self.progress.step("Restarting xochitl");
         // Starting xochitl while a hub run has it stopped would make the
@@ -935,20 +939,21 @@ impl Client {
             self.progress.finished();
             return Ok(());
         }
-        // Device-side restarts can transiently drop the command channel
-        // even though xochitl comes back; verify before failing.
-        thread::sleep(Duration::from_secs(1));
-        let status = self.session.run(xochitl_service::IS_ACTIVE)?;
-        if status.status.success() && xochitl_service::state(&status.stdout) == "active" {
+        let mut state = String::new();
+        let came_back =
+            xochitl_service::came_back(&restart, xochitl_service::RECHECK_DELAY, || {
+                let output = self.session.run(xochitl_service::IS_ACTIVE)?;
+                state = xochitl_service::state(&output.stdout);
+                xochitl_service::active(&output)
+            })?;
+        if came_back {
             self.progress.finished();
             return Ok(());
         }
         Err(Error::XochitlRestart(format!(
-            "restart exit={:?} stderr='{}'; is-active exit={:?} stdout='{}'",
+            "restart exit={:?} stderr='{}'; is-active: {state}",
             restart.status.code(),
             String::from_utf8_lossy(&restart.stderr).trim(),
-            status.status.code(),
-            xochitl_service::state(&status.stdout),
         )))
     }
 

@@ -301,6 +301,17 @@ Every `systemctl start xochitl` — steps 6 and 16, the watchdog, and
 error paths — is preceded by `systemctl reset-failed xochitl.service`,
 as `Client::restart_xochitl` does today.
 
+The hub `start`s where the maintenance restart (`rmu restart`, and the
+other commands after writes) `restart`s: the hub stopped xochitl
+itself, and xochitl may be back before the hub's start (the watchdog
+fired, or a start whose reply was lost did run); `start` leaves a
+running xochitl alone, so it is always safe to send again. After a
+failed start or restart both share one flow (`xochitl_service`): a
+tablet that did not answer is `Unreachable` and not asked again;
+otherwise, after a second, one look whether xochitl came back anyway
+(the hub checks its lock first), in which ssh's own failure (exit 255)
+is `Unreachable` too, never "not running".
+
 ### How the library runs it
 
 `hub::cycle` implements the cycle (and `clone`, `backup`, `status`,
