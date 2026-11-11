@@ -534,7 +534,10 @@ pub fn run(
     };
     let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
     let cache = cycle::default_cache_dir()
-        .context("no cache directory for rmu hub: set XDG_CACHE_HOME or HOME")
+        .context(
+            "no cache directory for rmu hub: XDG_CACHE_HOME and HOME are both unset or empty; \
+             set one of them",
+        )
         .map_err(setup_error)?;
     let hub = Hub::new(
         Git::new().interactive(interactive),

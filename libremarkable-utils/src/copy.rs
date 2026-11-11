@@ -46,7 +46,9 @@ pub(crate) fn copy<E>(
             None => CHUNK,
             Some(bound) if copied > bound => return Ok(copied),
             // One byte past `bound`, so an over-long reader is detected.
-            Some(bound) => CHUNK.min(usize::try_from(bound - copied + 1).unwrap_or(usize::MAX)),
+            Some(bound) => {
+                CHUNK.min(usize::try_from((bound - copied).saturating_add(1)).unwrap_or(usize::MAX))
+            }
         };
         let n = match reader.read(&mut buffer[..want]) {
             Ok(0) => return Ok(copied),

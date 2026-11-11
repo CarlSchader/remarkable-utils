@@ -677,9 +677,10 @@ fn run_docs_sync(
         conflict: map_conflict(conflict, a_is_src),
     };
 
+    // Without a state directory, refuse before contacting either tablet.
+    let state_path = sync::pair_state_path(&id_a, &id_b)?;
     let (snapshot_a, missing_a) = sync_tablet_snapshot(&client_a, &path_a, mode != Mode::Push)?;
     let (snapshot_b, missing_b) = sync_tablet_snapshot(&client_b, &path_b, mode != Mode::Pull)?;
-    let state_path = sync::pair_state_path(&id_a, &id_b)?;
     let mut state = sync::PairState::load(&state_path)?;
     let plan = sync::plan_docs(options, &snapshot_a, &snapshot_b, &state);
     [

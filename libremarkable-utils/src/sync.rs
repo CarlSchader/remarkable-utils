@@ -542,7 +542,7 @@ fn write_atomically(path: &Path, data: &[u8]) -> Result<()> {
 /// `pull` over the same pair share state. [`Error::NoStateDir`] without
 /// either variable (see [`state_dir`]).
 pub fn sync_state_path(label_a: &str, label_b: &str) -> Result<PathBuf> {
-    Ok(state_dir()?.join(format!("sync-{}.json", pair_key_hash(label_a, label_b))))
+    Ok(state_file(&state_dir()?, "sync", label_a, label_b))
 }
 
 // ---------------------------------------------------------------------------
@@ -3528,10 +3528,12 @@ impl PairState {
 /// keyed order-independently by the endpoint pair. [`Error::NoStateDir`]
 /// without either variable (see [`state_dir`]).
 pub fn pair_state_path(endpoint_a: &str, endpoint_b: &str) -> Result<PathBuf> {
-    Ok(state_dir()?.join(format!(
-        "sync-pair-{}.json",
-        pair_key_hash(endpoint_a, endpoint_b)
-    )))
+    Ok(state_file(
+        &state_dir()?,
+        "sync-pair",
+        endpoint_a,
+        endpoint_b,
+    ))
 }
 
 /// Where the incremental listing cache for a device lives (keyed by
@@ -3560,6 +3562,12 @@ fn state_dir_from(state_home: Option<OsString>, home: Option<OsString>) -> Resul
     xdg::base_dir(state_home, home, ".local/state")
         .map(|dir| dir.join("rmu"))
         .ok_or(Error::NoStateDir)
+}
+
+/// `<dir>/<prefix>-<pair hash>.json`: a pair's file in the state
+/// directory, the same whichever endpoint comes first. Pure.
+fn state_file(dir: &Path, prefix: &str, label_a: &str, label_b: &str) -> PathBuf {
+    dir.join(format!("{prefix}-{}.json", pair_key_hash(label_a, label_b)))
 }
 
 /// Order-independent stable hash of an endpoint pair.
@@ -5122,17 +5130,24 @@ mod tests {
         );
     }
 
-    // The archive paths key on `pair_key_hash` (the directory comes from
-    // the environment: see `state_dir_from`).
+    // The archive file names, without the environment (the directory
+    // comes from `state_dir_from`).
     #[test]
     fn sync_state_path_is_order_independent() {
+        let dir = Path::new("/s/rmu");
+        let file = |a, b| state_file(dir, "sync", a, b);
         assert_eq!(
-            pair_key_hash("/home/u/books", "rm:/Books"),
-            pair_key_hash("rm:/Books", "/home/u/books")
+            file("/home/u/books", "rm:/Books"),
+            file("rm:/Books", "/home/u/books")
         );
         assert_ne!(
-            pair_key_hash("/home/u/books", "rm:/Books"),
-            pair_key_hash("/home/u/books", "rm:/Other")
+            file("/home/u/books", "rm:/Books"),
+            file("/home/u/books", "rm:/Other")
+        );
+        // Pinned: a different name would orphan every existing archive.
+        assert_eq!(
+            file("/home/u/books", "rm:/Books"),
+            PathBuf::from("/s/rmu/sync-35b42684ad5d6ef6.json")
         );
     }
 
@@ -7570,10 +7585,14 @@ mod tests {
 
     #[test]
     fn pair_state_path_is_order_independent() {
-        let one = pair_key_hash("rm1:/a", "rm2:/b");
-        let two = pair_key_hash("rm2:/b", "rm1:/a");
-        assert_eq!(one, two);
-        assert_ne!(one, pair_key_hash("rm1:/a", "rm2:/c"));
+        let dir = Path::new("/s/rmu");
+        let file = |a, b| state_file(dir, "sync-pair", a, b);
+        assert_eq!(file("rm1:/a", "rm2:/b"), file("rm2:/b", "rm1:/a"));
+        assert_ne!(file("rm1:/a", "rm2:/b"), file("rm1:/a", "rm2:/c"));
+        assert_eq!(
+            file("rm1:/a", "rm2:/b"),
+            PathBuf::from("/s/rmu/sync-pair-cf910b59b9079e67.json")
+        );
     }
 
     // ---- ssh fs listing parsing ---------------------------------------------

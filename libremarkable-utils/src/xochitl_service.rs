@@ -58,6 +58,15 @@ pub(crate) fn state(stdout: &[u8]) -> String {
 /// is ssh's own (`systemctl` never exits 255): the tablet did not answer,
 /// [`Error::Unreachable`], never "not active". An empty answer is no
 /// answer either: [`Error::Remote`].
+///
+/// This is deliberately stricter than [`ssh::failure`], which calls a 255
+/// unreachable only for ssh's timeout messages: on the (re)start's output
+/// a 255 such as "connection closed" may be a channel dropped while
+/// xochitl restarts, worth one look ([`came_back`]); on that look's
+/// output it is a second failure in a row, and the tablet is gone. A rare
+/// 255 for another reason (say, failed authentication without
+/// multiplexing) then gets the "did not answer" advice, with ssh's own
+/// message carried along.
 pub(crate) fn active(output: &Output) -> Result<bool> {
     if output.status.code() == Some(255) {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -77,7 +86,10 @@ pub(crate) fn active(output: &Output) -> Result<bool> {
 /// failed with `output` (callers map their own refusals, guard statuses,
 /// first). A tablet that did not answer it ([`ssh::is_unreachable`]) is
 /// not asked again, since every further try only waits for another
-/// timeout: [`Error::Unreachable`]. Any other failure, a dropped channel
+/// timeout: [`Error::Unreachable`]. (The hub hands over raw
+/// `run_script` output and relies on this check; the client's
+/// [`SshSession::run`](crate::ssh::SshSession::run) already returns that
+/// error itself, so the check is a backstop there.) Any other failure, a dropped channel
 /// included, gets one look after `delay` ([`RECHECK_DELAY`]; tests pass
 /// less): `look` runs [`IS_ACTIVE`], after whatever the caller must
 /// check first, and reads it with [`active`].

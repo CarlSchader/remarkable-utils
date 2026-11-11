@@ -99,6 +99,10 @@ fn a_failed_restart_with_xochitl_down_says_so() {
     assert_eq!(fixture.calls(), ALL);
 }
 
+/// For the client this is `SshSession::run` turning the timeout into
+/// `Error::Unreachable` before `came_back` sees it; `came_back`'s own
+/// check is exercised by the hub's tests (`xochitl_service::tests` and
+/// `contract_tests::ssh_tablet`), whose start passes raw output.
 #[test]
 fn a_tablet_that_timed_out_is_not_asked_again() {
     let fixture = Fixture::new(
