@@ -114,8 +114,8 @@ Only supported files participate (`.pdf`, `.epub`, `.rmdoc`); everything
 else is left alone. Notebooks pull as `.rmdoc` bundles; mapped `.rmdoc`
 files are pull-only (handwriting can't be merged — the tablet wins).
 
-Sync keeps an archive per endpoint pair under `~/.local/state/rmu/`
-(never inside the synced tree) recording what both sides looked like at
+Sync keeps an archive per endpoint pair under `$XDG_STATE_HOME/rmu/`
+(default `~/.local/state/rmu/`; never inside the synced tree) recording what both sides looked like at
 last sync, including content hashes: repeated syncs only transfer real
 changes — touched-but-identical files and annotation-only device
 changes are recognized by hash and skipped. If the archive is ever

@@ -341,6 +341,31 @@ fn history_commands(toolset: &Toolset) {
     assert_eq!(content["cPages"]["pages"].as_array().unwrap().len(), 4);
 }
 
+/// Empty `XDG_CACHE_HOME` and `HOME` count as unset, as for sync's state
+/// directory: a setup error naming both, never a cache in the cwd.
+#[test]
+fn no_cache_directory_is_a_setup_error() {
+    let world = World::new(&Toolset::Host);
+    let cwd = world.scratch.join("cwd");
+    fs::create_dir(&cwd).unwrap();
+    let output = world
+        .command(&cwd)
+        .env("XDG_CACHE_HOME", "")
+        .env("HOME", "")
+        .args(["--host", "tablet", "--no-multiplex", "hub", "status"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains(
+            "no cache directory for rmu hub: XDG_CACHE_HOME and HOME are both unset or empty"
+        ),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(fs::read_dir(&cwd).unwrap().count(), 0, "nothing in the cwd");
+}
+
 #[test]
 fn exit_codes_over_ssh() {
     Toolset::all().iter().for_each(exit_codes);

@@ -35,6 +35,7 @@
 
 pub mod bundle;
 pub mod client;
+mod copy;
 pub mod error;
 pub mod git;
 pub mod hub;

@@ -121,6 +121,37 @@ archive. Never inside the synced tree: no git pollution, no accidental
 deletion, overlapping roots each get their own archive. tablet↔tablet
 pair-state files live in the same directory (`sync-pair-<hash>.json`).
 
+Empty `$XDG_STATE_HOME` and `$HOME` count as unset, as the XDG Base
+Directory specification says (the hub's cache directory follows the
+same rule). With neither, `rmu sync` refuses before touching either side
+and names both variables: an archive is never written into the current
+directory.
+
+Migrating from older versions: an empty variable used to count as set,
+and with neither variable rmu used the current directory, so archives
+could land relative to wherever `rmu sync` ran:
+
+- `./rmu/` when `XDG_STATE_HOME` was empty, or when both variables were
+  unset;
+- `./.local/state/rmu/` when `XDG_STATE_HOME` was unset and `HOME` was
+  empty.
+
+Those files are no longer read. **Move them into the state directory**
+(`$XDG_STATE_HOME/rmu/`, or `~/.local/state/rmu/`), keeping their file
+names (`sync-*.json`, `sync-*.files-v1.json`, `sync-pair-*.json`): that
+keeps each pair's history. `listing-*.json` files are only a cache and can
+be deleted. Without the move, the next sync starts with no archive, and
+what that means depends on the pairing:
+
+- filesystem↔tablet re-pairs identical files by content hash; only
+  genuinely divergent files show up;
+- filesystem↔filesystem and tablet↔tablet have no hash adoption: every
+  file present on both sides is reported as a conflict (even if
+  identical), and with `--delete`, files deleted on one side since the
+  last sync may be copied back instead of deleted, as for the files-v1
+  transition below. The default `skip` policy loses nothing; review
+  `--dry-run` before choosing a conflict policy.
+
 For local↔local and SSH↔SSH filesystem pairs, side A is the
 lexicographically smaller endpoint identity, independent of argument
 order. SSH filesystem identities retain `/` for the filesystem root:
@@ -262,7 +293,8 @@ notes.
 
 `Client::list_items` with a listing cache
 (`$XDG_STATE_HOME/rmu/listing-<hash>.json`, keyed by ssh destination +
-xochitl dir) provides change-scaled read-only listings, Unison-archive style:
+xochitl dir) provides change-scaled read-only listings, Unison-archive style
+(without a state directory, listings simply run uncached):
 
 1. Round trip 1: `stat -c '%Y %s %n'` over every
    `.metadata`/`.content`/payload file — tiny output, one exec.

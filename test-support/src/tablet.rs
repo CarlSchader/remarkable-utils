@@ -149,7 +149,7 @@ impl TabletTools {
     /// else succeeds.
     fn systemctl_stub(&self) -> String {
         format!(
-            "printf '%s\\n' \"$*\" >> {log}\n\
+            "[ -n \"$RMU_SYSTEMCTL_LOGGED\" ] || printf '%s\\n' \"$*\" >> {log}\n\
              case \"$*\" in\n\
              'stop xochitl.service') rm -f {running} ;;\n\
              'start xochitl.service') : > {running} ;;\n\
@@ -211,6 +211,31 @@ impl TabletTools {
             "for cmd do :; done\nPATH={}; export PATH\nexec sh -c \"$cmd\"\n",
             q(&self.bin)
         )
+    }
+
+    /// Make `systemctl` run `arms` first: `case "$*"` arms such as
+    /// `'start xochitl.service') exit 1 ;;`, which can run the stub (to
+    /// simulate the command) as `"$stub" "$@"`. Anything no arm ends goes
+    /// to the stub. Every call is logged as before. Each call replaces the
+    /// previous arms; `""` restores plain stub behaviour. Also for
+    /// failures only ssh could cause (exit 255): the mock `ssh` passes the
+    /// status through.
+    pub fn systemctl_arms(&self, arms: &str) {
+        let systemctl = self.bin.join("systemctl");
+        let stub = self.sys.join("systemctl-stub");
+        if !stub.exists() {
+            fs::rename(&systemctl, &stub).unwrap();
+        }
+        write_script(
+            &systemctl,
+            &format!(
+                "printf '%s\\n' \"$*\" >> {log}\n\
+                 RMU_SYSTEMCTL_LOGGED=1; export RMU_SYSTEMCTL_LOGGED\n\
+                 stub={stub}\ncase \"$*\" in\n{arms}\nesac\nexec \"$stub\" \"$@\"\n",
+                log = q(&self.sys.join("systemctl.log")),
+                stub = q(&stub),
+            ),
+        );
     }
 
     pub fn systemctl_log(&self) -> String {

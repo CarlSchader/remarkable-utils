@@ -386,3 +386,99 @@ fn failed_authoritative_sync_listing_never_uses_warm_cache() {
         }
     }
 }
+
+/// Empty `$XDG_STATE_HOME` and `$HOME` count as unset (as the XDG spec
+/// says): `rmu sync` refuses before writing anything, naming the
+/// variables, and listings run uncached. Nothing lands in the current
+/// directory, where an empty variable used to put the state.
+#[test]
+fn empty_state_variables_never_mean_the_current_directory() {
+    let fixture = Fixture::new();
+    fixture.folder("b", ROOT, "AAAA");
+    fs::write(fixture.0.join("local/keep.pdf"), ORIGINAL).unwrap();
+    let cwd = fixture.0.join("cwd");
+    fs::create_dir(&cwd).unwrap();
+    let before = fs::read_dir(fixture.0.join("b/device")).unwrap().count();
+    let run = |args: &[&str]| {
+        fixture
+            .command()
+            .current_dir(&cwd)
+            .env("XDG_STATE_HOME", "")
+            .env("HOME", "")
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let local = local_path(&fixture);
+    let sync = run(&[
+        "sync",
+        "--remote-kind",
+        "remarkable",
+        &local,
+        "root@b.invalid:/AAAA",
+    ]);
+    assert!(!sync.status.success());
+    let stderr = String::from_utf8_lossy(&sync.stderr);
+    assert!(
+        stderr.contains("XDG_STATE_HOME and HOME are both unset or empty"),
+        "{stderr}"
+    );
+    assert_eq!(
+        fs::read_dir(fixture.0.join("b/device")).unwrap().count(),
+        before,
+        "nothing written to the tablet"
+    );
+    assert_success(&run(&[
+        "--host",
+        "b.invalid",
+        "--user",
+        "root",
+        "ls",
+        "--json",
+    ]));
+    assert_eq!(fs::read_dir(&cwd).unwrap().count(), 0, "nothing in the cwd");
+    assert_eq!(
+        fs::read_dir(fixture.0.join("state")).unwrap().count(),
+        0,
+        "nor in the state dir the fixture otherwise uses"
+    );
+}
+
+/// The same refusal for the symmetric pairings, before either side is
+/// contacted: the tablet hosts here are ones the mock `ssh` rejects, and
+/// the local directories do not exist, so any contact would fail with a
+/// different error.
+#[test]
+fn symmetric_pairings_refuse_without_a_state_directory_before_any_contact() {
+    let fixture = Fixture::new();
+    let cwd = fixture.0.join("cwd");
+    fs::create_dir(&cwd).unwrap();
+    let missing = |name: &str| fixture.0.join(name).to_str().unwrap().to_string();
+    let pairs = [
+        (
+            "tablet↔tablet",
+            "root@c.invalid:/A".to_string(),
+            "root@d.invalid:/B".to_string(),
+            "remarkable",
+        ),
+        ("fs↔fs", missing("absent-a"), missing("absent-b"), "fs"),
+    ];
+    pairs.iter().for_each(|(label, src, dst, kind)| {
+        let output = fixture
+            .command()
+            .current_dir(&cwd)
+            .env("XDG_STATE_HOME", "")
+            .env("HOME", "")
+            .args(["sync", "--two-way", "--remote-kind", kind, src, dst])
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{label}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("XDG_STATE_HOME and HOME are both unset or empty"),
+            "{label}: {stderr}"
+        );
+    });
+    assert_eq!(fs::read_dir(&cwd).unwrap().count(), 0, "nothing in the cwd");
+    assert!(!fixture.0.join("absent-a").exists() && !fixture.0.join("absent-b").exists());
+}

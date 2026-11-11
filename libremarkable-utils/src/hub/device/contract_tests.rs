@@ -1116,6 +1116,57 @@ mod ssh_tablet {
         run_contract(&busybox, "busybox");
     }
 
+    /// A failed start gets one look whether xochitl came back anyway,
+    /// as `Client::restart_xochitl` does (`xochitl_service::came_back`);
+    /// ssh's own failure on that look is the tablet not answering, never
+    /// "not running".
+    #[test]
+    fn a_failed_start_gets_one_look_and_ssh_failure_is_unreachable() {
+        const DROPPED: &str = "echo 'Connection to tablet closed by remote host.' >&2; exit 255";
+        on_both(true, |harness| {
+            let t = harness.ssh_tablet();
+            let lock = t.acquire_lock(&request(), false).unwrap();
+            t.arm_watchdog(&lock, WATCHDOG).unwrap();
+            let stopped = || {
+                t.stop_xochitl(&lock).unwrap();
+                assert!(!harness.running());
+            };
+            // The start took effect, then the channel dropped: up, time 0.
+            stopped();
+            harness.systemctl_arms(&format!(
+                "'start xochitl.service') \"$stub\" \"$@\"; {DROPPED} ;;"
+            ));
+            assert_eq!(t.start_xochitl(&lock).unwrap(), 0);
+            assert!(harness.running());
+            // The channel dropped and the look got no answer either:
+            // the tablet did not answer (it used to be a remote error).
+            stopped();
+            harness.systemctl_arms(&format!(
+                "'start xochitl.service') {DROPPED} ;;\n'is-active xochitl.service') exit 255 ;;"
+            ));
+            let result = t.start_xochitl(&lock);
+            assert!(matches!(result, Err(Error::Unreachable(_))), "{result:?}");
+            // The start failed and xochitl is down: a failed start.
+            harness.systemctl_arms("'start xochitl.service') echo 'Job failed.' >&2; exit 1 ;;");
+            let result = t.start_xochitl(&lock);
+            assert!(
+                device_error(&result, |e| matches!(e, DeviceError::XochitlStart(_))),
+                "{result:?}"
+            );
+            // A tablet that timed out is not asked again.
+            harness.systemctl_arms(
+                "'start xochitl.service') echo 'Timeout, server tablet not responding.' >&2; exit 255 ;;",
+            );
+            let before = harness.systemctl_log().matches("is-active").count();
+            assert!(matches!(t.start_xochitl(&lock), Err(Error::Unreachable(_))));
+            assert_eq!(harness.systemctl_log().matches("is-active").count(), before);
+            harness.systemctl_arms("");
+            assert!(t.start_xochitl(&lock).unwrap() > 0);
+            t.disarm_watchdog(&lock).unwrap();
+            t.release_lock(&lock).unwrap();
+        });
+    }
+
     #[test]
     fn rearms_before_removing_the_old_watchdog() {
         let harness = SshHarness::new(&Toolset::Host, true);

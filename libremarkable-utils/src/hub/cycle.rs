@@ -385,8 +385,8 @@ impl Default for HubOptions {
 /// live by default.
 pub fn default_cache_dir() -> Option<PathBuf> {
     xdg::base_dir(
-        xdg::non_empty_var("XDG_CACHE_HOME"),
-        xdg::non_empty_var("HOME"),
+        std::env::var_os("XDG_CACHE_HOME"),
+        std::env::var_os("HOME"),
         ".cache",
     )
     .map(|dir| dir.join("rmu").join("hub"))
