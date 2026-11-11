@@ -438,11 +438,13 @@ while implementing it, beyond the steps above:
     and the whole tablet version of documents both sides changed (a
     conflict copy). About a second at the 1 MB/s measured over Wi-Fi and
     a VPN. Origin unchanged since every base skips the estimate. Not when
-    the fetch under the lock (step 2) took over a quarter of the budget:
-    a slow origin, or git asking for credentials, would make the later
-    network steps slow too, now with the UI down. Only `sync` decides
-    this (`rmu hub sync --two-windows` never keeps it stopped); `clone`
-    and `backup` start xochitl at step 6.
+    the fetch under the lock (step 2) took longer than 2.5 s
+    (`SingleStop::slow_fetch`, its own setting, not derived from the
+    budget): a slow origin, or git asking for credentials, would make the
+    later network steps slow too, now with the UI down. A step-6 start
+    for any reason but "nothing to apply" says why in its progress line.
+    Only `sync` decides this (`rmu hub sync --two-windows` never keeps it
+    stopped); `clone` and `backup` start xochitl at step 6.
   - *Checked again* against the actual plan before staging (same
     limits); nothing to apply, or more, starts xochitl there and the run
     goes on as the two-window cycle.
@@ -451,11 +453,17 @@ while implementing it, beyond the steps above:
     plan, before staging; once spent, xochitl is started and the run
     goes on with two windows. Not after staging: only the apply is left
     then, and a start would be stopped again during its start-up, so the
-    run applies stopped, under a fresh timer. While xochitl stays
-    stopped, the watchdog is armed (and re-armed before each long step) for 60 s, not
-    the run's timeout: a step that hangs between two checks brings the
-    UI back after that long, and, the watchdog having fired, the run
-    ends as after a crash (the journal covers it).
+    run applies stopped, under a fresh timer. The budget counts only
+    while xochitl stays stopped (`Session::stopped_for` is `None` once it
+    has started), so a clone or a two-window sync can never be "over
+    budget" and start a running xochitl. While xochitl stays stopped,
+    the watchdog is armed (and re-armed before each long step) for 60 s,
+    not the run's timeout: a step that hangs between two checks brings
+    the UI back after that long, and, the watchdog having fired, the run
+    ends as after a crash (the journal covers it). A fallback start is
+    followed by an arm at the run's timeout (the push attempt's, or
+    staging's), except after an empty plan, where only the record is
+    left, under the watchdog already pending.
   - *Unchanged*: the device-ref backup is pushed before any write, the
     journal precedes the push, and step 14 still re-reads, verifies and
     runs the live tree checks before the apply. The racy-entry reference
@@ -540,8 +548,9 @@ while implementing it, beyond the steps above:
   leftovers of an interrupted write cannot block a document forever. A
   step-5 stat with a coarse mtime in the second of the first start
   after the read (step 6's, or a later one in a sync that kept xochitl
-  stopped) counts as moved; with no start since the read, none does. A planned change that would carry a document the user
-  touched since step 5 into the trash (origin trashed its folder) is
+  stopped) counts as moved; with no start since the read, none does. A
+  planned change that would carry a document the user touched since
+  step 5 into the trash (origin trashed its folder) is
   skipped: on the next merge that tablet's own tree would have the edited
   document in the trash, and the edit could no longer pull it out. Tree
   checks blame only violations the live tablet does not already have.
