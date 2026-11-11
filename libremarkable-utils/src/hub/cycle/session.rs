@@ -18,7 +18,8 @@ pub(super) struct Session<'t> {
     /// Set before a stop is attempted (its reply may be lost), cleared by
     /// a start that succeeded.
     pub(super) maybe_stopped: bool,
-    /// When the last stop was attempted.
+    /// When the last stop was attempted, while xochitl has not started
+    /// since.
     stopped_at: Option<Instant>,
     /// Keeping xochitl stopped past step 6 (single-stop): the watchdog
     /// timeout meanwhile, cleared by a start.
@@ -91,6 +92,7 @@ impl<'t> Session<'t> {
         let time = self.tablet.start_xochitl(self.lock())?;
         self.maybe_stopped = false;
         self.deferred = None;
+        self.stopped_at = None;
         self.started_at.get_or_insert(time);
         Ok(time)
     }
@@ -113,9 +115,10 @@ impl<'t> Session<'t> {
         self.deferred.is_some() && self.maybe_stopped
     }
 
-    /// How long ago xochitl was last stopped (zero if it never was).
-    pub(super) fn stopped_for(&self) -> Duration {
-        self.stopped_at.map_or(Duration::ZERO, |at| at.elapsed())
+    /// How long xochitl has been stopped, if it has not started since
+    /// this run stopped it: a budget never counts the time it ran.
+    pub(super) fn stopped_for(&self) -> Option<Duration> {
+        self.stopped_at.map(|at| at.elapsed())
     }
 
     pub(super) fn write_state(&self, state: &TabletState) -> Result<()> {

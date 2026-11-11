@@ -218,7 +218,11 @@ impl Hub<'_> {
                 self.progress.step("Keeping xochitl stopped: a small sync");
                 s.defer_start(limits.watchdog)
             }
-            Some(_) => self.start_xochitl(s),
+            Some(plan::StartNow::NothingToApply) => self.start_xochitl(s),
+            Some(why) => {
+                self.progress.step(&format!("Starting xochitl: {why}"));
+                s.start().map(drop)
+            }
         }
     }
 
@@ -253,7 +257,7 @@ impl Hub<'_> {
             limits,
             &estimate,
             apply_bytes,
-            s.stopped_for(),
+            s.stopped_for().unwrap_or_default(),
             p.fetch_took,
         ))
     }
@@ -264,8 +268,9 @@ impl Hub<'_> {
         match why {
             Some(why) if s.deferring() => {
                 self.progress.step(&format!("Starting xochitl: {why}"));
-                // Every caller arms next (the push attempt, staging), at
-                // the run's own timeout again.
+                // The push attempt and staging arm next, at the run's own
+                // timeout again; after an empty plan only the record is
+                // left, under the watchdog already pending.
                 s.start().map(drop)
             }
             _ => Ok(()),
@@ -282,7 +287,8 @@ impl Hub<'_> {
         let why = self
             .options
             .single_stop
-            .and_then(|limits| plan::single_stop_overdue(&limits, s.stopped_for()));
+            .zip(s.stopped_for())
+            .and_then(|(limits, stopped_for)| plan::single_stop_overdue(&limits, stopped_for));
         self.end_single_stop(s, why)
     }
 

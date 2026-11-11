@@ -4865,6 +4865,11 @@ fn a_restore_lands_while_a_tablet_edits_the_original() {
 use libremarkable_utils::hub::cycle::SingleStop;
 use std::time::Duration;
 
+/// A budget for tests that run past it on purpose, with room for slow git
+/// under load before then; and a delay that surely runs past it.
+const SHORT_BUDGET: Duration = Duration::from_secs(1);
+const PAST_BUDGET: Duration = Duration::from_millis(1300);
+
 /// How many times `kind` is in `ops`.
 fn count_ops(ops: &[OpKind], kind: OpKind) -> usize {
     ops.iter().filter(|op| **op == kind).count()
@@ -4927,6 +4932,12 @@ fn a_small_sync_stops_xochitl_once() {
         .rposition(|op| *op == OpKind::StatAll)
         .unwrap();
     assert!(journal < stage && stage < recheck, "{window:?}");
+    // Step 13 re-arms (a fresh timer) between staging and the recheck.
+    let last_stage = window.iter().rposition(|op| *op == OpKind::Stage).unwrap();
+    assert!(
+        window[last_stage..recheck].contains(&OpKind::ArmWatchdog),
+        "{window:?}"
+    );
     assert!(world.tablet(0).is_running());
     assert!(
         world.tablet(0).watchdog_armed().is_none(),
@@ -4980,7 +4991,7 @@ fn a_large_sync_keeps_two_windows() {
 fn a_small_sync_that_runs_long_starts_xochitl() {
     let (mut template, _) = small_apply();
     template.options.single_stop = Some(SingleStop {
-        budget: Duration::from_millis(300),
+        budget: SHORT_BUDGET,
         ..SingleStop::default()
     });
     let (_, reference) = sync_ops(&template.duplicate());
@@ -4989,7 +5000,7 @@ fn a_small_sync_that_runs_long_starts_xochitl() {
     let world = template.duplicate();
     world
         .tablet(0)
-        .inject(Fault::SlowOp(journal + 1, Duration::from_millis(400)));
+        .inject(Fault::SlowOp(journal + 1, PAST_BUDGET));
     let (report, ops) = sync_ops(&world);
     report.unwrap();
     assert_eq!(count_ops(&ops, OpKind::StartXochitl), 2, "{ops:?}");
@@ -5114,14 +5125,14 @@ fn a_clone_keeps_two_windows() {
 fn a_budget_spent_while_staging_still_applies_stopped() {
     let (mut template, _) = small_apply();
     template.options.single_stop = Some(SingleStop {
-        budget: Duration::from_millis(300),
+        budget: SHORT_BUDGET,
         ..SingleStop::default()
     });
     let (_, reference) = sync_ops(&template.duplicate());
     let world = template.duplicate();
     world.tablet(0).inject(Fault::SlowOp(
         first_op(&reference, OpKind::Stage) + 1,
-        Duration::from_millis(400),
+        PAST_BUDGET,
     ));
     let (report, ops) = sync_ops(&world);
     report.unwrap();
@@ -5181,44 +5192,42 @@ fn sync_hooked(
 /// other push outlasts, xochitl starts before the retry's journal.
 #[test]
 fn a_small_sync_retries_its_push_stopped_or_within_budget() {
-    [None, Some(Duration::from_millis(300))]
-        .into_iter()
-        .for_each(|budget| {
-            let (mut world, lib) = small_apply();
-            if let Some(budget) = budget {
-                world.options.single_stop = Some(SingleStop {
-                    budget,
-                    ..SingleStop::default()
-                });
-            }
-            // A changes something of its own (so it pushes); B renames
-            // another document, pushed while A is about to push.
-            let page = world.pages(0, &lib.sketch)[0].clone();
-            world.ink(0, &lib.sketch, &page);
-            world.rename(1, &lib.paper, "Paper (renamed on B)");
-            let other = world.hub_parts(1);
-            let (report, ops) = sync_hooked(&world, 0, "Pushing to origin", move || {
-                other.sync().unwrap();
-                if let Some(budget) = budget {
-                    std::thread::sleep(budget + Duration::from_millis(100));
-                }
+    [None, Some(SHORT_BUDGET)].into_iter().for_each(|budget| {
+        let (mut world, lib) = small_apply();
+        if let Some(budget) = budget {
+            world.options.single_stop = Some(SingleStop {
+                budget,
+                ..SingleStop::default()
             });
-            assert_eq!(report.push_attempts, 2, "{report:?}");
-            let stop = first_op(&ops, OpKind::StopXochitl);
-            // Device ref recorded, then a journal per attempt.
-            let writes: Vec<usize> = (stop..ops.len())
-                .filter(|at| ops[*at] == OpKind::WriteState)
-                .collect();
-            let first_start = first_op(&ops, OpKind::StartXochitl);
-            match budget {
-                None => assert_eq!(count_ops(&ops, OpKind::StartXochitl), 1, "{ops:?}"),
-                Some(_) => assert!(
-                    writes[1] < first_start && first_start < writes[2],
-                    "before the second attempt's journal: {ops:?}"
-                ),
+        }
+        // A changes something of its own (so it pushes); B renames
+        // another document, pushed while A is about to push.
+        let page = world.pages(0, &lib.sketch)[0].clone();
+        world.ink(0, &lib.sketch, &page);
+        world.rename(1, &lib.paper, "Paper (renamed on B)");
+        let other = world.hub_parts(1);
+        let (report, ops) = sync_hooked(&world, 0, "Pushing to origin", move || {
+            other.sync().unwrap();
+            if budget.is_some() {
+                std::thread::sleep(PAST_BUDGET);
             }
-            world.converge();
         });
+        assert_eq!(report.push_attempts, 2, "{report:?}");
+        let stop = first_op(&ops, OpKind::StopXochitl);
+        // Device ref recorded, then a journal per attempt.
+        let writes: Vec<usize> = (stop..ops.len())
+            .filter(|at| ops[*at] == OpKind::WriteState)
+            .collect();
+        let first_start = first_op(&ops, OpKind::StartXochitl);
+        match budget {
+            None => assert_eq!(count_ops(&ops, OpKind::StartXochitl), 1, "{ops:?}"),
+            Some(_) => assert!(
+                writes[1] < first_start && first_start < writes[2],
+                "before the second attempt's journal: {ops:?}"
+            ),
+        }
+        world.converge();
+    });
 }
 
 /// Origin moves between the lock and the sync's fetch, by more than a
@@ -5278,7 +5287,7 @@ fn watchdog_fires_before_every_operation() {
 fn a_slow_backup_starts_xochitl_before_the_merge() {
     let (mut template, lib) = small_apply();
     template.options.single_stop = Some(SingleStop {
-        budget: Duration::from_millis(300),
+        budget: SHORT_BUDGET,
         ..SingleStop::default()
     });
     let page = template.pages(0, &lib.sketch)[0].clone();
@@ -5289,7 +5298,7 @@ fn a_slow_backup_starts_xochitl_before_the_merge() {
     let world = template.duplicate();
     world
         .tablet(0)
-        .inject(Fault::SlowOp(record + 1, Duration::from_millis(400)));
+        .inject(Fault::SlowOp(record + 1, PAST_BUDGET));
     let (report, ops) = sync_ops(&world);
     report.unwrap();
     let writes: Vec<usize> = (stop..ops.len())
@@ -5332,7 +5341,7 @@ impl StepTimes {
         };
         let decided = times
             .iter()
-            .find(|(step, _)| step == "Starting xochitl" || step.starts_with("Keeping"))
+            .find(|(step, _)| step.starts_with("Starting xochitl") || step.starts_with("Keeping"))
             .map(|(_, at)| *at)
             .unwrap();
         decided - at("Stopping xochitl")
@@ -5382,4 +5391,102 @@ fn single_stop_estimate_scale() {
          (whole syncs {:?}, {:?})",
         unchanged.0, moved.0, unchanged.1, moved.1
     );
+}
+
+/// Where xochitl starts in `ops` (the first start), and whether the
+/// single-stop timer was armed right before: a deferral then ended.
+fn first_start_after_defer(ops: &[OpKind]) -> (usize, bool) {
+    let start = first_op(ops, OpKind::StartXochitl);
+    (start, ops[start - 1] == OpKind::ArmWatchdog)
+}
+
+/// A small sync whose fetch under the lock was slower than `slow_fetch`
+/// (zero here: any fetch) starts xochitl at step 6, without deferring.
+#[test]
+fn a_slow_fetch_starts_xochitl_at_step_6() {
+    let (mut world, _) = small_apply();
+    world.options.single_stop = Some(SingleStop {
+        slow_fetch: Duration::ZERO,
+        ..SingleStop::default()
+    });
+    let (report, ops) = sync_ops(&world);
+    report.unwrap();
+    let stop = first_op(&ops, OpKind::StopXochitl);
+    let first_write = stop + first_op(&ops[stop..], OpKind::WriteState);
+    let (start, deferred) = first_start_after_defer(&ops);
+    assert!(start < first_write && !deferred, "{ops:?}");
+    assert_eq!(count_ops(&ops, OpKind::StartXochitl), 2, "{ops:?}");
+    world.converge();
+}
+
+/// A stopped read that already spent the budget: started at step 6, not
+/// deferred first.
+#[test]
+fn a_read_past_the_budget_starts_xochitl_at_step_6() {
+    let (mut template, _) = small_apply();
+    template.options.single_stop = Some(SingleStop {
+        budget: SHORT_BUDGET,
+        ..SingleStop::default()
+    });
+    let (_, reference) = sync_ops(&template.duplicate());
+    let stop = first_op(&reference, OpKind::StopXochitl);
+    let read = stop + first_op(&reference[stop..], OpKind::StatAll);
+    let world = template.duplicate();
+    world.tablet(0).inject(Fault::SlowOp(read + 1, PAST_BUDGET));
+    let (report, ops) = sync_ops(&world);
+    report.unwrap();
+    let (start, deferred) = first_start_after_defer(&ops);
+    assert!(!deferred, "{ops:?}");
+    assert!(
+        start < stop + first_op(&ops[stop..], OpKind::WriteState),
+        "{ops:?}"
+    );
+    world.converge();
+}
+
+/// With no budget at all, a sync and a clone each start xochitl exactly
+/// twice: a budget never counts time xochitl ran, so nothing tries to
+/// start a running xochitl.
+#[test]
+fn a_zero_budget_never_starts_xochitl_twice_in_a_row() {
+    let zero = |world: &mut World| {
+        world.options.single_stop = Some(SingleStop {
+            budget: Duration::ZERO,
+            ..SingleStop::default()
+        });
+    };
+    let (mut world, _) = small_apply();
+    zero(&mut world);
+    let (report, ops) = sync_ops(&world);
+    report.unwrap();
+    assert_eq!(count_ops(&ops, OpKind::StartXochitl), 2, "{ops:?}");
+    world.converge();
+    let mut world = clone_template();
+    zero(&mut world);
+    let start = world.tablet(1).ops().len();
+    world.clone_tablet(1).unwrap();
+    let ops = world.tablet(1).ops()[start..].to_vec();
+    assert_eq!(count_ops(&ops, OpKind::StartXochitl), 2, "{ops:?}");
+}
+
+/// A document quarantined on A (broken metadata) that B changed: the
+/// estimate counts it, the plan leaves it alone, so a sync that kept
+/// xochitl stopped starts it at the plan, before recording.
+#[test]
+fn an_empty_plan_starts_xochitl_before_recording() {
+    let (world, lib) = two_tablets();
+    world.corrupt(0, &lib.diary);
+    world.rename(1, &lib.diary, "Diary (renamed on B)");
+    world.sync(1).unwrap();
+    let (report, ops) = sync_ops(&world);
+    let report = report.unwrap();
+    assert!(report.applied.is_empty(), "{report:?}");
+    assert!(report.quarantined.contains_key(&lib.diary), "{report:?}");
+    let (start, deferred) = first_start_after_defer(&ops);
+    let record = ops
+        .iter()
+        .rposition(|op| *op == OpKind::WriteState)
+        .unwrap();
+    assert!(deferred && start < record, "{ops:?}");
+    assert_eq!(count_ops(&ops, OpKind::StartXochitl), 1, "{ops:?}");
 }

@@ -1473,6 +1473,7 @@ fn a_sync_keeps_xochitl_stopped_only_within_every_bound() {
         max_bytes: 1000,
         max_docs: 2,
         budget: Duration::from_secs(8),
+        slow_fetch: Duration::from_secs(2),
         watchdog: Duration::from_secs(60),
     };
     let estimate = |docs: usize, tablet_bytes: u64| NetworkEstimate {

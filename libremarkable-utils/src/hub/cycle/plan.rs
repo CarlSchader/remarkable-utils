@@ -1355,9 +1355,8 @@ impl std::fmt::Display for StartNow {
 
 /// Step 6: whether a sync keeps xochitl stopped, given the estimate, the
 /// size of its origin blobs (`apply_bytes`), how long xochitl has been
-/// stopped and how long the fetch under the lock took. `None`: keep it
-/// stopped. A fetch that took over a quarter of the budget counts as
-/// slow. Pure.
+/// stopped and how long the fetch under the lock took (slow past
+/// [`super::SingleStop::slow_fetch`]). `None`: keep it stopped. Pure.
 pub(super) fn single_stop_at_start(
     limits: &super::SingleStop,
     estimate: &NetworkEstimate,
@@ -1371,7 +1370,7 @@ pub(super) fn single_stop_at_start(
         || estimate.tablet_bytes.saturating_add(apply_bytes) > limits.max_bytes
     {
         Some(StartNow::TooLarge)
-    } else if fetch_took > limits.budget / 4 {
+    } else if fetch_took > limits.slow_fetch {
         Some(StartNow::SlowOrigin)
     } else {
         single_stop_overdue(limits, stopped_for)

@@ -424,7 +424,12 @@ impl Hub<'_> {
         let contents = staged_contents(planned)?;
         let size_of = content_sizes(&p.origin.store, &contents)?;
         let bytes: u64 = contents.iter().map(|(_, content)| size_of(content)).sum();
-        let why = plan::single_stop_at_plan(&limits, planned.len(), bytes, s.stopped_for());
+        let why = plan::single_stop_at_plan(
+            &limits,
+            planned.len(),
+            bytes,
+            s.stopped_for().unwrap_or_default(),
+        );
         self.end_single_stop(s, why)
     }
 

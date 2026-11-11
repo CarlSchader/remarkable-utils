@@ -329,7 +329,8 @@ pub struct HubOptions {
 /// When a sync keeps xochitl stopped through its network steps: only if
 /// what it would send is small (an estimate before step 7, the actual
 /// plan before staging), and only for so long. Past either bound it
-/// starts xochitl and goes on as the two-window cycle.
+/// starts xochitl and goes on as the two-window cycle. Defaults: 1 MiB,
+/// 32 documents, a 10 s budget, a 2.5 s slow fetch, a 60 s watchdog.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SingleStop {
     /// At most this many bytes for the device-ref push and the staging
@@ -341,6 +342,10 @@ pub struct SingleStop {
     /// Checked between steps: once xochitl has been stopped this long,
     /// it is started and the run goes on with two windows.
     pub budget: Duration,
+    /// A fetch under the lock (step 2) slower than this means a slow
+    /// origin, or git asking for credentials: the later network steps
+    /// would be slow too, so xochitl is started at step 6.
+    pub slow_fetch: Duration,
     /// The watchdog timeout while xochitl stays stopped past step 6 (at
     /// most [`HubOptions::watchdog`]): the bound on one step that hangs
     /// between two budget checks. When it fires, xochitl comes back and
@@ -354,6 +359,7 @@ impl Default for SingleStop {
             max_bytes: 1024 * 1024,
             max_docs: 32,
             budget: Duration::from_secs(10),
+            slow_fetch: Duration::from_millis(2500),
             watchdog: Duration::from_secs(60),
         }
     }
