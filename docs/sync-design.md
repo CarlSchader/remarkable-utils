@@ -125,11 +125,32 @@ Empty `$XDG_STATE_HOME` and `$HOME` count as unset, as the XDG Base
 Directory specification says (the hub's cache directory follows the
 same rule). With neither, `rmu sync` refuses before touching either side
 and names both variables: an archive is never written into the current
-directory. (Before, an empty variable counted as set, so the archive
-could land in `./rmu/` or `./.local/state/rmu/`. Such a file is no
-longer read; the next sync with a proper state directory starts without
-an archive, which is benign: identical files re-pair by content hash.
-Delete it, or move it into the state directory to keep its history.)
+directory.
+
+Migrating from older versions: an empty variable used to count as set,
+and with neither variable rmu used the current directory, so archives
+could land relative to wherever `rmu sync` ran:
+
+- `./rmu/` when `XDG_STATE_HOME` was empty, or when both variables were
+  unset;
+- `./.local/state/rmu/` when `XDG_STATE_HOME` was unset and `HOME` was
+  empty.
+
+Those files are no longer read. **Move them into the state directory**
+(`$XDG_STATE_HOME/rmu/`, or `~/.local/state/rmu/`), keeping their file
+names (`sync-*.json`, `sync-*.files-v1.json`, `sync-pair-*.json`): that
+keeps each pair's history. `listing-*.json` files are only a cache and can
+be deleted. Without the move, the next sync starts with no archive, and
+what that means depends on the pairing:
+
+- filesystem↔tablet re-pairs identical files by content hash; only
+  genuinely divergent files show up;
+- filesystem↔filesystem and tablet↔tablet have no hash adoption: every
+  file present on both sides is reported as a conflict (even if
+  identical), and with `--delete`, files deleted on one side since the
+  last sync may be copied back instead of deleted, as for the files-v1
+  transition below. The default `skip` policy loses nothing; review
+  `--dry-run` before choosing a conflict policy.
 
 For local↔local and SSH↔SSH filesystem pairs, side A is the
 lexicographically smaller endpoint identity, independent of argument
