@@ -132,6 +132,11 @@ pub enum HubCommand {
         /// the tablet); the consent is recorded in the merge commit
         #[arg(long)]
         allow_deletions: bool,
+        /// Always bring the UI back between reading the tablet and
+        /// applying changes, even for a small sync (two short outages
+        /// instead of one); for slow or flaky links
+        #[arg(long, conflicts_with = "dry_run")]
+        two_windows: bool,
         #[command(flatten)]
         run: RunArgs,
         #[command(flatten)]
@@ -438,13 +443,18 @@ pub fn options(command: &HubCommand) -> HubOptions {
         },
         HubCommand::Sync {
             allow_deletions,
+            two_windows,
             run: args,
             origin: url,
             ..
-        } => HubOptions {
-            allow_deletions: *allow_deletions,
-            ..run(args, origin(url))
-        },
+        } => {
+            let options = run(args, origin(url));
+            HubOptions {
+                allow_deletions: *allow_deletions,
+                single_stop: options.single_stop.filter(|_| !*two_windows),
+                ..options
+            }
+        }
         HubCommand::Backup {
             run: args,
             origin: url,

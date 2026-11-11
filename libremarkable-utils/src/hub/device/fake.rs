@@ -129,6 +129,12 @@ pub enum Fault {
     /// stopped then, the edit waits for the first operation after it runs
     /// again.
     EditBefore(usize, Edit),
+    /// The `n`th operation of any kind takes this much longer (a slow
+    /// link), whether xochitl runs or not.
+    SlowOp(usize, Duration),
+    /// The watchdog fires (as [`FakeTablet::fire_watchdog`]) right before
+    /// the `n`th operation of any kind, whether xochitl runs or not.
+    FireWatchdogBefore(usize),
 }
 
 /// What happens to a mutating operation.
@@ -152,6 +158,8 @@ enum Pending {
     Mutation(usize, MutationFault),
     Op(usize, OpFault),
     EditBefore(usize, Edit),
+    Slow(usize, Duration),
+    Fire(usize),
 }
 
 /// The armed watchdog: its timeout and the run that armed it.
@@ -212,6 +220,8 @@ impl FakeState {
                 return;
             }
             Fault::EditBefore(n, edit) => Pending::EditBefore(self.ops + n, edit),
+            Fault::SlowOp(n, delay) => Pending::Slow(self.ops + n, delay),
+            Fault::FireWatchdogBefore(n) => Pending::Fire(self.ops + n),
         };
         self.pending.push(pending);
     }
@@ -233,9 +243,32 @@ impl FakeState {
         due.into_iter()
             .filter_map(|pending| match pending {
                 Pending::EditBefore(_, edit) => Some(edit),
-                Pending::Mutation(..) | Pending::Op(..) => None,
+                Pending::Mutation(..) | Pending::Op(..) | Pending::Slow(..) | Pending::Fire(..) => {
+                    None
+                }
             })
             .collect()
+    }
+
+    /// Take a watchdog firing planned before operation `op`, if any.
+    fn due_fire(&mut self, op: usize) -> bool {
+        let position = self
+            .pending
+            .iter()
+            .position(|pending| matches!(pending, Pending::Fire(at) if *at == op));
+        position.map(|at| self.pending.remove(at)).is_some()
+    }
+
+    /// Take the delay planned for operation `op`, if any.
+    fn due_delay(&mut self, op: usize) -> Option<Duration> {
+        let position = self
+            .pending
+            .iter()
+            .position(|pending| matches!(pending, Pending::Slow(at, _) if *at == op))?;
+        match self.pending.remove(position) {
+            Pending::Slow(_, delay) => Some(delay),
+            _ => unreachable!("matched above"),
+        }
     }
 
     /// Take the fault planned for operation `op`, if any.
@@ -246,7 +279,10 @@ impl FakeState {
             .position(|pending| matches!(pending, Pending::Op(at, _) if *at == op))?;
         match self.pending.remove(position) {
             Pending::Op(_, fault) => Some(fault),
-            Pending::Mutation(..) | Pending::EditBefore(..) => None,
+            Pending::Mutation(..)
+            | Pending::EditBefore(..)
+            | Pending::Slow(..)
+            | Pending::Fire(..) => None,
         }
     }
 
@@ -258,7 +294,9 @@ impl FakeState {
             .position(|pending| matches!(pending, Pending::Mutation(at, _) if *at == n))?;
         match self.pending.remove(position) {
             Pending::Mutation(_, fault) => Some(fault),
-            Pending::Op(..) | Pending::EditBefore(..) => None,
+            Pending::Op(..) | Pending::EditBefore(..) | Pending::Slow(..) | Pending::Fire(..) => {
+                None
+            }
         }
     }
 }
@@ -663,12 +701,21 @@ impl FakeTablet {
 
     /// Count the operation, run due edits, apply injected faults.
     fn begin(&self, kind: OpKind) -> Result<Ack> {
-        let (edits, outcome) = {
+        let fire = {
+            let mut state = self.state();
+            let op = state.ops + 1;
+            state.due_fire(op)
+        };
+        if fire {
+            self.fire_watchdog();
+        }
+        let (edits, delay, outcome) = {
             let mut state = self.state();
             state.ops += 1;
             state.log.push(kind);
             let op = state.ops;
             let edits = state.due_edits(op);
+            let delay = state.due_delay(op);
             let outcome = if state.disconnected && state.asleep {
                 Err(asleep_error())
             } else if state.disconnected {
@@ -702,8 +749,11 @@ impl FakeTablet {
             } else {
                 Ok(Ack::Report)
             };
-            (edits, outcome)
+            (edits, delay, outcome)
         };
+        if let Some(delay) = delay {
+            std::thread::sleep(delay);
+        }
         edits.into_iter().for_each(|edit| edit(&self.xochitl));
         outcome
     }

@@ -268,7 +268,9 @@ its stored URL (see "History, restore and add").
                 with carry-forward
  6. start       reset-failed + start xochitl (UI back; network work
                 happens with it up, the watchdog re-armed before each
-                long step)
+                long step) — unless the sync is small: then xochitl
+                stays stopped through step 16 (see "One outage for a
+                small sync")
  7. backup      commit the snapshot (parents: base, previous device ref);
                 push the device ref; record device_ref on the tablet
  8. fetch       fetch origin main; check identity and ancestry
@@ -279,7 +281,8 @@ its stored URL (see "History, restore and add").
                 N times; nothing when the tablet already matches origin
                 or has no changes of its own
 12. stage       upload new and changed files into the staging directory
-13. stop        arm the watchdog; systemctl stop xochitl
+13. stop        arm the watchdog; systemctl stop xochitl (already
+                stopped in a small sync: re-arm only)
 14. apply       re-read changed metadata; verify; tree checks against the
                 live tablet; move staged files into place; device sync
 15. record      update base, overrides, manifest; clear the journal
@@ -289,7 +292,8 @@ its stored URL (see "History, restore and add").
 ```
 
 The UI is down only for reconcile + snapshot (4–5) and apply (14), not
-for network transfers. If the tablet is edited between 6 and 13, step
+for network transfers, except in a small sync, which keeps it down from
+3 to 16 for one outage. If the tablet is edited between 6 and 13, step
 14 notices: those documents are not overwritten, keep their snapshot
 version as a base override, and are picked up by the next sync.
 
@@ -397,7 +401,13 @@ while implementing it, beyond the steps above:
   there (their content is exactly `fast-import`).
 - **Pure work after the start.** Validation, carry-forward, and (for
   `clone`) base inference run after step 6; while xochitl is stopped
-  only the stat pass and downloads (streamed into `fast-import`) happen.
+  only the stat pass and downloads (streamed into `fast-import`) happen,
+  plus, in a sync where origin moved since the bases, the step-6
+  estimate below: it reads the base's and origin's trees (cached) and
+  compares them with the read, about 29 ms more in the snapshot window
+  on a library of 1000 notebooks (release build;
+  `single_stop_estimate_scale`). A sync that keeps xochitl stopped also
+  validates, carries forward and merges stopped; it is small by then.
 - **The watchdog stays armed** from step 2 to step 16 and is re-armed
   (a fresh timer) before every step that may take long: the device-ref
   push, each fetch, each staging batch, each stop. Disarming after step
@@ -411,8 +421,57 @@ while implementing it, beyond the steps above:
   than a whole first-clone upload (which would otherwise fire it on
   every attempt). Pushes and fetches are incremental, so one that
   outlasts the timeout is not repeated by the next run. Starts per
-  cycle: two (one when nothing is applied), plus one if the watchdog
-  fires, each after `reset-failed`.
+  cycle: two (one when nothing is applied, or for a small sync), plus
+  one if the watchdog fires, each after `reset-failed`.
+- **One outage for a small sync.** On the Paper Pro xochitl needs about
+  2.3 s after systemd reports it started, and on a sync that applies,
+  step 13 used to stop it 1.4–2 s after step 6 started it: one outage of
+  6–7 s, plus a start spent against the 4-in-600 s start limit. So when
+  a sync looks small, step 6 keeps xochitl stopped instead, and step 16
+  is its only start (`HubOptions::single_stop`, `SingleStop`):
+  - *Eligible* when, estimated after the read and before the merge
+    (`plan::network_estimate`, pure): origin changed documents since
+    their base that the tablet does not hold as origin does (at least
+    one: with nothing to apply, the push goes better with the UI up),
+    at most 32 of them, and at most 1 MiB to send in all: origin's blobs
+    the tablet lacks, the tablet's own new blobs (the device-ref push),
+    and the whole tablet version of documents both sides changed (a
+    conflict copy). About a second at the 1 MB/s measured over Wi-Fi and
+    a VPN. Origin unchanged since every base skips the estimate. Not when
+    the fetch under the lock (step 2) took longer than 2.5 s
+    (`SingleStop::slow_fetch`, its own setting, not derived from the
+    budget): a slow origin, or git asking for credentials, would make the
+    later network steps slow too, now with the UI down. A step-6 start
+    for any reason but "nothing to apply" says why in its progress line.
+    Only `sync` decides this (`rmu hub sync --two-windows` never keeps it
+    stopped); `clone` and `backup` start xochitl at step 6.
+  - *Checked again* against the actual plan before staging (same
+    limits); nothing to apply, or more, starts xochitl there and the run
+    goes on as the two-window cycle.
+  - *Bounded*: from the stop, a 10 s budget is checked before each push
+    attempt (the first right after the device-ref push) and, with the
+    plan, before staging; once spent, xochitl is started and the run
+    goes on with two windows. Not after staging: only the apply is left
+    then, and a start would be stopped again during its start-up, so the
+    run applies stopped, under a fresh timer. The budget counts only
+    while xochitl stays stopped (`Session::stopped_for` is `None` once it
+    has started), so a clone or a two-window sync can never be "over
+    budget" and start a running xochitl. While xochitl stays stopped,
+    the watchdog is armed (and re-armed before each long step) for 60 s,
+    not the run's timeout: a step that hangs between two checks brings
+    the UI back after that long, and, the watchdog having fired, the run
+    ends as after a crash (the journal covers it). A fallback start is
+    followed by an arm at the run's timeout (the push attempt's, or
+    staging's), except after an empty plan, where only the record is
+    left, under the watchdog already pending.
+  - *Unchanged*: the device-ref backup is pushed before any write, the
+    journal precedes the push, and step 14 still re-reads, verifies and
+    runs the live tree checks before the apply. The racy-entry reference
+    of the read is the first start after it: the apply's device time
+    when xochitl stays stopped to the end (step 16 starts it later), and
+    the step-14 re-read counts no coarse mtime as racy when nothing has
+    started xochitl since the read. `clone` and `backup` keep the
+    two-window cycle.
 - **A tablet that stops answering** (asleep, off the network) is
   `Error::Unreachable`: ssh gets a connect timeout and a keepalive (see
   `ssh.rs`), and every further try would wait for another timeout, so
@@ -487,9 +546,11 @@ while implementing it, beyond the steps above:
   what step 5 read (the same mirrored files, and every file whose stat
   moved equivalent to what was read), not with the snapshot version, so
   leftovers of an interrupted write cannot block a document forever. A
-  step-5 stat with a coarse mtime in the second of the step-6 start
-  counts as moved. A planned change that would carry a document the user
-  touched since step 5 into the trash (origin trashed its folder) is
+  step-5 stat with a coarse mtime in the second of the first start
+  after the read (step 6's, or a later one in a sync that kept xochitl
+  stopped) counts as moved; with no start since the read, none does. A
+  planned change that would carry a document the user touched since
+  step 5 into the trash (origin trashed its folder) is
   skipped: on the next merge that tablet's own tree would have the edited
   document in the trash, and the edit could no longer pull it out. Tree
   checks blame only violations the live tablet does not already have.
@@ -653,7 +714,8 @@ in an earlier first-parent ancestor of that base.
 
 - New and changed files are uploaded into a staging directory under
   `/home/root/.local/share/rmu/` (same filesystem) **before** xochitl is
-  stopped, so the outage covers only verification and moves. Each run
+  stopped, so the outage covers only verification and moves (a small
+  sync stages with xochitl still stopped since step 3). Each run
   stages into `staging/<run-id>/`, keeping xochitl-relative paths, as one
   streamed tar; staged files are `touch`ed after extraction, so applied
   files carry device-clock nanosecond mtimes (never kept out of the
@@ -958,7 +1020,9 @@ Further:
   another computer took the lock over and dropped the journal as "never
   landed"; the tablet's later edits would then fork once. That needs a
   push longer than the watchdog timeout and a second computer syncing
-  the same tablet meanwhile.
+  the same tablet meanwhile: 60 s rather than 600 s while a small sync
+  keeps xochitl stopped (its watchdog), which the budget and the size
+  limits make unlikely but not impossible.
 - **`clone --reattach` with a pending journal** refuses
   (`JournalPending`) when the journaled merge is in the new origin's
   history: only that journal's reconciliation knows which documents an
@@ -1900,7 +1964,9 @@ To be handled in the implementation PRs named:
   the second start only adds start-limit budget and seconds of
   outage. When the staged upload is small (a size threshold), the cycle
   could keep xochitl stopped from step 3 through step 16 under the
-  armed watchdog, with one start instead of two.
+  armed watchdog, with one start instead of two. Done: "One outage for
+  a small sync"; the thresholds are a first guess from one tablet's
+  measurements, to revisit with more devices and links.
 - The four bugs listed under "Device validation results".
 
 ## Implementation plan

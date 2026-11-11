@@ -1235,6 +1235,173 @@ pub(super) fn removed(
         .collect()
 }
 
+// ---- single stop ---------------------------------------------------------------------
+
+/// What a sync would send over the network, estimated after the step-5
+/// read and before the merge, to decide whether xochitl may stay stopped
+/// through steps 7–12 ([`super::SingleStop`]).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct NetworkEstimate {
+    /// Documents the apply would write or delete: those origin changed
+    /// since the base and the tablet does not hold as origin does.
+    pub apply_docs: usize,
+    /// Origin's blobs those documents need that the tablet lacks (their
+    /// sizes are in the local cache).
+    pub apply_blobs: BTreeSet<Oid>,
+    /// Bytes of the tablet's own: files of documents it changed whose
+    /// blobs the base lacks (the device-ref push), plus the whole tablet
+    /// version of documents both sides changed (a conflict copy is
+    /// staged).
+    pub tablet_bytes: u64,
+}
+
+/// The [`NetworkEstimate`] from the base, the tablet as read (each file's
+/// blob and size) and origin's `main`, per document, by blob ids. An
+/// estimate, not the plan: view state, the tree rules and the merge's own
+/// decisions can only make the apply smaller or add a conflict copy,
+/// which is counted. Pure.
+pub(super) fn network_estimate(
+    base: &BTreeMap<DocId, BTreeMap<DocFile, Oid>>,
+    tablet: &BTreeMap<DocId, BTreeMap<DocFile, (Oid, u64)>>,
+    origin: &BTreeMap<DocId, BTreeMap<DocFile, Oid>>,
+) -> NetworkEstimate {
+    let blobs = |files: Option<&BTreeMap<DocFile, (Oid, u64)>>| -> BTreeMap<DocFile, Oid> {
+        files
+            .into_iter()
+            .flatten()
+            .map(|(file, (blob, _))| (file.clone(), blob.clone()))
+            .collect()
+    };
+    let none = BTreeMap::new();
+    let changed_by_tablet = |doc: &DocId| blobs(tablet.get(doc)) != *base.get(doc).unwrap_or(&none);
+    let to_apply: Vec<&DocId> = base
+        .keys()
+        .chain(origin.keys())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter(|doc| {
+            let theirs = origin.get(*doc).unwrap_or(&none);
+            theirs != base.get(*doc).unwrap_or(&none) && *theirs != blobs(tablet.get(*doc))
+        })
+        .collect();
+    let apply_blobs = to_apply
+        .iter()
+        .filter_map(|doc| origin.get(*doc).map(|files| (doc, files)))
+        .flat_map(|(doc, files)| {
+            let held: BTreeSet<Oid> = blobs(tablet.get(*doc)).into_values().collect();
+            files
+                .values()
+                .filter(move |blob| !held.contains(*blob))
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let size = |files: &BTreeMap<DocFile, (Oid, u64)>, keep: &dyn Fn(&Oid) -> bool| -> u64 {
+        files
+            .values()
+            .filter(|(blob, _)| keep(blob))
+            .map(|(_, size)| size)
+            .sum()
+    };
+    let pushed: u64 = tablet
+        .iter()
+        .filter(|(doc, _)| changed_by_tablet(doc))
+        .map(|(doc, files)| {
+            let based: BTreeSet<&Oid> = base
+                .get(doc)
+                .into_iter()
+                .flat_map(BTreeMap::values)
+                .collect();
+            size(files, &|blob| !based.contains(blob))
+        })
+        .sum();
+    let copies: u64 = to_apply
+        .iter()
+        .filter(|doc| changed_by_tablet(doc))
+        .filter_map(|doc| tablet.get(*doc))
+        .map(|files| size(files, &|_| true))
+        .sum();
+    NetworkEstimate {
+        apply_docs: to_apply.len(),
+        apply_blobs,
+        tablet_bytes: pushed + copies,
+    }
+}
+
+/// Why a sync starts xochitl rather than keep it stopped through step 16.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StartNow {
+    /// Nothing to apply: the network work goes better with the UI up.
+    NothingToApply,
+    /// More to send or apply than a small sync may.
+    TooLarge,
+    /// The budget is spent.
+    Overdue,
+    /// The fetch under the lock took long (a slow origin, or credentials
+    /// prompted for): the later network steps would too.
+    SlowOrigin,
+}
+
+impl std::fmt::Display for StartNow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NothingToApply => "nothing to apply",
+            Self::TooLarge => "more than a small sync",
+            Self::Overdue => "the sync is taking long",
+            Self::SlowOrigin => "origin is slow to answer",
+        })
+    }
+}
+
+/// Step 6: whether a sync keeps xochitl stopped, given the estimate, the
+/// size of its origin blobs (`apply_bytes`), how long xochitl has been
+/// stopped and how long the fetch under the lock took (slow past
+/// [`super::SingleStop::slow_fetch`]). `None`: keep it stopped. Pure.
+pub(super) fn single_stop_at_start(
+    limits: &super::SingleStop,
+    estimate: &NetworkEstimate,
+    apply_bytes: u64,
+    stopped_for: std::time::Duration,
+    fetch_took: std::time::Duration,
+) -> Option<StartNow> {
+    if estimate.apply_docs == 0 {
+        Some(StartNow::NothingToApply)
+    } else if estimate.apply_docs > limits.max_docs
+        || estimate.tablet_bytes.saturating_add(apply_bytes) > limits.max_bytes
+    {
+        Some(StartNow::TooLarge)
+    } else if fetch_took > limits.slow_fetch {
+        Some(StartNow::SlowOrigin)
+    } else {
+        single_stop_overdue(limits, stopped_for)
+    }
+}
+
+/// Before staging: whether a sync that kept xochitl stopped goes on, given
+/// its plan's documents and bytes to stage. Pure.
+pub(super) fn single_stop_at_plan(
+    limits: &super::SingleStop,
+    docs: usize,
+    bytes: u64,
+    stopped_for: std::time::Duration,
+) -> Option<StartNow> {
+    if docs == 0 {
+        Some(StartNow::NothingToApply)
+    } else if docs > limits.max_docs || bytes > limits.max_bytes {
+        Some(StartNow::TooLarge)
+    } else {
+        single_stop_overdue(limits, stopped_for)
+    }
+}
+
+/// Between network steps: whether the budget is spent. Pure.
+pub(super) fn single_stop_overdue(
+    limits: &super::SingleStop,
+    stopped_for: std::time::Duration,
+) -> Option<StartNow> {
+    (stopped_for >= limits.budget).then_some(StartNow::Overdue)
+}
+
 // ---- the manifest --------------------------------------------------------------------
 
 /// What the manifest is recorded from.

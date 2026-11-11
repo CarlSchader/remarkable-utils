@@ -102,26 +102,8 @@ impl Hub<'_> {
         planned: &[Planned],
         merge: Option<&Oid>,
     ) -> Result<BTreeMap<XochitlPath, u64>> {
-        let contents: Vec<(XochitlPath, &Content)> = planned
-            .iter()
-            .flat_map(|entry| match &entry.change {
-                Change::Write { writes, .. } => writes
-                    .iter()
-                    .map(|write| Ok((xochitl_path(&entry.doc, &write.file)?, &write.content)))
-                    .collect(),
-                Change::Delete => Vec::new(),
-            })
-            .collect::<Result<_>>()?;
-        let blob_sizes = store
-            .repo
-            .object_sizes(contents.iter().filter_map(|(_, content)| match content {
-                Content::Blob(oid) => Some(oid),
-                Content::Bytes(_) => None,
-            }))?;
-        let size_of = |content: &Content| match content {
-            Content::Blob(oid) => blob_sizes.get(oid).copied().unwrap_or_default(),
-            Content::Bytes(bytes) => bytes.len() as u64,
-        };
+        let contents = staged_contents(planned)?;
+        let size_of = content_sizes(store, &contents)?;
         let total: u64 = contents.iter().map(|(_, content)| size_of(content)).sum();
         let batches = contents.iter().fold(
             Vec::<(Vec<&(XochitlPath, &Content)>, u64)>::new(),
@@ -184,14 +166,15 @@ impl Hub<'_> {
     /// `.content` whose stat moved or that are new (any document: the
     /// tree checks need them), and the SHA-256 of other moved files of
     /// planned documents. A step-5 stat with a coarse mtime in the second
-    /// of the step-6 start counts as moved (xochitl could have changed
-    /// the file within that second).
+    /// of the first start after the read counts as moved (xochitl could
+    /// have changed the file within that second); with no start since
+    /// the read (`None`, a single-stop sync), none does.
     fn recheck(
         &self,
         s: &Session,
         rules: &MirrorRules,
         read: &TabletRead,
-        started_at: i64,
+        started_at: Option<i64>,
         planned: &BTreeSet<DocId>,
     ) -> Result<Recheck> {
         let listing = s.tablet.stat_all()?;
@@ -218,7 +201,7 @@ impl Hub<'_> {
             &now.iter()
                 .map(|(path, (_, stat))| (path.clone(), *stat))
                 .collect(),
-            started_at,
+            started_at.unwrap_or(i64::MAX),
         );
         let file_of = |path: &XochitlPath| {
             now.get(path)
@@ -330,6 +313,7 @@ impl Hub<'_> {
                 pushed.update != MainUpdate::UpToDate || planned.is_empty(),
                 "a run that found the tablet up to date applies nothing (it has no journal)"
             );
+            self.single_stop_plan(s, &p, &planned)?;
             let applied = if planned.is_empty() {
                 Applied::default()
             } else {
@@ -377,7 +361,11 @@ impl Hub<'_> {
             .collect();
         p.state.manifest = plan::manifest(&plan::ManifestInput {
             read: &p.read.stats(),
-            read_reference_ns: p.started_at,
+            // A single-stop sync starts xochitl only after this: the
+            // apply's device time is before that start (0 if all it
+            // planned was skipped: coarse-mtime entries are then left
+            // out, fine ones kept).
+            read_reference_ns: s.started_at().unwrap_or(applied.written_at),
             before_apply: applied.before.as_ref(),
             written: &applied.written,
             removed: &applied.removed,
@@ -425,6 +413,26 @@ impl Hub<'_> {
         Ok((report, p.origin))
     }
 
+    /// Before staging, while xochitl is kept stopped: start it when there
+    /// is nothing to apply, or more than a small sync may apply with the
+    /// UI down ([`crate::hub::cycle::SingleStop`]), or the budget is
+    /// spent.
+    fn single_stop_plan(&self, s: &mut Session, p: &Prepared, planned: &[Planned]) -> Result<()> {
+        let Some(limits) = self.options.single_stop.filter(|_| s.deferring()) else {
+            return Ok(());
+        };
+        let contents = staged_contents(planned)?;
+        let size_of = content_sizes(&p.origin.store, &contents)?;
+        let bytes: u64 = contents.iter().map(|(_, content)| size_of(content)).sum();
+        let why = plan::single_stop_at_plan(
+            &limits,
+            planned.len(),
+            bytes,
+            s.stopped_for().unwrap_or_default(),
+        );
+        self.end_single_stop(s, why)
+    }
+
     /// Steps 12–14 for a non-empty plan.
     fn apply_planned(&self, s: &mut Session, p: &Prepared, input: ApplyInput) -> Result<Applied> {
         let ApplyInput {
@@ -450,18 +458,24 @@ impl Hub<'_> {
             .chain(p.read.items())
             .collect();
         let planned = plan::order(planned, &merged_items, &current_items, &copies);
-        // 12. Stage while xochitl runs.
+        // 12. Stage (while xochitl runs, unless kept stopped).
         self.progress.step("Staging changes on the tablet");
         s.arm()?;
         s.tablet.clear_staging(s.lock())?;
         let mut sizes = self.stage(s, store, &planned, Some(&pushed.base))?;
-        // 13.
-        self.progress.step("Stopping xochitl");
-        s.stop()?;
+        // 13. A sync that kept xochitl stopped has no network work left:
+        // it applies stopped, under a fresh timer (starting xochitl now
+        // would only stop it again during its start-up).
+        if s.deferring() {
+            s.arm()?;
+        } else {
+            self.progress.step("Stopping xochitl");
+            s.stop()?;
+        }
         // 14. Re-read, verify, check the live tree.
         self.progress.step("Applying changes");
         let planned_docs: BTreeSet<DocId> = planned.iter().map(|entry| entry.doc.clone()).collect();
-        let recheck = self.recheck(s, rules, &p.read, p.started_at, &planned_docs)?;
+        let recheck = self.recheck(s, rules, &p.read, s.started_at(), &planned_docs)?;
         let before = p.read.doc_files();
         let sha256: HashMap<Oid, String> = recheck
             .moved
@@ -572,6 +586,37 @@ impl Hub<'_> {
         applied.applied = report.applied;
         Ok(applied)
     }
+}
+
+/// What staging uploads for `planned`: each written file's content.
+fn staged_contents(planned: &[Planned]) -> Result<Vec<(XochitlPath, &Content)>> {
+    planned
+        .iter()
+        .flat_map(|entry| match &entry.change {
+            Change::Write { writes, .. } => writes
+                .iter()
+                .map(|write| Ok((xochitl_path(&entry.doc, &write.file)?, &write.content)))
+                .collect(),
+            Change::Delete => Vec::new(),
+        })
+        .collect()
+}
+
+/// The size of each of `contents` (blobs from the local cache).
+fn content_sizes(
+    store: &Store,
+    contents: &[(XochitlPath, &Content)],
+) -> Result<impl Fn(&Content) -> u64 + use<>> {
+    let blob_sizes = store
+        .repo
+        .object_sizes(contents.iter().filter_map(|(_, content)| match content {
+            Content::Blob(oid) => Some(oid),
+            Content::Bytes(_) => None,
+        }))?;
+    Ok(move |content: &Content| match content {
+        Content::Blob(oid) => blob_sizes.get(oid).copied().unwrap_or_default(),
+        Content::Bytes(bytes) => bytes.len() as u64,
+    })
 }
 
 /// The device apply plan for planned documents, with staged sizes.

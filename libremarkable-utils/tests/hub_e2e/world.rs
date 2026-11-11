@@ -131,7 +131,7 @@ impl Device {
         fs::write(self.tablet.paths().state_file(), state.to_json()).unwrap();
     }
 
-    fn file(&self, path: &str) -> Option<Vec<u8>> {
+    pub fn file(&self, path: &str) -> Option<Vec<u8>> {
         self.tablet.read_file(path)
     }
 
@@ -256,6 +256,30 @@ impl DeskParts {
     }
 }
 
+/// What a run on tablet `i`'s computer needs, owned, to run it from
+/// another run's progress hook (another computer acting mid-run).
+pub struct HubParts {
+    pub git: Git,
+    pub cache: PathBuf,
+    pub options: HubOptions,
+    pub tablet: Arc<FakeTablet>,
+}
+
+impl HubParts {
+    /// A sync of that tablet.
+    pub fn sync(self) -> Result<SyncReport> {
+        static PROGRESS: NoProgress = NoProgress;
+        Hub::new(
+            self.git,
+            self.cache,
+            LockRequest::for_this_process("other-host"),
+            &PROGRESS,
+        )
+        .with_options(self.options)
+        .sync(&*self.tablet)
+    }
+}
+
 /// The world (see the module docs).
 pub struct World {
     /// Everything lives here; removed on drop.
@@ -309,17 +333,25 @@ impl World {
     }
 
     /// A copy of this world in a new directory: origin, tablets (files,
-    /// hub state) and caches; ink bookkeeping included. The fakes start
-    /// fresh (xochitl running, a new boot id, no faults).
+    /// hub state) and caches; ink bookkeeping and options included. The
+    /// fakes start fresh (xochitl running, a new boot id, no faults).
     pub fn duplicate(&self) -> Self {
         let scratch = Scratch::new("hub-e2e");
         copy_dir(&self.root, scratch.path());
-        let copy = Self::at(scratch, self.devices.len(), false);
+        let mut copy = Self::at(scratch, self.devices.len(), false);
+        copy.options = self.options.clone();
         let inks = self.inks.lock().unwrap().clone();
         *copy.inks.lock().unwrap() = inks;
         let ids = *self.ids.lock().unwrap();
         *copy.ids.lock().unwrap() = ids;
         copy
+    }
+
+    /// This world with the two-window cycle only: every sync starts
+    /// xochitl after its read and stops it again to apply.
+    pub fn two_windows(mut self) -> Self {
+        self.options.single_stop = None;
+        self
     }
 
     pub fn device(&self, i: usize) -> &Device {
@@ -347,6 +379,38 @@ impl World {
             origin: Some(self.origin.clone()),
             ..options
         })
+    }
+
+    /// A hub for tablet `i` that reports progress to `progress`.
+    pub fn hub_with_progress(
+        &self,
+        i: usize,
+        options: HubOptions,
+        progress: &'static dyn libremarkable_utils::progress::Progress,
+    ) -> Hub<'static> {
+        Hub::new(
+            self.git.clone(),
+            self.devices[i].cache.clone(),
+            LockRequest::for_this_process("test-host"),
+            progress,
+        )
+        .with_options(HubOptions {
+            origin: Some(self.origin.clone()),
+            ..options
+        })
+    }
+
+    /// [`HubParts`] for tablet `i`.
+    pub fn hub_parts(&self, i: usize) -> HubParts {
+        HubParts {
+            git: self.git.clone(),
+            cache: self.devices[i].cache.clone(),
+            options: HubOptions {
+                origin: Some(self.origin.clone()),
+                ..self.options.clone()
+            },
+            tablet: Arc::clone(&self.devices[i].tablet),
+        }
     }
 
     /// A hub on a computer that has no tablet (`log`, `restore`, `add`

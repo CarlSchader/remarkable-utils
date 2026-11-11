@@ -175,6 +175,8 @@ impl Hub<'_> {
         snapshot_commit: &Oid,
         attempt: usize,
     ) -> Result<Option<Pushed>> {
+        // After the backup (the first attempt) or a rejected push.
+        self.check_single_stop(s)?;
         s.arm()?;
         self.progress.step("Fetching origin");
         p.origin.refresh(&p.state.device_id)?;

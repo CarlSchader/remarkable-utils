@@ -162,6 +162,21 @@ impl MirrorRules {
 }
 
 impl RepoTree {
+    /// Each document's mirrored files by blob id.
+    pub fn doc_blobs(&self) -> BTreeMap<DocId, BTreeMap<DocFile, Oid>> {
+        self.docs
+            .iter()
+            .map(|(doc, version)| {
+                let files = version
+                    .files
+                    .iter()
+                    .map(|(file, entry)| (file.clone(), entry.id.clone()))
+                    .collect();
+                (doc.clone(), files)
+            })
+            .collect()
+    }
+
     /// The inverse of [`MirrorRules::group_tree`].
     pub fn to_listing(&self) -> TreeListing {
         self.docs
